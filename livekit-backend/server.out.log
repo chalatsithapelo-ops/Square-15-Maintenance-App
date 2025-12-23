@@ -1,0 +1,8 @@
+🚀 Square 15 Livekit Backend
+📡 Server running on port 3000
+🌐 Health check: http://localhost:3000/health
+🔑 Token endpoint: http://localhost:3000/api/token
+🧠 Voice start endpoint: http://localhost:3000/api/voice/start
+📦 Environment: development
+✅ Server ready to accept requests
+
