@@ -1,0 +1,44 @@
+services:
+  # 1) Public HTTPS backend (token + dispatch)
+  - type: web
+    name: square15-livekit-backend
+    env: node
+    rootDir: livekit-backend
+    plan: starter
+    buildCommand: npm install
+    startCommand: npm start
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # IMPORTANT: Set the following as "Secret" in Render dashboard after first deploy.
+      # Render Blueprints don't allow marking secrets directly in yaml.
+      - key: LIVEKIT_WS_URL
+        sync: false
+      - key: LIVEKIT_API_KEY
+        sync: false
+      - key: LIVEKIT_API_SECRET
+        sync: false
+      - key: LIVEKIT_AGENT_NAME
+        value: square15-voice-assistant
+
+  # 2) Always-on agent worker (receives dispatch jobs and speaks)
+  - type: worker
+    name: square15-agent-worker
+    env: docker
+    plan: starter
+    rootDir: .
+    dockerfilePath: agent-worker/Dockerfile
+    autoDeploy: true
+    envVars:
+      - key: LIVEKIT_URL
+        sync: false
+      - key: LIVEKIT_API_KEY
+        sync: false
+      - key: LIVEKIT_API_SECRET
+        sync: false
+      - key: LIVEKIT_AGENT_NAME
+        value: square15-voice-assistant
+      - key: OPENAI_API_KEY
+        sync: false
