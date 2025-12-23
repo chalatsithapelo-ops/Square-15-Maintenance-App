@@ -3,6 +3,20 @@ const cors = require('cors');
 const { AccessToken, AgentDispatchClient } = require('livekit-server-sdk');
 require('dotenv').config();
 
+function sanitizeEnvValue(value) {
+  if (typeof value !== 'string') return value;
+  let v = value.trim();
+  // Render UI copy/paste sometimes includes surrounding quotes
+  if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
+    v = v.slice(1, -1).trim();
+  }
+  return v;
+}
+
+function env(name) {
+  return sanitizeEnvValue(process.env[name]);
+}
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -14,7 +28,7 @@ app.use(cors({
 app.use(express.json());
 
 function getLiveKitWsUrl() {
-  return process.env.LIVEKIT_WS_URL || process.env.LIVEKIT_URL;
+  return env('LIVEKIT_WS_URL') || env('LIVEKIT_URL');
 }
 
 function getLiveKitHttpUrl() {
@@ -27,13 +41,13 @@ function getLiveKitHttpUrl() {
 }
 
 function getAgentName() {
-  return process.env.LIVEKIT_AGENT_NAME || 'square15-voice-assistant';
+  return env('LIVEKIT_AGENT_NAME') || 'square15-voice-assistant';
 }
 
 function validateLiveKitEnv(res) {
   const wsUrl = getLiveKitWsUrl();
-  const apiKey = process.env.LIVEKIT_API_KEY;
-  const apiSecret = process.env.LIVEKIT_API_SECRET;
+  const apiKey = env('LIVEKIT_API_KEY');
+  const apiSecret = env('LIVEKIT_API_SECRET');
 
   if (!wsUrl || !apiKey || !apiSecret) {
     console.error('❌ Livekit credentials not configured');
@@ -48,12 +62,34 @@ function validateLiveKitEnv(res) {
   return { wsUrl, apiKey, apiSecret };
 }
 
+function getSdkVersion() {
+  try {
+    // eslint-disable-next-line global-require
+    return require('livekit-server-sdk/package.json').version;
+  } catch {
+    return 'unknown';
+  }
+}
+
 // Health check endpoint
 app.get('/health', (req, res) => {
+  const wsUrl = getLiveKitWsUrl();
+  const httpUrl = getLiveKitHttpUrl();
+  const apiKey = env('LIVEKIT_API_KEY');
+  const apiSecret = env('LIVEKIT_API_SECRET');
   res.json({ 
     status: 'ok', 
     message: 'Livekit Token Server is running',
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    sdkVersion: getSdkVersion(),
+    livekit: {
+      wsUrl: wsUrl || null,
+      httpUrl: httpUrl || null,
+      agentName: getAgentName(),
+      apiKeyPrefix: apiKey ? apiKey.slice(0, 6) : null,
+      apiKeyLength: apiKey ? apiKey.length : 0,
+      apiSecretLength: apiSecret ? apiSecret.length : 0,
+    },
   });
 });
 
