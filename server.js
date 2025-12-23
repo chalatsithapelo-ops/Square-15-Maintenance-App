@@ -14,7 +14,8 @@ app.use(cors({
 app.use(express.json());
 
 function getLiveKitWsUrl() {
-  return process.env.LIVEKIT_WS_URL || process.env.LIVEKIT_URL;
+  const raw = process.env.LIVEKIT_WS_URL || process.env.LIVEKIT_URL;
+  return typeof raw === 'string' ? raw.trim() : raw;
 }
 
 function getLiveKitHttpUrl() {
@@ -279,3 +280,4 @@ if (require.main === module) {
     console.log('✅ Server ready to accept requests\n');
   });
 }
+
