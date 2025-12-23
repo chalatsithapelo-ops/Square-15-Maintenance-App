@@ -33,8 +33,8 @@ function getAgentName() {
 
 function validateLiveKitEnv(res) {
   const wsUrl = getLiveKitWsUrl();
-  const apiKey = process.env.LIVEKIT_API_KEY;
-  const apiSecret = process.env.LIVEKIT_API_SECRET;
+  const apiKey = typeof process.env.LIVEKIT_API_KEY === 'string' ? process.env.LIVEKIT_API_KEY.trim() : process.env.LIVEKIT_API_KEY;
+const apiSecret = typeof process.env.LIVEKIT_API_SECRET === 'string' ? process.env.LIVEKIT_API_SECRET.trim() : process.env.LIVEKIT_API_SECRET;
 
   if (!wsUrl || !apiKey || !apiSecret) {
     console.error('❌ Livekit credentials not configured');
@@ -280,4 +280,5 @@ if (require.main === module) {
     console.log('✅ Server ready to accept requests\n');
   });
 }
+
 
