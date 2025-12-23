@@ -21,10 +21,12 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Middleware
-app.use(cors({
-  origin: process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : '*',
-  credentials: true
-}));
+app.use(
+  cors({
+    origin: process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : '*',
+    credentials: true,
+  }),
+);
 app.use(express.json());
 
 function getLiveKitWsUrl() {
@@ -64,7 +66,6 @@ function validateLiveKitEnv(res) {
 
 function getSdkVersion() {
   try {
-    // eslint-disable-next-line global-require
     return require('livekit-server-sdk/package.json').version;
   } catch {
     return 'unknown';
@@ -77,8 +78,9 @@ app.get('/health', (req, res) => {
   const httpUrl = getLiveKitHttpUrl();
   const apiKey = env('LIVEKIT_API_KEY');
   const apiSecret = env('LIVEKIT_API_SECRET');
-  res.json({ 
-    status: 'ok', 
+
+  res.json({
+    status: 'ok',
     message: 'Livekit Token Server is running',
     timestamp: new Date().toISOString(),
     sdkVersion: getSdkVersion(),
@@ -101,19 +103,18 @@ app.get('/health', (req, res) => {
  */
 app.post('/api/voice/start', async (req, res) => {
   try {
-    const env = validateLiveKitEnv(res);
-    if (!env) return;
+    const lk = validateLiveKitEnv(res);
+    if (!lk) return;
 
     const agentName = getAgentName();
     const httpUrl = getLiveKitHttpUrl();
 
     const roomName = req.body.roomName || `square15-voice-${Date.now()}`;
-    const participantName =
-      req.body.participantName || `user-${Date.now()}`;
+    const participantName = req.body.participantName || `user-${Date.now()}`;
     const metadata = typeof req.body.metadata === 'string' ? req.body.metadata : '';
 
     // 1) Generate access token (server-side)
-    const at = new AccessToken(env.apiKey, env.apiSecret, {
+    const at = new AccessToken(lk.apiKey, lk.apiSecret, {
       identity: participantName,
       name: participantName,
       metadata,
@@ -130,18 +131,20 @@ app.post('/api/voice/start', async (req, res) => {
     const token = await at.toJwt();
 
     // 2) Explicitly dispatch the agent to the room
-    const dispatchClient = new AgentDispatchClient(httpUrl, env.apiKey, env.apiSecret);
+    const dispatchClient = new AgentDispatchClient(httpUrl, lk.apiKey, lk.apiSecret);
     const dispatch = await dispatchClient.createDispatch(roomName, agentName, {
       metadata: metadata || undefined,
     });
 
-    console.log(`✅ Session started. room=${roomName} user=${participantName} agent=${agentName}`);
+    console.log(
+      `✅ Session started. room=${roomName} user=${participantName} agent=${agentName}`,
+    );
 
     res.json({
       roomName,
       participantName,
       token,
-      url: env.wsUrl,
+      url: lk.wsUrl,
       agentName,
       dispatch,
     });
@@ -163,29 +166,22 @@ app.post('/api/token', async (req, res) => {
   try {
     const { roomName, participantName, metadata } = req.body;
 
-    // Validate required fields
     if (!roomName || !participantName) {
       return res.status(400).json({
         error: 'Missing required fields',
-        message: 'roomName and participantName are required'
+        message: 'roomName and participantName are required',
       });
     }
 
-    const env = validateLiveKitEnv(res);
-    if (!env) return;
+    const lk = validateLiveKitEnv(res);
+    if (!lk) return;
 
-    // Create access token
-    const at = new AccessToken(
-      env.apiKey,
-      env.apiSecret,
-      {
-        identity: participantName,
-        name: participantName,
-        metadata: metadata || '',
-      }
-    );
+    const at = new AccessToken(lk.apiKey, lk.apiSecret, {
+      identity: participantName,
+      name: participantName,
+      metadata: metadata || '',
+    });
 
-    // Grant permissions
     at.addGrant({
       room: roomName,
       roomJoin: true,
@@ -194,47 +190,21 @@ app.post('/api/token', async (req, res) => {
       canPublishData: true,
     });
 
-    // Generate JWT token
     const token = await at.toJwt();
 
     console.log(`✅ Token generated for ${participantName} in room ${roomName}`);
 
     res.json({
-      token: token,
-      url: env.wsUrl,
-      roomName: roomName,
-      participantName: participantName
+      token,
+      url: lk.wsUrl,
+      roomName,
+      participantName,
     });
-
   } catch (error) {
     console.error('❌ Error generating token:', error);
     res.status(500).json({
       error: 'Token generation failed',
-      message: error.message
-    });
-  }
-});
-
-/**
- * Create a new AI voice agent room
- * POST /api/create-room
- * Body: { roomName?: string }
- */
-app.post('/api/create-room', async (req, res) => {
-  try {
-    const roomName = req.body.roomName || `voice-assistant-${Date.now()}`;
-    
-    res.json({
-      roomName: roomName,
-      url: getLiveKitWsUrl(),
-      message: 'Room created successfully'
-    });
-
-  } catch (error) {
-    console.error('❌ Error creating room:', error);
-    res.status(500).json({
-      error: 'Room creation failed',
-      message: error.message
+      message: error.message,
     });
   }
 });
@@ -242,7 +212,7 @@ app.post('/api/create-room', async (req, res) => {
 /**
  * Dispatch agent to room
  * POST /api/dispatch-agent
- * Body: { roomName: string }
+ * Body: { roomName: string, metadata?: string }
  */
 app.post('/api/dispatch-agent', async (req, res) => {
   try {
@@ -251,34 +221,34 @@ app.post('/api/dispatch-agent', async (req, res) => {
     if (!roomName) {
       return res.status(400).json({
         error: 'Missing roomName',
-        message: 'roomName is required'
+        message: 'roomName is required',
       });
     }
 
-    const env = validateLiveKitEnv(res);
-    if (!env) return;
+    const lk = validateLiveKitEnv(res);
+    if (!lk) return;
 
     const agentName = getAgentName();
     const httpUrl = getLiveKitHttpUrl();
-    const dispatchClient = new AgentDispatchClient(httpUrl, env.apiKey, env.apiSecret);
+    const dispatchClient = new AgentDispatchClient(httpUrl, lk.apiKey, lk.apiSecret);
     const dispatch = await dispatchClient.createDispatch(roomName, agentName, {
       metadata: typeof metadata === 'string' ? metadata : undefined,
     });
 
     console.log(`✅ Agent dispatched to room: ${roomName} (agent=${agentName})`);
+
     res.json({
       success: true,
       roomName,
       agentName,
       dispatch,
-      message: 'Agent dispatched successfully'
+      message: 'Agent dispatched successfully',
     });
-
   } catch (error) {
     console.error('❌ Error dispatching agent:', error);
     res.status(500).json({
       error: 'Agent dispatch failed',
-      message: error.message
+      message: error.message,
     });
   }
 });
@@ -288,7 +258,7 @@ app.use((err, req, res, next) => {
   console.error('❌ Server error:', err);
   res.status(500).json({
     error: 'Internal server error',
-    message: err.message
+    message: err.message,
   });
 });
 
@@ -296,14 +266,12 @@ app.use((err, req, res, next) => {
 app.use((req, res) => {
   res.status(404).json({
     error: 'Not found',
-    message: 'The requested endpoint does not exist'
+    message: 'The requested endpoint does not exist',
   });
 });
 
-// Export app for serverless/tests
 module.exports = app;
 
-// Start server only when executed directly (node server.js)
 if (require.main === module) {
   app.listen(PORT, () => {
     console.log('🚀 Square 15 Livekit Backend');
