@@ -1,0 +1,13 @@
+🚀 LiveKit Agent Dispatch Server running on port 3001
+📡 Listening on all interfaces (0.0.0.0:3001)
+🔗 Local: http://localhost:3001
+🔗 Network: http://192.168.123.36:3001
+
+⚠️  Main backend should run on port 3000
+⚠️  This dispatch server uses port 3001
+
+Ready to receive dispatch requests...
+📞 Dispatch request received for room: square15-voice-1766446638131
+✅ Agent dispatch created for room: square15-voice-1766446638131
+📞 Dispatch request received for room: square15-voice-1766487614650
+✅ Agent dispatch created for room: square15-voice-1766487614650

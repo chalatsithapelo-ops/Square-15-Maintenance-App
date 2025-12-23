@@ -1,0 +1,1649 @@
+2025-12-23 01:35:24,259 - __main__ - INFO - \U0001f680 Starting Square 15 Voice Agent Worker...
+2025-12-23 01:35:24,262 - __main__ - INFO - \U0001f4e1 Listening for room join events...
+2025-12-23 01:35:24,264 - __main__ - INFO - \U0001f91d Explicit dispatch agent_name: square15-voice-assistant
+2025-12-23 01:35:24,279 - livekit.agents - INFO - starting worker
+2025-12-23 01:35:24,284 - livekit.agents - INFO - HTTP server listening on :64788
+2025-12-23 01:35:24,296 - livekit.agents - INFO - initializing job runner
+2025-12-23 01:35:24,300 - livekit.agents - INFO - initializing job runner
+2025-12-23 01:35:24,301 - livekit.agents - INFO - initializing job runner
+2025-12-23 01:35:24,302 - livekit.agents - INFO - initializing job runner
+2025-12-23 01:35:24,304 - livekit.agents - INFO - job runner initialized
+2025-12-23 01:35:24,309 - livekit.agents - INFO - job runner initialized
+2025-12-23 01:35:24,311 - livekit.agents - INFO - job runner initialized
+2025-12-23 01:35:24,311 - livekit.agents - INFO - job runner initialized
+2025-12-23 01:35:24,468 - livekit.agents - INFO - registered worker
+2025-12-23 01:37:10,566 - livekit.agents - INFO - received job request
+2025-12-23 01:37:10,593 - __main__ - INFO - \U0001f3af New job received for room: square15-voice-1766446638131
+--- Logging error ---
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\logging\__init__.py", line 1163, in emit
+    stream.write(msg + self.terminator)
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\U0001f3af' in position 13: character maps to <undefined>
+Call stack:
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1009, in _bootstrap
+    self._bootstrap_inner()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1052, in _bootstrap_inner
+    self.run()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 989, in run
+    self._target(*self._args, **self._kwargs)
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\job_proc_lazy_main.py", line 389, in thread_main
+    client.run()
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\proc_client.py", line 71, in run
+    loop.run_until_complete(self._task)
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 651, in run_until_complete
+    self.run_forever()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\windows_events.py", line 321, in run_forever
+    super().run_forever()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 618, in run_forever
+    self._run_once()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 1951, in _run_once
+    handle._run()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\events.py", line 84, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\opentelemetry\util\_decorator.py", line 71, in async_wrapper
+    return await func(*args, **kwargs)  # type: ignore
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\job_proc_lazy_main.py", line 286, in _traceable_entrypoint
+    await self._job_entrypoint_fnc(job_ctx)
+  File "C:\Users\Thapelo\Downloads\square_15-master\square_15-master\scripts\voice_agent_worker.py", line 165, in request_handler
+    await entrypoint(ctx)
+  File "C:\Users\Thapelo\Downloads\square_15-master\square_15-master\scripts\voice_agent_worker.py", line 43, in entrypoint
+    logger.info(f"\U0001f3af New job received for room: {room_name}")
+Message: '\U0001f3af New job received for room: square15-voice-1766446638131'
+Arguments: ()
+2025-12-23 01:37:10,615 - __main__ - INFO - \U0001f4e1 Connecting to room: square15-voice-1766446638131
+--- Logging error ---
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\logging\__init__.py", line 1163, in emit
+    stream.write(msg + self.terminator)
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\U0001f4e1' in position 13: character maps to <undefined>
+Call stack:
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1009, in _bootstrap
+    self._bootstrap_inner()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1052, in _bootstrap_inner
+    self.run()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 989, in run
+    self._target(*self._args, **self._kwargs)
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\job_proc_lazy_main.py", line 389, in thread_main
+    client.run()
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\proc_client.py", line 71, in run
+    loop.run_until_complete(self._task)
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 651, in run_until_complete
+    self.run_forever()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\windows_events.py", line 321, in run_forever
+    super().run_forever()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 618, in run_forever
+    self._run_once()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 1951, in _run_once
+    handle._run()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\events.py", line 84, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\opentelemetry\util\_decorator.py", line 71, in async_wrapper
+    return await func(*args, **kwargs)  # type: ignore
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\job_proc_lazy_main.py", line 286, in _traceable_entrypoint
+    await self._job_entrypoint_fnc(job_ctx)
+  File "C:\Users\Thapelo\Downloads\square_15-master\square_15-master\scripts\voice_agent_worker.py", line 165, in request_handler
+    await entrypoint(ctx)
+  File "C:\Users\Thapelo\Downloads\square_15-master\square_15-master\scripts\voice_agent_worker.py", line 52, in entrypoint
+    logger.info(f"\U0001f4e1 Connecting to room: {room_name}")
+Message: '\U0001f4e1 Connecting to room: square15-voice-1766446638131'
+Arguments: ()
+2025-12-23 01:37:10,653 - livekit.agents - INFO - initializing job runner
+2025-12-23 01:37:10,655 - livekit.agents - INFO - job runner initialized
+2025-12-23 01:37:10,840 - __main__ - INFO - \u2705 Agent connected to room: square15-voice-1766446638131
+--- Logging error ---
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\logging\__init__.py", line 1163, in emit
+    stream.write(msg + self.terminator)
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\u2705' in position 13: character maps to <undefined>
+Call stack:
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1009, in _bootstrap
+    self._bootstrap_inner()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1052, in _bootstrap_inner
+    self.run()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 989, in run
+    self._target(*self._args, **self._kwargs)
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\job_proc_lazy_main.py", line 389, in thread_main
+    client.run()
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\proc_client.py", line 71, in run
+    loop.run_until_complete(self._task)
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 651, in run_until_complete
+    self.run_forever()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\windows_events.py", line 321, in run_forever
+    super().run_forever()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 618, in run_forever
+    self._run_once()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 1951, in _run_once
+    handle._run()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\events.py", line 84, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\opentelemetry\util\_decorator.py", line 71, in async_wrapper
+    return await func(*args, **kwargs)  # type: ignore
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\job_proc_lazy_main.py", line 286, in _traceable_entrypoint
+    await self._job_entrypoint_fnc(job_ctx)
+  File "C:\Users\Thapelo\Downloads\square_15-master\square_15-master\scripts\voice_agent_worker.py", line 165, in request_handler
+    await entrypoint(ctx)
+  File "C:\Users\Thapelo\Downloads\square_15-master\square_15-master\scripts\voice_agent_worker.py", line 59, in entrypoint
+    logger.info(f"\u2705 Agent connected to room: {room_name}")
+Message: '\u2705 Agent connected to room: square15-voice-1766446638131'
+Arguments: ()
+2025-12-23 01:37:10,848 - __main__ - INFO - \U0001f3a4 Loading Voice Activity Detection...
+--- Logging error ---
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\logging\__init__.py", line 1163, in emit
+    stream.write(msg + self.terminator)
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\U0001f3a4' in position 13: character maps to <undefined>
+Call stack:
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1009, in _bootstrap
+    self._bootstrap_inner()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1052, in _bootstrap_inner
+    self.run()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 989, in run
+    self._target(*self._args, **self._kwargs)
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\job_proc_lazy_main.py", line 389, in thread_main
+    client.run()
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\proc_client.py", line 71, in run
+    loop.run_until_complete(self._task)
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 651, in run_until_complete
+    self.run_forever()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\windows_events.py", line 321, in run_forever
+    super().run_forever()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 618, in run_forever
+    self._run_once()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 1951, in _run_once
+    handle._run()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\events.py", line 84, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\opentelemetry\util\_decorator.py", line 71, in async_wrapper
+    return await func(*args, **kwargs)  # type: ignore
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\job_proc_lazy_main.py", line 286, in _traceable_entrypoint
+    await self._job_entrypoint_fnc(job_ctx)
+  File "C:\Users\Thapelo\Downloads\square_15-master\square_15-master\scripts\voice_agent_worker.py", line 165, in request_handler
+    await entrypoint(ctx)
+  File "C:\Users\Thapelo\Downloads\square_15-master\square_15-master\scripts\voice_agent_worker.py", line 71, in entrypoint
+    logger.info("\U0001f3a4 Loading Voice Activity Detection...")
+Message: '\U0001f3a4 Loading Voice Activity Detection...'
+Arguments: ()
+2025-12-23 01:37:11,024 - __main__ - INFO - \U0001f916 Creating voice agent...
+--- Logging error ---
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\logging\__init__.py", line 1163, in emit
+    stream.write(msg + self.terminator)
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\U0001f916' in position 13: character maps to <undefined>
+Call stack:
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1009, in _bootstrap
+    self._bootstrap_inner()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1052, in _bootstrap_inner
+    self.run()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 989, in run
+    self._target(*self._args, **self._kwargs)
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\job_proc_lazy_main.py", line 389, in thread_main
+    client.run()
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\proc_client.py", line 71, in run
+    loop.run_until_complete(self._task)
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 651, in run_until_complete
+    self.run_forever()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\windows_events.py", line 321, in run_forever
+    super().run_forever()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 618, in run_forever
+    self._run_once()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 1951, in _run_once
+    handle._run()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\events.py", line 84, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\opentelemetry\util\_decorator.py", line 71, in async_wrapper
+    return await func(*args, **kwargs)  # type: ignore
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\job_proc_lazy_main.py", line 286, in _traceable_entrypoint
+    await self._job_entrypoint_fnc(job_ctx)
+  File "C:\Users\Thapelo\Downloads\square_15-master\square_15-master\scripts\voice_agent_worker.py", line 165, in request_handler
+    await entrypoint(ctx)
+  File "C:\Users\Thapelo\Downloads\square_15-master\square_15-master\scripts\voice_agent_worker.py", line 87, in entrypoint
+    logger.info("\U0001f916 Creating voice agent...")
+Message: '\U0001f916 Creating voice agent...'
+Arguments: ()
+2025-12-23 01:37:12,205 - __main__ - INFO - \u2705 Voice agent created successfully
+--- Logging error ---
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\logging\__init__.py", line 1163, in emit
+    stream.write(msg + self.terminator)
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\u2705' in position 13: character maps to <undefined>
+Call stack:
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1009, in _bootstrap
+    self._bootstrap_inner()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1052, in _bootstrap_inner
+    self.run()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 989, in run
+    self._target(*self._args, **self._kwargs)
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\job_proc_lazy_main.py", line 389, in thread_main
+    client.run()
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\proc_client.py", line 71, in run
+    loop.run_until_complete(self._task)
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 651, in run_until_complete
+    self.run_forever()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\windows_events.py", line 321, in run_forever
+    super().run_forever()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 618, in run_forever
+    self._run_once()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 1951, in _run_once
+    handle._run()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\events.py", line 84, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\opentelemetry\util\_decorator.py", line 71, in async_wrapper
+    return await func(*args, **kwargs)  # type: ignore
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\job_proc_lazy_main.py", line 286, in _traceable_entrypoint
+    await self._job_entrypoint_fnc(job_ctx)
+  File "C:\Users\Thapelo\Downloads\square_15-master\square_15-master\scripts\voice_agent_worker.py", line 165, in request_handler
+    await entrypoint(ctx)
+  File "C:\Users\Thapelo\Downloads\square_15-master\square_15-master\scripts\voice_agent_worker.py", line 113, in entrypoint
+    logger.info("\u2705 Voice agent created successfully")
+Message: '\u2705 Voice agent created successfully'
+Arguments: ()
+2025-12-23 01:37:12,213 - __main__ - INFO - \U0001f680 Starting agent session...
+--- Logging error ---
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\logging\__init__.py", line 1163, in emit
+    stream.write(msg + self.terminator)
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\U0001f680' in position 13: character maps to <undefined>
+Call stack:
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1009, in _bootstrap
+    self._bootstrap_inner()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1052, in _bootstrap_inner
+    self.run()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 989, in run
+    self._target(*self._args, **self._kwargs)
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\job_proc_lazy_main.py", line 389, in thread_main
+    client.run()
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\proc_client.py", line 71, in run
+    loop.run_until_complete(self._task)
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 651, in run_until_complete
+    self.run_forever()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\windows_events.py", line 321, in run_forever
+    super().run_forever()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 618, in run_forever
+    self._run_once()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 1951, in _run_once
+    handle._run()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\events.py", line 84, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\opentelemetry\util\_decorator.py", line 71, in async_wrapper
+    return await func(*args, **kwargs)  # type: ignore
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\job_proc_lazy_main.py", line 286, in _traceable_entrypoint
+    await self._job_entrypoint_fnc(job_ctx)
+  File "C:\Users\Thapelo\Downloads\square_15-master\square_15-master\scripts\voice_agent_worker.py", line 165, in request_handler
+    await entrypoint(ctx)
+  File "C:\Users\Thapelo\Downloads\square_15-master\square_15-master\scripts\voice_agent_worker.py", line 119, in entrypoint
+    logger.info("\U0001f680 Starting agent session...")
+Message: '\U0001f680 Starting agent session...'
+Arguments: ()
+2025-12-23 01:37:12,230 - __main__ - INFO - \u2705 Agent session started and running!
+--- Logging error ---
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\logging\__init__.py", line 1163, in emit
+    stream.write(msg + self.terminator)
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\u2705' in position 13: character maps to <undefined>
+Call stack:
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1009, in _bootstrap
+    self._bootstrap_inner()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1052, in _bootstrap_inner
+    self.run()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 989, in run
+    self._target(*self._args, **self._kwargs)
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\job_proc_lazy_main.py", line 389, in thread_main
+    client.run()
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\proc_client.py", line 71, in run
+    loop.run_until_complete(self._task)
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 651, in run_until_complete
+    self.run_forever()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\windows_events.py", line 321, in run_forever
+    super().run_forever()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 618, in run_forever
+    self._run_once()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 1951, in _run_once
+    handle._run()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\events.py", line 84, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\opentelemetry\util\_decorator.py", line 71, in async_wrapper
+    return await func(*args, **kwargs)  # type: ignore
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\job_proc_lazy_main.py", line 286, in _traceable_entrypoint
+    await self._job_entrypoint_fnc(job_ctx)
+  File "C:\Users\Thapelo\Downloads\square_15-master\square_15-master\scripts\voice_agent_worker.py", line 165, in request_handler
+    await entrypoint(ctx)
+  File "C:\Users\Thapelo\Downloads\square_15-master\square_15-master\scripts\voice_agent_worker.py", line 124, in entrypoint
+    logger.info("\u2705 Agent session started and running!")
+Message: '\u2705 Agent session started and running!'
+Arguments: ()
+2025-12-23 01:37:18,246 - __main__ - INFO - \u2705 Greeting sent
+--- Logging error ---
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\logging\__init__.py", line 1163, in emit
+    stream.write(msg + self.terminator)
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\u2705' in position 13: character maps to <undefined>
+Call stack:
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1009, in _bootstrap
+    self._bootstrap_inner()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1052, in _bootstrap_inner
+    self.run()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 989, in run
+    self._target(*self._args, **self._kwargs)
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\job_proc_lazy_main.py", line 389, in thread_main
+    client.run()
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\proc_client.py", line 71, in run
+    loop.run_until_complete(self._task)
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 651, in run_until_complete
+    self.run_forever()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\windows_events.py", line 321, in run_forever
+    super().run_forever()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 618, in run_forever
+    self._run_once()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 1951, in _run_once
+    handle._run()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\events.py", line 84, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\opentelemetry\util\_decorator.py", line 71, in async_wrapper
+    return await func(*args, **kwargs)  # type: ignore
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\job_proc_lazy_main.py", line 286, in _traceable_entrypoint
+    await self._job_entrypoint_fnc(job_ctx)
+  File "C:\Users\Thapelo\Downloads\square_15-master\square_15-master\scripts\voice_agent_worker.py", line 165, in request_handler
+    await entrypoint(ctx)
+  File "C:\Users\Thapelo\Downloads\square_15-master\square_15-master\scripts\voice_agent_worker.py", line 132, in entrypoint
+    logger.info("\u2705 Greeting sent")
+Message: '\u2705 Greeting sent'
+Arguments: ()
+2025-12-23 01:37:46,940 - livekit.agents - INFO - closing agent session due to participant disconnect (disable via `RoomInputOptions.close_on_disconnect=False`)
+2025-12-23 01:38:24,481 - livekit.agents - INFO - worker is at full capacity, marking as unavailable
+2025-12-23 10:18:07,922 - livekit.agents - WARNING - unexpected message type: 258
+2025-12-23 10:18:07,944 - livekit.agents - WARNING - failed to connect to livekit, retrying in 0s
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\worker.py", line 1013, in _connection_task
+    await self._run_ws(ws)
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\worker.py", line 1094, in _run_ws
+    await asyncio.gather(*tasks)
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\worker.py", line 1066, in _recv_task
+    raise Exception("worker connection closed unexpectedly")
+Exception: worker connection closed unexpectedly
+2025-12-23 10:18:07,961 - livekit.agents - WARNING - failed to connect to livekit, retrying in 2s
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1532, in _create_direct_connection
+    hosts = await self._resolve_host(host, port, traces=traces)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1148, in _resolve_host
+    return await asyncio.shield(resolved_host_task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1179, in _resolve_host_with_throttle
+    addrs = await self._resolver.resolve(host, port, family=self._family)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\resolver.py", line 40, in resolve
+    infos = await self._loop.getaddrinfo(
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 878, in getaddrinfo
+    return await self.run_in_executor(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\concurrent\futures\thread.py", line 58, in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\socket.py", line 963, in getaddrinfo
+    for res in _socket.getaddrinfo(host, port, family, type, proto, flags):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+socket.gaierror: [Errno 11004] getaddrinfo failed
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\worker.py", line 973, in _connection_task
+    ws = await self._http_session.ws_connect(
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 1076, in _ws_connect
+    resp = await self.request(
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 779, in _request
+    resp = await handler(req)
+           ^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 734, in _connect_and_send_request
+    conn = await self._connector.connect(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 642, in connect
+    proto = await self._create_connection(req, traces, timeout)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1209, in _create_connection
+    _, proto = await self._create_direct_connection(req, traces, timeout)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1538, in _create_direct_connection
+    raise ClientConnectorDNSError(req.connection_key, exc) from exc
+aiohttp.client_exceptions.ClientConnectorDNSError: Cannot connect to host square-15-maintenance-app-n6ijx3po.livekit.cloud:443 ssl:default [getaddrinfo failed]
+2025-12-23 10:18:10,075 - livekit.agents - WARNING - failed to connect to livekit, retrying in 4s
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1532, in _create_direct_connection
+    hosts = await self._resolve_host(host, port, traces=traces)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1148, in _resolve_host
+    return await asyncio.shield(resolved_host_task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1179, in _resolve_host_with_throttle
+    addrs = await self._resolver.resolve(host, port, family=self._family)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\resolver.py", line 40, in resolve
+    infos = await self._loop.getaddrinfo(
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 878, in getaddrinfo
+    return await self.run_in_executor(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\concurrent\futures\thread.py", line 58, in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\socket.py", line 963, in getaddrinfo
+    for res in _socket.getaddrinfo(host, port, family, type, proto, flags):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+socket.gaierror: [Errno 11004] getaddrinfo failed
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\worker.py", line 973, in _connection_task
+    ws = await self._http_session.ws_connect(
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 1076, in _ws_connect
+    resp = await self.request(
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 779, in _request
+    resp = await handler(req)
+           ^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 734, in _connect_and_send_request
+    conn = await self._connector.connect(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 642, in connect
+    proto = await self._create_connection(req, traces, timeout)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1209, in _create_connection
+    _, proto = await self._create_direct_connection(req, traces, timeout)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1538, in _create_direct_connection
+    raise ClientConnectorDNSError(req.connection_key, exc) from exc
+aiohttp.client_exceptions.ClientConnectorDNSError: Cannot connect to host square-15-maintenance-app-n6ijx3po.livekit.cloud:443 ssl:default [getaddrinfo failed]
+2025-12-23 10:18:14,094 - livekit.agents - WARNING - failed to connect to livekit, retrying in 6s
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1532, in _create_direct_connection
+    hosts = await self._resolve_host(host, port, traces=traces)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1148, in _resolve_host
+    return await asyncio.shield(resolved_host_task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1179, in _resolve_host_with_throttle
+    addrs = await self._resolver.resolve(host, port, family=self._family)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\resolver.py", line 40, in resolve
+    infos = await self._loop.getaddrinfo(
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 878, in getaddrinfo
+    return await self.run_in_executor(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\concurrent\futures\thread.py", line 58, in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\socket.py", line 963, in getaddrinfo
+    for res in _socket.getaddrinfo(host, port, family, type, proto, flags):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+socket.gaierror: [Errno 11004] getaddrinfo failed
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\worker.py", line 973, in _connection_task
+    ws = await self._http_session.ws_connect(
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 1076, in _ws_connect
+    resp = await self.request(
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 779, in _request
+    resp = await handler(req)
+           ^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 734, in _connect_and_send_request
+    conn = await self._connector.connect(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 642, in connect
+    proto = await self._create_connection(req, traces, timeout)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1209, in _create_connection
+    _, proto = await self._create_direct_connection(req, traces, timeout)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1538, in _create_direct_connection
+    raise ClientConnectorDNSError(req.connection_key, exc) from exc
+aiohttp.client_exceptions.ClientConnectorDNSError: Cannot connect to host square-15-maintenance-app-n6ijx3po.livekit.cloud:443 ssl:default [getaddrinfo failed]
+2025-12-23 10:18:20,191 - livekit.agents - WARNING - failed to connect to livekit, retrying in 8s
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1532, in _create_direct_connection
+    hosts = await self._resolve_host(host, port, traces=traces)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1148, in _resolve_host
+    return await asyncio.shield(resolved_host_task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1179, in _resolve_host_with_throttle
+    addrs = await self._resolver.resolve(host, port, family=self._family)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\resolver.py", line 40, in resolve
+    infos = await self._loop.getaddrinfo(
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 878, in getaddrinfo
+    return await self.run_in_executor(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\concurrent\futures\thread.py", line 58, in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\socket.py", line 963, in getaddrinfo
+    for res in _socket.getaddrinfo(host, port, family, type, proto, flags):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+socket.gaierror: [Errno 11004] getaddrinfo failed
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\worker.py", line 973, in _connection_task
+    ws = await self._http_session.ws_connect(
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 1076, in _ws_connect
+    resp = await self.request(
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 779, in _request
+    resp = await handler(req)
+           ^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 734, in _connect_and_send_request
+    conn = await self._connector.connect(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 642, in connect
+    proto = await self._create_connection(req, traces, timeout)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1209, in _create_connection
+    _, proto = await self._create_direct_connection(req, traces, timeout)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1538, in _create_direct_connection
+    raise ClientConnectorDNSError(req.connection_key, exc) from exc
+aiohttp.client_exceptions.ClientConnectorDNSError: Cannot connect to host square-15-maintenance-app-n6ijx3po.livekit.cloud:443 ssl:default [getaddrinfo failed]
+2025-12-23 10:18:28,209 - livekit.agents - WARNING - failed to connect to livekit, retrying in 10s
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1532, in _create_direct_connection
+    hosts = await self._resolve_host(host, port, traces=traces)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1148, in _resolve_host
+    return await asyncio.shield(resolved_host_task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1179, in _resolve_host_with_throttle
+    addrs = await self._resolver.resolve(host, port, family=self._family)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\resolver.py", line 40, in resolve
+    infos = await self._loop.getaddrinfo(
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 878, in getaddrinfo
+    return await self.run_in_executor(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\concurrent\futures\thread.py", line 58, in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\socket.py", line 963, in getaddrinfo
+    for res in _socket.getaddrinfo(host, port, family, type, proto, flags):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+socket.gaierror: [Errno 11004] getaddrinfo failed
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\worker.py", line 973, in _connection_task
+    ws = await self._http_session.ws_connect(
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 1076, in _ws_connect
+    resp = await self.request(
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 779, in _request
+    resp = await handler(req)
+           ^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 734, in _connect_and_send_request
+    conn = await self._connector.connect(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 642, in connect
+    proto = await self._create_connection(req, traces, timeout)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1209, in _create_connection
+    _, proto = await self._create_direct_connection(req, traces, timeout)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1538, in _create_direct_connection
+    raise ClientConnectorDNSError(req.connection_key, exc) from exc
+aiohttp.client_exceptions.ClientConnectorDNSError: Cannot connect to host square-15-maintenance-app-n6ijx3po.livekit.cloud:443 ssl:default [getaddrinfo failed]
+2025-12-23 10:18:38,221 - livekit.agents - WARNING - failed to connect to livekit, retrying in 10s
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1532, in _create_direct_connection
+    hosts = await self._resolve_host(host, port, traces=traces)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1148, in _resolve_host
+    return await asyncio.shield(resolved_host_task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1179, in _resolve_host_with_throttle
+    addrs = await self._resolver.resolve(host, port, family=self._family)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\resolver.py", line 40, in resolve
+    infos = await self._loop.getaddrinfo(
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 878, in getaddrinfo
+    return await self.run_in_executor(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\concurrent\futures\thread.py", line 58, in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\socket.py", line 963, in getaddrinfo
+    for res in _socket.getaddrinfo(host, port, family, type, proto, flags):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+socket.gaierror: [Errno 11004] getaddrinfo failed
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\worker.py", line 973, in _connection_task
+    ws = await self._http_session.ws_connect(
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 1076, in _ws_connect
+    resp = await self.request(
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 779, in _request
+    resp = await handler(req)
+           ^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 734, in _connect_and_send_request
+    conn = await self._connector.connect(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 642, in connect
+    proto = await self._create_connection(req, traces, timeout)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1209, in _create_connection
+    _, proto = await self._create_direct_connection(req, traces, timeout)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1538, in _create_direct_connection
+    raise ClientConnectorDNSError(req.connection_key, exc) from exc
+aiohttp.client_exceptions.ClientConnectorDNSError: Cannot connect to host square-15-maintenance-app-n6ijx3po.livekit.cloud:443 ssl:default [getaddrinfo failed]
+2025-12-23 10:18:48,225 - livekit.agents - WARNING - failed to connect to livekit, retrying in 10s
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1532, in _create_direct_connection
+    hosts = await self._resolve_host(host, port, traces=traces)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1148, in _resolve_host
+    return await asyncio.shield(resolved_host_task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1179, in _resolve_host_with_throttle
+    addrs = await self._resolver.resolve(host, port, family=self._family)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\resolver.py", line 40, in resolve
+    infos = await self._loop.getaddrinfo(
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 878, in getaddrinfo
+    return await self.run_in_executor(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\concurrent\futures\thread.py", line 58, in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\socket.py", line 963, in getaddrinfo
+    for res in _socket.getaddrinfo(host, port, family, type, proto, flags):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+socket.gaierror: [Errno 11004] getaddrinfo failed
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\worker.py", line 973, in _connection_task
+    ws = await self._http_session.ws_connect(
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 1076, in _ws_connect
+    resp = await self.request(
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 779, in _request
+    resp = await handler(req)
+           ^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 734, in _connect_and_send_request
+    conn = await self._connector.connect(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 642, in connect
+    proto = await self._create_connection(req, traces, timeout)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1209, in _create_connection
+    _, proto = await self._create_direct_connection(req, traces, timeout)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1538, in _create_direct_connection
+    raise ClientConnectorDNSError(req.connection_key, exc) from exc
+aiohttp.client_exceptions.ClientConnectorDNSError: Cannot connect to host square-15-maintenance-app-n6ijx3po.livekit.cloud:443 ssl:default [getaddrinfo failed]
+2025-12-23 10:18:58,562 - livekit.agents - INFO - registered worker
+2025-12-23 10:19:07,789 - livekit.agents - WARNING - failed to connect to livekit, retrying in 0s
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\worker.py", line 1013, in _connection_task
+    await self._run_ws(ws)
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\worker.py", line 1094, in _run_ws
+    await asyncio.gather(*tasks)
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\worker.py", line 1066, in _recv_task
+    raise Exception("worker connection closed unexpectedly")
+Exception: worker connection closed unexpectedly
+2025-12-23 10:19:07,794 - livekit.agents - WARNING - failed to connect to livekit, retrying in 2s
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1268, in _wrap_create_connection
+    sock = await aiohappyeyeballs.start_connection(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohappyeyeballs\impl.py", line 122, in start_connection
+    raise first_exception
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohappyeyeballs\impl.py", line 73, in start_connection
+    sock = await _connect_sock(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohappyeyeballs\impl.py", line 208, in _connect_sock
+    await loop.sock_connect(sock, address)
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\proactor_events.py", line 727, in sock_connect
+    return await self._proactor.connect(sock, address)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\windows_events.py", line 798, in _poll
+    value = callback(transferred, key, ov)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\windows_events.py", line 594, in finish_connect
+    ov.getresult()
+OSError: [WinError 1231] The network location cannot be reached. For information about network troubleshooting, see Windows Help
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\worker.py", line 973, in _connection_task
+    ws = await self._http_session.ws_connect(
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 1076, in _ws_connect
+    resp = await self.request(
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 779, in _request
+    resp = await handler(req)
+           ^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 734, in _connect_and_send_request
+    conn = await self._connector.connect(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 642, in connect
+    proto = await self._create_connection(req, traces, timeout)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1209, in _create_connection
+    _, proto = await self._create_direct_connection(req, traces, timeout)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1581, in _create_direct_connection
+    raise last_exc
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1550, in _create_direct_connection
+    transp, proto = await self._wrap_create_connection(
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1291, in _wrap_create_connection
+    raise client_error(req.connection_key, exc) from exc
+aiohttp.client_exceptions.ClientConnectorError: Cannot connect to host square-15-maintenance-app-n6ijx3po.livekit.cloud:443 ssl:default [The network location cannot be reached. For information about network troubleshooting, see Windows Help]
+2025-12-23 10:19:10,672 - livekit.agents - WARNING - failed to connect to livekit, retrying in 4s
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1283, in _wrap_create_connection
+    return await self._loop.create_connection(*args, **kwargs, sock=sock)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 1126, in create_connection
+    transport, protocol = await self._create_connection_transport(
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 1159, in _create_connection_transport
+    await waiter
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\sslproto.py", line 575, in _on_handshake_complete
+    raise handshake_exc
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\sslproto.py", line 557, in _do_handshake
+    self._sslobj.do_handshake()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\ssl.py", line 917, in do_handshake
+    self._sslobj.do_handshake()
+ssl.SSLCertVerificationError: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Hostname mismatch, certificate is not valid for 'square-15-maintenance-app-n6ijx3po.livekit.cloud'. (_ssl.c:1000)
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\worker.py", line 973, in _connection_task
+    ws = await self._http_session.ws_connect(
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 1076, in _ws_connect
+    resp = await self.request(
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 779, in _request
+    resp = await handler(req)
+           ^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 734, in _connect_and_send_request
+    conn = await self._connector.connect(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 642, in connect
+    proto = await self._create_connection(req, traces, timeout)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1209, in _create_connection
+    _, proto = await self._create_direct_connection(req, traces, timeout)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1581, in _create_direct_connection
+    raise last_exc
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1550, in _create_direct_connection
+    transp, proto = await self._wrap_create_connection(
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1285, in _wrap_create_connection
+    raise ClientConnectorCertificateError(req.connection_key, exc) from exc
+aiohttp.client_exceptions.ClientConnectorCertificateError: Cannot connect to host square-15-maintenance-app-n6ijx3po.livekit.cloud:443 ssl:True [SSLCertVerificationError: (1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Hostname mismatch, certificate is not valid for 'square-15-maintenance-app-n6ijx3po.livekit.cloud'. (_ssl.c:1000)")]
+2025-12-23 10:19:15,954 - livekit.agents - WARNING - failed to connect to livekit, retrying in 6s
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1283, in _wrap_create_connection
+    return await self._loop.create_connection(*args, **kwargs, sock=sock)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 1126, in create_connection
+    transport, protocol = await self._create_connection_transport(
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 1159, in _create_connection_transport
+    await waiter
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\sslproto.py", line 575, in _on_handshake_complete
+    raise handshake_exc
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\sslproto.py", line 557, in _do_handshake
+    self._sslobj.do_handshake()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\ssl.py", line 917, in do_handshake
+    self._sslobj.do_handshake()
+ssl.SSLCertVerificationError: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Hostname mismatch, certificate is not valid for 'square-15-maintenance-app-n6ijx3po.livekit.cloud'. (_ssl.c:1000)
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\worker.py", line 973, in _connection_task
+    ws = await self._http_session.ws_connect(
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 1076, in _ws_connect
+    resp = await self.request(
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 779, in _request
+    resp = await handler(req)
+           ^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 734, in _connect_and_send_request
+    conn = await self._connector.connect(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 642, in connect
+    proto = await self._create_connection(req, traces, timeout)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1209, in _create_connection
+    _, proto = await self._create_direct_connection(req, traces, timeout)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1581, in _create_direct_connection
+    raise last_exc
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1550, in _create_direct_connection
+    transp, proto = await self._wrap_create_connection(
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1285, in _wrap_create_connection
+    raise ClientConnectorCertificateError(req.connection_key, exc) from exc
+aiohttp.client_exceptions.ClientConnectorCertificateError: Cannot connect to host square-15-maintenance-app-n6ijx3po.livekit.cloud:443 ssl:True [SSLCertVerificationError: (1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Hostname mismatch, certificate is not valid for 'square-15-maintenance-app-n6ijx3po.livekit.cloud'. (_ssl.c:1000)")]
+2025-12-23 10:19:22,729 - livekit.agents - WARNING - failed to connect to livekit, retrying in 8s
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1283, in _wrap_create_connection
+    return await self._loop.create_connection(*args, **kwargs, sock=sock)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 1126, in create_connection
+    transport, protocol = await self._create_connection_transport(
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 1159, in _create_connection_transport
+    await waiter
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\sslproto.py", line 575, in _on_handshake_complete
+    raise handshake_exc
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\sslproto.py", line 557, in _do_handshake
+    self._sslobj.do_handshake()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\ssl.py", line 917, in do_handshake
+    self._sslobj.do_handshake()
+ssl.SSLCertVerificationError: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Hostname mismatch, certificate is not valid for 'square-15-maintenance-app-n6ijx3po.livekit.cloud'. (_ssl.c:1000)
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\worker.py", line 973, in _connection_task
+    ws = await self._http_session.ws_connect(
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 1076, in _ws_connect
+    resp = await self.request(
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 779, in _request
+    resp = await handler(req)
+           ^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 734, in _connect_and_send_request
+    conn = await self._connector.connect(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 642, in connect
+    proto = await self._create_connection(req, traces, timeout)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1209, in _create_connection
+    _, proto = await self._create_direct_connection(req, traces, timeout)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1581, in _create_direct_connection
+    raise last_exc
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1550, in _create_direct_connection
+    transp, proto = await self._wrap_create_connection(
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1285, in _wrap_create_connection
+    raise ClientConnectorCertificateError(req.connection_key, exc) from exc
+aiohttp.client_exceptions.ClientConnectorCertificateError: Cannot connect to host square-15-maintenance-app-n6ijx3po.livekit.cloud:443 ssl:True [SSLCertVerificationError: (1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Hostname mismatch, certificate is not valid for 'square-15-maintenance-app-n6ijx3po.livekit.cloud'. (_ssl.c:1000)")]
+2025-12-23 10:19:31,243 - livekit.agents - WARNING - failed to connect to livekit, retrying in 10s
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1283, in _wrap_create_connection
+    return await self._loop.create_connection(*args, **kwargs, sock=sock)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 1126, in create_connection
+    transport, protocol = await self._create_connection_transport(
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 1159, in _create_connection_transport
+    await waiter
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\sslproto.py", line 575, in _on_handshake_complete
+    raise handshake_exc
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\sslproto.py", line 557, in _do_handshake
+    self._sslobj.do_handshake()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\ssl.py", line 917, in do_handshake
+    self._sslobj.do_handshake()
+ssl.SSLCertVerificationError: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Hostname mismatch, certificate is not valid for 'square-15-maintenance-app-n6ijx3po.livekit.cloud'. (_ssl.c:1000)
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\worker.py", line 973, in _connection_task
+    ws = await self._http_session.ws_connect(
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 1076, in _ws_connect
+    resp = await self.request(
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 779, in _request
+    resp = await handler(req)
+           ^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 734, in _connect_and_send_request
+    conn = await self._connector.connect(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 642, in connect
+    proto = await self._create_connection(req, traces, timeout)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1209, in _create_connection
+    _, proto = await self._create_direct_connection(req, traces, timeout)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1581, in _create_direct_connection
+    raise last_exc
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1550, in _create_direct_connection
+    transp, proto = await self._wrap_create_connection(
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1285, in _wrap_create_connection
+    raise ClientConnectorCertificateError(req.connection_key, exc) from exc
+aiohttp.client_exceptions.ClientConnectorCertificateError: Cannot connect to host square-15-maintenance-app-n6ijx3po.livekit.cloud:443 ssl:True [SSLCertVerificationError: (1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Hostname mismatch, certificate is not valid for 'square-15-maintenance-app-n6ijx3po.livekit.cloud'. (_ssl.c:1000)")]
+2025-12-23 10:19:46,919 - livekit.agents - WARNING - failed to connect to livekit, retrying in 10s
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1283, in _wrap_create_connection
+    return await self._loop.create_connection(*args, **kwargs, sock=sock)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 1126, in create_connection
+    transport, protocol = await self._create_connection_transport(
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 1159, in _create_connection_transport
+    await waiter
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\sslproto.py", line 575, in _on_handshake_complete
+    raise handshake_exc
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\sslproto.py", line 557, in _do_handshake
+    self._sslobj.do_handshake()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\ssl.py", line 917, in do_handshake
+    self._sslobj.do_handshake()
+ssl.SSLCertVerificationError: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Hostname mismatch, certificate is not valid for 'square-15-maintenance-app-n6ijx3po.livekit.cloud'. (_ssl.c:1000)
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\worker.py", line 973, in _connection_task
+    ws = await self._http_session.ws_connect(
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 1076, in _ws_connect
+    resp = await self.request(
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 779, in _request
+    resp = await handler(req)
+           ^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 734, in _connect_and_send_request
+    conn = await self._connector.connect(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 642, in connect
+    proto = await self._create_connection(req, traces, timeout)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1209, in _create_connection
+    _, proto = await self._create_direct_connection(req, traces, timeout)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1581, in _create_direct_connection
+    raise last_exc
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1550, in _create_direct_connection
+    transp, proto = await self._wrap_create_connection(
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1285, in _wrap_create_connection
+    raise ClientConnectorCertificateError(req.connection_key, exc) from exc
+aiohttp.client_exceptions.ClientConnectorCertificateError: Cannot connect to host square-15-maintenance-app-n6ijx3po.livekit.cloud:443 ssl:True [SSLCertVerificationError: (1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Hostname mismatch, certificate is not valid for 'square-15-maintenance-app-n6ijx3po.livekit.cloud'. (_ssl.c:1000)")]
+2025-12-23 10:19:57,294 - livekit.agents - WARNING - failed to connect to livekit, retrying in 10s
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1283, in _wrap_create_connection
+    return await self._loop.create_connection(*args, **kwargs, sock=sock)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 1126, in create_connection
+    transport, protocol = await self._create_connection_transport(
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 1159, in _create_connection_transport
+    await waiter
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\sslproto.py", line 575, in _on_handshake_complete
+    raise handshake_exc
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\sslproto.py", line 557, in _do_handshake
+    self._sslobj.do_handshake()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\ssl.py", line 917, in do_handshake
+    self._sslobj.do_handshake()
+ssl.SSLCertVerificationError: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Hostname mismatch, certificate is not valid for 'square-15-maintenance-app-n6ijx3po.livekit.cloud'. (_ssl.c:1000)
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\worker.py", line 973, in _connection_task
+    ws = await self._http_session.ws_connect(
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 1076, in _ws_connect
+    resp = await self.request(
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 779, in _request
+    resp = await handler(req)
+           ^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 734, in _connect_and_send_request
+    conn = await self._connector.connect(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 642, in connect
+    proto = await self._create_connection(req, traces, timeout)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1209, in _create_connection
+    _, proto = await self._create_direct_connection(req, traces, timeout)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1581, in _create_direct_connection
+    raise last_exc
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1550, in _create_direct_connection
+    transp, proto = await self._wrap_create_connection(
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1285, in _wrap_create_connection
+    raise ClientConnectorCertificateError(req.connection_key, exc) from exc
+aiohttp.client_exceptions.ClientConnectorCertificateError: Cannot connect to host square-15-maintenance-app-n6ijx3po.livekit.cloud:443 ssl:True [SSLCertVerificationError: (1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Hostname mismatch, certificate is not valid for 'square-15-maintenance-app-n6ijx3po.livekit.cloud'. (_ssl.c:1000)")]
+2025-12-23 10:20:07,697 - livekit.agents - WARNING - failed to connect to livekit, retrying in 10s
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1283, in _wrap_create_connection
+    return await self._loop.create_connection(*args, **kwargs, sock=sock)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 1126, in create_connection
+    transport, protocol = await self._create_connection_transport(
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 1159, in _create_connection_transport
+    await waiter
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\sslproto.py", line 575, in _on_handshake_complete
+    raise handshake_exc
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\sslproto.py", line 557, in _do_handshake
+    self._sslobj.do_handshake()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\ssl.py", line 917, in do_handshake
+    self._sslobj.do_handshake()
+ssl.SSLCertVerificationError: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Hostname mismatch, certificate is not valid for 'square-15-maintenance-app-n6ijx3po.livekit.cloud'. (_ssl.c:1000)
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\worker.py", line 973, in _connection_task
+    ws = await self._http_session.ws_connect(
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 1076, in _ws_connect
+    resp = await self.request(
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 779, in _request
+    resp = await handler(req)
+           ^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 734, in _connect_and_send_request
+    conn = await self._connector.connect(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 642, in connect
+    proto = await self._create_connection(req, traces, timeout)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1209, in _create_connection
+    _, proto = await self._create_direct_connection(req, traces, timeout)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1581, in _create_direct_connection
+    raise last_exc
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1550, in _create_direct_connection
+    transp, proto = await self._wrap_create_connection(
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1285, in _wrap_create_connection
+    raise ClientConnectorCertificateError(req.connection_key, exc) from exc
+aiohttp.client_exceptions.ClientConnectorCertificateError: Cannot connect to host square-15-maintenance-app-n6ijx3po.livekit.cloud:443 ssl:True [SSLCertVerificationError: (1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Hostname mismatch, certificate is not valid for 'square-15-maintenance-app-n6ijx3po.livekit.cloud'. (_ssl.c:1000)")]
+2025-12-23 10:20:18,319 - livekit.agents - WARNING - failed to connect to livekit, retrying in 10s
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1283, in _wrap_create_connection
+    return await self._loop.create_connection(*args, **kwargs, sock=sock)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 1126, in create_connection
+    transport, protocol = await self._create_connection_transport(
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 1159, in _create_connection_transport
+    await waiter
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\sslproto.py", line 575, in _on_handshake_complete
+    raise handshake_exc
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\sslproto.py", line 557, in _do_handshake
+    self._sslobj.do_handshake()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\ssl.py", line 917, in do_handshake
+    self._sslobj.do_handshake()
+ssl.SSLCertVerificationError: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Hostname mismatch, certificate is not valid for 'square-15-maintenance-app-n6ijx3po.livekit.cloud'. (_ssl.c:1000)
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\worker.py", line 973, in _connection_task
+    ws = await self._http_session.ws_connect(
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 1076, in _ws_connect
+    resp = await self.request(
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 779, in _request
+    resp = await handler(req)
+           ^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 734, in _connect_and_send_request
+    conn = await self._connector.connect(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 642, in connect
+    proto = await self._create_connection(req, traces, timeout)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1209, in _create_connection
+    _, proto = await self._create_direct_connection(req, traces, timeout)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1581, in _create_direct_connection
+    raise last_exc
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1550, in _create_direct_connection
+    transp, proto = await self._wrap_create_connection(
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1285, in _wrap_create_connection
+    raise ClientConnectorCertificateError(req.connection_key, exc) from exc
+aiohttp.client_exceptions.ClientConnectorCertificateError: Cannot connect to host square-15-maintenance-app-n6ijx3po.livekit.cloud:443 ssl:True [SSLCertVerificationError: (1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Hostname mismatch, certificate is not valid for 'square-15-maintenance-app-n6ijx3po.livekit.cloud'. (_ssl.c:1000)")]
+2025-12-23 10:20:28,395 - livekit.agents - INFO - registered worker
+2025-12-23 10:20:28,397 - livekit.agents - INFO - worker is below capacity, marking as available
+2025-12-23 10:32:26,128 - livekit.agents - INFO - worker is at full capacity, marking as unavailable
+2025-12-23 10:32:28,632 - livekit.agents - INFO - worker is below capacity, marking as available
+2025-12-23 10:33:18,690 - livekit.agents - INFO - worker is at full capacity, marking as unavailable
+2025-12-23 10:33:21,198 - livekit.agents - INFO - worker is below capacity, marking as available
+2025-12-23 12:58:38,853 - livekit.agents - WARNING - failed to connect to livekit, retrying in 0s
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\worker.py", line 1013, in _connection_task
+    await self._run_ws(ws)
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\worker.py", line 1094, in _run_ws
+    await asyncio.gather(*tasks)
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\worker.py", line 1066, in _recv_task
+    raise Exception("worker connection closed unexpectedly")
+Exception: worker connection closed unexpectedly
+2025-12-23 12:58:38,861 - livekit.agents - WARNING - failed to connect to livekit, retrying in 2s
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1532, in _create_direct_connection
+    hosts = await self._resolve_host(host, port, traces=traces)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1148, in _resolve_host
+    return await asyncio.shield(resolved_host_task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1179, in _resolve_host_with_throttle
+    addrs = await self._resolver.resolve(host, port, family=self._family)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\resolver.py", line 40, in resolve
+    infos = await self._loop.getaddrinfo(
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 878, in getaddrinfo
+    return await self.run_in_executor(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\concurrent\futures\thread.py", line 58, in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\socket.py", line 963, in getaddrinfo
+    for res in _socket.getaddrinfo(host, port, family, type, proto, flags):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+socket.gaierror: [Errno 11004] getaddrinfo failed
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\worker.py", line 973, in _connection_task
+    ws = await self._http_session.ws_connect(
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 1076, in _ws_connect
+    resp = await self.request(
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 779, in _request
+    resp = await handler(req)
+           ^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 734, in _connect_and_send_request
+    conn = await self._connector.connect(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 642, in connect
+    proto = await self._create_connection(req, traces, timeout)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1209, in _create_connection
+    _, proto = await self._create_direct_connection(req, traces, timeout)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1538, in _create_direct_connection
+    raise ClientConnectorDNSError(req.connection_key, exc) from exc
+aiohttp.client_exceptions.ClientConnectorDNSError: Cannot connect to host square-15-maintenance-app-n6ijx3po.livekit.cloud:443 ssl:default [getaddrinfo failed]
+2025-12-23 12:58:40,879 - livekit.agents - WARNING - failed to connect to livekit, retrying in 4s
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1532, in _create_direct_connection
+    hosts = await self._resolve_host(host, port, traces=traces)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1148, in _resolve_host
+    return await asyncio.shield(resolved_host_task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1179, in _resolve_host_with_throttle
+    addrs = await self._resolver.resolve(host, port, family=self._family)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\resolver.py", line 40, in resolve
+    infos = await self._loop.getaddrinfo(
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 878, in getaddrinfo
+    return await self.run_in_executor(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\concurrent\futures\thread.py", line 58, in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\socket.py", line 963, in getaddrinfo
+    for res in _socket.getaddrinfo(host, port, family, type, proto, flags):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+socket.gaierror: [Errno 11004] getaddrinfo failed
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\worker.py", line 973, in _connection_task
+    ws = await self._http_session.ws_connect(
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 1076, in _ws_connect
+    resp = await self.request(
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 779, in _request
+    resp = await handler(req)
+           ^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\client.py", line 734, in _connect_and_send_request
+    conn = await self._connector.connect(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 642, in connect
+    proto = await self._create_connection(req, traces, timeout)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1209, in _create_connection
+    _, proto = await self._create_direct_connection(req, traces, timeout)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\aiohttp\connector.py", line 1538, in _create_direct_connection
+    raise ClientConnectorDNSError(req.connection_key, exc) from exc
+aiohttp.client_exceptions.ClientConnectorDNSError: Cannot connect to host square-15-maintenance-app-n6ijx3po.livekit.cloud:443 ssl:default [getaddrinfo failed]
+2025-12-23 12:58:45,068 - livekit.agents - INFO - registered worker
+2025-12-23 12:58:45,070 - livekit.agents - INFO - worker is at full capacity, marking as unavailable
+2025-12-23 12:58:50,077 - livekit.agents - INFO - worker is below capacity, marking as available
+2025-12-23 13:00:07,545 - livekit.agents - INFO - received job request
+2025-12-23 13:00:07,555 - __main__ - INFO - \U0001f3af New job received for room: square15-voice-1766487614650
+--- Logging error ---
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\logging\__init__.py", line 1163, in emit
+    stream.write(msg + self.terminator)
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\U0001f3af' in position 13: character maps to <undefined>
+Call stack:
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1009, in _bootstrap
+    self._bootstrap_inner()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1052, in _bootstrap_inner
+    self.run()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 989, in run
+    self._target(*self._args, **self._kwargs)
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\job_proc_lazy_main.py", line 389, in thread_main
+    client.run()
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\proc_client.py", line 71, in run
+    loop.run_until_complete(self._task)
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 651, in run_until_complete
+    self.run_forever()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\windows_events.py", line 321, in run_forever
+    super().run_forever()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 618, in run_forever
+    self._run_once()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 1951, in _run_once
+    handle._run()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\events.py", line 84, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\opentelemetry\util\_decorator.py", line 71, in async_wrapper
+    return await func(*args, **kwargs)  # type: ignore
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\job_proc_lazy_main.py", line 286, in _traceable_entrypoint
+    await self._job_entrypoint_fnc(job_ctx)
+  File "C:\Users\Thapelo\Downloads\square_15-master\square_15-master\scripts\voice_agent_worker.py", line 165, in request_handler
+    await entrypoint(ctx)
+  File "C:\Users\Thapelo\Downloads\square_15-master\square_15-master\scripts\voice_agent_worker.py", line 43, in entrypoint
+    logger.info(f"\U0001f3af New job received for room: {room_name}")
+Message: '\U0001f3af New job received for room: square15-voice-1766487614650'
+Arguments: ()
+2025-12-23 13:00:07,562 - __main__ - INFO - \U0001f4e1 Connecting to room: square15-voice-1766487614650
+--- Logging error ---
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\logging\__init__.py", line 1163, in emit
+    stream.write(msg + self.terminator)
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\U0001f4e1' in position 13: character maps to <undefined>
+Call stack:
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1009, in _bootstrap
+    self._bootstrap_inner()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1052, in _bootstrap_inner
+    self.run()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 989, in run
+    self._target(*self._args, **self._kwargs)
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\job_proc_lazy_main.py", line 389, in thread_main
+    client.run()
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\proc_client.py", line 71, in run
+    loop.run_until_complete(self._task)
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 651, in run_until_complete
+    self.run_forever()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\windows_events.py", line 321, in run_forever
+    super().run_forever()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 618, in run_forever
+    self._run_once()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 1951, in _run_once
+    handle._run()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\events.py", line 84, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\opentelemetry\util\_decorator.py", line 71, in async_wrapper
+    return await func(*args, **kwargs)  # type: ignore
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\job_proc_lazy_main.py", line 286, in _traceable_entrypoint
+    await self._job_entrypoint_fnc(job_ctx)
+  File "C:\Users\Thapelo\Downloads\square_15-master\square_15-master\scripts\voice_agent_worker.py", line 165, in request_handler
+    await entrypoint(ctx)
+  File "C:\Users\Thapelo\Downloads\square_15-master\square_15-master\scripts\voice_agent_worker.py", line 52, in entrypoint
+    logger.info(f"\U0001f4e1 Connecting to room: {room_name}")
+Message: '\U0001f4e1 Connecting to room: square15-voice-1766487614650'
+Arguments: ()
+2025-12-23 13:00:07,658 - livekit.agents - INFO - initializing job runner
+2025-12-23 13:00:07,660 - livekit.agents - INFO - job runner initialized
+2025-12-23 13:00:07,783 - __main__ - INFO - \u2705 Agent connected to room: square15-voice-1766487614650
+--- Logging error ---
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\logging\__init__.py", line 1163, in emit
+    stream.write(msg + self.terminator)
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\u2705' in position 13: character maps to <undefined>
+Call stack:
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1009, in _bootstrap
+    self._bootstrap_inner()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1052, in _bootstrap_inner
+    self.run()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 989, in run
+    self._target(*self._args, **self._kwargs)
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\job_proc_lazy_main.py", line 389, in thread_main
+    client.run()
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\proc_client.py", line 71, in run
+    loop.run_until_complete(self._task)
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 651, in run_until_complete
+    self.run_forever()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\windows_events.py", line 321, in run_forever
+    super().run_forever()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 618, in run_forever
+    self._run_once()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 1951, in _run_once
+    handle._run()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\events.py", line 84, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\opentelemetry\util\_decorator.py", line 71, in async_wrapper
+    return await func(*args, **kwargs)  # type: ignore
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\job_proc_lazy_main.py", line 286, in _traceable_entrypoint
+    await self._job_entrypoint_fnc(job_ctx)
+  File "C:\Users\Thapelo\Downloads\square_15-master\square_15-master\scripts\voice_agent_worker.py", line 165, in request_handler
+    await entrypoint(ctx)
+  File "C:\Users\Thapelo\Downloads\square_15-master\square_15-master\scripts\voice_agent_worker.py", line 59, in entrypoint
+    logger.info(f"\u2705 Agent connected to room: {room_name}")
+Message: '\u2705 Agent connected to room: square15-voice-1766487614650'
+Arguments: ()
+2025-12-23 13:00:07,846 - __main__ - INFO - \U0001f3a4 Loading Voice Activity Detection...
+--- Logging error ---
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\logging\__init__.py", line 1163, in emit
+    stream.write(msg + self.terminator)
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\U0001f3a4' in position 13: character maps to <undefined>
+Call stack:
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1009, in _bootstrap
+    self._bootstrap_inner()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1052, in _bootstrap_inner
+    self.run()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 989, in run
+    self._target(*self._args, **self._kwargs)
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\job_proc_lazy_main.py", line 389, in thread_main
+    client.run()
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\proc_client.py", line 71, in run
+    loop.run_until_complete(self._task)
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 651, in run_until_complete
+    self.run_forever()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\windows_events.py", line 321, in run_forever
+    super().run_forever()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 618, in run_forever
+    self._run_once()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 1951, in _run_once
+    handle._run()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\events.py", line 84, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\opentelemetry\util\_decorator.py", line 71, in async_wrapper
+    return await func(*args, **kwargs)  # type: ignore
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\job_proc_lazy_main.py", line 286, in _traceable_entrypoint
+    await self._job_entrypoint_fnc(job_ctx)
+  File "C:\Users\Thapelo\Downloads\square_15-master\square_15-master\scripts\voice_agent_worker.py", line 165, in request_handler
+    await entrypoint(ctx)
+  File "C:\Users\Thapelo\Downloads\square_15-master\square_15-master\scripts\voice_agent_worker.py", line 71, in entrypoint
+    logger.info("\U0001f3a4 Loading Voice Activity Detection...")
+Message: '\U0001f3a4 Loading Voice Activity Detection...'
+Arguments: ()
+2025-12-23 13:00:08,030 - __main__ - INFO - \U0001f916 Creating voice agent...
+--- Logging error ---
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\logging\__init__.py", line 1163, in emit
+    stream.write(msg + self.terminator)
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\U0001f916' in position 13: character maps to <undefined>
+Call stack:
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1009, in _bootstrap
+    self._bootstrap_inner()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1052, in _bootstrap_inner
+    self.run()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 989, in run
+    self._target(*self._args, **self._kwargs)
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\job_proc_lazy_main.py", line 389, in thread_main
+    client.run()
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\proc_client.py", line 71, in run
+    loop.run_until_complete(self._task)
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 651, in run_until_complete
+    self.run_forever()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\windows_events.py", line 321, in run_forever
+    super().run_forever()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 618, in run_forever
+    self._run_once()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 1951, in _run_once
+    handle._run()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\events.py", line 84, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\opentelemetry\util\_decorator.py", line 71, in async_wrapper
+    return await func(*args, **kwargs)  # type: ignore
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\job_proc_lazy_main.py", line 286, in _traceable_entrypoint
+    await self._job_entrypoint_fnc(job_ctx)
+  File "C:\Users\Thapelo\Downloads\square_15-master\square_15-master\scripts\voice_agent_worker.py", line 165, in request_handler
+    await entrypoint(ctx)
+  File "C:\Users\Thapelo\Downloads\square_15-master\square_15-master\scripts\voice_agent_worker.py", line 87, in entrypoint
+    logger.info("\U0001f916 Creating voice agent...")
+Message: '\U0001f916 Creating voice agent...'
+Arguments: ()
+2025-12-23 13:00:09,069 - __main__ - INFO - \u2705 Voice agent created successfully
+--- Logging error ---
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\logging\__init__.py", line 1163, in emit
+    stream.write(msg + self.terminator)
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\u2705' in position 13: character maps to <undefined>
+Call stack:
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1009, in _bootstrap
+    self._bootstrap_inner()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1052, in _bootstrap_inner
+    self.run()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 989, in run
+    self._target(*self._args, **self._kwargs)
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\job_proc_lazy_main.py", line 389, in thread_main
+    client.run()
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\proc_client.py", line 71, in run
+    loop.run_until_complete(self._task)
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 651, in run_until_complete
+    self.run_forever()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\windows_events.py", line 321, in run_forever
+    super().run_forever()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 618, in run_forever
+    self._run_once()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 1951, in _run_once
+    handle._run()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\events.py", line 84, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\opentelemetry\util\_decorator.py", line 71, in async_wrapper
+    return await func(*args, **kwargs)  # type: ignore
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\job_proc_lazy_main.py", line 286, in _traceable_entrypoint
+    await self._job_entrypoint_fnc(job_ctx)
+  File "C:\Users\Thapelo\Downloads\square_15-master\square_15-master\scripts\voice_agent_worker.py", line 165, in request_handler
+    await entrypoint(ctx)
+  File "C:\Users\Thapelo\Downloads\square_15-master\square_15-master\scripts\voice_agent_worker.py", line 113, in entrypoint
+    logger.info("\u2705 Voice agent created successfully")
+Message: '\u2705 Voice agent created successfully'
+Arguments: ()
+2025-12-23 13:00:09,075 - __main__ - INFO - \U0001f680 Starting agent session...
+--- Logging error ---
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\logging\__init__.py", line 1163, in emit
+    stream.write(msg + self.terminator)
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\U0001f680' in position 13: character maps to <undefined>
+Call stack:
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1009, in _bootstrap
+    self._bootstrap_inner()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1052, in _bootstrap_inner
+    self.run()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 989, in run
+    self._target(*self._args, **self._kwargs)
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\job_proc_lazy_main.py", line 389, in thread_main
+    client.run()
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\proc_client.py", line 71, in run
+    loop.run_until_complete(self._task)
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 651, in run_until_complete
+    self.run_forever()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\windows_events.py", line 321, in run_forever
+    super().run_forever()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 618, in run_forever
+    self._run_once()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 1951, in _run_once
+    handle._run()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\events.py", line 84, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\opentelemetry\util\_decorator.py", line 71, in async_wrapper
+    return await func(*args, **kwargs)  # type: ignore
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\job_proc_lazy_main.py", line 286, in _traceable_entrypoint
+    await self._job_entrypoint_fnc(job_ctx)
+  File "C:\Users\Thapelo\Downloads\square_15-master\square_15-master\scripts\voice_agent_worker.py", line 165, in request_handler
+    await entrypoint(ctx)
+  File "C:\Users\Thapelo\Downloads\square_15-master\square_15-master\scripts\voice_agent_worker.py", line 119, in entrypoint
+    logger.info("\U0001f680 Starting agent session...")
+Message: '\U0001f680 Starting agent session...'
+Arguments: ()
+2025-12-23 13:00:09,093 - __main__ - INFO - \u2705 Agent session started and running!
+--- Logging error ---
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\logging\__init__.py", line 1163, in emit
+    stream.write(msg + self.terminator)
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\u2705' in position 13: character maps to <undefined>
+Call stack:
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1009, in _bootstrap
+    self._bootstrap_inner()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1052, in _bootstrap_inner
+    self.run()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 989, in run
+    self._target(*self._args, **self._kwargs)
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\job_proc_lazy_main.py", line 389, in thread_main
+    client.run()
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\proc_client.py", line 71, in run
+    loop.run_until_complete(self._task)
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 651, in run_until_complete
+    self.run_forever()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\windows_events.py", line 321, in run_forever
+    super().run_forever()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 618, in run_forever
+    self._run_once()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 1951, in _run_once
+    handle._run()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\events.py", line 84, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\opentelemetry\util\_decorator.py", line 71, in async_wrapper
+    return await func(*args, **kwargs)  # type: ignore
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\job_proc_lazy_main.py", line 286, in _traceable_entrypoint
+    await self._job_entrypoint_fnc(job_ctx)
+  File "C:\Users\Thapelo\Downloads\square_15-master\square_15-master\scripts\voice_agent_worker.py", line 165, in request_handler
+    await entrypoint(ctx)
+  File "C:\Users\Thapelo\Downloads\square_15-master\square_15-master\scripts\voice_agent_worker.py", line 124, in entrypoint
+    logger.info("\u2705 Agent session started and running!")
+Message: '\u2705 Agent session started and running!'
+Arguments: ()
+2025-12-23 13:00:16,107 - __main__ - INFO - \u2705 Greeting sent
+--- Logging error ---
+Traceback (most recent call last):
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\logging\__init__.py", line 1163, in emit
+    stream.write(msg + self.terminator)
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\u2705' in position 13: character maps to <undefined>
+Call stack:
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1009, in _bootstrap
+    self._bootstrap_inner()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1052, in _bootstrap_inner
+    self.run()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 989, in run
+    self._target(*self._args, **self._kwargs)
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\job_proc_lazy_main.py", line 389, in thread_main
+    client.run()
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\proc_client.py", line 71, in run
+    loop.run_until_complete(self._task)
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 651, in run_until_complete
+    self.run_forever()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\windows_events.py", line 321, in run_forever
+    super().run_forever()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 618, in run_forever
+    self._run_once()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 1951, in _run_once
+    handle._run()
+  File "C:\Users\Thapelo\AppData\Local\Programs\Python\Python312\Lib\asyncio\events.py", line 84, in _run
+    self._context.run(self._callback, *self._args)
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\opentelemetry\util\_decorator.py", line 71, in async_wrapper
+    return await func(*args, **kwargs)  # type: ignore
+  File "C:\Users\Thapelo\Downloads\square_15-master\.venv\Lib\site-packages\livekit\agents\ipc\job_proc_lazy_main.py", line 286, in _traceable_entrypoint
+    await self._job_entrypoint_fnc(job_ctx)
+  File "C:\Users\Thapelo\Downloads\square_15-master\square_15-master\scripts\voice_agent_worker.py", line 165, in request_handler
+    await entrypoint(ctx)
+  File "C:\Users\Thapelo\Downloads\square_15-master\square_15-master\scripts\voice_agent_worker.py", line 132, in entrypoint
+    logger.info("\u2705 Greeting sent")
+Message: '\u2705 Greeting sent'
+Arguments: ()
+2025-12-23 13:00:17,234 - livekit.agents - INFO - closing agent session due to participant disconnect (disable via `RoomInputOptions.close_on_disconnect=False`)
