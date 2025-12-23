@@ -1,0 +1,32 @@
+<variant
+    name="release"
+    package="io.flutter.plugins.flutter_plugin_android_lifecycle"
+    minSdkVersion="21"
+    targetSdkVersion="21"
+    mergedManifest="C:\Users\Thapelo\Downloads\square_15-master\square_15-master\build\flutter_plugin_android_lifecycle\intermediates\merged_manifest\release\processReleaseManifest\AndroidManifest.xml"
+    manifestMergeReport="C:\Users\Thapelo\Downloads\square_15-master\square_15-master\build\flutter_plugin_android_lifecycle\outputs\logs\manifest-merger-release-report.txt"
+    proguardFiles="C:\Users\Thapelo\Downloads\square_15-master\square_15-master\build\flutter_plugin_android_lifecycle\intermediates\default_proguard_files\global\proguard-android.txt-8.6.0"
+    consumerProguardFiles="proguard.txt"
+    partialResultsDir="C:\Users\Thapelo\Downloads\square_15-master\square_15-master\build\flutter_plugin_android_lifecycle\intermediates\lint_partial_results\release\lintAnalyzeRelease\out">
+  <buildFeatures
+      namespacing="REQUIRED"/>
+  <sourceProviders>
+    <sourceProvider
+        manifests="src\main\AndroidManifest.xml"
+        javaDirectories="src\main\java;src\release\java;src\main\kotlin;src\release\kotlin"
+        resDirectories="src\main\res;src\release\res"
+        assetsDirectories="src\main\assets;src\release\assets"/>
+  </sourceProviders>
+  <testSourceProviders>
+  </testSourceProviders>
+  <testFixturesSourceProviders>
+  </testFixturesSourceProviders>
+  <artifact
+      classOutputs="C:\Users\Thapelo\Downloads\square_15-master\square_15-master\build\flutter_plugin_android_lifecycle\intermediates\javac\release\compileReleaseJavaWithJavac\classes;C:\Users\Thapelo\Downloads\square_15-master\square_15-master\build\flutter_plugin_android_lifecycle\intermediates\compile_r_class_jar\release\generateReleaseRFile\R.jar"
+      type="MAIN"
+      applicationId="io.flutter.plugins.flutter_plugin_android_lifecycle"
+      generatedSourceFolders="C:\Users\Thapelo\Downloads\square_15-master\square_15-master\build\flutter_plugin_android_lifecycle\generated\ap_generated_sources\release\out"
+      generatedResourceFolders="C:\Users\Thapelo\Downloads\square_15-master\square_15-master\build\flutter_plugin_android_lifecycle\generated\res\resValues\release"
+      desugaredMethodsFiles="C:\Users\Thapelo\.gradle\caches\transforms-4\f475af800554688dbe1b8d603c054a87\transformed\D8BackportedDesugaredMethods.txt">
+  </artifact>
+</variant>
