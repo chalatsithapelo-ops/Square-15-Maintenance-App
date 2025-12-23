@@ -67,8 +67,25 @@ function getSdkVersion() {
     // eslint-disable-next-line global-require
     return require('livekit-server-sdk/package.json').version;
   } catch {
-    return 'unknown';
+    // Some package managers / export maps may prevent requiring package.json.
+    // Fall back to the version range declared in this service's package.json.
+    try {
+      // eslint-disable-next-line global-require
+      const pkg = require('./package.json');
+      return (
+        (pkg.dependencies && pkg.dependencies['livekit-server-sdk']) ||
+        (pkg.devDependencies && pkg.devDependencies['livekit-server-sdk']) ||
+        'unknown'
+      );
+    } catch {
+      return 'unknown';
+    }
   }
+}
+
+function isLiveKitInvalidTokenError(error) {
+  const msg = (error && error.message ? String(error.message) : '').toLowerCase();
+  return msg.includes('invalid token') || msg.includes('unauthorized') || msg.includes('401');
 }
 
 // Health check endpoint
@@ -149,7 +166,18 @@ app.post('/api/voice/start', async (req, res) => {
     console.error('❌ Error starting voice session:', error);
     res.status(500).json({
       error: 'Voice session start failed',
-      message: error.message,
+      message: error && error.message ? error.message : 'Unknown error',
+      hint: isLiveKitInvalidTokenError(error)
+        ? 'LiveKit returned an auth error. Most commonly the backend LIVEKIT_API_KEY/LIVEKIT_API_SECRET do not match the LiveKit project URL, or they do not match each other. Compare the backend /health apiKeyPrefix/apiKeyLength/apiSecretLength with the worker service values, or rotate the key/secret in LiveKit Cloud and update BOTH services.'
+        : undefined,
+      debug: {
+        sdkVersion: getSdkVersion(),
+        livekit: {
+          wsUrl: getLiveKitWsUrl() || null,
+          httpUrl: getLiveKitHttpUrl() || null,
+          agentName: getAgentName(),
+        },
+      },
     });
   }
 });
@@ -278,7 +306,18 @@ app.post('/api/dispatch-agent', async (req, res) => {
     console.error('❌ Error dispatching agent:', error);
     res.status(500).json({
       error: 'Agent dispatch failed',
-      message: error.message
+      message: error && error.message ? error.message : 'Unknown error',
+      hint: isLiveKitInvalidTokenError(error)
+        ? 'LiveKit returned an auth error. Ensure backend LIVEKIT_API_KEY and LIVEKIT_API_SECRET are correct for this LiveKit Cloud project and that there are no hidden quotes/spaces. If the worker registers but backend fails, the backend env vars are likely different.'
+        : undefined,
+      debug: {
+        sdkVersion: getSdkVersion(),
+        livekit: {
+          wsUrl: getLiveKitWsUrl() || null,
+          httpUrl: getLiveKitHttpUrl() || null,
+          agentName: getAgentName(),
+        },
+      },
     });
   }
 });
