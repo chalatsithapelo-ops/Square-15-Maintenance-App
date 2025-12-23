@@ -6,12 +6,14 @@ services:
     rootDir: livekit-backend
     plan: starter
     buildCommand: npm install
-    startCommand: npm start
+    startCommand: node server.js
     autoDeploy: true
     healthCheckPath: /health
     envVars:
       - key: NODE_ENV
         value: production
+      - key: NODE_VERSION
+        value: "20"
       # IMPORTANT: Set the following as "Secret" in Render dashboard after first deploy.
       # Render Blueprints don't allow marking secrets directly in yaml.
       - key: LIVEKIT_WS_URL
@@ -32,6 +34,8 @@ services:
     dockerfilePath: agent-worker/Dockerfile
     autoDeploy: true
     envVars:
+      - key: NODE_VERSION
+        value: "20"
       - key: LIVEKIT_URL
         sync: false
       - key: LIVEKIT_API_KEY
