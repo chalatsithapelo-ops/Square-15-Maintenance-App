@@ -1,127 +1,360 @@
 """
-LiveKit Voice Agent Worker - Cloud Deploy
-
-This file is a copy of the app worker script, placed in agent-worker/ so you can
-upload/deploy a minimal set of files to GitHub/Render.
+LiveKit Voice Agent Worker - Production Ready
+Automatically connects to rooms and responds to user audio with robust error handling
 """
-
 import os
 import asyncio
 import logging
 from pathlib import Path
-
+import inspect
 from livekit.agents import AutoSubscribe, JobContext, WorkerOptions, cli
-from livekit.agents import voice
 from livekit.plugins import openai, silero
+from livekit.agents import voice
+from livekit.agents import llm
 from livekit import rtc
+import json
 
-
+# Setup logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-
-# Load environment variables (optional locally; Render uses service env vars)
-# Must never crash if the file is nested differently in a container.
+# Load environment variables
 try:
     from dotenv import load_dotenv
 
-    # First, load from process environment (no-op if none)
+    # 1) Current working directory
     load_dotenv(override=False)
 
+    # 2) Common locations relative to this file (supports Docker/cloud layouts too)
     script_path = Path(__file__).resolve()
-
-    # Try nearby .env files without assuming a fixed depth.
-    candidate_envs = []
-    candidate_envs.append(script_path.parent / ".env")
-    for parent in script_path.parents:
-        candidate_envs.append(parent / ".env")
-
+    candidate_envs = [
+        script_path.parent.parent / ".env",  # .../scripts/../.env
+        script_path.parents[2] / ".env",     # workspace root in this repo layout
+    ]
     for env_path in candidate_envs:
         if env_path.exists():
             load_dotenv(env_path, override=False)
-            break
-except Exception as e:
-    # Missing python-dotenv or any other issue should not prevent the worker from starting.
-    logger.info(f"dotenv not loaded (ok on Render): {e}")
+except ImportError:
+    logger.warning("dotenv not available, using system environment variables")
 
 
 async def entrypoint(ctx: JobContext):
+    """
+    Entry point for the voice assistant agent.
+    This function is called whenever a participant joins a room.
+    Includes comprehensive error handling and recovery.
+    """
     room_name = ctx.room.name
     logger.info(f"🎯 New job received for room: {room_name}")
-
-    openai_key = os.getenv("OPENAI_API_KEY")
-    if not openai_key:
-        logger.error("❌ OPENAI_API_KEY not set!")
-        return
-
-    logger.info(f"📡 Connecting to room: {room_name}")
-
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
-            logger.info(f"✅ Agent connected to room: {room_name}")
-            break
-        except Exception as e:
-            if attempt < max_retries - 1:
-                logger.warning(
-                    f"⚠️ Connection attempt {attempt + 1} failed: {e}. Retrying..."
-                )
-                await asyncio.sleep(2**attempt)
-            else:
-                logger.error(f"❌ Failed to connect after {max_retries} attempts: {e}")
-                raise
-
-    logger.info("🎤 Loading Voice Activity Detection...")
-    if not hasattr(silero, "VAD"):
-        raise RuntimeError(
-            "Silero plugin not available (silero.VAD missing). Install 'livekit-plugins-silero'."
-        )
-    vad = silero.VAD.load()
-
-    logger.info("🤖 Creating voice agent...")
-    agent = voice.Agent(
-        vad=vad,
-        stt=openai.STT(model="whisper-1", language="en"),
-        llm=openai.LLM(model="gpt-4o-mini", temperature=0.7),
-        tts=openai.TTS(model="tts-1", voice="alloy"),
-        instructions=(
-            "You are the Square 15 voice assistant. "
-            "Speak clearly and keep your responses short and helpful. "
-            "Assist users with maintenance bookings, schedules, and general support. "
-            "Be friendly and professional. "
-            "Always respond to what the user says. "
-            "If you don't understand, politely ask the user to repeat. "
-            "Keep responses under 30 seconds."
-        ),
-    )
-
-    logger.info("🚀 Starting agent session...")
-    session = voice.AgentSession()
-    await session.start(agent, room=ctx.room)
-    logger.info("✅ Agent session started and running!")
-
+    
     try:
-        await session.say(
-            "Hello! I'm your Square 15 voice assistant. How can I help you today?",
-            allow_interruptions=True,
-        )
-        logger.info("✅ Greeting sent")
-    except Exception as e:
-        logger.warning(f"⚠️ Could not send greeting: {e}")
+        # Validate environment variables
+        openai_key = os.getenv("OPENAI_API_KEY")
+        if not openai_key:
+            logger.error("❌ OPENAI_API_KEY not set!")
+            return
+        
+        logger.info(f"📡 Connecting to room: {room_name}")
+        
+        # Connect to the room with retry logic
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+                logger.info(f"✅ Agent connected to room: {room_name}")
+                break
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    logger.warning(f"⚠️ Connection attempt {attempt + 1} failed: {e}. Retrying...")
+                    await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                else:
+                    logger.error(f"❌ Failed to connect after {max_retries} attempts: {e}")
+                    raise
 
-    while ctx.room.connection_state != rtc.ConnectionState.CONN_DISCONNECTED:
-        await asyncio.sleep(1)
+        # Initialize VAD with error handling
+        try:
+            logger.info("🎤 Loading Voice Activity Detection...")
+
+            # livekit-plugins-silero provides silero.VAD (and VADStream). If the package is
+            # missing, older namespace stubs can exist without VAD.
+            if not hasattr(silero, "VAD"):
+                raise RuntimeError(
+                    "Silero plugin not available (silero.VAD missing). "
+                    "Install 'livekit-plugins-silero' into the active environment."
+                )
+
+            vad = silero.VAD.load()
+        except Exception as e:
+            logger.error(f"❌ Failed to load VAD: {e}")
+            raise
+
+        async def _detect_caller_role() -> str:
+            """Best-effort role detection from the non-agent participant identity."""
+            try:
+                await asyncio.sleep(0.25)
+                for _ in range(12):
+                    try:
+                        participants = getattr(ctx.room, "remote_participants", None) or {}
+                        for _, p in participants.items():
+                            ident = (getattr(p, "identity", "") or "").strip().lower()
+                            if ident.startswith("artisan-"):
+                                return "artisan"
+                            if ident.startswith("client-"):
+                                return "client"
+                            if ident:
+                                return "client"
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.25)
+            except Exception:
+                pass
+            return "client"
+
+        caller_role = await _detect_caller_role()
+        logger.info(f"🧭 Detected caller role: {caller_role}")
+
+        async def _set_agent_metadata(meta: dict) -> None:
+            """Set agent participant metadata in a way that works across SDK versions."""
+            try:
+                if not (ctx.room and ctx.room.local_participant):
+                    return
+                payload = json.dumps(meta)
+                result = ctx.room.local_participant.set_metadata(payload)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to set agent metadata: {e}")
+
+        # Emit a handshake metadata packet so the mobile app can verify
+        # it is receiving participant metadata updates from the agent.
+        try:
+            await _set_agent_metadata(
+                {
+                    "type": "square15_ui",
+                    "action": "agent_ready",
+                    "payload": {"role": caller_role},
+                    "text": "Agent ready",
+                }
+            )
+            logger.info("✅ Sent agent_ready metadata")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to send agent_ready metadata: {e}")
+
+        def _instructions_for_role(role: str) -> str:
+            role = (role or "client").strip().lower()
+            role_banner = (
+                "You are the Square 15 Voice AI Assistant. "
+                f"You are currently speaking to a {role.upper()} user.\n"
+            )
+            hard_rules = (
+                "Hard rules (must follow):\n"
+                "- If the user asks you to DO something in the app, you MUST call ui_navigate.\n"
+                "- Never say you cannot access the app. The way you act in the app is by calling ui_navigate.\n"
+                "- When you are ready to dispatch/accept/reject/call, CALL ui_navigate immediately, then confirm in 1 sentence.\n"
+                "- Never get stuck: do not say 'checking availability' unless you are calling ui_navigate in the SAME turn.\n"
+                "- Speak naturally (not robotic). Keep it concise (1-3 short sentences).\n"
+            )
+            client_flow = (
+                "Client workflow (dispatch):\n"
+                "1) Identify trade/category from symptoms. If unclear, ask ONE clarifying question.\n"
+                "2) Collect minimum details needed to dispatch: category_name + problem_description.\n"
+                "   Location is preferred; if missing, ask ONE question: 'Use your current location or a different address?'\n"
+                "3) As soon as you have category + problem_description, you MUST dispatch.\n"
+                "   CALL ui_navigate(action='dispatch_artisan' or 'create_order_booking') with whatever fields you know.\n"
+                "4) If it sounds like an RFQ (complex/quote needed/unclear), ask for 2-3 photos and CALL ui_navigate(action='open_rfq_upload').\n"
+                "5) If the user asks to call the assigned artisan, CALL ui_navigate(action='call_assigned_artisan').\n"
+            )
+            artisan_flow = (
+                "Artisan workflow (tasks):\n"
+                "- Accept latest: CALL ui_navigate(action='accept_latest_request').\n"
+                "- Reject latest: CALL ui_navigate(action='reject_latest_request').\n"
+                "- Open requests: CALL ui_navigate(action='open_artisan_requests').\n"
+                "- Do not dispatch artisans while speaking to an artisan.\n"
+            )
+            general = (
+                "General behavior:\n"
+                "- Speak naturally and professionally. You can answer general questions too.\n"
+                "- If user says 'how are you', answer briefly then continue helping.\n"
+                "- Always be helpful: acknowledge urgency, then take the next step.\n"
+            )
+            return "\n".join(
+                [
+                    role_banner,
+                    hard_rules,
+                    client_flow if role != "artisan" else artisan_flow,
+                    general,
+                ]
+            )
+
+        # Create voice agent with robust configuration
+        logger.info("🤖 Creating voice agent...")
+        try:
+
+            @llm.function_tool(
+                description=(
+                    "Send a UI navigation command to the Square 15 mobile app. "
+                    "Use this to open the RFQ photo upload workflow or to ask the app to create an Order booking "
+                    "(dispatch nearest artisan) once the user has provided enough details."
+                )
+            )
+            async def ui_navigate(
+                action: str,
+                category_name: str = "",
+                task_name: str = "",
+                problem_description: str = "",
+                additional_notes: str = "",
+                service_address: str = "",
+                service_lat: str = "",
+                service_lng: str = "",
+                scheduled_date: str = "",
+                scheduled_time: str = "",
+                materials_responsibility: str = "",
+                accept: str = "",
+                request_id: str = "",
+                artisan_id: str = "",
+                phone: str = "",
+                booking_id: str = "",
+            ) -> str:
+                """Triggers an in-app navigation action."""
+                try:
+                    payload = {
+                        "category_name": category_name,
+                        "task_name": task_name,
+                        "problem_description": problem_description,
+                        "additional_notes": additional_notes,
+                        "service_address": service_address,
+                        "service_lat": service_lat,
+                        "service_lng": service_lng,
+                        "scheduled_date": scheduled_date,
+                        "scheduled_time": scheduled_time,
+                        "materials_responsibility": materials_responsibility,
+                        "accept": accept,
+                        "request_id": request_id,
+                        "artisan_id": artisan_id,
+                        "phone": phone,
+                        "booking_id": booking_id,
+                    }
+                    text = ""
+                    if action == "create_order_booking":
+                        text = (
+                            "Creating your booking now and dispatching the nearest available artisan. "
+                            "Please keep the app open."
+                        )
+                    elif action == "dispatch_artisan":
+                        text = (
+                            "Dispatching the nearest available artisan now. Please keep the app open."
+                        )
+                    elif action == "open_rfq_upload":
+                        text = (
+                            "Opening the photo upload page now. Please add 2–3 clear photos of the work needed."
+                        )
+                    elif action == "open_bookings_tab":
+                        text = "Opening your bookings now."
+                    elif action == "open_future_bookings":
+                        text = "Opening your future bookings now."
+                    elif action == "open_artisan_requests":
+                        text = "Opening your requests now."
+                    elif action == "open_artisan_appointments":
+                        text = "Opening your appointments now."
+                    elif action == "open_artisan_wallet":
+                        text = "Opening your wallet now."
+                    elif action == "accept_latest_request":
+                        text = "Accepting the latest pending request now."
+                    elif action == "reject_latest_request":
+                        text = "Rejecting the latest pending request now."
+                    elif action == "respond_to_request":
+                        text = "Updating that request now."
+                    elif action == "call_assigned_artisan" or action == "call_artisan":
+                        text = "Calling the assigned artisan now."
+                    else:
+                        text = "Working on that now."
+                    meta = {
+                        "type": "square15_ui",
+                        "action": action,
+                        "payload": payload,
+                        "text": text,
+                    }
+                    await _set_agent_metadata(meta)
+                    return "ok"
+                except Exception as e:
+                    logger.warning(f"ui_navigate failed: {e}")
+                    return "error"
+
+            session = voice.AgentSession(tools=[ui_navigate])
+
+            agent = voice.Agent(
+                vad=vad,
+                stt=openai.STT(
+                    model="whisper-1",
+                    language="en"
+                ),
+                llm=openai.LLM(
+                    model="gpt-4o-mini",
+                    temperature=0.2
+                ),
+                tts=openai.TTS(
+                    model="tts-1",
+                    voice="alloy"
+                ),
+                instructions=_instructions_for_role(caller_role)
+            )
+            logger.info("✅ Voice agent created successfully")
+        except Exception as e:
+            logger.error(f"❌ Failed to create agent: {e}")
+            raise
+
+        # Start the agent session with error handling
+        logger.info("🚀 Starting agent session...")
+        try:
+            await session.start(agent, room=ctx.room)
+            logger.info("✅ Agent session started and running!")
+
+            # Send an initial greeting so the user hears the agent immediately.
+            try:
+                await session.say(
+                    "Hi there — thanks for calling Square 15. How can I help you today?",
+                    allow_interruptions=True,
+                )
+                logger.info("✅ Greeting sent")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not send greeting: {e}")
+
+            # Keep the job alive while the room is connected/reconnecting.
+            while ctx.room.connection_state != rtc.ConnectionState.CONN_DISCONNECTED:
+                await asyncio.sleep(1)
+
+        except Exception as e:
+            logger.error(f"❌ Error during agent session: {e}")
+            # Try to gracefully handle the error
+            try:
+                logger.info("🔄 Attempting graceful recovery...")
+                await asyncio.sleep(2)
+            except Exception:
+                pass
+            raise
+            
+    except asyncio.CancelledError:
+        logger.info(f"⚠️ Job cancelled for room: {room_name}")
+        raise
+    except Exception as e:
+        logger.error(f"❌ Unhandled error in room {room_name}: {e}", exc_info=True)
+        raise
+    finally:
+        logger.info(f"🏁 Agent session ended for room: {room_name}")
 
 
 async def request_handler(ctx: JobContext):
+    """
+    Wrapper for entrypoint with additional monitoring
+    """
     try:
         await entrypoint(ctx)
     except Exception as e:
         logger.error(f"❌ Fatal error in request handler: {e}", exc_info=True)
+        # Don't re-raise to prevent worker crash
 
 
 if __name__ == "__main__":
@@ -130,11 +363,15 @@ if __name__ == "__main__":
 
     agent_name = os.getenv("LIVEKIT_AGENT_NAME", "square15-voice-assistant")
     logger.info(f"🤝 Explicit dispatch agent_name: {agent_name}")
-
+    
+    # Run the agent worker with production settings
     cli.run_app(
         WorkerOptions(
             entrypoint_fnc=request_handler,
             agent_name=agent_name,
+            # Avoid frequent Windows dev restarts failing due to port 8081 already in use.
+            # Port 0 requests an ephemeral free port.
             port=0,
+            # Worker will automatically reconnect if connection is lost
         ),
     )
