@@ -290,6 +290,77 @@ async def entrypoint(ctx: JobContext):
 
             session = voice.AgentSession(tools=[ui_navigate])
 
+            # Listen for app->agent requests delivered via participant metadata.
+            # The mobile app sends: {"type":"square15_app","action":"speak","payload":{"text":"..."}}
+            # so the agent can speak without needing Firestore access.
+            _last_spoken_meta_by_identity: dict[str, str] = {}
+
+            def _extract_speak_text(meta_str: str) -> str:
+                if not meta_str:
+                    return ""
+                try:
+                    data = json.loads(meta_str)
+                except Exception:
+                    return ""
+
+                if not isinstance(data, dict):
+                    return ""
+                if data.get("type") != "square15_app" or data.get("action") != "speak":
+                    return ""
+
+                payload = data.get("payload")
+                if isinstance(payload, dict):
+                    text = payload.get("text")
+                    if isinstance(text, str) and text.strip():
+                        return text.strip()
+
+                text = data.get("text")
+                if isinstance(text, str) and text.strip():
+                    return text.strip()
+
+                return ""
+
+            async def _say_from_app(text: str) -> None:
+                try:
+                    await session.say(text, allow_interruptions=True)
+                    logger.info(f"[ai_meta] spoke_from_app len={len(text)}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Failed to speak app message: {e}")
+
+            def _on_participant_metadata_changed(*args, **kwargs) -> None:
+                try:
+                    participant = args[0] if len(args) > 0 else None
+                    new_meta = args[2] if len(args) > 2 else None
+
+                    identity = (getattr(participant, "identity", "") or "unknown").strip()
+
+                    meta_str = ""
+                    if isinstance(new_meta, str) and new_meta:
+                        meta_str = new_meta
+                    else:
+                        meta_str = getattr(participant, "metadata", "") or ""
+
+                    # De-dupe repeated metadata packets.
+                    if meta_str and _last_spoken_meta_by_identity.get(identity) == meta_str:
+                        return
+                    if meta_str:
+                        _last_spoken_meta_by_identity[identity] = meta_str
+
+                    text = _extract_speak_text(meta_str)
+                    if not text:
+                        return
+
+                    asyncio.create_task(_say_from_app(text))
+                except Exception as e:
+                    logger.warning(f"⚠️ metadata_changed handler failed: {e}")
+
+            try:
+                if hasattr(ctx.room, "on"):
+                    ctx.room.on("participant_metadata_changed", _on_participant_metadata_changed)
+                    logger.info("✅ Listening for square15_app:speak via participant metadata")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not attach metadata listener: {e}")
+
             agent = voice.Agent(
                 vad=vad,
                 stt=openai.STT(model="whisper-1", language="en"),

@@ -13,3 +13,9 @@ yarn-error.log*
 *.swo
 dist/
 build/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
