@@ -250,16 +250,14 @@ async def entrypoint(ctx: JobContext):
             }
             text = ""
             if action == "create_order_booking":
-                text = (
-                    "Creating your booking now and dispatching the nearest available artisan. "
-                    "Please keep the app open."
-                )
+                # Don't speak yet - let the app confirm actual booking result
+                text = ""
             elif action == "dispatch_artisan":
-                text = "Dispatching the nearest available artisan now. Please keep the app open."
+                # Don't speak yet - let the app confirm actual booking result
+                text = ""
             elif action == "open_rfq_upload":
-                text = (
-                    "Opening the photo upload page now. Please add 2-3 clear photos of the work needed."
-                )
+                # Don't speak yet - app will speak before opening upload
+                text = ""
             elif action == "open_bookings_tab":
                 text = "Opening your bookings now."
             elif action == "open_future_bookings":
