@@ -7,38 +7,43 @@ import asyncio
 import logging
 from pathlib import Path
 import inspect
+import json
+
 from livekit.agents import AutoSubscribe, JobContext, WorkerOptions, cli
 from livekit.plugins import openai, silero
 from livekit.agents import voice
 from livekit.agents import llm
 from livekit import rtc
-import json
+
 
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
-# Load environment variables
+# Load environment variables (optional locally; cloud uses service env vars)
+# Must never crash if the file is nested differently in a container.
 try:
     from dotenv import load_dotenv
 
     # 1) Current working directory
     load_dotenv(override=False)
 
-    # 2) Common locations relative to this file (supports Docker/cloud layouts too)
+    # 2) Try nearby .env files without assuming a fixed depth.
     script_path = Path(__file__).resolve()
-    candidate_envs = [
-        script_path.parent.parent / ".env",  # .../scripts/../.env
-        script_path.parents[2] / ".env",     # workspace root in this repo layout
-    ]
+    candidate_envs = []
+    candidate_envs.append(script_path.parent / ".env")
+    for parent in script_path.parents:
+        candidate_envs.append(parent / ".env")
+
     for env_path in candidate_envs:
         if env_path.exists():
             load_dotenv(env_path, override=False)
-except ImportError:
-    logger.warning("dotenv not available, using system environment variables")
+            break
+except Exception as e:
+    logger.info(f"dotenv not loaded (ok on cloud): {e}")
 
 
 async def entrypoint(ctx: JobContext):
@@ -49,16 +54,16 @@ async def entrypoint(ctx: JobContext):
     """
     room_name = ctx.room.name
     logger.info(f"🎯 New job received for room: {room_name}")
-    
+
     try:
         # Validate environment variables
         openai_key = os.getenv("OPENAI_API_KEY")
         if not openai_key:
             logger.error("❌ OPENAI_API_KEY not set!")
             return
-        
+
         logger.info(f"📡 Connecting to room: {room_name}")
-        
+
         # Connect to the room with retry logic
         max_retries = 3
         for attempt in range(max_retries):
@@ -68,8 +73,10 @@ async def entrypoint(ctx: JobContext):
                 break
             except Exception as e:
                 if attempt < max_retries - 1:
-                    logger.warning(f"⚠️ Connection attempt {attempt + 1} failed: {e}. Retrying...")
-                    await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                    logger.warning(
+                        f"⚠️ Connection attempt {attempt + 1} failed: {e}. Retrying..."
+                    )
+                    await asyncio.sleep(2**attempt)  # Exponential backoff
                 else:
                     logger.error(f"❌ Failed to connect after {max_retries} attempts: {e}")
                     raise
@@ -189,7 +196,6 @@ async def entrypoint(ctx: JobContext):
                 ]
             )
 
-        # Create voice agent with robust configuration
         logger.info("🤖 Creating voice agent...")
         try:
 
@@ -237,16 +243,14 @@ async def entrypoint(ctx: JobContext):
                         "phone": phone,
                         "booking_id": booking_id,
                     }
-                    text = ""
+
                     if action == "create_order_booking":
                         text = (
                             "Creating your booking now and dispatching the nearest available artisan. "
                             "Please keep the app open."
                         )
                     elif action == "dispatch_artisan":
-                        text = (
-                            "Dispatching the nearest available artisan now. Please keep the app open."
-                        )
+                        text = "Dispatching the nearest available artisan now. Please keep the app open."
                     elif action == "open_rfq_upload":
                         text = (
                             "Opening the photo upload page now. Please add 2–3 clear photos of the work needed."
@@ -271,6 +275,7 @@ async def entrypoint(ctx: JobContext):
                         text = "Calling the assigned artisan now."
                     else:
                         text = "Working on that now."
+
                     meta = {
                         "type": "square15_ui",
                         "action": action,
@@ -287,32 +292,21 @@ async def entrypoint(ctx: JobContext):
 
             agent = voice.Agent(
                 vad=vad,
-                stt=openai.STT(
-                    model="whisper-1",
-                    language="en"
-                ),
-                llm=openai.LLM(
-                    model="gpt-4o-mini",
-                    temperature=0.2
-                ),
-                tts=openai.TTS(
-                    model="tts-1",
-                    voice="alloy"
-                ),
-                instructions=_instructions_for_role(caller_role)
+                stt=openai.STT(model="whisper-1", language="en"),
+                llm=openai.LLM(model="gpt-4o-mini", temperature=0.2),
+                tts=openai.TTS(model="tts-1", voice="alloy"),
+                instructions=_instructions_for_role(caller_role),
             )
             logger.info("✅ Voice agent created successfully")
         except Exception as e:
             logger.error(f"❌ Failed to create agent: {e}")
             raise
 
-        # Start the agent session with error handling
         logger.info("🚀 Starting agent session...")
         try:
             await session.start(agent, room=ctx.room)
             logger.info("✅ Agent session started and running!")
 
-            # Send an initial greeting so the user hears the agent immediately.
             try:
                 await session.say(
                     "Hi there — thanks for calling Square 15. How can I help you today?",
@@ -322,20 +316,18 @@ async def entrypoint(ctx: JobContext):
             except Exception as e:
                 logger.warning(f"⚠️ Could not send greeting: {e}")
 
-            # Keep the job alive while the room is connected/reconnecting.
             while ctx.room.connection_state != rtc.ConnectionState.CONN_DISCONNECTED:
                 await asyncio.sleep(1)
 
         except Exception as e:
             logger.error(f"❌ Error during agent session: {e}")
-            # Try to gracefully handle the error
             try:
                 logger.info("🔄 Attempting graceful recovery...")
                 await asyncio.sleep(2)
             except Exception:
                 pass
             raise
-            
+
     except asyncio.CancelledError:
         logger.info(f"⚠️ Job cancelled for room: {room_name}")
         raise
@@ -347,14 +339,11 @@ async def entrypoint(ctx: JobContext):
 
 
 async def request_handler(ctx: JobContext):
-    """
-    Wrapper for entrypoint with additional monitoring
-    """
+    """Wrapper for entrypoint with additional monitoring."""
     try:
         await entrypoint(ctx)
     except Exception as e:
         logger.error(f"❌ Fatal error in request handler: {e}", exc_info=True)
-        # Don't re-raise to prevent worker crash
 
 
 if __name__ == "__main__":
@@ -363,15 +352,11 @@ if __name__ == "__main__":
 
     agent_name = os.getenv("LIVEKIT_AGENT_NAME", "square15-voice-assistant")
     logger.info(f"🤝 Explicit dispatch agent_name: {agent_name}")
-    
-    # Run the agent worker with production settings
+
     cli.run_app(
         WorkerOptions(
             entrypoint_fnc=request_handler,
             agent_name=agent_name,
-            # Avoid frequent Windows dev restarts failing due to port 8081 already in use.
-            # Port 0 requests an ephemeral free port.
             port=0,
-            # Worker will automatically reconnect if connection is lost
         ),
     )
