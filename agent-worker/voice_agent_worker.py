@@ -388,6 +388,18 @@ async def request_handler(ctx: JobContext):
 
 if __name__ == "__main__":
     logger.info("🚀 Starting Square 15 Voice Agent Worker...")
+    build_tag = "2026-01-03-photos-first-no-tool-narration"
+    render_commit = (
+        os.getenv("RENDER_GIT_COMMIT")
+        or os.getenv("RENDER_COMMIT")
+        or os.getenv("GIT_COMMIT")
+        or ""
+    ).strip()
+    logger.info(
+        "🧩 Worker build tag: %s%s",
+        build_tag,
+        f" (commit={render_commit})" if render_commit else "",
+    )
     logger.info("📡 Listening for room join events...")
 
     agent_name = os.getenv("LIVEKIT_AGENT_NAME", "square15-voice-assistant")
