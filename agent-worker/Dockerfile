@@ -9,8 +9,8 @@ RUN pip install --no-cache-dir --upgrade pip
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Copy worker script (kept local to this folder for minimal uploads)
-COPY voice_agent_worker.py /app/voice_agent_worker.py
+# Copy worker script
+COPY agent-worker/voice_agent_worker.py /app/voice_agent_worker.py
 
 # Runtime env vars are expected to be provided by your hosting platform:
 # LIVEKIT_URL or LIVEKIT_WS_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET,
