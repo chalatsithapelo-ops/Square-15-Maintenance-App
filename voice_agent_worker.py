@@ -165,21 +165,41 @@ async def entrypoint(ctx: JobContext):
                 "- Speak naturally (not robotic). Keep it concise (1-3 short sentences).\n"
             )
             client_flow = (
-                "Client workflow (dispatch):\n"
-                "1) Identify trade/category from symptoms. If unclear, ask ONE clarifying question.\n"
-                "2) Collect minimum details needed to dispatch: category_name + problem_description.\n"
+                "Client workflow (PHOTOS-FIRST dispatch):\n"
+                "1) Identify the trade/category from symptoms. If unclear, ask ONE clarifying question.\n"
+                "2) Collect the minimum details needed: category_name + problem_description.\n"
                 "   Location is preferred; if missing, ask ONE question: 'Use your current location or a different address?'\n"
-                "3) As soon as you have category + problem_description, you MUST dispatch.\n"
-                "   CALL ui_navigate(action='dispatch_artisan' or 'create_order_booking') with whatever fields you know.\n"
-                "4) If it sounds like an RFQ (complex/quote needed/unclear), ask for 2-3 photos and CALL ui_navigate(action='open_rfq_upload').\n"
-                "5) If the user asks to call the assigned artisan, CALL ui_navigate(action='call_assigned_artisan').\n"
+                "3) CRITICAL: Once you have category + problem_description, you MUST open photo upload FIRST.\n"
+                "   CALL ui_navigate(action='dispatch_artisan', require_photos=True) to open the photo upload screen.\n"
+                "   The app will ask the client to upload minimum 3 photos, then automatically dispatch after photos are uploaded.\n"
+                "4) NEVER call 'create_order_booking' directly - always use 'dispatch_artisan' with require_photos=True.\n"
+                "5) For RFQ (big/complex/needs quote), use CALL ui_navigate(action='open_rfq_upload') instead.\n"
+                "6) If the user asks to call the assigned artisan, CALL ui_navigate(action='call_assigned_artisan').\n"
+                "7) After the app dispatches, it will send you a confirmation message via metadata. Repeat that message to the client.\n"
+                "\nExamples (client):\n"
+                "- User: 'I need a plumber, my tap is leaking.'\n"
+                "  You: (ask location if missing), then CALL ui_navigate(action='dispatch_artisan', category_name='Plumbing', problem_description='Leaking tap', require_photos=True).\n"
+                "  Then wait for the app to send you the dispatch result via metadata.\n"
             )
             artisan_flow = (
-                "Artisan workflow (tasks):\n"
-                "- Accept latest: CALL ui_navigate(action='accept_latest_request').\n"
-                "- Reject latest: CALL ui_navigate(action='reject_latest_request').\n"
-                "- Open requests: CALL ui_navigate(action='open_artisan_requests').\n"
-                "- Do not dispatch artisans while speaking to an artisan.\n"
+                "Artisan workflow (availability & tasks):\n"
+                "- When a new booking arrives, you will receive notification from the app via metadata.\n"
+                "- Read the booking details to the artisan: problem description, location, scheduled date/time.\n"
+                "- If artisan asks to check appointments, CALL ui_navigate(action='open_artisan_appointments').\n"
+                "- If artisan wants to see the photos, CALL ui_navigate(action='open_artisan_requests') - photos are in the request details.\n"
+                "- If artisan says to accept the booking, CALL ui_navigate(action='accept_latest_request') immediately.\n"
+                "- If artisan says to reject, CALL ui_navigate(action='reject_latest_request').\n"
+                "- If artisan asks for wallet, use open_artisan_wallet.\n"
+                "- If artisan says 'check my appointments to see if I am available, if I am please confirm the booking',\n"
+                "  you MUST: 1) CALL ui_navigate(action='open_artisan_appointments'), wait for app response,\n"
+                "  2) Then if available, CALL ui_navigate(action='accept_latest_request').\n"
+                "- Do not attempt to dispatch artisans while speaking to an artisan.\n"
+                "\nExamples (artisan):\n"
+                "- User: 'Accept the latest request.'\n"
+                "  You: CALL ui_navigate(action='accept_latest_request'), then say 'Done — I accepted it.'\n"
+                "- User: 'Check my appointments to see if I am available, if I am please confirm the booking.'\n"
+                "  You: CALL ui_navigate(action='open_artisan_appointments'), then wait for the app's response.\n"
+                "  If the app says you're available, CALL ui_navigate(action='accept_latest_request').\n"
             )
             general = (
                 "General behavior:\n"
@@ -245,16 +265,14 @@ async def entrypoint(ctx: JobContext):
                     }
 
                     if action == "create_order_booking":
-                        text = (
-                            "Creating your booking now and dispatching the nearest available artisan. "
-                            "Please keep the app open."
-                        )
+                        # Don't speak yet - let the app confirm actual booking result
+                        text = ""
                     elif action == "dispatch_artisan":
-                        text = "Dispatching the nearest available artisan now. Please keep the app open."
+                        # Don't speak yet - let the app confirm actual booking result
+                        text = ""
                     elif action == "open_rfq_upload":
-                        text = (
-                            "Opening the photo upload page now. Please add 2–3 clear photos of the work needed."
-                        )
+                        # Don't speak yet - app will speak before opening upload
+                        text = ""
                     elif action == "open_bookings_tab":
                         text = "Opening your bookings now."
                     elif action == "open_future_bookings":
