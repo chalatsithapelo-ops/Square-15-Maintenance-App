@@ -176,20 +176,44 @@ async def entrypoint(ctx: JobContext):
                 "5) For RFQ (big/complex/needs quote), use CALL ui_navigate(action='open_rfq_upload') instead.\n"
                 "6) If the user asks to call the assigned artisan, CALL ui_navigate(action='call_assigned_artisan').\n"
                 "7) After the app dispatches, it will send you a confirmation message via metadata. Repeat that message to the client.\n"
+                "8) Available navigation actions for clients:\n"
+                "   - open_bookings_tab, open_future_bookings: View bookings\n"
+                "   - open_notifications: View notifications\n"
+                "   - open_profile: View/edit profile\n"
+                "   - open_settings: App settings\n"
+                "   - open_chat_support, open_support: Customer support\n"
+                "   - open_user_wallet, open_wallet: View wallet/payments\n"
+                "   - open_map, show_location: View service location\n"
+                "   - open_help, open_faq: Get help\n"
+                "   - go_home, open_dashboard: Go to home screen\n"
+                "   - go_back, navigate_back: Go back\n"
                 "\nExamples (client):\n"
                 "- User: 'I need a plumber, my tap is leaking.'\n"
                 "  You: (ask location if missing), then CALL ui_navigate(action='dispatch_artisan', category_name='Plumbing', problem_description='Leaking tap', require_photos=True).\n"
                 "  Then wait for the app to send you the dispatch result via metadata.\n"
+                "- User: 'Show me my notifications'\n"
+                "  You: CALL ui_navigate(action='open_notifications'), then say 'Opening your notifications.'\n"
             )
             artisan_flow = (
                 "Artisan workflow (availability & tasks):\n"
                 "- When a new booking arrives, you will receive notification from the app via metadata.\n"
                 "- Read the booking details to the artisan: problem description, location, scheduled date/time.\n"
+                "- Available actions for artisans:\n"
+                "  - open_artisan_requests: View pending requests\n"
+                "  - open_artisan_appointments: View calendar/schedule\n"
+                "  - open_artisan_wallet: View earnings/wallet\n"
+                "  - open_calendar, open_artisan_calendar: View calendar\n"
+                "  - accept_latest_request: Accept pending booking\n"
+                "  - reject_latest_request: Reject pending booking\n"
+                "  - open_notifications: View notifications\n"
+                "  - open_profile: View/edit profile\n"
+                "  - open_settings: App settings\n"
+                "  - go_home, open_dashboard: Go to home\n"
+                "  - go_back: Navigate back\n"
                 "- If artisan asks to check appointments, CALL ui_navigate(action='open_artisan_appointments').\n"
                 "- If artisan wants to see the photos, CALL ui_navigate(action='open_artisan_requests') - photos are in the request details.\n"
                 "- If artisan says to accept the booking, CALL ui_navigate(action='accept_latest_request') immediately.\n"
                 "- If artisan says to reject, CALL ui_navigate(action='reject_latest_request').\n"
-                "- If artisan asks for wallet, use open_artisan_wallet.\n"
                 "- If artisan says 'check my appointments to see if I am available, if I am please confirm the booking',\n"
                 "  you MUST: 1) CALL ui_navigate(action='open_artisan_appointments'), wait for app response,\n"
                 "  2) Then if available, CALL ui_navigate(action='accept_latest_request').\n"
@@ -200,6 +224,8 @@ async def entrypoint(ctx: JobContext):
                 "- User: 'Check my appointments to see if I am available, if I am please confirm the booking.'\n"
                 "  You: CALL ui_navigate(action='open_artisan_appointments'), then wait for the app's response.\n"
                 "  If the app says you're available, CALL ui_navigate(action='accept_latest_request').\n"
+                "- User: 'Show my notifications'\n"
+                "  You: CALL ui_navigate(action='open_notifications'), then say 'Opening your notifications.'\n"
             )
             general = (
                 "General behavior:\n"
@@ -293,6 +319,26 @@ async def entrypoint(ctx: JobContext):
                         text = "Updating that request now."
                     elif action == "call_assigned_artisan" or action == "call_artisan":
                         text = "Calling the assigned artisan now."
+                    elif action == "open_notifications":
+                        text = "Opening your notifications now."
+                    elif action == "open_profile":
+                        text = "Opening your profile now."
+                    elif action == "open_settings":
+                        text = "Opening settings now."
+                    elif action == "open_chat_support" or action == "open_support":
+                        text = "Opening customer support now."
+                    elif action == "open_user_wallet" or action == "open_wallet":
+                        text = "Opening your wallet now."
+                    elif action == "open_calendar" or action == "open_artisan_calendar":
+                        text = "Opening the calendar now."
+                    elif action == "open_map" or action == "show_location":
+                        text = "Opening the map now."
+                    elif action == "open_help" or action == "open_faq":
+                        text = "Opening help now."
+                    elif action == "go_home" or action == "open_dashboard":
+                        text = "Going to the home screen now."
+                    elif action == "go_back" or action == "navigate_back":
+                        text = "Going back now."
                     else:
                         text = "Working on that now."
 
