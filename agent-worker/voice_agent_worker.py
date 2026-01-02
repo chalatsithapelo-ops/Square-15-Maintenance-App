@@ -158,22 +158,31 @@ async def entrypoint(ctx: JobContext):
             "- If the user asks you to DO something in the app, you MUST call ui_navigate.\n"
             "- Never say you cannot access the app. The way you act in the app is by calling ui_navigate.\n"
             "- When you are ready to dispatch/accept/reject/call, CALL ui_navigate immediately, then confirm in 1 sentence.\n"
+            "- Never SAY or narrate tool calls. Do not say phrases like 'calling ui_navigate' or 'calling UI navigator'.\n"
+            "- Never speak JSON, code, function names, or metadata. Only speak user-facing sentences.\n"
             "- Never get stuck: do not say 'checking availability' unless you are calling ui_navigate in the SAME turn.\n"
             "- Speak naturally (not robotic). Keep it concise (1-3 short sentences).\n"
         )
 
         client_flow = (
-            "Client workflow (dispatch):\n"
+            "Client workflow (PHOTOS-FIRST dispatch):\n"
             "1) Identify the trade/category from symptoms. If unclear, ask ONE clarifying question.\n"
-            "2) Collect the minimum details needed to dispatch: category_name + problem_description.\n"
-            "   Location is preferred; if missing, ask ONE question: 'Use your current location or a different address?'\n"
-            "3) As soon as you have category + problem_description, you MUST dispatch.\n"
-            "   CALL ui_navigate(action='dispatch_artisan' or 'create_order_booking') with whatever fields you know.\n"
-            "4) If it sounds like an RFQ (big/complex/needs quote/unclear), ask for 2-3 photos and CALL ui_navigate(action='open_rfq_upload').\n"
-            "5) If the user asks to call the assigned artisan, CALL ui_navigate(action='call_assigned_artisan').\n"
+            "2) Collect the minimum details needed: category_name + problem_description + scheduling (date/time).\n"
+            "   Ask: 'When would you like this done? Today, tomorrow, or a specific time?'\n"
+            "   Convert to scheduled_date (YYYY-MM-DD) and scheduled_time (HH:MM:SS).\n"
+            "   For 'as soon as possible' or 'today', use TODAY with 10:00:00. For 'tomorrow', use TOMORROW with 09:00:00.\n"
+            "3) Ask about location: 'Use your current location or provide an address?'\n"
+            "   If current location: service_address='' (empty). If address: service_address='...'.\n"
+            "4) CRITICAL: Once you have category + description + schedule + location, you MUST open photo upload FIRST.\n"
+            "   CALL ui_navigate(action='dispatch_artisan', category_name=..., problem_description=..., scheduled_date=..., scheduled_time=..., service_address=..., require_photos=True).\n"
+            "   The app will enforce minimum 3 photos, then automatically dispatch after photos are uploaded.\n"
+            "5) For RFQ (big/complex/needs quote/unclear), CALL ui_navigate(action='open_rfq_upload').\n"
+            "6) If the user asks to call the assigned artisan, CALL ui_navigate(action='call_assigned_artisan').\n"
             "\nExamples (client):\n"
-            "- User: 'Dispatch a plumber, my tap is leaking.'\n"
-            "  You: ask location if missing; then CALL ui_navigate(action='dispatch_artisan', category_name='Plumbing', problem_description='Leaking tap', ...).\n"
+            "- User: 'I need a plumber, my tap is leaking.'\n"
+            "  You: 'When would you like this fixed — today or tomorrow?' (wait)\n"
+            "  Then: 'Should I use your current location or a different address?' (wait)\n"
+            "  Then: CALL ui_navigate(action='dispatch_artisan', category_name='Plumbing', problem_description='Leaking tap', scheduled_date='2026-01-02', scheduled_time='10:00:00', service_address='', require_photos=True).\n"
         )
 
         artisan_flow = (
@@ -222,6 +231,7 @@ async def entrypoint(ctx: JobContext):
         service_lng: str = "",
         scheduled_date: str = "",
         scheduled_time: str = "",
+        require_photos: bool = True,
         materials_responsibility: str = "",
         accept: str = "",
         request_id: str = "",
@@ -241,6 +251,7 @@ async def entrypoint(ctx: JobContext):
                 "service_lng": service_lng,
                 "scheduled_date": scheduled_date,
                 "scheduled_time": scheduled_time,
+                "require_photos": require_photos,
                 "materials_responsibility": materials_responsibility,
                 "accept": accept,
                 "request_id": request_id,
