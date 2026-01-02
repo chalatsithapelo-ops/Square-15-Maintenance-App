@@ -163,42 +163,29 @@ async def entrypoint(ctx: JobContext):
         )
 
         client_flow = (
-            "Client workflow (PHOTOS-FIRST dispatch):\n"
+            "Client workflow (dispatch):\n"
             "1) Identify the trade/category from symptoms. If unclear, ask ONE clarifying question.\n"
-            "2) Collect the minimum details needed: category_name + problem_description.\n"
+            "2) Collect the minimum details needed to dispatch: category_name + problem_description.\n"
             "   Location is preferred; if missing, ask ONE question: 'Use your current location or a different address?'\n"
-            "3) CRITICAL: Once you have category + problem_description, you MUST open photo upload FIRST.\n"
-            "   CALL ui_navigate(action='dispatch_artisan', require_photos=True) to open the photo upload screen.\n"
-            "   The app will ask the client to upload minimum 3 photos, then automatically dispatch after photos are uploaded.\n"
-            "4) NEVER call 'create_order_booking' directly - always use 'dispatch_artisan' with require_photos=True.\n"
-            "5) For RFQ (big/complex/needs quote), use CALL ui_navigate(action='open_rfq_upload') instead.\n"
-            "6) If the user asks to call the assigned artisan, CALL ui_navigate(action='call_assigned_artisan').\n"
-            "7) After the app dispatches, it will send you a confirmation message via metadata. Repeat that message to the client.\n"
+            "3) As soon as you have category + problem_description, you MUST dispatch.\n"
+            "   CALL ui_navigate(action='dispatch_artisan' or 'create_order_booking') with whatever fields you know.\n"
+            "4) If it sounds like an RFQ (big/complex/needs quote/unclear), ask for 2-3 photos and CALL ui_navigate(action='open_rfq_upload').\n"
+            "5) If the user asks to call the assigned artisan, CALL ui_navigate(action='call_assigned_artisan').\n"
             "\nExamples (client):\n"
-            "- User: 'I need a plumber, my tap is leaking.'\n"
-            "  You: (ask location if missing), then CALL ui_navigate(action='dispatch_artisan', category_name='Plumbing', problem_description='Leaking tap', require_photos=True).\n"
-            "  Then wait for the app to send you the dispatch result via metadata.\n"
+            "- User: 'Dispatch a plumber, my tap is leaking.'\n"
+            "  You: ask location if missing; then CALL ui_navigate(action='dispatch_artisan', category_name='Plumbing', problem_description='Leaking tap', ...).\n"
         )
 
         artisan_flow = (
-            "Artisan workflow (availability & tasks):\n"
-            "- When a new booking arrives, you will receive notification from the app via metadata.\n"
-            "- Read the booking details to the artisan: problem description, location, scheduled date/time.\n"
-            "- If artisan asks to check appointments, CALL ui_navigate(action='open_artisan_appointments').\n"
-            "- If artisan wants to see the photos, CALL ui_navigate(action='open_artisan_requests') - photos are in the request details.\n"
-            "- If artisan says to accept the booking, CALL ui_navigate(action='accept_latest_request') immediately.\n"
-            "- If artisan says to reject, CALL ui_navigate(action='reject_latest_request').\n"
-            "- If artisan asks for wallet, use open_artisan_wallet.\n"
-            "- If artisan says 'check my appointments to see if I am available, if I am please confirm the booking',\n"
-            "  you MUST: 1) CALL ui_navigate(action='open_artisan_appointments'), wait for app response,\n"
-            "  2) Then if available, CALL ui_navigate(action='accept_latest_request').\n"
+            "Artisan workflow (tasks):\n"
+            "- If artisan asks to accept a job/request, you MUST CALL ui_navigate(action='accept_latest_request').\n"
+            "- If artisan asks to reject, you MUST CALL ui_navigate(action='reject_latest_request').\n"
+            "- If artisan asks to open requests, CALL ui_navigate(action='open_artisan_requests').\n"
+            "- If artisan asks for appointments/wallet, use open_artisan_appointments/open_artisan_wallet.\n"
             "- Do not attempt to dispatch artisans while speaking to an artisan.\n"
             "\nExamples (artisan):\n"
             "- User: 'Accept the latest request.'\n"
-            "  You: CALL ui_navigate(action='accept_latest_request'), then say 'Done \u2014 I accepted it.'\n"
-            "- User: 'Check my appointments to see if I am available, if I am please confirm the booking.'\n"
-            "  You: CALL ui_navigate(action='open_artisan_appointments'), then wait for the app's response.\n"
-            "  If the app says you're available, CALL ui_navigate(action='accept_latest_request').\n"
+            "  You: CALL ui_navigate(action='accept_latest_request'), then say 'Done — I accepted it.'\n"
         )
 
         general = (
@@ -263,14 +250,16 @@ async def entrypoint(ctx: JobContext):
             }
             text = ""
             if action == "create_order_booking":
-                # Don't speak yet - let the app confirm actual booking result
-                text = ""
+                text = (
+                    "Creating your booking now and dispatching the nearest available artisan. "
+                    "Please keep the app open."
+                )
             elif action == "dispatch_artisan":
-                # Don't speak yet - let the app confirm actual booking result
-                text = ""
+                text = "Dispatching the nearest available artisan now. Please keep the app open."
             elif action == "open_rfq_upload":
-                # Don't speak yet - app will speak before opening upload
-                text = ""
+                text = (
+                    "Opening the photo upload page now. Please add 2-3 clear photos of the work needed."
+                )
             elif action == "open_bookings_tab":
                 text = "Opening your bookings now."
             elif action == "open_future_bookings":
@@ -303,79 +292,6 @@ async def entrypoint(ctx: JobContext):
             logger.warning(f"ui_navigate failed: {e}")
             return "error"
 
-    session = voice.AgentSession(tools=[ui_navigate])
-
-    # Listen for app->agent requests delivered via participant metadata.
-    # The mobile app sends: {"type":"square15_app","action":"speak","payload":{"text":"..."}}
-    # so the agent can speak without needing Firestore access.
-    _last_spoken_meta_by_identity: dict[str, str] = {}
-
-    def _extract_speak_text(meta_str: str) -> str:
-        if not meta_str:
-            return ""
-        try:
-            data = json.loads(meta_str)
-        except Exception:
-            return ""
-
-        if not isinstance(data, dict):
-            return ""
-        if data.get("type") != "square15_app" or data.get("action") != "speak":
-            return ""
-
-        payload = data.get("payload")
-        if isinstance(payload, dict):
-            text = payload.get("text")
-            if isinstance(text, str) and text.strip():
-                return text.strip()
-
-        text = data.get("text")
-        if isinstance(text, str) and text.strip():
-            return text.strip()
-
-        return ""
-
-    async def _say_from_app(text: str) -> None:
-        try:
-            await session.say(text, allow_interruptions=True)
-            logger.info(f"[ai_meta] spoke_from_app len={len(text)}")
-        except Exception as e:
-            logger.warning(f"⚠️ Failed to speak app message: {e}")
-
-    def _on_participant_metadata_changed(*args, **kwargs) -> None:
-        try:
-            participant = args[0] if len(args) > 0 else None
-            new_meta = args[2] if len(args) > 2 else None
-
-            identity = (getattr(participant, "identity", "") or "unknown").strip()
-
-            meta_str = ""
-            if isinstance(new_meta, str) and new_meta:
-                meta_str = new_meta
-            else:
-                meta_str = getattr(participant, "metadata", "") or ""
-
-            # De-dupe repeated metadata packets.
-            if meta_str and _last_spoken_meta_by_identity.get(identity) == meta_str:
-                return
-            if meta_str:
-                _last_spoken_meta_by_identity[identity] = meta_str
-
-            text = _extract_speak_text(meta_str)
-            if not text:
-                return
-
-            asyncio.create_task(_say_from_app(text))
-        except Exception as e:
-            logger.warning(f"⚠️ metadata_changed handler failed: {e}")
-
-    try:
-        if hasattr(ctx.room, "on"):
-            ctx.room.on("participant_metadata_changed", _on_participant_metadata_changed)
-            logger.info("✅ Listening for square15_app:speak via participant metadata")
-    except Exception as e:
-        logger.warning(f"⚠️ Could not attach metadata listener: {e}")
-
     agent = voice.Agent(
         vad=vad,
         stt=openai.STT(model="whisper-1", language="en"),
@@ -385,8 +301,59 @@ async def entrypoint(ctx: JobContext):
     )
 
     logger.info("🚀 Starting agent session...")
+    session = voice.AgentSession(tools=[ui_navigate])
     await session.start(agent, room=ctx.room)
     logger.info("✅ Agent session started and running!")
+
+    # Listen for app -> agent metadata messages (e.g. booking updates).
+    # The Flutter app will set its own participant metadata to JSON:
+    #   {"type":"square15_app","action":"speak","payload":{"text":"..."},...}
+    last_metadata_by_identity: dict[str, str] = {}
+
+    def on_participant_metadata_changed(participant, old_metadata, new_metadata):
+        try:
+            if not new_metadata or not str(new_metadata).strip():
+                return
+
+            # Ignore agent's own metadata updates.
+            try:
+                if ctx.room and ctx.room.local_participant and participant.identity == ctx.room.local_participant.identity:
+                    return
+            except Exception:
+                pass
+
+            ident = (getattr(participant, "identity", "") or "").strip()
+            if ident:
+                if last_metadata_by_identity.get(ident) == new_metadata:
+                    return
+                last_metadata_by_identity[ident] = new_metadata
+
+            try:
+                msg = json.loads(new_metadata)
+            except Exception:
+                return
+            if not isinstance(msg, dict):
+                return
+
+            if (msg.get("type") or "").strip() != "square15_app":
+                return
+
+            action = (msg.get("action") or "").strip()
+            payload = msg.get("payload") if isinstance(msg.get("payload"), dict) else {}
+
+            if action == "speak":
+                text = (payload.get("text") or msg.get("text" ) or "").strip()
+                if not text:
+                    return
+                asyncio.create_task(session.say(text, allow_interruptions=True))
+        except Exception as e:
+            logger.info(f"metadata handler error (ignored): {e}")
+
+    try:
+        ctx.room.on("participant_metadata_changed", on_participant_metadata_changed)
+        logger.info("✅ Listening for app metadata (square15_app)")
+    except Exception as e:
+        logger.warning(f"⚠️ Could not attach metadata listener: {e}")
 
     try:
         await session.say(
