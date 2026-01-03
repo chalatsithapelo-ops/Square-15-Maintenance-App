@@ -158,6 +158,7 @@ async def entrypoint(ctx: JobContext):
             "- If the user asks you to DO something in the app, you MUST call ui_navigate.\n"
             "- Never say you cannot access the app. The way you act in the app is by calling ui_navigate.\n"
             "- When you are ready to dispatch/accept/reject/call, CALL ui_navigate immediately, then confirm in 1 sentence.\n"
+            "- Do NOT say 'I will open/dispatch...' unless you have called ui_navigate in that same turn.\n"
             "- Never SAY or narrate tool calls. Do not say phrases like 'calling ui_navigate' or 'calling UI navigator'.\n"
             "- Never speak JSON, code, function names, or metadata. Only speak user-facing sentences.\n"
             "- Never get stuck: do not say 'checking availability' unless you are calling ui_navigate in the SAME turn.\n"
@@ -167,22 +168,17 @@ async def entrypoint(ctx: JobContext):
         client_flow = (
             "Client workflow (PHOTOS-FIRST dispatch):\n"
             "1) Identify the trade/category from symptoms. If unclear, ask ONE clarifying question.\n"
-            "2) Collect the minimum details needed: category_name + problem_description + scheduling (date/time).\n"
-            "   Ask: 'When would you like this done? Today, tomorrow, or a specific time?'\n"
-            "   Convert to scheduled_date (YYYY-MM-DD) and scheduled_time (HH:MM:SS).\n"
-            "   For 'as soon as possible' or 'today', use TODAY with 10:00:00. For 'tomorrow', use TOMORROW with 09:00:00.\n"
-            "3) Ask about location: 'Use your current location or provide an address?'\n"
-            "   If current location: service_address='' (empty). If address: service_address='...'.\n"
-            "4) CRITICAL: Once you have category + description + schedule + location, you MUST open photo upload FIRST.\n"
-            "   CALL ui_navigate(action='dispatch_artisan', category_name=..., problem_description=..., scheduled_date=..., scheduled_time=..., service_address=..., require_photos=True).\n"
+            "2) Collect the minimum details needed: category_name + problem_description.\n"
+            "3) CRITICAL: As soon as you have category + description, you MUST open photo upload FIRST.\n"
+            "   CALL ui_navigate(action='dispatch_artisan', category_name=..., problem_description=..., require_photos=True).\n"
             "   The app will enforce minimum 3 photos, then automatically dispatch after photos are uploaded.\n"
+            "4) Only ask scheduling/location if the user specifically wants a different time or address.\n"
+            "   If needed, include scheduled_date/scheduled_time and/or service_address in the same ui_navigate call.\n"
             "5) For RFQ (big/complex/needs quote/unclear), CALL ui_navigate(action='open_rfq_upload').\n"
             "6) If the user asks to call the assigned artisan, CALL ui_navigate(action='call_assigned_artisan').\n"
             "\nExamples (client):\n"
             "- User: 'I need a plumber, my tap is leaking.'\n"
-            "  You: 'When would you like this fixed — today or tomorrow?' (wait)\n"
-            "  Then: 'Should I use your current location or a different address?' (wait)\n"
-            "  Then: CALL ui_navigate(action='dispatch_artisan', category_name='Plumbing', problem_description='Leaking tap', scheduled_date='2026-01-02', scheduled_time='10:00:00', service_address='', require_photos=True).\n"
+            "  You: CALL ui_navigate(action='dispatch_artisan', category_name='Plumbing', problem_description='Leaking tap', require_photos=True), then say 'Opening photo upload now.'\n"
         )
 
         artisan_flow = (
@@ -306,7 +302,7 @@ async def entrypoint(ctx: JobContext):
     agent = voice.Agent(
         vad=vad,
         stt=openai.STT(model="whisper-1", language="en"),
-        llm=openai.LLM(model="gpt-4o-mini", temperature=0.2),
+        llm=openai.LLM(model="gpt-4o-mini", temperature=0.0),
         tts=openai.TTS(model="tts-1", voice="alloy"),
         instructions=_instructions_for_role(caller_role),
     )
