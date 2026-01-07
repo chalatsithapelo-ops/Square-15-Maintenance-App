@@ -8,6 +8,7 @@ import logging
 from pathlib import Path
 import inspect
 import json
+import re
 
 from livekit.agents import AutoSubscribe, JobContext, WorkerOptions, cli
 from livekit.plugins import openai, silero
@@ -22,6 +23,28 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+_FORBIDDEN_SPEECH_PATTERNS = [
+    # Tool call narration / internal jargon (including the common typo "nagivation")
+    re.compile(r"\bcalling\s+ui\s+na(?:g)?ivation\b", re.IGNORECASE),
+    re.compile(r"\bcalling\s+ui_navigate\b", re.IGNORECASE),
+    re.compile(r"\bui_navigate\b", re.IGNORECASE),
+    re.compile(r"\bsquare15_ui\b", re.IGNORECASE),
+    re.compile(r"\bsquare15_app\b", re.IGNORECASE),
+    re.compile(r"\bSQUARE15_UI\b", re.IGNORECASE),
+]
+
+
+def _sanitize_spoken_text(text: str) -> str:
+    """Remove internal/tool narration from anything that could be spoken."""
+    t = (text or "").strip()
+    if not t:
+        return ""
+    for pat in _FORBIDDEN_SPEECH_PATTERNS:
+        if pat.search(t):
+            return ""
+    return t
 
 # Load environment variables (optional locally; cloud uses service env vars)
 # Must never crash if the file is nested differently in a container.
@@ -356,6 +379,17 @@ async def entrypoint(ctx: JobContext):
 
             session = voice.AgentSession(tools=[ui_navigate])
 
+            # Guardrail: never allow internal/tool narration to reach TTS.
+            _orig_say = session.say
+
+            async def _say_sanitized(text: str, *args, **kwargs):
+                cleaned = _sanitize_spoken_text(text)
+                if not cleaned:
+                    return None
+                return await _orig_say(cleaned, *args, **kwargs)
+
+            session.say = _say_sanitized
+
             # Listen for app->agent requests delivered via participant metadata.
             # The mobile app sends: {"type":"square15_app","action":"speak","payload":{"text":"..."}}
             # so the agent can speak without needing Firestore access.
@@ -378,11 +412,11 @@ async def entrypoint(ctx: JobContext):
                 if isinstance(payload, dict):
                     text = payload.get("text")
                     if isinstance(text, str) and text.strip():
-                        return text.strip()
+                        return _sanitize_spoken_text(text)
 
                 text = data.get("text")
                 if isinstance(text, str) and text.strip():
-                    return text.strip()
+                    return _sanitize_spoken_text(text)
 
                 return ""
 
