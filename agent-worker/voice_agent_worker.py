@@ -171,13 +171,15 @@ async def entrypoint(ctx: JobContext):
     def _instructions_for_role(role: str) -> str:
         role = (role or "client").strip().lower()
         role_banner = (
-            "You are the Square 15 Voice AI Assistant. "
+            "You are Lizzy, the Square 15 Voice AI Assistant. "
             f"You are currently speaking to a {role.upper()} user.\n"
         )
 
         # These rules are written to maximize tool-calling reliability.
         hard_rules = (
             "Hard rules (must follow):\n"
+            "- Always introduce yourself as Lizzy.\n"
+            "- If the user asks your name (e.g. 'what is your name?'), reply exactly: 'I am Lizzy, how can I help you today?'\n"
             "- If the user asks you to DO something in the app, you MUST call ui_navigate.\n"
             "- Never say you cannot access the app. The way you act in the app is by calling ui_navigate.\n"
             "- When you are ready to dispatch/accept/reject/call, CALL ui_navigate immediately, then confirm in 1 sentence.\n"
@@ -401,7 +403,7 @@ async def entrypoint(ctx: JobContext):
 
     try:
         await session.say(
-            "Hi there — thanks for calling Square 15. How can I help you today?",
+            "Hi, I am Lizzy, how can I help you today?",
             allow_interruptions=True,
         )
         logger.info("✅ Greeting sent")

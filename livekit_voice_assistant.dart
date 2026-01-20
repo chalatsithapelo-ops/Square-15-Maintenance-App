@@ -61,6 +61,7 @@ class _RoomEventHandler {
 
 class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
     with TickerProviderStateMixin {
+  static const String _assistantName = 'Lizzy';
   // Backend Configuration
   // IMPORTANT: To work on mobile data and without your laptop, this must be a publicly reachable HTTPS URL
   // pointing to the deployed `livekit-backend` server.
@@ -252,7 +253,7 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
 
     setState(() {
       _isConnecting = true;
-      _connectionStatus = 'Connecting to AI Assistant...';
+      _connectionStatus = 'Connecting to $_assistantName...';
     });
     try {
       // Check microphone permission
@@ -314,7 +315,7 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
         _aiResponse = '🎤 YOU ARE NOW CONNECTED!\n\n'
             'Room: $roomName\n\n'
             'AI agent is being started by the backend.\n\n'
-            'Start speaking to interact with the voice assistant!\n\n'
+            'Start speaking to interact with $_assistantName!\n\n'
             'The agent will help you with:\n'
             '• Maintenance bookings\n'
             '• Schedule inquiries\n'
@@ -344,11 +345,11 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
       setState(() {
         _isConnecting = false;
         _connectionStatus = 'Connection Failed';
-        _aiResponse = 'Failed to connect to AI Assistant. Please try again.';
+        _aiResponse = 'Failed to connect to $_assistantName. Please try again.';
       });
 
       _showErrorDialog(
-          'Connection Error', 'Failed to connect to AI Assistant: $e');
+          'Connection Error', 'Failed to connect to $_assistantName: $e');
     }
   }
 
@@ -1909,6 +1910,9 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
   void _watchBookingUntilConfirmed({required String bookingId}) {
     _bookingStatusSubscription?.cancel();
     _watchBookingLastProviderId = '';
+    bool hasAnnouncedAcceptance = false;
+    bool hasAnnouncedPaymentComplete = false;
+    
     _bookingStatusSubscription = FutureBookingService.futureBookingsRef
         .doc(bookingId)
         .snapshots()
@@ -1924,6 +1928,53 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
       final artisanConfirmed =
           (data['artisan_confirmed'] ?? '').toString().trim().toLowerCase();
       final artisanId = (data['service_provider_id'] ?? '').toString().trim();
+
+      // Check payment status
+      bool isPaid = false;
+      try {
+        final bookingPaymentStatus = (data['payment_status'] ?? '').toString().trim().toLowerCase();
+        if (bookingPaymentStatus == 'paid' || bookingPaymentStatus == 'success') {
+          isPaid = true;
+        }
+        
+        if (!isPaid) {
+          // Also check in tasksManagement
+          final tmIdRaw = (data['tasks_management_id'] ?? '').toString().trim();
+          if (tmIdRaw.isNotEmpty) {
+            final tmDoc = await FirebaseFirestore.instance
+                .collection('tasksManagement')
+                .doc(tmIdRaw)
+                .get();
+            if (tmDoc.exists) {
+              final tmData = tmDoc.data() ?? <String, dynamic>{};
+              final tmPaymentStatus = (tmData['payment_status'] ?? '').toString().trim().toLowerCase();
+              if (tmPaymentStatus == 'paid' || tmPaymentStatus == 'success') {
+                isPaid = true;
+              }
+            }
+          }
+        }
+      } catch (_) {}
+
+      // If payment is complete and we haven't announced it yet, announce and stop watching
+      if (isPaid && !hasAnnouncedPaymentComplete) {
+        hasAnnouncedPaymentComplete = true;
+        final completionMsg = 'Thank you, your booking process is complete. Please monitor the booking on the Future Bookings tab.';
+        
+        setState(() {
+          _aiResponse = completionMsg;
+        });
+        _addToTranscript('AI', completionMsg);
+        
+        await _sendSpeakToAgent(completionMsg);
+        
+        Get.snackbar('Voice AI', completionMsg,
+            backgroundColor: Colors.green, colorText: Colors.white);
+
+        await _bookingStatusSubscription?.cancel();
+        _bookingStatusSubscription = null;
+        return;
+      }
 
       if (_watchBookingLastProviderId.isNotEmpty &&
           artisanId.isNotEmpty &&
@@ -1948,7 +1999,10 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
         _watchBookingLastProviderId = artisanId;
       }
 
-      if (status == 'confirmed' || artisanConfirmed == 'yes') {
+      if ((status == 'confirmed' || artisanConfirmed == 'yes') &&
+          !hasAnnouncedAcceptance) {
+        hasAnnouncedAcceptance = true;
+        
         String artisanName = '';
         try {
           if (artisanId.isNotEmpty && artisanId != 'admin') {
@@ -1985,8 +2039,7 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
         Get.snackbar('Voice AI', msg,
             backgroundColor: Colors.green, colorText: Colors.white);
 
-        await _bookingStatusSubscription?.cancel();
-        _bookingStatusSubscription = null;
+        // DO NOT CANCEL - continue watching for payment completion
         return;
       }
 
