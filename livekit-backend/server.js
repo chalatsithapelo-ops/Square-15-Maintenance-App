@@ -81,6 +81,8 @@ function getServiceAccountFromEnv() {
 
 let firebaseInitialized = false;
 let firebaseInitError = null;
+let firebaseProjectIdHint = null;
+let firebaseClientEmailHint = null;
 
 function initFirebaseIfPossible() {
   if (firebaseInitialized) return;
@@ -93,6 +95,9 @@ function initFirebaseIfPossible() {
       firebaseInitialized = true;
       return;
     }
+
+    firebaseProjectIdHint = sa.project_id || sa.projectId || null;
+    firebaseClientEmailHint = sa.client_email || sa.clientEmail || null;
     admin.initializeApp({
       credential: admin.credential.cert(sa),
     });
@@ -139,10 +144,11 @@ async function verifyFirebaseAuth(req, res) {
   try {
     const decoded = await admin.auth().verifyIdToken(idToken);
     return decoded;
-  } catch {
+  } catch (e) {
     res.status(401).json({
       error: 'Unauthorized',
       message: 'Invalid Firebase ID token',
+      details: e && e.message ? String(e.message) : undefined,
     });
     return null;
   }
@@ -356,11 +362,19 @@ app.get('/health', (req, res) => {
   const httpUrl = getLiveKitHttpUrl();
   const apiKey = env('LIVEKIT_API_KEY');
   const apiSecret = env('LIVEKIT_API_SECRET');
+  initFirebaseIfPossible();
   res.json({ 
     status: 'ok', 
     message: 'Livekit Token Server is running',
     timestamp: new Date().toISOString(),
     sdkVersion: getSdkVersion(),
+    firebase: {
+      initialized: firebaseInitialized,
+      configured: firebaseInitialized && !firebaseInitError,
+      projectId: firebaseProjectIdHint,
+      clientEmail: firebaseClientEmailHint,
+      initError: firebaseInitError ? firebaseInitError.message : null,
+    },
     livekit: {
       wsUrl: wsUrl || null,
       httpUrl: httpUrl || null,
