@@ -1,6 +1,9 @@
 const express = require('express');
 const cors = require('cors');
 const { AccessToken, AgentDispatchClient } = require('livekit-server-sdk');
+const admin = require('firebase-admin');
+const crypto = require('crypto');
+const fs = require('fs');
 require('dotenv').config();
 
 function sanitizeEnvValue(value) {
@@ -26,6 +29,265 @@ app.use(cors({
   credentials: true
 }));
 app.use(express.json());
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function randomId(prefix = '') {
+  const id = crypto.randomUUID();
+  return prefix ? `${prefix}${id}` : id;
+}
+
+function getBearerToken(req) {
+  const header = req.headers.authorization || req.headers.Authorization;
+  if (!header || typeof header !== 'string') return '';
+  const m = header.match(/^Bearer\s+(.+)$/i);
+  return m ? m[1].trim() : '';
+}
+
+function getServiceAccountFromEnv() {
+  const jsonRaw = env('FIREBASE_SERVICE_ACCOUNT_JSON');
+  if (jsonRaw) {
+    try {
+      return JSON.parse(jsonRaw);
+    } catch {
+      throw new Error('FIREBASE_SERVICE_ACCOUNT_JSON is not valid JSON');
+    }
+  }
+
+  const filePath = env('FIREBASE_SERVICE_ACCOUNT_FILE');
+  if (filePath) {
+    try {
+      const raw = fs.readFileSync(filePath, 'utf8');
+      return JSON.parse(raw);
+    } catch {
+      throw new Error('FIREBASE_SERVICE_ACCOUNT_FILE is not a readable JSON file');
+    }
+  }
+
+  const b64 = env('FIREBASE_SERVICE_ACCOUNT_BASE64');
+  if (b64) {
+    try {
+      const decoded = Buffer.from(b64, 'base64').toString('utf8');
+      return JSON.parse(decoded);
+    } catch {
+      throw new Error('FIREBASE_SERVICE_ACCOUNT_BASE64 is not valid base64 JSON');
+    }
+  }
+
+  return null;
+}
+
+let firebaseInitialized = false;
+let firebaseInitError = null;
+
+function initFirebaseIfPossible() {
+  if (firebaseInitialized) return;
+  try {
+    const sa = getServiceAccountFromEnv();
+    if (!sa) {
+      firebaseInitError = new Error(
+        'Firebase Admin is not configured. Set FIREBASE_SERVICE_ACCOUNT_JSON or FIREBASE_SERVICE_ACCOUNT_BASE64 on the backend service.'
+      );
+      firebaseInitialized = true;
+      return;
+    }
+    admin.initializeApp({
+      credential: admin.credential.cert(sa),
+    });
+    firebaseInitialized = true;
+  } catch (e) {
+    firebaseInitError = e;
+    firebaseInitialized = true;
+  }
+}
+
+function requireFirebase(res) {
+  initFirebaseIfPossible();
+  if (firebaseInitError) {
+    res.status(503).json({
+      error: 'Firebase Admin not configured',
+      message: firebaseInitError.message,
+      hint:
+        'Configure FIREBASE_SERVICE_ACCOUNT_JSON, FIREBASE_SERVICE_ACCOUNT_BASE64, or FIREBASE_SERVICE_ACCOUNT_FILE in Render env vars for the livekit-backend service.',
+    });
+    return null;
+  }
+  return admin.firestore();
+}
+
+async function verifyFirebaseAuth(req, res) {
+  initFirebaseIfPossible();
+  if (firebaseInitError) {
+    res.status(503).json({
+      error: 'Firebase Admin not configured',
+      message: firebaseInitError.message,
+    });
+    return null;
+  }
+
+  const idToken = getBearerToken(req);
+  if (!idToken) {
+    res.status(401).json({
+      error: 'Unauthorized',
+      message: 'Missing Authorization: Bearer <Firebase ID token>',
+    });
+    return null;
+  }
+
+  try {
+    const decoded = await admin.auth().verifyIdToken(idToken);
+    return decoded;
+  } catch {
+    res.status(401).json({
+      error: 'Unauthorized',
+      message: 'Invalid Firebase ID token',
+    });
+    return null;
+  }
+}
+
+function isTruthy(v) {
+  if (v === true) return true;
+  if (v === false) return false;
+  if (v == null) return false;
+  const s = String(v).trim().toLowerCase();
+  return s === '1' || s === 'true' || s === 'yes' || s === 'y';
+}
+
+function normalizeAction(action) {
+  return String(action || '').trim().toLowerCase();
+}
+
+function normalizeBookingId(payload) {
+  const p = payload && typeof payload === 'object' ? payload : {};
+  const id = String(p.booking_id || p.bookingId || '').trim();
+  return id;
+}
+
+function getIdempotencyKey(req) {
+  const k = req.headers['idempotency-key'] || req.headers['Idempotency-Key'];
+  const s = typeof k === 'string' ? k.trim() : '';
+  const raw = s || randomId('idem-');
+  return raw.replace(/\//g, '_');
+}
+
+async function writeAudit({ firestore, auditId, audit }) {
+  await firestore.collection('assistant_action_audit').doc(auditId).set(audit, { merge: true });
+}
+
+async function writeNotification({ firestore, userId, userType, title, message, type, data }) {
+  const doc = {
+    user_id: String(userId || '').trim(),
+    user_type: String(userType || '').trim(),
+    title: String(title || '').trim() || 'Notification',
+    message: String(message || '').trim(),
+    type: String(type || '').trim(),
+    booking_id: (data && (data.booking_id || data.bookingId)) ? String(data.booking_id || data.bookingId) : '',
+    data: data && typeof data === 'object' ? data : {},
+    read: false,
+    view: false,
+    created_at: nowIso(),
+    updated_at: nowIso(),
+  };
+
+  await firestore.collection('notifications').add(doc);
+}
+
+async function executeBookingAction({ firestore, action, actorUid, actorRole, payload }) {
+  if (action !== 'create_order_booking') {
+    return { ok: false, status: 400, error: 'unsupported_action' };
+  }
+
+  if (!actorUid) {
+    return { ok: false, status: 401, error: 'unauthorized' };
+  }
+
+  // For now, allow any authenticated user to create a booking.
+  // Admin/artisan can also create, but the actorUid becomes client_id/user_id.
+  const p = payload && typeof payload === 'object' ? payload : {};
+  const isRFQFlag = isTruthy(p.is_rfq_requested ?? p.is_rfq ?? p.isRFQ ?? p.isRfq);
+
+  const categoryName = String(p.category_name || p.categoryName || '').trim();
+  const problemDescription = String(p.problem_description || p.problemDescription || '').trim();
+
+  const scheduledDate = String(p.scheduled_date || p.scheduledDate || new Date().toISOString().slice(0, 10)).trim();
+  const scheduledTime = String(p.scheduled_time || p.scheduledTime || new Date().toTimeString().slice(0, 5)).trim();
+
+  const bookingRef = firestore.collection('futureBookings').doc();
+  const bookingIdLocal = bookingRef.id;
+
+  const jobIds = Array.isArray(p.job_ids || p.jobIds) ? (p.job_ids || p.jobIds) : [];
+
+  const status = isRFQFlag ? 'rfq_submitted' : 'pending_assignment';
+  const bookingDoc = {
+    booking_id: bookingIdLocal,
+    bookingId: bookingIdLocal,
+
+    user_id: actorUid,
+    client_id: actorUid,
+    user_type: actorRole || 'client',
+
+    is_rfq: isRFQFlag ? 'yes' : 'no',
+    is_rfq_requested: isRFQFlag ? 'yes' : 'no',
+    order_type: isRFQFlag ? 'rfq' : 'order',
+
+    category_name: categoryName,
+    problem_description: problemDescription,
+    job_ids: jobIds,
+
+    scheduled_date: scheduledDate,
+    scheduled_time: scheduledTime,
+
+    service_provider_id: 'admin',
+    artisan_confirmed: isRFQFlag ? 'pending' : 'pending',
+    status,
+
+    created_at: nowIso(),
+    updated_at: nowIso(),
+  };
+
+  await bookingRef.set(bookingDoc);
+
+  // Admin notification (shows in Admin Inbox).
+  await writeNotification({
+    firestore,
+    userId: 'admin',
+    userType: 'admin',
+    title: isRFQFlag ? 'RFQ Request' : 'New Booking',
+    message: isRFQFlag
+      ? `New RFQ request for ${categoryName || 'service'} (booking ${bookingIdLocal}).`
+      : `New booking created for ${categoryName || 'service'} (booking ${bookingIdLocal}).`,
+    type: isRFQFlag ? 'rfq' : 'order',
+    data: { booking_id: bookingIdLocal, order_type: isRFQFlag ? 'rfq' : 'order' },
+  });
+
+  // Personal notification to the requesting user.
+  await writeNotification({
+    firestore,
+    userId: actorUid,
+    userType: 'user',
+    title: isRFQFlag ? 'RFQ submitted' : 'Booking created',
+    message: isRFQFlag
+      ? 'Your request has been submitted for a quote. Admin will review and assign the best available artisan.'
+      : 'Your booking was created. We are assigning the nearest available artisan.',
+    type: isRFQFlag ? 'rfq' : 'order',
+    data: { booking_id: bookingIdLocal, status },
+  });
+
+  return {
+    ok: true,
+    status: 200,
+    data: {
+      booking_id: bookingIdLocal,
+      bookingId: bookingIdLocal,
+      is_rfq: isRFQFlag,
+      isRFQ: isRFQFlag,
+      status,
+    },
+  };
+}
 
 function getLiveKitWsUrl() {
   return env('LIVEKIT_WS_URL') || env('LIVEKIT_URL');
@@ -318,6 +580,135 @@ app.post('/api/dispatch-agent', async (req, res) => {
           agentName: getAgentName(),
         },
       },
+    });
+  }
+});
+
+/**
+ * Secure assistant action execution
+ * POST /api/action/execute
+ * Headers: Authorization: Bearer <Firebase ID Token>
+ * Optional: Idempotency-Key: <string>
+ * Body: { action: string, payload: object, context?: object }
+ */
+app.post('/api/action/execute', async (req, res) => {
+  const startedAt = nowIso();
+  const idempotencyKey = getIdempotencyKey(req);
+  const action = normalizeAction(req.body && req.body.action);
+  const payload = (req.body && typeof req.body.payload === 'object' && req.body.payload) || {};
+  const context = (req.body && typeof req.body.context === 'object' && req.body.context) || {};
+
+  const firestore = requireFirebase(res);
+  if (!firestore) return;
+
+  const decoded = await verifyFirebaseAuth(req, res);
+  if (!decoded) return;
+
+  const actorUid = decoded.uid;
+  const actorRole = String(decoded.role || decoded.user_role || decoded.user_type || 'client').trim().toLowerCase();
+
+  const auditRef = firestore.collection('assistant_action_audit').doc(idempotencyKey);
+  const existing = await auditRef.get();
+  if (existing.exists) {
+    const data = existing.data() || {};
+    if (data.status === 'success') {
+      return res.json({
+        ok: true,
+        success: true,
+        idempotencyKey,
+        action,
+        reused: true,
+        data: data.result || null,
+        result: data.result || null,
+      });
+    }
+    if (data.status === 'started') {
+      return res.status(409).json({
+        error: 'duplicate_in_flight',
+        message: 'This action is already being processed',
+        idempotencyKey,
+      });
+    }
+  }
+
+  const auditBase = {
+    id: idempotencyKey,
+    created_at: startedAt,
+    updated_at: startedAt,
+    status: 'started',
+    action,
+    actor_uid: actorUid,
+    actor_role: actorRole,
+    booking_id: normalizeBookingId(payload) || null,
+    context,
+    payload,
+  };
+
+  await writeAudit({ firestore, auditId: idempotencyKey, audit: auditBase });
+
+  try {
+    const result = await executeBookingAction({
+      firestore,
+      action,
+      actorUid,
+      actorRole,
+      payload,
+      context,
+    });
+
+    if (!result.ok) {
+      await writeAudit({
+        firestore,
+        auditId: idempotencyKey,
+        audit: {
+          status: 'error',
+          updated_at: nowIso(),
+          error: result.error,
+          http_status: result.status,
+        },
+      });
+      return res.status(result.status).json({
+        error: result.error,
+        message: 'Action failed',
+        idempotencyKey,
+      });
+    }
+
+    await writeAudit({
+      firestore,
+      auditId: idempotencyKey,
+      audit: {
+        status: 'success',
+        updated_at: nowIso(),
+        completed_at: nowIso(),
+        result: result.data || null,
+      },
+    });
+
+    return res.json({
+      ok: true,
+      success: true,
+      idempotencyKey,
+      action,
+      data: result.data || null,
+      result: result.data || null,
+    });
+  } catch (e) {
+    await writeAudit({
+      firestore,
+      auditId: idempotencyKey,
+      audit: {
+        status: 'error',
+        updated_at: nowIso(),
+        completed_at: nowIso(),
+        error: 'exception',
+        exception_message: e && e.message ? String(e.message) : String(e),
+      },
+    });
+    return res.status(500).json({
+      error: 'internal_error',
+      message: 'Action execution failed',
+      idempotencyKey,
     });
   }
 });
