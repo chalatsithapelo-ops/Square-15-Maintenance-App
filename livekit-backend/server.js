@@ -695,6 +695,7 @@ app.post('/api/action/execute', async (req, res) => {
         status: 'success',
         updated_at: nowIso(),
         completed_at: nowIso(),
+        booking_id: normalizeBookingId(result.data) || normalizeBookingId(payload) || null,
         result: result.data || null,
       },
     });
