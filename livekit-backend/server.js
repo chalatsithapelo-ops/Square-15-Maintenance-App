@@ -376,6 +376,9 @@ function coerceBooleanish(v) {
 // Tier A = read-only; Tier B = normal state changes; Tier C = financial / high-risk (blocked until further controls added).
 const ACTION_TIERS = Object.freeze({
   get_booking_status: 'A',
+  list_user_bookings: 'A',
+  explain_rfq_quote: 'A',
+  get_payment_status: 'A',
   create_order_booking: 'B',
   create_order_booking_order: 'B',
   dispatch_artisan: 'B',
@@ -529,7 +532,13 @@ function validateActionExecuteBody(body) {
   }
 
   // Canonical actions supported by this backend.
-  const supportedActions = new Set(['create_order_booking']);
+  const supportedActions = new Set([
+    'get_booking_status',
+    'list_user_bookings',
+    'explain_rfq_quote',
+    'get_payment_status',
+    'create_order_booking',
+  ]);
   if (action && !supportedActions.has(action)) {
     errors.push({ field: 'action', message: `Unsupported action: ${action}` });
   }
@@ -676,6 +685,221 @@ async function writeNotification({ firestore, userId, userType, title, message, 
   await firestore.collection('notifications').add(doc);
 }
 
+// Phase 2: Read-only support assistant tools (Tier A)
+
+async function handleGetBookingStatus({ firestore, actorUid, actorRole, payload }) {
+  if (!actorUid) {
+    return { ok: false, status: 401, error: 'unauthorized' };
+  }
+
+  const bookingId = String(payload.booking_id || payload.bookingId || '').trim();
+  if (!bookingId) {
+    return { ok: false, status: 400, error: 'missing_booking_id' };
+  }
+
+  const snap = await firestore.collection('futureBookings').doc(bookingId).get();
+  if (!snap.exists) {
+    return { ok: false, status: 404, error: 'booking_not_found' };
+  }
+
+  const booking = snap.data() || {};
+  const bookingUserId = String(booking.user_id || booking.client_id || '').trim();
+
+  // Only allow the booking owner or admin to view status
+  if (actorRole !== 'admin' && bookingUserId !== actorUid) {
+    return { ok: false, status: 403, error: 'forbidden' };
+  }
+
+  // Return a minimal, safe subset of booking data
+  const result = {
+    booking_id: bookingId,
+    status: String(booking.status || '').trim(),
+    order_type: String(booking.order_type || booking.is_rfq === 'yes' ? 'rfq' : 'order').trim(),
+    category_name: String(booking.category_name || '').trim(),
+    scheduled_date: String(booking.scheduled_date || '').trim(),
+    scheduled_time: String(booking.scheduled_time || '').trim(),
+    service_provider_id: String(booking.service_provider_id || '').trim(),
+    artisan_confirmed: String(booking.artisan_confirmed || '').trim(),
+    created_at: String(booking.created_at || '').trim(),
+  };
+
+  // If assigned to artisan, include artisan info
+  if (result.service_provider_id && result.service_provider_id !== 'admin') {
+    try {
+      const artisanSnap = await firestore.collection('serviceProvider').doc(result.service_provider_id).get();
+      if (artisanSnap.exists) {
+        const artisan = artisanSnap.data() || {};
+        result.artisan = {
+          name: String(artisan.full_name || artisan.name || '').trim(),
+          phone: String(artisan.phone || artisan.phone_number || '').trim(),
+          profession: String(artisan.profession || artisan.trade || '').trim(),
+        };
+      }
+    } catch (_) {
+      // Best effort
+    }
+  }
+
+  return { ok: true, status: 200, data: result };
+}
+
+async function handleListUserBookings({ firestore, actorUid, actorRole, payload }) {
+  if (!actorUid) {
+    return { ok: false, status: 401, error: 'unauthorized' };
+  }
+
+  const statusFilter = String(payload.status || '').trim().toLowerCase();
+  const limit = Math.min(Math.max(Number(payload.limit || 10), 1), 50);
+
+  let query = firestore.collection('futureBookings');
+
+  // Admin can see all; users see only their own
+  if (actorRole !== 'admin') {
+    query = query.where('user_id', '==', actorUid);
+  }
+
+  if (statusFilter) {
+    query = query.where('status', '==', statusFilter);
+  }
+
+  query = query.orderBy('created_at', 'desc').limit(limit);
+
+  const qs = await query.get();
+  const bookings = [];
+
+  for (const doc of qs.docs) {
+    const b = doc.data() || {};
+    bookings.push({
+      booking_id: doc.id,
+      status: String(b.status || '').trim(),
+      order_type: String(b.order_type || b.is_rfq === 'yes' ? 'rfq' : 'order').trim(),
+      category_name: String(b.category_name || '').trim(),
+      scheduled_date: String(b.scheduled_date || '').trim(),
+      scheduled_time: String(b.scheduled_time || '').trim(),
+      created_at: String(b.created_at || '').trim(),
+    });
+  }
+
+  return { ok: true, status: 200, data: { bookings, count: bookings.length } };
+}
+
+async function handleExplainRfqQuote({ firestore, actorUid, actorRole, payload }) {
+  if (!actorUid) {
+    return { ok: false, status: 401, error: 'unauthorized' };
+  }
+
+  const bookingId = String(payload.booking_id || payload.bookingId || '').trim();
+  if (!bookingId) {
+    return { ok: false, status: 400, error: 'missing_booking_id' };
+  }
+
+  const snap = await firestore.collection('futureBookings').doc(bookingId).get();
+  if (!snap.exists) {
+    return { ok: false, status: 404, error: 'booking_not_found' };
+  }
+
+  const booking = snap.data() || {};
+  const bookingUserId = String(booking.user_id || booking.client_id || '').trim();
+
+  if (actorRole !== 'admin' && bookingUserId !== actorUid) {
+    return { ok: false, status: 403, error: 'forbidden' };
+  }
+
+  const isRfq = String(booking.is_rfq || booking.is_rfq_requested || '').toLowerCase() === 'yes';
+  if (!isRfq) {
+    return { ok: false, status: 400, error: 'not_an_rfq', message: 'This booking is not an RFQ' };
+  }
+
+  const result = {
+    booking_id: bookingId,
+    status: String(booking.status || '').trim(),
+    category_name: String(booking.category_name || '').trim(),
+    problem_description: String(booking.problem_description || '').trim(),
+    created_at: String(booking.created_at || '').trim(),
+    quote_status: 'pending',
+    explanation: 'Your RFQ has been submitted. Admin will review and provide a detailed quote shortly.',
+  };
+
+  // Check if quote fields exist
+  if (booking.quoted_price || booking.quote_price || booking.total_price) {
+    result.quote_status = 'quoted';
+    result.quoted_price = String(booking.quoted_price || booking.quote_price || booking.total_price || '').trim();
+    result.quote_details = String(booking.quote_details || booking.quote_notes || '').trim();
+    result.explanation = `Admin has provided a quote of ${result.quoted_price} for your ${result.category_name} request. You can approve or request changes via the app.`;
+  }
+
+  return { ok: true, status: 200, data: result };
+}
+
+async function handleGetPaymentStatus({ firestore, actorUid, actorRole, payload }) {
+  if (!actorUid) {
+    return { ok: false, status: 401, error: 'unauthorized' };
+  }
+
+  const tasksManagementId = String(payload.tasks_management_id || payload.tasksManagementId || payload.booking_id || payload.bookingId || '').trim();
+  if (!tasksManagementId) {
+    return { ok: false, status: 400, error: 'missing_identifier' };
+  }
+
+  // Try to find payment in transactionLogs
+  let query = firestore.collection('transactionLogs')
+    .where('tasks_management_id', '==', tasksManagementId)
+    .orderBy('created_at', 'desc')
+    .limit(5);
+
+  let qs = await query.get();
+
+  // Fallback: try booking_id field
+  if (qs.empty) {
+    query = firestore.collection('transactionLogs')
+      .where('booking_id', '==', tasksManagementId)
+      .orderBy('created_at', 'desc')
+      .limit(5);
+    qs = await query.get();
+  }
+
+  if (qs.empty) {
+    return {
+      ok: true,
+      status: 200,
+      data: {
+        payment_status: 'not_found',
+        message: 'No payment records found for this booking',
+      },
+    };
+  }
+
+  const transactions = [];
+  for (const doc of qs.docs) {
+    const tx = doc.data() || {};
+    const txUserId = String(tx.user_id || tx.client_id || '').trim();
+
+    // Only allow owner or admin to see payment details
+    if (actorRole !== 'admin' && txUserId !== actorUid) continue;
+
+    transactions.push({
+      transaction_id: doc.id,
+      type: String(tx.transaction_type || tx.type || '').trim(),
+      amount: String(tx.amount || '').trim(),
+      status: String(tx.status || tx.payment_status || '').trim(),
+      created_at: String(tx.created_at || '').trim(),
+    });
+  }
+
+  const latestTx = transactions[0] || null;
+  const paymentStatus = latestTx ? latestTx.status : 'unknown';
+
+  return {
+    ok: true,
+    status: 200,
+    data: {
+      payment_status: paymentStatus,
+      transactions,
+      message: latestTx ? `Latest payment: ${paymentStatus}` : 'No payment records found',
+    },
+  };
+}
+
 async function handleCreateOrderBooking({ firestore, actorUid, actorRole, payload }) {
   if (!actorUid) {
     return { ok: false, status: 401, error: 'unauthorized' };
@@ -767,6 +991,10 @@ async function handleCreateOrderBooking({ firestore, actorUid, actorRole, payloa
 }
 
 const ACTION_HANDLERS = {
+  get_booking_status: handleGetBookingStatus,
+  list_user_bookings: handleListUserBookings,
+  explain_rfq_quote: handleExplainRfqQuote,
+  get_payment_status: handleGetPaymentStatus,
   create_order_booking: handleCreateOrderBooking,
 };
 
