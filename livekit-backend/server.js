@@ -172,6 +172,174 @@ function normalizeBookingId(payload) {
   return id;
 }
 
+function isPlainObject(v) {
+  if (!v || typeof v !== 'object') return false;
+  const proto = Object.getPrototypeOf(v);
+  return proto === Object.prototype || proto === null;
+}
+
+function safeTrimString(v, { maxLen = 5000 } = {}) {
+  if (v == null) return '';
+  const s = String(v).trim();
+  if (!s) return '';
+  return s.length > maxLen ? s.slice(0, maxLen) : s;
+}
+
+function coerceBooleanish(v) {
+  if (v === true || v === false) return v;
+  if (v == null) return null;
+  const s = String(v).trim().toLowerCase();
+  if (s === '1' || s === 'true' || s === 'yes' || s === 'y') return true;
+  if (s === '0' || s === 'false' || s === 'no' || s === 'n') return false;
+  return null;
+}
+
+function validateActionExecuteBody(body) {
+  const errors = [];
+  const b = isPlainObject(body) ? body : {};
+
+  // Only allow known top-level keys.
+  const allowedTopKeys = new Set(['action', 'payload', 'context']);
+  for (const k of Object.keys(b)) {
+    if (!allowedTopKeys.has(k)) {
+      errors.push({ field: k, message: 'Unknown top-level field' });
+    }
+  }
+
+  const action = normalizeAction(b.action);
+  if (!action) {
+    errors.push({ field: 'action', message: 'Missing action' });
+  }
+
+  const rawPayload = b.payload;
+  if (rawPayload != null && !isPlainObject(rawPayload)) {
+    errors.push({ field: 'payload', message: 'payload must be an object' });
+  }
+
+  const rawContext = b.context;
+  if (rawContext != null && !isPlainObject(rawContext)) {
+    errors.push({ field: 'context', message: 'context must be an object' });
+  }
+
+  // Canonical actions supported by this backend.
+  const supportedActions = new Set(['create_order_booking']);
+  if (action && !supportedActions.has(action)) {
+    errors.push({ field: 'action', message: `Unsupported action: ${action}` });
+  }
+
+  const payload = isPlainObject(rawPayload) ? rawPayload : {};
+
+  // Validate create_order_booking payload.
+  let normalizedPayload = payload;
+  if (action === 'create_order_booking') {
+    const vp = validateCreateOrderBookingPayload(payload);
+    normalizedPayload = vp.payload;
+    errors.push(...vp.errors);
+  }
+
+  const context = isPlainObject(rawContext) ? rawContext : {};
+  const normalizedContext = {
+    session_id: safeTrimString(context.session_id, { maxLen: 200 }) || undefined,
+    room_name: safeTrimString(context.room_name, { maxLen: 200 }) || undefined,
+  };
+
+  return {
+    ok: errors.length === 0,
+    errors,
+    action,
+    payload: normalizedPayload,
+    context: normalizedContext,
+  };
+}
+
+function validateCreateOrderBookingPayload(payload) {
+  const errors = [];
+  const p = isPlainObject(payload) ? payload : {};
+
+  // Allow only known fields to prevent accidental/unsafe writes.
+  const allowed = new Set([
+    'is_rfq_requested',
+    'is_rfq',
+    'isRFQ',
+    'isRfq',
+    'category_name',
+    'categoryName',
+    'problem_description',
+    'problemDescription',
+    'job_ids',
+    'jobIds',
+    'materials_responsibility',
+    'materialsResponsibility',
+    'service_on_current_location',
+    'serviceOnCurrentLocation',
+    'scheduled_date',
+    'scheduledDate',
+    'scheduled_time',
+    'scheduledTime',
+    'booking_id',
+    'bookingId',
+  ]);
+
+  for (const k of Object.keys(p)) {
+    if (!allowed.has(k)) {
+      errors.push({ field: `payload.${k}`, message: 'Unknown payload field' });
+    }
+  }
+
+  const isRfq = isTruthy(p.is_rfq_requested ?? p.is_rfq ?? p.isRFQ ?? p.isRfq);
+
+  const problem = safeTrimString(p.problem_description ?? p.problemDescription, { maxLen: 2000 });
+  if (!problem) {
+    errors.push({ field: 'payload.problem_description', message: 'problem_description is required' });
+  }
+
+  const category = safeTrimString(p.category_name ?? p.categoryName, { maxLen: 200 });
+
+  const jobIdsRaw = p.job_ids ?? p.jobIds;
+  const jobIds = Array.isArray(jobIdsRaw)
+    ? jobIdsRaw.map((x) => safeTrimString(x, { maxLen: 200 })).filter(Boolean)
+    : [];
+
+  if (!isRfq) {
+    if (jobIds.length < 1) {
+      errors.push({ field: 'payload.job_ids', message: 'job_ids must be a non-empty array for non-RFQ orders' });
+    }
+  }
+
+  const materials = safeTrimString(p.materials_responsibility ?? p.materialsResponsibility, { maxLen: 50 });
+  if (materials && !['artisan', 'client'].includes(materials.toLowerCase())) {
+    errors.push({ field: 'payload.materials_responsibility', message: 'materials_responsibility must be artisan|client' });
+  }
+
+  const scheduledDate = safeTrimString(p.scheduled_date ?? p.scheduledDate, { maxLen: 20 });
+  const scheduledTime = safeTrimString(p.scheduled_time ?? p.scheduledTime, { maxLen: 10 });
+  if (scheduledDate && !/^\d{4}-\d{2}-\d{2}$/.test(scheduledDate)) {
+    errors.push({ field: 'payload.scheduled_date', message: 'scheduled_date must be YYYY-MM-DD' });
+  }
+  if (scheduledTime && !/^\d{2}:\d{2}$/.test(scheduledTime)) {
+    errors.push({ field: 'payload.scheduled_time', message: 'scheduled_time must be HH:MM' });
+  }
+
+  const serviceOnCurrentLocation =
+    coerceBooleanish(p.service_on_current_location ?? p.serviceOnCurrentLocation) ?? undefined;
+
+  return {
+    ok: errors.length === 0,
+    errors,
+    payload: {
+      is_rfq_requested: isRfq,
+      category_name: category || undefined,
+      problem_description: problem,
+      job_ids: jobIds,
+      materials_responsibility: materials ? materials.toLowerCase() : undefined,
+      service_on_current_location: serviceOnCurrentLocation,
+      scheduled_date: scheduledDate || undefined,
+      scheduled_time: scheduledTime || undefined,
+      booking_id: safeTrimString(p.booking_id ?? p.bookingId, { maxLen: 200 }) || undefined,
+    },
+  };
+}
+
 function getIdempotencyKey(req) {
   const k = req.headers['idempotency-key'] || req.headers['Idempotency-Key'];
   const s = typeof k === 'string' ? k.trim() : '';
@@ -620,15 +788,25 @@ app.post('/api/dispatch-agent', async (req, res) => {
 app.post('/api/action/execute', async (req, res) => {
   const startedAt = nowIso();
   const idempotencyKey = getIdempotencyKey(req);
-  const action = normalizeAction(req.body && req.body.action);
-  const payload = (req.body && typeof req.body.payload === 'object' && req.body.payload) || {};
-  const context = (req.body && typeof req.body.context === 'object' && req.body.context) || {};
+  const validation = validateActionExecuteBody(req.body);
+  const action = validation.action;
+  const payload = validation.payload;
+  const context = validation.context;
 
   const firestore = requireFirebase(res);
   if (!firestore) return;
 
   const decoded = await verifyFirebaseAuth(req, res);
   if (!decoded) return;
+
+  if (!validation.ok) {
+    return res.status(400).json({
+      error: 'invalid_request',
+      message: 'Request validation failed',
+      idempotencyKey,
+      details: validation.errors,
+    });
+  }
 
   const actorUid = decoded.uid;
   const actorRole = String(decoded.role || decoded.user_role || decoded.user_type || 'client').trim().toLowerCase();
