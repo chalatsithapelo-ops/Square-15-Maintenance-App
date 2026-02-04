@@ -369,11 +369,7 @@ async function writeNotification({ firestore, userId, userType, title, message, 
   await firestore.collection('notifications').add(doc);
 }
 
-async function executeBookingAction({ firestore, action, actorUid, actorRole, payload }) {
-  if (action !== 'create_order_booking') {
-    return { ok: false, status: 400, error: 'unsupported_action' };
-  }
-
+async function handleCreateOrderBooking({ firestore, actorUid, actorRole, payload }) {
   if (!actorUid) {
     return { ok: false, status: 401, error: 'unauthorized' };
   }
@@ -415,7 +411,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     scheduled_time: scheduledTime,
 
     service_provider_id: 'admin',
-    artisan_confirmed: isRFQFlag ? 'pending' : 'pending',
+    artisan_confirmed: 'pending',
     status,
 
     created_at: nowIso(),
@@ -461,6 +457,23 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       status,
     },
   };
+}
+
+const ACTION_HANDLERS = {
+  create_order_booking: handleCreateOrderBooking,
+};
+
+async function executeAction({ firestore, action, actorUid, actorRole, payload, context }) {
+  if (!action || typeof action !== 'string') {
+    return { ok: false, status: 400, error: 'missing_action' };
+  }
+
+  const handler = ACTION_HANDLERS[action];
+  if (!handler) {
+    return { ok: false, status: 400, error: 'unsupported_action' };
+  }
+
+  return handler({ firestore, actorUid, actorRole, payload, context });
 }
 
 function getLiveKitWsUrl() {
@@ -851,7 +864,7 @@ app.post('/api/action/execute', async (req, res) => {
   await writeAudit({ firestore, auditId: idempotencyKey, audit: auditBase });
 
   try {
-    const result = await executeBookingAction({
+    const result = await executeAction({
       firestore,
       action,
       actorUid,
