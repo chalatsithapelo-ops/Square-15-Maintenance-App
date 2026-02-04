@@ -44,6 +44,25 @@ const apiLimiter = rateLimit({
 
 app.use('/api/', apiLimiter);
 
+function getOrCreateRequestId(req) {
+  const h = req.headers['x-request-id'];
+  const incoming = typeof h === 'string' ? h.trim() : '';
+  return incoming || randomId('req-');
+}
+
+app.use((req, res, next) => {
+  const requestId = getOrCreateRequestId(req);
+  req.requestId = requestId;
+  res.setHeader('x-request-id', requestId);
+  next();
+});
+
+function asyncHandler(fn) {
+  return function wrapped(req, res, next) {
+    Promise.resolve(fn(req, res, next)).catch(next);
+  };
+}
+
 function nowIso() {
   return new Date().toISOString();
 }
@@ -673,7 +692,7 @@ app.get('/health', (req, res) => {
  * Body: { roomName?: string, participantName?: string, metadata?: string }
  * Returns: { roomName, participantName, token, url }
  */
-app.post('/api/voice/start', async (req, res) => {
+app.post('/api/voice/start', asyncHandler(async (req, res) => {
   try {
     const env = validateLiveKitEnv(res);
     if (!env) return;
@@ -737,14 +756,14 @@ app.post('/api/voice/start', async (req, res) => {
       },
     });
   }
-});
+}));
 
 /**
  * Generate Livekit Access Token
  * POST /api/token
  * Body: { roomName: string, participantName: string, metadata?: string }
  */
-app.post('/api/token', async (req, res) => {
+app.post('/api/token', asyncHandler(async (req, res) => {
   try {
     const { roomName, participantName, metadata } = req.body;
 
@@ -798,7 +817,7 @@ app.post('/api/token', async (req, res) => {
       message: error.message
     });
   }
-});
+}));
 
 /**
  * Create a new AI voice agent room
@@ -886,7 +905,7 @@ app.post('/api/dispatch-agent', async (req, res) => {
  * Optional: Idempotency-Key: <string>
  * Body: { action: string, payload: object, context?: object }
  */
-app.post('/api/action/execute', async (req, res) => {
+app.post('/api/action/execute', asyncHandler(async (req, res) => {
   const startedAt = nowIso();
   const idempotencyKey = getIdempotencyKey(req);
   const validation = validateActionExecuteBody(req.body);
@@ -1099,7 +1118,7 @@ app.post('/api/action/execute', async (req, res) => {
       idempotencyKey,
     });
   }
-});
+}));
 
 async function processActionJob({ jobId }) {
   const firestore = getFirestoreOrNull();
@@ -1212,7 +1231,7 @@ async function processActionJob({ jobId }) {
   }
 }
 
-app.get('/api/action/job/:id', async (req, res) => {
+app.get('/api/action/job/:id', asyncHandler(async (req, res) => {
   const firestore = requireFirebase(res);
   if (!firestore) return;
 
@@ -1235,7 +1254,7 @@ app.get('/api/action/job/:id', async (req, res) => {
     return res.status(403).json({ error: 'forbidden', message: 'Not allowed to read this job' });
   }
   return res.json({ ok: true, job });
-});
+}));
 
 function requireAdminRole(decoded, res) {
   const role = normalizeRole(decoded);
@@ -1246,7 +1265,7 @@ function requireAdminRole(decoded, res) {
   return role;
 }
 
-app.get('/api/admin/audit/:id', async (req, res) => {
+app.get('/api/admin/audit/:id', asyncHandler(async (req, res) => {
   const firestore = requireFirebase(res);
   if (!firestore) return;
   const decoded = await verifyFirebaseAuth(req, res);
@@ -1257,9 +1276,9 @@ app.get('/api/admin/audit/:id', async (req, res) => {
   const snap = await firestore.collection('assistant_action_audit').doc(id).get();
   if (!snap.exists) return res.status(404).json({ error: 'not_found', message: 'Audit not found' });
   return res.json({ ok: true, audit: snap.data() || null });
-});
+}));
 
-app.get('/api/admin/jobs/:id', async (req, res) => {
+app.get('/api/admin/jobs/:id', asyncHandler(async (req, res) => {
   const firestore = requireFirebase(res);
   if (!firestore) return;
   const decoded = await verifyFirebaseAuth(req, res);
@@ -1270,9 +1289,9 @@ app.get('/api/admin/jobs/:id', async (req, res) => {
   const snap = await firestore.collection('assistant_action_jobs').doc(id).get();
   if (!snap.exists) return res.status(404).json({ error: 'not_found', message: 'Job not found' });
   return res.json({ ok: true, job: snap.data() || null });
-});
+}));
 
-app.post('/api/admin/jobs/process-next', async (req, res) => {
+app.post('/api/admin/jobs/process-next', asyncHandler(async (req, res) => {
   const firestore = requireFirebase(res);
   if (!firestore) return;
   const decoded = await verifyFirebaseAuth(req, res);
@@ -1293,14 +1312,15 @@ app.post('/api/admin/jobs/process-next', async (req, res) => {
   }
 
   return res.json({ ok: true, processed: jobIds.length, jobIds });
-});
+}));
 
 // Error handling middleware
 app.use((err, req, res, next) => {
   console.error('❌ Server error:', err);
   res.status(500).json({
     error: 'Internal server error',
-    message: err.message
+    message: err && err.message ? String(err.message) : 'Unknown error',
+    requestId: req && req.requestId ? String(req.requestId) : undefined,
   });
 });
 
