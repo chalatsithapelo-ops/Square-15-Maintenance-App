@@ -288,6 +288,50 @@ async function verifyFirebaseAuth(req, res) {
   }
 }
 
+async function verifyFirebaseAppCheck(req, res, { required = false } = {}) {
+  initFirebaseIfPossible();
+  if (firebaseInitError) {
+    if (required) {
+      res.status(503).json({
+        error: 'Firebase Admin not configured',
+        message: firebaseInitError.message,
+        request_id: req.requestId || null,
+      });
+      return null;
+    }
+    return { ok: false, reason: 'firebase_not_configured' };
+  }
+
+  const header = req.headers['x-firebase-appcheck'] || req.headers['X-Firebase-AppCheck'];
+  const token = typeof header === 'string' ? header.trim() : '';
+  if (!token) {
+    if (required) {
+      res.status(401).json({
+        error: 'Unauthorized',
+        message: 'Missing X-Firebase-AppCheck token',
+        request_id: req.requestId || null,
+      });
+      return null;
+    }
+    return { ok: false, reason: 'missing' };
+  }
+
+  try {
+    const decoded = await admin.appCheck().verifyToken(token);
+    return { ok: true, decoded };
+  } catch (e) {
+    if (required) {
+      res.status(401).json({
+        error: 'Unauthorized',
+        message: 'Invalid App Check token',
+        request_id: req.requestId || null,
+      });
+      return null;
+    }
+    return { ok: false, reason: 'invalid' };
+  }
+}
+
 function isTruthy(v) {
   if (v === true) return true;
   if (v === false) return false;
@@ -326,6 +370,135 @@ function coerceBooleanish(v) {
   if (s === '1' || s === 'true' || s === 'yes' || s === 'y') return true;
   if (s === '0' || s === 'false' || s === 'no' || s === 'n') return false;
   return null;
+}
+
+// Phase 1: Action tiering + policy enforcement
+// Tier A = read-only; Tier B = normal state changes; Tier C = financial / high-risk (blocked until further controls added).
+const ACTION_TIERS = Object.freeze({
+  get_booking_status: 'A',
+  create_order_booking: 'B',
+  create_order_booking_order: 'B',
+  dispatch_artisan: 'B',
+  cancel_booking: 'B',
+  reschedule_booking: 'B',
+  mark_booking_in_progress: 'B',
+  request_reassignment: 'B',
+  artisan_cancel_and_reassign: 'B',
+  reassign_booking: 'B',
+});
+
+function actionTier(action) {
+  const a = normalizeAction(action);
+  return ACTION_TIERS[a] || null;
+}
+
+function tierRank(t) {
+  const s = String(t || '').trim().toUpperCase();
+  if (s === 'A') return 1;
+  if (s === 'B') return 2;
+  if (s === 'C') return 3;
+  return 99;
+}
+
+async function enforceAssistantSessionBinding({ firestore, req, actorUid, action, context, required }) {
+  if (!required) return { ok: true, session: null };
+
+  const sessionId = String(context.session_id || context.sessionId || '').trim();
+  const sessionNonce = String(context.session_nonce || context.sessionNonce || '').trim();
+  const roomName = String(context.room_name || context.roomName || '').trim();
+
+  if (!sessionId || !sessionNonce) {
+    return {
+      ok: false,
+      status: 400,
+      error: 'missing_session_context',
+      message: 'Missing context.session_id or context.session_nonce',
+    };
+  }
+
+  const snap = await firestore.collection('assistant_voice_sessions').doc(sessionId).get();
+  if (!snap.exists) {
+    return {
+      ok: false,
+      status: 401,
+      error: 'invalid_session',
+      message: 'Unknown voice session',
+    };
+  }
+
+  const session = snap.data() || {};
+  if (String(session.uid || '').trim() !== actorUid) {
+    return {
+      ok: false,
+      status: 403,
+      error: 'session_uid_mismatch',
+      message: 'Voice session is not owned by this user',
+    };
+  }
+
+  if (String(session.session_nonce || '').trim() !== sessionNonce) {
+    return {
+      ok: false,
+      status: 401,
+      error: 'invalid_session_nonce',
+      message: 'Invalid voice session nonce',
+    };
+  }
+
+  if (session.revoked_at) {
+    return {
+      ok: false,
+      status: 401,
+      error: 'session_revoked',
+      message: 'Voice session has been revoked',
+    };
+  }
+
+  const exp = String(session.expires_at || '').trim();
+  if (exp) {
+    const expMs = Date.parse(exp);
+    if (Number.isFinite(expMs) && Date.now() > expMs) {
+      return {
+        ok: false,
+        status: 401,
+        error: 'session_expired',
+        message: 'Voice session expired',
+      };
+    }
+  }
+
+  if (roomName && session.room_name && String(session.room_name).trim() !== roomName) {
+    return {
+      ok: false,
+      status: 401,
+      error: 'session_room_mismatch',
+      message: 'Voice session room mismatch',
+    };
+  }
+
+  const allowed = session.allowed_actions;
+  if (Array.isArray(allowed) && allowed.length > 0) {
+    const norm = allowed.map((x) => String(x || '').trim().toLowerCase()).filter(Boolean);
+    if (!norm.includes('*') && !norm.includes(action)) {
+      return {
+        ok: false,
+        status: 403,
+        error: 'action_not_allowed',
+        message: 'Action not allowed for this voice session',
+      };
+    }
+  }
+
+  try {
+    await firestore.collection('assistant_voice_sessions').doc(sessionId).set(
+      { last_used_at: nowIso(), last_action: action, last_request_id: req.requestId || null },
+      { merge: true }
+    );
+  } catch (_) {
+    // Best-effort only
+  }
+
+  return { ok: true, session };
 }
 
 function validateActionExecuteBody(body) {
@@ -717,7 +890,7 @@ app.get('/health', (req, res) => {
  * Start a voice session (recommended for mobile)
  * POST /api/voice/start
  * Body: { roomName?: string, participantName?: string, metadata?: string }
- * Returns: { roomName, participantName, token, url }
+ * Returns: { roomName, participantName, token, url, sessionId?, sessionNonce?, sessionExpiresAt? }
  */
 app.post('/api/voice/start', asyncHandler(async (req, res) => {
   try {
@@ -726,6 +899,14 @@ app.post('/api/voice/start', asyncHandler(async (req, res) => {
 
     const agentName = getAgentName();
     const httpUrl = getLiveKitHttpUrl();
+    const requireAppCheck = isEnvTruthy('APP_CHECK_REQUIRED');
+    const requireSessionBinding = isEnvTruthy('ASSISTANT_SESSION_BINDING_REQUIRED');
+
+    // Phase 0: App Check verification
+    if (requireAppCheck) {
+      const appCheckResult = await verifyFirebaseAppCheck(req, res, { required: true });
+      if (!appCheckResult) return;
+    }
 
     const roomName = req.body.roomName || `square15-voice-${Date.now()}`;
     const participantName =
@@ -755,7 +936,45 @@ app.post('/api/voice/start', asyncHandler(async (req, res) => {
       metadata: metadata || undefined,
     });
 
-    console.log(`✅ Session started. room=${roomName} user=${participantName} agent=${agentName}`);
+    let sessionId = null;
+    let sessionNonce = null;
+    let sessionExpiresAt = null;
+
+    // Phase 0: Voice session binding (optional until clients migrate)
+    if (requireSessionBinding) {
+      try {
+        initFirebaseIfPossible();
+        if (!firebaseInitError) {
+          const firestore = admin.firestore();
+          const idToken = getBearerToken(req);
+          const decoded = idToken ? await admin.auth().verifyIdToken(idToken).catch(() => null) : null;
+          const uid = decoded ? decoded.uid : 'anon';
+          const ttlMin = Number.parseInt(env('VOICE_SESSION_TTL_MINUTES') || '60', 10);
+          const ttlMs = Math.max(1, Math.min(1440, ttlMin)) * 60_000;
+          sessionId = randomId('vsess-');
+          sessionNonce = crypto.randomBytes(24).toString('hex');
+          const now = nowIso();
+          sessionExpiresAt = new Date(Date.now() + ttlMs).toISOString();
+
+          await firestore.collection('assistant_voice_sessions').doc(sessionId).set({
+            id: sessionId,
+            uid,
+            room_name: roomName,
+            participant_name: participantName,
+            session_nonce: sessionNonce,
+            created_at: now,
+            updated_at: now,
+            expires_at: sessionExpiresAt,
+            allowed_actions: ['*'],
+            request_id: req.requestId || null,
+          });
+        }
+      } catch (e) {
+        console.error('❌ Failed to persist voice session:', e && e.message ? e.message : e);
+      }
+    }
+
+    console.log(`✅ Session started. room=${roomName} user=${participantName} agent=${agentName} session=${sessionId || 'none'}`);
 
     res.json({
       roomName,
@@ -764,6 +983,9 @@ app.post('/api/voice/start', asyncHandler(async (req, res) => {
       url: env.wsUrl,
       agentName,
       dispatch,
+      sessionId,
+      sessionNonce,
+      sessionExpiresAt,
     });
   } catch (error) {
     console.error('❌ Error starting voice session:', error);
@@ -929,7 +1151,7 @@ app.post('/api/dispatch-agent', async (req, res) => {
  * Secure assistant action execution
  * POST /api/action/execute
  * Headers: Authorization: Bearer <Firebase ID Token>
- * Optional: Idempotency-Key: <string>
+ * Optional: Idempotency-Key: <string>, X-Firebase-AppCheck: <token>
  * Body: { action: string, payload: object, context?: object }
  */
 app.post('/api/action/execute', asyncHandler(async (req, res) => {
@@ -945,6 +1167,52 @@ app.post('/api/action/execute', asyncHandler(async (req, res) => {
 
   const decoded = await verifyFirebaseAuth(req, res);
   if (!decoded) return;
+
+  // Phase 0: App Check (optional unless APP_CHECK_REQUIRED=true)
+  const requireAppCheck = isEnvTruthy('APP_CHECK_REQUIRED');
+  const appCheckResult = await verifyFirebaseAppCheck(req, res, { required: requireAppCheck });
+  if (requireAppCheck && !appCheckResult) return;
+
+  // Phase 0: Voice session binding (optional unless ASSISTANT_SESSION_BINDING_REQUIRED=true)
+  const requireSessionBinding = isEnvTruthy('ASSISTANT_SESSION_BINDING_REQUIRED');
+  const proposeConfirmRequired = isEnvTruthy('PROPOSE_CONFIRM_REQUIRED');
+  const sessionBindingCheck = await enforceAssistantSessionBinding({
+    firestore,
+    req,
+    actorUid: decoded.uid,
+    action,
+    context,
+    required: requireSessionBinding,
+  });
+  if (!sessionBindingCheck.ok) {
+    return res.status(sessionBindingCheck.status).json({
+      error: sessionBindingCheck.error,
+      message: sessionBindingCheck.message,
+      idempotencyKey,
+    });
+  }
+
+  // Phase 1: Tier enforcement - block Tier C (financial controls)
+  const tier = actionTier(action);
+  if (tier === 'C') {
+    return res.status(403).json({
+      error: 'action_tier_blocked',
+      message: 'This action tier is blocked until additional controls are in place',
+      idempotencyKey,
+      tier,
+    });
+  }
+
+  // Phase 1: If rollout flag requires propose→confirm for Tier B+, reject direct execute.
+  const rank = tierRank(tier);
+  if (proposeConfirmRequired && rank >= 2) {
+    return res.status(400).json({
+      error: 'propose_confirm_required',
+      message: 'Use /api/action/propose then /api/action/confirm for this action',
+      idempotencyKey,
+      tier,
+    });
+  }
 
   if (!validation.ok) {
     return res.status(400).json({
@@ -1031,6 +1299,8 @@ app.post('/api/action/execute', asyncHandler(async (req, res) => {
     request_hash: requestHash,
     context,
     payload,
+    session_nonce: context.session_nonce || context.sessionNonce || null,
+    app_check_ok: appCheckResult && appCheckResult.ok ? true : false,
   };
 
   try {
@@ -1383,6 +1653,360 @@ app.post('/api/admin/jobs/process-next', asyncHandler(async (req, res) => {
   }
 
   return res.json({ ok: true, processed: jobIds.length, jobIds });
+}));
+
+/**
+ * Phase 1: Propose an assistant action (server-side)
+ * POST /api/action/propose
+ * Headers: Authorization: Bearer <Firebase ID Token>
+ * Optional: X-Firebase-AppCheck
+ * Body: { action: string, payload: object, context?: { session_id?: string, session_nonce?: string, room_name?: string } }
+ */
+app.post('/api/action/propose', assistantLimiter, asyncHandler(async (req, res) => {
+  const startedAt = nowIso();
+  const action = normalizeAction(req.body && req.body.action);
+  const payload = (req.body && typeof req.body.payload === 'object' && req.body.payload) || {};
+  const context = (req.body && typeof req.body.context === 'object' && req.body.context) || {};
+
+  const requireAppCheck = isEnvTruthy('APP_CHECK_REQUIRED');
+  const requireSessionBinding = isEnvTruthy('ASSISTANT_SESSION_BINDING_REQUIRED');
+  const proposalTtlMinutes = Number.parseInt(env('PROPOSAL_TTL_MINUTES') || '10', 10);
+
+  const tier = actionTier(action);
+  if (!tier) {
+    return res.status(400).json({
+      error: 'unknown_action',
+      message: 'Unknown or unsupported action',
+      request_id: req.requestId || null,
+    });
+  }
+
+  if (tierRank(tier) >= tierRank('C')) {
+    return res.status(403).json({
+      error: 'tier_c_blocked',
+      message: 'This action requires step-up authorization and/or admin approval',
+      request_id: req.requestId || null,
+    });
+  }
+
+  const firestore = requireFirebase(res);
+  if (!firestore) return;
+
+  const appCheck = await verifyFirebaseAppCheck(req, res, { required: requireAppCheck });
+  if (requireAppCheck && !appCheck) return;
+
+  const decoded = await verifyFirebaseAuth(req, res);
+  if (!decoded) return;
+
+  const actorUid = decoded.uid;
+  const actorRole = normalizeRole(decoded);
+
+  const sessionValidation = await enforceAssistantSessionBinding({
+    firestore,
+    req,
+    actorUid,
+    action,
+    context,
+    required: requireSessionBinding,
+  });
+  if (!sessionValidation.ok) {
+    return res.status(sessionValidation.status).json({
+      error: sessionValidation.error,
+      message: sessionValidation.message,
+      request_id: req.requestId || null,
+    });
+  }
+
+  const proposalId = randomId('prop-');
+  const expiresAt = new Date(Date.now() + proposalTtlMinutes * 60_000).toISOString();
+
+  const bookingId = normalizeBookingId(payload) || null;
+  const summary = `Proposed ${action}${bookingId ? ` (booking_id=${bookingId})` : ''}`;
+
+  const proposalDoc = {
+    id: proposalId,
+    created_at: startedAt,
+    updated_at: startedAt,
+    expires_at: expiresAt,
+    status: 'proposed',
+    request_id: req.requestId || null,
+    action,
+    tier,
+    actor_uid: actorUid,
+    actor_role: actorRole,
+    booking_id: bookingId,
+    context: {
+      session_id: context.session_id || null,
+      session_nonce: context.session_nonce || context.sessionNonce || null,
+      room_name: context.room_name || null,
+      client_ip: getClientIp(req),
+    },
+    payload,
+    summary,
+    app_check: (appCheck && appCheck.ok && appCheck.decoded)
+      ? { app_id: appCheck.decoded.appId || null, enforced: requireAppCheck }
+      : { enforced: requireAppCheck },
+  };
+
+  try {
+    await firestore.collection('assistant_action_proposals').doc(proposalId).set(proposalDoc);
+  } catch (e) {
+    return res.status(500).json({
+      error: 'internal_error',
+      message: 'Failed to create proposal',
+      request_id: req.requestId || null,
+    });
+  }
+
+  return res.json({
+    success: true,
+    proposalId,
+    action,
+    tier,
+    summary,
+    expiresAt,
+    request_id: req.requestId || null,
+  });
+}));
+
+/**
+ * Phase 1: Confirm a proposed action (server-side)
+ * POST /api/action/confirm
+ * Headers: Authorization: Bearer <Firebase ID Token>
+ * Optional: Idempotency-Key
+ * Optional: X-Firebase-AppCheck
+ * Body: { proposalId: string }
+ */
+app.post('/api/action/confirm', assistantLimiter, asyncHandler(async (req, res) => {
+  const startedAt = nowIso();
+  const proposalId = String((req.body && (req.body.proposalId || req.body.proposal_id)) || '').trim();
+
+  if (!proposalId) {
+    return res.status(400).json({
+      error: 'invalid_request',
+      message: 'Missing proposalId',
+      request_id: req.requestId || null,
+    });
+  }
+
+  const requireAppCheck = isEnvTruthy('APP_CHECK_REQUIRED');
+  const requireSessionBinding = isEnvTruthy('ASSISTANT_SESSION_BINDING_REQUIRED');
+
+  const firestore = requireFirebase(res);
+  if (!firestore) return;
+
+  const appCheck = await verifyFirebaseAppCheck(req, res, { required: requireAppCheck });
+  if (requireAppCheck && !appCheck) return;
+
+  const decoded = await verifyFirebaseAuth(req, res);
+  if (!decoded) return;
+
+  const actorUid = decoded.uid;
+  const actorRole = normalizeRole(decoded);
+
+  const proposalRef = firestore.collection('assistant_action_proposals').doc(proposalId);
+  const proposalSnap = await proposalRef.get();
+  if (!proposalSnap.exists) {
+    return res.status(404).json({
+      error: 'not_found',
+      message: 'Proposal not found',
+      request_id: req.requestId || null,
+    });
+  }
+
+  const proposal = proposalSnap.data() || {};
+  if (String(proposal.actor_uid || '').trim() !== actorUid) {
+    return res.status(403).json({
+      error: 'forbidden',
+      message: 'This proposal does not belong to the current user',
+      request_id: req.requestId || null,
+    });
+  }
+
+  const status = String(proposal.status || '').trim().toLowerCase();
+  if (status === 'confirmed' || status === 'success') {
+    // Idempotent: if we have an audit record, return it.
+    const auditId = String(proposal.audit_id || proposalId).trim();
+    try {
+      const auditSnap = await firestore.collection('assistant_action_audit').doc(auditId).get();
+      const audit = auditSnap.exists ? (auditSnap.data() || {}) : null;
+      if (audit && audit.status === 'success') {
+        return res.json({
+          success: true,
+          reused: true,
+          proposalId,
+          idempotencyKey: auditId,
+          action: String(proposal.action || ''),
+          result: audit.result || null,
+          request_id: req.requestId || null,
+        });
+      }
+    } catch (_) {
+      // fall through
+    }
+  }
+
+  if (status && status !== 'proposed') {
+    return res.status(409).json({
+      error: 'invalid_state',
+      message: `Proposal is not confirmable (status=${status})`,
+      request_id: req.requestId || null,
+    });
+  }
+
+  const exp = String(proposal.expires_at || '').trim();
+  if (exp) {
+    const expMs = Date.parse(exp);
+    if (Number.isFinite(expMs) && Date.now() > expMs) {
+      return res.status(400).json({
+        error: 'proposal_expired',
+        message: 'This proposal has expired',
+        request_id: req.requestId || null,
+      });
+    }
+  }
+
+  const sessionCheck = await enforceAssistantSessionBinding({
+    firestore,
+    req,
+    actorUid,
+    action: String(proposal.action || ''),
+    context: proposal.context || {},
+    required: requireSessionBinding,
+  });
+  if (!sessionCheck.ok) {
+    return res.status(sessionCheck.status).json({
+      error: sessionCheck.error,
+      message: sessionCheck.message,
+      request_id: req.requestId || null,
+    });
+  }
+
+  const idempotencyKey = getIdempotencyKeyOr(req, proposalId);
+  const auditRef = firestore.collection('assistant_action_audit').doc(idempotencyKey);
+  const existingAudit = await auditRef.get();
+  if (existingAudit.exists) {
+    const existing = existingAudit.data() || {};
+    if (existing.status === 'success') {
+      return res.json({
+        success: true,
+        reused: true,
+        proposalId,
+        idempotencyKey,
+        action: String(proposal.action || ''),
+        result: existing.result || null,
+        request_id: req.requestId || null,
+      });
+    }
+  }
+
+  await proposalRef.set({ status: 'confirming', updated_at: nowIso(), audit_id: idempotencyKey }, { merge: true });
+
+  const action = String(proposal.action || '').trim();
+  const payload = proposal.payload || {};
+  const context = proposal.context || {};
+
+  const auditBase = {
+    id: idempotencyKey,
+    created_at: startedAt,
+    updated_at: startedAt,
+    status: 'started',
+    action,
+    actor_uid: actorUid,
+    actor_role: actorRole,
+    request_id: req.requestId || null,
+    booking_id: normalizeBookingId(payload) || null,
+    proposal_id: proposalId,
+    context,
+    payload,
+    session_nonce: context.session_nonce || context.sessionNonce || null,
+    app_check_ok: appCheck && appCheck.ok ? true : false,
+  };
+
+  try {
+    await writeAudit({ firestore, auditId: idempotencyKey, audit: auditBase });
+  } catch (e) {
+    return res.status(500).json({
+      error: 'internal_error',
+      message: 'Failed to create audit record',
+      request_id: req.requestId || null,
+    });
+  }
+
+  try {
+    const result = await executeAction({
+      firestore,
+      action,
+      actorUid,
+      actorRole,
+      payload,
+      context,
+    });
+
+    if (!result.ok) {
+      await writeAudit({
+        firestore,
+        auditId: idempotencyKey,
+        audit: {
+          status: 'error',
+          updated_at: nowIso(),
+          completed_at: nowIso(),
+          error: result.error,
+          http_status: result.status,
+        },
+      });
+      await proposalRef.set({ status: 'error', updated_at: nowIso(), error: result.error }, { merge: true });
+      return res.status(result.status).json({
+        error: result.error,
+        message: 'Action failed',
+        proposalId,
+        idempotencyKey,
+        request_id: req.requestId || null,
+      });
+    }
+
+    await writeAudit({
+      firestore,
+      auditId: idempotencyKey,
+      audit: {
+        status: 'success',
+        updated_at: nowIso(),
+        completed_at: nowIso(),
+        booking_id: normalizeBookingId(result.data) || normalizeBookingId(payload) || null,
+        result: result.data || null,
+      },
+    });
+    await proposalRef.set({ status: 'confirmed', updated_at: nowIso() }, { merge: true });
+
+    return res.json({
+      success: true,
+      proposalId,
+      idempotencyKey,
+      action,
+      result: result.data || null,
+      request_id: req.requestId || null,
+    });
+  } catch (e) {
+    await writeAudit({
+      firestore,
+      auditId: idempotencyKey,
+      audit: {
+        status: 'error',
+        updated_at: nowIso(),
+        completed_at: nowIso(),
+        error: 'exception',
+        exception_message: e && e.message ? String(e.message) : String(e),
+      },
+    });
+    await proposalRef.set({ status: 'error', updated_at: nowIso(), error: 'exception' }, { merge: true });
+    return res.status(500).json({
+      error: 'internal_error',
+      message: 'Action execution failed',
+      proposalId,
+      idempotencyKey,
+      request_id: req.requestId || null,
+    });
+  }
 }));
 
 // Error handling middleware
