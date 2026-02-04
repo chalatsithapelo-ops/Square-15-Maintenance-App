@@ -24,6 +24,10 @@ function env(name) {
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Render/Cloudflare always set X-Forwarded-* headers. express-rate-limit requires trust proxy enabled.
+// Use a conservative hop count (1) to avoid trusting arbitrary client-supplied headers.
+app.set('trust proxy', 1);
+
 // Middleware
 app.use(cors({
   origin: process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : '*',
@@ -55,6 +59,28 @@ function stableStringify(value) {
   if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
   const keys = Object.keys(value).sort();
   return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(value[k])}`).join(',')}}`;
+}
+
+function stripUndefinedDeep(value) {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  if (Array.isArray(value)) {
+    return value.map((v) => {
+      const out = stripUndefinedDeep(v);
+      return out === undefined ? null : out;
+    });
+  }
+  if (typeof value === 'object') {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      if (v === undefined) continue;
+      const nested = stripUndefinedDeep(v);
+      if (nested === undefined) continue;
+      out[k] = nested;
+    }
+    return out;
+  }
+  return value;
 }
 
 function sha256Hex(input) {
@@ -152,6 +178,8 @@ function initFirebaseIfPossible() {
     admin.initializeApp({
       credential: admin.credential.cert(sa),
     });
+    // Prevent runtime crashes when optional fields are undefined in audit/job/notification payloads.
+    admin.firestore().settings({ ignoreUndefinedProperties: true });
     firebaseInitialized = true;
   } catch (e) {
     firebaseInitError = e;
@@ -307,8 +335,8 @@ function validateActionExecuteBody(body) {
     ok: errors.length === 0,
     errors,
     action,
-    payload: normalizedPayload,
-    context: normalizedContext,
+    payload: stripUndefinedDeep(normalizedPayload),
+    context: stripUndefinedDeep(normalizedContext),
   };
 }
 
@@ -958,7 +986,16 @@ app.post('/api/action/execute', async (req, res) => {
     payload,
   };
 
-  await writeAudit({ firestore, auditId: idempotencyKey, audit: auditBase });
+  try {
+    await writeAudit({ firestore, auditId: idempotencyKey, audit: auditBase });
+  } catch (e) {
+    console.error('❌ Failed to write audit base:', e && e.message ? e.message : e);
+    return res.status(500).json({
+      error: 'internal_error',
+      message: 'Failed to persist audit record',
+      idempotencyKey,
+    });
+  }
 
   if (wantsAsync) {
     const jobRef = firestore.collection('assistant_action_jobs').doc(idempotencyKey);
