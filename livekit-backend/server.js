@@ -47,13 +47,28 @@ app.use('/api/', apiLimiter);
 function getOrCreateRequestId(req) {
   const h = req.headers['x-request-id'];
   const incoming = typeof h === 'string' ? h.trim() : '';
-  return incoming || randomId('req-');
+  if (!incoming) return randomId('req-');
+  const clipped = incoming.length > 200 ? incoming.slice(0, 200) : incoming;
+  // Only allow a safe subset of characters for headers/logs.
+  if (!/^[A-Za-z0-9._:-]+$/.test(clipped)) return randomId('req-');
+  return clipped;
 }
 
 app.use((req, res, next) => {
   const requestId = getOrCreateRequestId(req);
   req.requestId = requestId;
+  res.locals.requestId = requestId;
   res.setHeader('x-request-id', requestId);
+
+  const originalJson = res.json.bind(res);
+  res.json = (body) => {
+    if (body && typeof body === 'object' && !Array.isArray(body)) {
+      if (!Object.prototype.hasOwnProperty.call(body, 'request_id') && !Object.prototype.hasOwnProperty.call(body, 'requestId')) {
+        body = { ...body, request_id: requestId };
+      }
+    }
+    return originalJson(body);
+  };
   next();
 });
 
@@ -999,6 +1014,7 @@ app.post('/api/action/execute', asyncHandler(async (req, res) => {
     action,
     actor_uid: actorUid,
     actor_role: actorRole,
+    request_id: req.requestId || null,
     booking_id: normalizeBookingId(payload) || null,
     request_hash: requestHash,
     context,
@@ -1026,6 +1042,7 @@ app.post('/api/action/execute', asyncHandler(async (req, res) => {
       action,
       actor_uid: actorUid,
       actor_role: actorRole,
+      request_id: req.requestId || null,
       request_hash: requestHash,
       booking_id: normalizeBookingId(payload) || null,
       attempts: 0,
@@ -1320,7 +1337,7 @@ app.use((err, req, res, next) => {
   res.status(500).json({
     error: 'Internal server error',
     message: err && err.message ? String(err.message) : 'Unknown error',
-    requestId: req && req.requestId ? String(req.requestId) : undefined,
+    request_id: req && req.requestId ? String(req.requestId) : undefined,
   });
 });
 
