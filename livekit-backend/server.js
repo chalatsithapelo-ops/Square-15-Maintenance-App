@@ -31,7 +31,8 @@ app.set('trust proxy', 1);
 // Middleware
 app.use(cors({
   origin: process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : '*',
-  credentials: true
+  credentials: true,
+  exposedHeaders: ['x-request-id'],
 }));
 app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || '200kb' }));
 
@@ -69,6 +70,17 @@ app.use((req, res, next) => {
     }
     return originalJson(body);
   };
+  next();
+});
+
+app.use((req, res, next) => {
+  const startedAtMs = Date.now();
+  res.on('finish', () => {
+    const durationMs = Date.now() - startedAtMs;
+    const rid = req && req.requestId ? String(req.requestId) : '';
+    // Keep logs compact + grep-friendly.
+    console.log(`REQ ${res.statusCode} ${req.method} ${req.originalUrl} rid=${rid} durMs=${durationMs}`);
+  });
   next();
 });
 
@@ -1295,6 +1307,27 @@ app.get('/api/admin/audit/:id', asyncHandler(async (req, res) => {
   return res.json({ ok: true, audit: snap.data() || null });
 }));
 
+app.get('/api/admin/audits/by-request/:requestId', asyncHandler(async (req, res) => {
+  const firestore = requireFirebase(res);
+  if (!firestore) return;
+  const decoded = await verifyFirebaseAuth(req, res);
+  if (!decoded) return;
+  if (!requireAdminRole(decoded, res)) return;
+
+  const requestId = String(req.params.requestId || '').trim();
+  if (!requestId) return res.status(400).json({ error: 'invalid_request', message: 'Missing request id' });
+
+  const limit = Math.min(Math.max(Number(req.query.limit || 10) || 10, 1), 50);
+  const qs = await firestore
+    .collection('assistant_action_audit')
+    .where('request_id', '==', requestId)
+    .limit(limit)
+    .get();
+
+  const audits = qs.docs.map((d) => ({ id: d.id, ...(d.data() || {}) }));
+  return res.json({ ok: true, request_id: requestId, count: audits.length, audits });
+}));
+
 app.get('/api/admin/jobs/:id', asyncHandler(async (req, res) => {
   const firestore = requireFirebase(res);
   if (!firestore) return;
@@ -1306,6 +1339,27 @@ app.get('/api/admin/jobs/:id', asyncHandler(async (req, res) => {
   const snap = await firestore.collection('assistant_action_jobs').doc(id).get();
   if (!snap.exists) return res.status(404).json({ error: 'not_found', message: 'Job not found' });
   return res.json({ ok: true, job: snap.data() || null });
+}));
+
+app.get('/api/admin/jobs/by-request/:requestId', asyncHandler(async (req, res) => {
+  const firestore = requireFirebase(res);
+  if (!firestore) return;
+  const decoded = await verifyFirebaseAuth(req, res);
+  if (!decoded) return;
+  if (!requireAdminRole(decoded, res)) return;
+
+  const requestId = String(req.params.requestId || '').trim();
+  if (!requestId) return res.status(400).json({ error: 'invalid_request', message: 'Missing request id' });
+
+  const limit = Math.min(Math.max(Number(req.query.limit || 10) || 10, 1), 50);
+  const qs = await firestore
+    .collection('assistant_action_jobs')
+    .where('request_id', '==', requestId)
+    .limit(limit)
+    .get();
+
+  const jobs = qs.docs.map((d) => ({ id: d.id, ...(d.data() || {}) }));
+  return res.json({ ok: true, request_id: requestId, count: jobs.length, jobs });
 }));
 
 app.post('/api/admin/jobs/process-next', asyncHandler(async (req, res) => {
