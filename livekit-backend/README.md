@@ -129,6 +129,29 @@ Content-Type: application/json
 }
 ```
 
+### Secure Action API (Firestore writes via backend)
+```http
+POST /api/action/execute
+Authorization: Bearer <Firebase ID token>
+Idempotency-Key: <string>   # optional but recommended
+Content-Type: application/json
+
+{
+  "action": "create_order_booking",
+  "payload": { "problem_description": "..." },
+  "context": { "source": "voice" }
+}
+```
+
+**Async mode (queued + poll):**
+- Send header `Prefer: respond-async` (or query `?async=1`)
+- Poll `GET /api/action/job/:id` with the same Firebase ID token
+
+**Admin endpoints (admin role required):**
+- `GET /api/admin/audit/:id`
+- `GET /api/admin/jobs/:id`
+- `POST /api/admin/jobs/process-next?limit=1`
+
 ## 🔒 Security Notes
 
 1. **Never commit your `.env` file** - Add it to `.gitignore`
@@ -136,6 +159,10 @@ Content-Type: application/json
 3. **Validate requests** - Add authentication middleware
 4. **Rate limiting** - Implement rate limiting for production
 5. **CORS configuration** - Update `ALLOWED_ORIGINS` for production
+
+### Optional security tuning env vars
+- `RATE_LIMIT_PER_MINUTE` (default `120` for `/api/*`)
+- `JSON_BODY_LIMIT` (default `200kb`)
 
 ## 🌐 Deployment Options
 

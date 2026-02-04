@@ -1,0 +1,58 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function role() {
+      return isSignedIn() && request.auth.token.role is string ? request.auth.token.role : '';
+    }
+
+    function isAdmin() {
+      return role() == 'admin';
+    }
+
+    // Default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Notifications: users can read their own; admins can read admin notifications.
+    match /notifications/{id} {
+      allow read: if isSignedIn() && (
+        (resource.data.user_id == request.auth.uid) ||
+        (resource.data.user_type == 'admin' && isAdmin())
+      );
+      // Writes should be server-side only (Firebase Admin bypasses rules).
+      allow create, update, delete: if false;
+    }
+
+    // Audit + async jobs should be server-side only.
+    match /assistant_action_audit/{id} {
+      allow read, write: if false;
+    }
+
+    match /assistant_action_jobs/{id} {
+      allow read, write: if false;
+    }
+
+    // Bookings: proposal (adjust field names to match your schema).
+    // Intention: clients can read/write only their own bookings; admins can read all.
+    match /futureBookings/{id} {
+      allow read: if isSignedIn() && (
+        isAdmin() ||
+        resource.data.user_id == request.auth.uid ||
+        resource.data.client_id == request.auth.uid ||
+        resource.data.artisan_id == request.auth.uid
+      );
+      allow create, update: if isSignedIn() && (
+        isAdmin() ||
+        request.resource.data.user_id == request.auth.uid ||
+        request.resource.data.client_id == request.auth.uid
+      );
+      allow delete: if false;
+    }
+  }
+}

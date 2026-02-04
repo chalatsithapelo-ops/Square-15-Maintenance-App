@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const { AccessToken, AgentDispatchClient } = require('livekit-server-sdk');
 const admin = require('firebase-admin');
+const rateLimit = require('express-rate-limit');
 const crypto = require('crypto');
 const fs = require('fs');
 require('dotenv').config();
@@ -28,7 +29,16 @@ app.use(cors({
   origin: process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : '*',
   credentials: true
 }));
-app.use(express.json());
+app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || '200kb' }));
+
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: Number(process.env.RATE_LIMIT_PER_MINUTE || 120),
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+app.use('/api/', apiLimiter);
 
 function nowIso() {
   return new Date().toISOString();
@@ -37,6 +47,47 @@ function nowIso() {
 function randomId(prefix = '') {
   const id = crypto.randomUUID();
   return prefix ? `${prefix}${id}` : id;
+}
+
+function stableStringify(value) {
+  if (value === null || value === undefined) return 'null';
+  if (typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+  const keys = Object.keys(value).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(value[k])}`).join(',')}}`;
+}
+
+function sha256Hex(input) {
+  return crypto.createHash('sha256').update(String(input || ''), 'utf8').digest('hex');
+}
+
+function normalizeRole(decoded) {
+  const raw = String(decoded && (decoded.role || decoded.user_role || decoded.user_type) ? (decoded.role || decoded.user_role || decoded.user_type) : 'client')
+    .trim()
+    .toLowerCase();
+  if (raw === 'admin' || raw === 'administrator') return 'admin';
+  if (raw === 'artisan' || raw === 'provider' || raw === 'worker') return 'artisan';
+  if (raw === 'client' || raw === 'user') return 'client';
+  return raw;
+}
+
+function isAllowedRole(role) {
+  return role === 'client' || role === 'admin' || role === 'artisan';
+}
+
+function ensureActionAllowed({ action, actorRole }) {
+  const policies = {
+    create_order_booking: { roles: ['client', 'admin'] },
+  };
+
+  const p = policies[action];
+  if (!p) {
+    return { ok: false, status: 400, error: 'unsupported_action' };
+  }
+  if (!p.roles.includes(actorRole)) {
+    return { ok: false, status: 403, error: 'forbidden' };
+  }
+  return { ok: true };
 }
 
 function getBearerToken(req) {
@@ -117,6 +168,15 @@ function requireFirebase(res) {
       hint:
         'Configure FIREBASE_SERVICE_ACCOUNT_JSON, FIREBASE_SERVICE_ACCOUNT_BASE64, or FIREBASE_SERVICE_ACCOUNT_FILE in Render env vars for the livekit-backend service.',
     });
+    return null;
+  }
+  return admin.firestore();
+}
+
+function getFirestoreOrNull() {
+  initFirebaseIfPossible();
+  if (firebaseInitError) {
+    console.error('❌ Firebase Admin not configured:', firebaseInitError.message);
     return null;
   }
   return admin.firestore();
@@ -822,13 +882,49 @@ app.post('/api/action/execute', async (req, res) => {
   }
 
   const actorUid = decoded.uid;
-  const actorRole = String(decoded.role || decoded.user_role || decoded.user_type || 'client').trim().toLowerCase();
+  const actorRole = normalizeRole(decoded);
+  if (!isAllowedRole(actorRole)) {
+    return res.status(403).json({
+      error: 'forbidden',
+      message: 'Role is not allowed to perform actions',
+      idempotencyKey,
+    });
+  }
+
+  const policy = ensureActionAllowed({ action, actorRole });
+  if (!policy.ok) {
+    return res.status(policy.status).json({
+      error: policy.error,
+      message: 'Action not permitted',
+      idempotencyKey,
+    });
+  }
+
+  const requestHash = sha256Hex(
+    stableStringify({
+      v: 1,
+      actor_uid: actorUid,
+      action,
+      payload,
+      context,
+    })
+  );
+
+  const prefer = String(req.headers.prefer || '').toLowerCase();
+  const wantsAsync = prefer.includes('respond-async') || String(req.query.async || '').trim() === '1';
 
   const auditRef = firestore.collection('assistant_action_audit').doc(idempotencyKey);
   const existing = await auditRef.get();
   if (existing.exists) {
     const data = existing.data() || {};
     if (data.status === 'success') {
+      if (data.request_hash && String(data.request_hash) !== requestHash) {
+        return res.status(409).json({
+          error: 'idempotency_key_mismatch',
+          message: 'Idempotency-Key was already used for a different request',
+          idempotencyKey,
+        });
+      }
       return res.json({
         ok: true,
         success: true,
@@ -840,7 +936,7 @@ app.post('/api/action/execute', async (req, res) => {
       });
     }
     if (data.status === 'started') {
-      return res.status(409).json({
+      return res.status(wantsAsync ? 202 : 409).json({
         error: 'duplicate_in_flight',
         message: 'This action is already being processed',
         idempotencyKey,
@@ -857,11 +953,46 @@ app.post('/api/action/execute', async (req, res) => {
     actor_uid: actorUid,
     actor_role: actorRole,
     booking_id: normalizeBookingId(payload) || null,
+    request_hash: requestHash,
     context,
     payload,
   };
 
   await writeAudit({ firestore, auditId: idempotencyKey, audit: auditBase });
+
+  if (wantsAsync) {
+    const jobRef = firestore.collection('assistant_action_jobs').doc(idempotencyKey);
+    const jobDoc = {
+      id: idempotencyKey,
+      created_at: startedAt,
+      updated_at: startedAt,
+      status: 'queued',
+      action,
+      actor_uid: actorUid,
+      actor_role: actorRole,
+      request_hash: requestHash,
+      booking_id: normalizeBookingId(payload) || null,
+      attempts: 0,
+      payload,
+      context,
+    };
+    await jobRef.set(jobDoc, { merge: true });
+
+    setImmediate(() => {
+      processActionJob({ jobId: idempotencyKey }).catch((e) => {
+        console.error('❌ Background job processing failed:', e && e.message ? e.message : e);
+      });
+    });
+
+    return res.status(202).json({
+      ok: true,
+      accepted: true,
+      idempotencyKey,
+      action,
+      job: { id: idempotencyKey, status: 'queued' },
+      poll: `/api/action/job/${encodeURIComponent(idempotencyKey)}`,
+    });
+  }
 
   try {
     const result = await executeAction({
@@ -882,6 +1013,7 @@ app.post('/api/action/execute', async (req, res) => {
           updated_at: nowIso(),
           error: result.error,
           http_status: result.status,
+          response_hash: sha256Hex(stableStringify({ ok: false, error: result.error, status: result.status })),
         },
       });
       return res.status(result.status).json({
@@ -900,6 +1032,7 @@ app.post('/api/action/execute', async (req, res) => {
         completed_at: nowIso(),
         booking_id: normalizeBookingId(result.data) || normalizeBookingId(payload) || null,
         result: result.data || null,
+        response_hash: sha256Hex(stableStringify({ ok: true, data: result.data || null })),
       },
     });
 
@@ -931,6 +1064,200 @@ app.post('/api/action/execute', async (req, res) => {
   }
 });
 
+async function processActionJob({ jobId }) {
+  const firestore = getFirestoreOrNull();
+  if (!firestore) return;
+
+  const jobRef = firestore.collection('assistant_action_jobs').doc(jobId);
+
+  const claim = await firestore.runTransaction(async (tx) => {
+    const snap = await tx.get(jobRef);
+    if (!snap.exists) return { ok: false, reason: 'missing' };
+    const job = snap.data() || {};
+    if (job.status === 'success' || job.status === 'error') return { ok: false, reason: 'done', job };
+    if (job.status !== 'queued' && job.status !== 'started') return { ok: false, reason: 'invalid', job };
+
+    const attempts = Number(job.attempts || 0) + 1;
+    tx.update(jobRef, { status: 'started', attempts, updated_at: nowIso(), started_at: job.started_at || nowIso() });
+    return { ok: true, job: { ...job, attempts } };
+  });
+
+  if (!claim.ok) return;
+
+  const job = claim.job;
+  try {
+    const result = await executeAction({
+      firestore,
+      action: job.action,
+      actorUid: job.actor_uid,
+      actorRole: job.actor_role,
+      payload: job.payload,
+      context: job.context,
+    });
+
+    if (!result.ok) {
+      await jobRef.set(
+        {
+          status: 'error',
+          updated_at: nowIso(),
+          completed_at: nowIso(),
+          error: result.error,
+          http_status: result.status,
+          response_hash: sha256Hex(stableStringify({ ok: false, error: result.error, status: result.status })),
+        },
+        { merge: true }
+      );
+
+      await writeAudit({
+        firestore,
+        auditId: jobId,
+        audit: {
+          status: 'error',
+          updated_at: nowIso(),
+          completed_at: nowIso(),
+          error: result.error,
+          http_status: result.status,
+          response_hash: sha256Hex(stableStringify({ ok: false, error: result.error, status: result.status })),
+        },
+      });
+      return;
+    }
+
+    const bookingId = normalizeBookingId(result.data) || normalizeBookingId(job.payload) || null;
+
+    await jobRef.set(
+      {
+        status: 'success',
+        updated_at: nowIso(),
+        completed_at: nowIso(),
+        booking_id: bookingId,
+        result: result.data || null,
+        response_hash: sha256Hex(stableStringify({ ok: true, data: result.data || null })),
+      },
+      { merge: true }
+    );
+
+    await writeAudit({
+      firestore,
+      auditId: jobId,
+      audit: {
+        status: 'success',
+        updated_at: nowIso(),
+        completed_at: nowIso(),
+        booking_id: bookingId,
+        result: result.data || null,
+        response_hash: sha256Hex(stableStringify({ ok: true, data: result.data || null })),
+      },
+    });
+  } catch (e) {
+    await jobRef.set(
+      {
+        status: 'error',
+        updated_at: nowIso(),
+        completed_at: nowIso(),
+        error: 'exception',
+        exception_message: e && e.message ? String(e.message) : String(e),
+      },
+      { merge: true }
+    );
+
+    await writeAudit({
+      firestore,
+      auditId: jobId,
+      audit: {
+        status: 'error',
+        updated_at: nowIso(),
+        completed_at: nowIso(),
+        error: 'exception',
+        exception_message: e && e.message ? String(e.message) : String(e),
+      },
+    });
+  }
+}
+
+app.get('/api/action/job/:id', async (req, res) => {
+  const firestore = requireFirebase(res);
+  if (!firestore) return;
+
+  const decoded = await verifyFirebaseAuth(req, res);
+  if (!decoded) return;
+
+  const actorUid = decoded.uid;
+  const actorRole = normalizeRole(decoded);
+  const jobId = String(req.params.id || '').trim();
+  if (!jobId) {
+    return res.status(400).json({ error: 'invalid_request', message: 'Missing job id' });
+  }
+
+  const snap = await firestore.collection('assistant_action_jobs').doc(jobId).get();
+  if (!snap.exists) {
+    return res.status(404).json({ error: 'not_found', message: 'Job not found' });
+  }
+  const job = snap.data() || {};
+  if (job.actor_uid !== actorUid && actorRole !== 'admin') {
+    return res.status(403).json({ error: 'forbidden', message: 'Not allowed to read this job' });
+  }
+  return res.json({ ok: true, job });
+});
+
+function requireAdminRole(decoded, res) {
+  const role = normalizeRole(decoded);
+  if (role !== 'admin') {
+    res.status(403).json({ error: 'forbidden', message: 'Admin role required' });
+    return null;
+  }
+  return role;
+}
+
+app.get('/api/admin/audit/:id', async (req, res) => {
+  const firestore = requireFirebase(res);
+  if (!firestore) return;
+  const decoded = await verifyFirebaseAuth(req, res);
+  if (!decoded) return;
+  if (!requireAdminRole(decoded, res)) return;
+
+  const id = String(req.params.id || '').trim();
+  const snap = await firestore.collection('assistant_action_audit').doc(id).get();
+  if (!snap.exists) return res.status(404).json({ error: 'not_found', message: 'Audit not found' });
+  return res.json({ ok: true, audit: snap.data() || null });
+});
+
+app.get('/api/admin/jobs/:id', async (req, res) => {
+  const firestore = requireFirebase(res);
+  if (!firestore) return;
+  const decoded = await verifyFirebaseAuth(req, res);
+  if (!decoded) return;
+  if (!requireAdminRole(decoded, res)) return;
+
+  const id = String(req.params.id || '').trim();
+  const snap = await firestore.collection('assistant_action_jobs').doc(id).get();
+  if (!snap.exists) return res.status(404).json({ error: 'not_found', message: 'Job not found' });
+  return res.json({ ok: true, job: snap.data() || null });
+});
+
+app.post('/api/admin/jobs/process-next', async (req, res) => {
+  const firestore = requireFirebase(res);
+  if (!firestore) return;
+  const decoded = await verifyFirebaseAuth(req, res);
+  if (!decoded) return;
+  if (!requireAdminRole(decoded, res)) return;
+
+  const limit = Math.min(Math.max(Number(req.query.limit || 1) || 1, 1), 10);
+  const qs = await firestore
+    .collection('assistant_action_jobs')
+    .where('status', '==', 'queued')
+    .limit(limit)
+    .get();
+
+  const jobIds = qs.docs.map((d) => d.id);
+  for (const id of jobIds) {
+    // sequential to reduce contention
+    await processActionJob({ jobId: id });
+  }
+
+  return res.json({ ok: true, processed: jobIds.length, jobIds });
+});
+
 // Error handling middleware
 app.use((err, req, res, next) => {
   console.error('❌ Server error:', err);
@@ -950,6 +1277,13 @@ app.use((req, res) => {
 
 // Export app for serverless/tests
 module.exports = app;
+module.exports._internals = {
+  stableStringify,
+  sha256Hex,
+  normalizeRole,
+  isAllowedRole,
+  ensureActionAllowed,
+};
 
 // Start server only when executed directly (node server.js)
 if (require.main === module) {
