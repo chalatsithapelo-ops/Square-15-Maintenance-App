@@ -317,6 +317,8 @@ async def entrypoint(ctx: JobContext):
             "- For QUERIES (status/info requests), use BACKEND tools: get_booking_status, list_my_bookings, explain_quote, check_payment.\n"
             "- For UI NAVIGATION (opening screens), use ui_navigate.\n"
             "- For WRITE OPERATIONS (create/cancel bookings), use create_booking which handles propose→confirm automatically.\n"
+            "- For MESSAGING (contact artisan/support), use: send_message_to_artisan, send_message_to_admin, get_messages.\n"
+            "- For SUPPORT CASES, use: get_case_status.\n"
             "- Never SAY or narrate tool calls. Do not say phrases like 'calling get_booking_status'.\n"
             "- Never speak JSON, code, function names, or metadata. Only speak user-facing sentences.\n"
             "- CRITICAL: NEVER say you are 'loading', 'checking', 'opening', or 'opened' pictures/photos/images or upload screens.\n"
@@ -347,11 +349,20 @@ async def entrypoint(ctx: JobContext):
             "   - Call artisan: ui_navigate(action='call_assigned_artisan')\n"
             "   - Reschedule (UI flow): ui_navigate(action='reschedule_booking', booking_id='...', scheduled_date='...', scheduled_time='...')\n"
             "   - Cancel (UI flow): ui_navigate(action='cancel_booking', booking_id='...', additional_notes='reason')\n"
+            "4) MESSAGING (Phase 3) - Use backend tools:\n"
+            "   - 'Contact my artisan' / 'Is the artisan on the way?' → CALL send_message_to_artisan(booking_id='...', message='...')\n"
+            "   - 'I need to talk to support' / 'File a complaint' → CALL send_message_to_admin(message='...', booking_id='...', subject='...')\n"
+            "   - 'Show my messages' / 'What did the artisan say?' → CALL get_messages(booking_id='...')\n"
+            "   - 'Check my support case' → CALL get_case_status(case_id='...')\n"
             "\nExamples (client):\n"
             "- User: 'What's the status of booking 123?'\n"
             "  You: CALL get_booking_status('123'), then SPEAK: 'Your plumbing booking is in progress. John the plumber is on the way.'\n"
             "- User: 'Dispatch a plumber, my tap is leaking.'\n"
             "  You: CALL create_booking(category_name='Plumbing', problem_description='Leaking tap', ...)\n"
+            "- User: 'Is my artisan on the way?'\n"
+            "  You: CALL send_message_to_artisan(booking_id='123', message='Are you on your way?'), then SPEAK: 'Message sent to the artisan. They'll be notified immediately.'\n"
+            "- User: 'I need to complain about the service quality.'\n"
+            "  You: CALL send_message_to_admin(message='User complaint about service quality', subject='Service Quality Issue', booking_id='123'), then SPEAK: 'I've forwarded your complaint to support. They'll respond shortly.'\n"
         )
 
         artisan_flow = (
@@ -725,6 +736,189 @@ async def entrypoint(ctx: JobContext):
             logger.error(f"create_booking error: {e}", exc_info=True)
             return "Sorry, I had trouble creating the booking. Please try again or use the app directly."
 
+    # =========================================
+    # Phase 3: Messaging Tools
+    # =========================================
+
+    @ai_callable(
+        description=(
+            "Send a message to the artisan assigned to a booking. "
+            "Use this when the user wants to contact their artisan (ask about ETA, location, confirm details, etc.). "
+            "Requires: booking_id, message."
+        )
+    )
+    async def send_message_to_artisan(
+        booking_id: str,
+        message: str
+    ) -> str:
+        """Send a message to the artisan assigned to a booking."""
+        nonlocal backend_client
+        if not backend_client:
+            return "I need you to be authenticated first."
+
+        try:
+            payload = {'booking_id': booking_id, 'message': message}
+            result = await backend_client.call_backend_action('send_message_to_artisan', payload)
+
+            if not result.get('success'):
+                error = result.get('error', 'unknown_error')
+                if error == 'no_artisan_assigned':
+                    return "There's no artisan assigned to this booking yet. You can't send a message until an artisan accepts."
+                elif error == 'booking_not_found':
+                    return f"I couldn't find booking {booking_id}."
+                return f"I couldn't send the message: {error}"
+
+            return "Message sent to the artisan successfully. They'll be notified immediately."
+
+        except Exception as e:
+            logger.error(f"send_message_to_artisan error: {e}", exc_info=True)
+            return "Sorry, I had trouble sending the message. Please try again."
+
+    @ai_callable(
+        description=(
+            "Send a message to admin support. "
+            "Use this when the user needs help from support (complaints, escalations, complex issues). "
+            "Requires: message. Optional: booking_id, subject."
+        )
+    )
+    async def send_message_to_admin(
+        message: str,
+        booking_id: str = "",
+        subject: str = "Support Request"
+    ) -> str:
+        """Send a message to admin support, creates a support case."""
+        nonlocal backend_client
+        if not backend_client:
+            return "I need you to be authenticated first."
+
+        try:
+            payload = {
+                'message': message,
+                'subject': subject,
+                'booking_id': booking_id or None
+            }
+            result = await backend_client.call_backend_action('send_message_to_admin', payload)
+
+            if not result.get('success'):
+                error = result.get('error', 'unknown_error')
+                return f"I couldn't send your message to support: {error}"
+
+            case_id = (result.get('result') or {}).get('case_id', '')
+            if case_id:
+                return f"I've forwarded your message to our support team (case {case_id}). They'll respond shortly and you'll be notified."
+            else:
+                return "I've forwarded your message to our support team. They'll respond shortly."
+
+        except Exception as e:
+            logger.error(f"send_message_to_admin error: {e}", exc_info=True)
+            return "Sorry, I had trouble contacting support. Please try again."
+
+    @ai_callable(
+        description=(
+            "Get chat messages for a booking. "
+            "Use this when the user asks to see their messages or conversation with the artisan. "
+            "Requires: booking_id or tasks_management_id."
+        )
+    )
+    async def get_messages(
+        booking_id: str = "",
+        tasks_management_id: str = ""
+    ) -> str:
+        """Get chat messages for a booking."""
+        nonlocal backend_client
+        if not backend_client:
+            return "I need you to be authenticated first."
+
+        if not booking_id and not tasks_management_id:
+            return "I need either a booking ID or tasks management ID to get messages."
+
+        try:
+            payload = {
+                'booking_id': booking_id or None,
+                'tasks_management_id': tasks_management_id or None,
+                'limit': 10
+            }
+            result = await backend_client.call_backend_action('get_messages', payload)
+
+            if not result.get('success'):
+                error = result.get('error', 'unknown_error')
+                if error == 'booking_not_found':
+                    return f"I couldn't find booking {booking_id}."
+                elif error == 'no_tasks_management_id_for_booking':
+                    return "This booking doesn't have a chat yet. You can send a message once an artisan is assigned."
+                return f"I couldn't get the messages: {error}"
+
+            result_data = result.get('result', {})
+            messages = result_data.get('messages', [])
+            
+            if not messages:
+                return "There are no messages yet in this conversation."
+
+            # Format messages for readability
+            msg_list = []
+            for msg in messages[-5:]:  # Last 5 messages
+                sender = "You" if msg.get('sender_id') == backend_client.firebase_token else "Artisan"
+                text = msg.get('message', '')
+                msg_list.append(f"{sender}: {text}")
+
+            messages_text = "\n".join(msg_list)
+            return f"Recent messages:\n{messages_text}"
+
+        except Exception as e:
+            logger.error(f"get_messages error: {e}", exc_info=True)
+            return "Sorry, I had trouble getting the messages. Please try again."
+
+    # =========================================
+    # Phase 3: Case Management Tools
+    # =========================================
+
+    @ai_callable(
+        description=(
+            "Get the status of a support case. "
+            "Use this when the user asks about their support request or case. "
+            "Requires: case_id."
+        )
+    )
+    async def get_case_status(
+        case_id: str
+    ) -> str:
+        """Get the status of a support case."""
+        nonlocal backend_client
+        if not backend_client:
+            return "I need you to be authenticated first."
+
+        try:
+            payload = {'case_id': case_id}
+            result = await backend_client.call_backend_action('get_case_status', payload)
+
+            if not result.get('success'):
+                error = result.get('error', 'unknown_error')
+                if error == 'case_not_found':
+                    return f"I couldn't find case {case_id}."
+                return f"I couldn't get the case status: {error}"
+
+            result_data = result.get('result', {})
+            state = result_data.get('state', 'unknown')
+            case_type = result_data.get('type', 'support')
+            subject = result_data.get('subject', '')
+
+            state_messages = {
+                'open': "Your case is open and waiting for admin review.",
+                'pending_admin': "Your case is waiting for admin action.",
+                'in_progress': "Your case is being worked on by our team.",
+                'resolved': "Your case has been resolved.",
+                'closed': "Your case is closed."
+            }
+
+            status_msg = state_messages.get(state, f"Your case status is: {state}")
+            if subject:
+                return f"{subject} - {status_msg}"
+            return status_msg
+
+        except Exception as e:
+            logger.error(f"get_case_status error: {e}", exc_info=True)
+            return "Sorry, I had trouble getting the case status. Please try again."
+
     agent = voice.Agent(
         vad=vad,
         stt=openai.STT(model="whisper-1", language="en"),
@@ -734,7 +928,20 @@ async def entrypoint(ctx: JobContext):
     )
 
     logger.info("🚀 Starting agent session...")
-    session = voice.AgentSession(tools=[ui_navigate, get_booking_status, list_my_bookings, explain_quote, check_payment, create_booking])
+    session = voice.AgentSession(tools=[
+        ui_navigate,
+        get_booking_status,
+        list_my_bookings,
+        explain_quote,
+        check_payment,
+        create_booking,
+        # Phase 3: Messaging tools
+        send_message_to_artisan,
+        send_message_to_admin,
+        get_messages,
+        # Phase 3: Case management
+        get_case_status
+    ])
 
     # Guardrail: never allow internal/tool narration to reach TTS.
     _orig_say = session.say
