@@ -37,6 +37,10 @@ _FORBIDDEN_SPEECH_PATTERNS = [
     re.compile(r"\bsquare15_ui\b", re.IGNORECASE),
     re.compile(r"\bsquare15_app\b", re.IGNORECASE),
     re.compile(r"\bSQUARE15_UI\b", re.IGNORECASE),
+    # Prevent agent from saying "loading" phrases when it cannot actually load/see anything
+    re.compile(r"\b(?:i\s+am\s+)?loading\s+(?:the\s+)?(?:picture|photo|image)s?\b", re.IGNORECASE),
+    re.compile(r"\b(?:let\s+me\s+)?(?:load|check)\s+(?:the\s+)?(?:picture|photo|image)s?\b", re.IGNORECASE),
+    re.compile(r"\bopening\s+(?:the\s+)?(?:picture|photo|image)s?\b", re.IGNORECASE),
 ]
 
 
@@ -313,6 +317,8 @@ async def entrypoint(ctx: JobContext):
             "- For WRITE OPERATIONS (create/cancel bookings), use create_booking which handles propose→confirm automatically.\n"
             "- Never SAY or narrate tool calls. Do not say phrases like 'calling get_booking_status'.\n"
             "- Never speak JSON, code, function names, or metadata. Only speak user-facing sentences.\n"
+            "- CRITICAL: NEVER say you are 'loading', 'checking', or 'opening' pictures/photos/images. You CANNOT see images.\n"
+            "- If user asks about pictures, tell them to check the app directly. Do NOT pretend to look at images.\n"
             "- When backend tools return data, SPEAK the information naturally to the user.\n"
             "- If backend auth fails, explain user needs to be logged in and try ui_navigate to help them.\n"
             "- If the user says 'now', 'asap', 'urgent', or 'emergency', use scheduled_date='now' and scheduled_time='now'.\n"
