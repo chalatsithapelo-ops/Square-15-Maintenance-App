@@ -367,6 +367,18 @@ app.get('/health', (req, res) => {
     status: 'ok', 
     message: 'Livekit Token Server is running',
     timestamp: new Date().toISOString(),
+    deploy: {
+      node: process.version,
+      render: {
+        gitCommit: process.env.RENDER_GIT_COMMIT || null,
+        gitBranch: process.env.RENDER_GIT_BRANCH || null,
+        serviceId: process.env.RENDER_SERVICE_ID || null,
+        serviceName: process.env.RENDER_SERVICE_NAME || null,
+        externalUrl: process.env.RENDER_EXTERNAL_URL || null,
+        region: process.env.RENDER_REGION || null,
+        instanceId: process.env.RENDER_INSTANCE_ID || null,
+      },
+    },
     sdkVersion: getSdkVersion(),
     firebase: {
       initialized: firebaseInitialized,
