@@ -43,6 +43,22 @@ const apiLimiter = rateLimit({
   legacyHeaders: false,
 });
 
+const assistantLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: Number(process.env.ASSISTANT_RATE_LIMIT_PER_MINUTE || 120),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'rate_limited', message: 'Too many assistant requests. Please try again shortly.' },
+});
+
+const adminLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: Number(process.env.ADMIN_RATE_LIMIT_PER_MINUTE || 240),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'rate_limited', message: 'Too many admin requests. Please try again shortly.' },
+});
+
 app.use('/api/', apiLimiter);
 
 function getOrCreateRequestId(req) {
