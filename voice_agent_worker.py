@@ -20,6 +20,7 @@ from livekit import rtc
 import json
 import aiohttp
 from typing import Optional, Dict, Any
+import uuid
 
 
 logging.basicConfig(
@@ -328,6 +329,7 @@ async def entrypoint(ctx: JobContext):
             "- If backend auth fails, explain user needs to be logged in and try ui_navigate to help them.\n"
             "- If the user says 'now', 'asap', 'urgent', or 'emergency', use scheduled_date='now' and scheduled_time='now'.\n"
             "- Speak naturally (not robotic). Keep it concise (1-3 short sentences).\n"
+            "- UI tool reliability: ui_navigate returns 'ok' only if the app ACKs the action. If it returns anything else, DO NOT claim it succeeded; ask the user to confirm what they see.\n"
         )
 
         client_flow = (
@@ -422,6 +424,7 @@ async def entrypoint(ctx: JobContext):
     ) -> str:
         """Triggers an in-app navigation action."""
         try:
+            client_action_id = uuid.uuid4().hex
             payload = {
                 "category_name": category_name,
                 "task_name": task_name,
@@ -438,6 +441,7 @@ async def entrypoint(ctx: JobContext):
                 "artisan_id": artisan_id,
                 "phone": phone,
                 "booking_id": booking_id,
+                "client_action_id": client_action_id,
             }
             text = ""
             if action == "create_order_booking":
@@ -458,23 +462,23 @@ async def entrypoint(ctx: JobContext):
                     "Please upload 3 clear photos of the work needed in the photo upload screen."
                 )
             elif action == "open_bookings_tab":
-                text = "Opening your bookings now."
+                text = "I sent the bookings command. Tell me when you see the bookings screen."
             elif action == "open_future_bookings":
-                text = "Opening your future bookings now."
+                text = "I sent the future bookings command. Tell me when you see the future bookings screen."
             elif action == "open_artisan_requests":
-                text = "Opening your requests now."
+                text = "I sent the requests command. Tell me when you see the requests screen."
             elif action == "open_artisan_appointments":
-                text = "Opening your appointments now."
+                text = "I sent the appointments command. Tell me when you see the appointments screen."
             elif action == "open_artisan_wallet":
-                text = "Opening your wallet now."
+                text = "I sent the wallet command. Tell me when you see the wallet screen."
             elif action == "accept_latest_request":
-                text = "Accepting the latest pending request now."
+                text = "I sent the accept command. Tell me if it shows accepted."
             elif action == "reject_latest_request":
-                text = "Rejecting the latest pending request now."
+                text = "I sent the reject command. Tell me if it shows rejected."
             elif action == "respond_to_request":
-                text = "Updating that request now."
+                text = "I sent the update command. Tell me if it updated."
             elif action == "call_assigned_artisan" or action == "call_artisan":
-                text = "Calling the assigned artisan now."
+                text = "I sent the call command. Tell me if the call screen opens."
             elif action == "get_booking_status":
                 text = "Checking that booking status now."
             elif action == "reschedule_booking":
@@ -484,9 +488,11 @@ async def entrypoint(ctx: JobContext):
             elif action == "reassign_booking":
                 text = "Reassigning that booking now. If no nearby artisan is available, an admin will assign one."
             elif action == "mark_booking_in_progress":
-                text = "Marking that booking as in progress now."
+                text = "I sent the in-progress update. Tell me if it changed to in progress."
             elif action == "artisan_cancel_and_reassign":
                 text = "Cancelling and reassigning now. If no nearby artisan is available, an admin will assign one."
+            elif action == "go_back" or action == "close_window" or action == "close_dialog" or action == "dismiss":
+                text = "I sent the close command. Tell me if the window closed."
             else:
                 text = "Working on that now."
             meta = {
@@ -496,10 +502,97 @@ async def entrypoint(ctx: JobContext):
                 "text": text,
             }
             await _set_agent_metadata(meta)
-            return "ok"
+
+            async def _wait_for_ui_ack(timeout_s: float = 6.0) -> Optional[Dict[str, Any]]:
+                """Wait for the mobile app to ACK this UI action via participant metadata."""
+                deadline = asyncio.get_event_loop().time() + timeout_s
+                last_seen = None
+                while asyncio.get_event_loop().time() < deadline:
+                    try:
+                        participants = getattr(ctx.room, "remote_participants", None) or {}
+                        for _, p in participants.items():
+                            ident = (getattr(p, "identity", "") or "").strip().lower()
+                            if ident.startswith("square15-"):
+                                # Likely the agent itself; skip.
+                                continue
+                            md = getattr(p, "metadata", None)
+                            if not md or not isinstance(md, str):
+                                continue
+                            if md == last_seen:
+                                continue
+                            last_seen = md
+                            try:
+                                data = json.loads(md)
+                            except Exception:
+                                continue
+                            if not isinstance(data, dict):
+                                continue
+                            if str(data.get("type", "")) != "square15_app":
+                                continue
+                            if str(data.get("action", "")) != "ui_action_result":
+                                continue
+                            payload2 = data.get("payload") or {}
+                            if not isinstance(payload2, dict):
+                                continue
+                            if str(payload2.get("client_action_id", "")) != client_action_id:
+                                continue
+                            return data
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.12)
+                return None
+
+            ack = await _wait_for_ui_ack()
+            if not ack:
+                return "sent_no_ack"
+            payload_ack = ack.get("payload") or {}
+            ok = bool(payload_ack.get("ok") is True)
+            if ok:
+                return "ok"
+            err = str(payload_ack.get("error") or "ui_action_failed").strip()
+            return f"error:{err}"[:240]
         except Exception as e:
             logger.warning(f"ui_navigate failed: {e}")
             return "error"
+
+    @llm.function_tool(
+        description=(
+            "Get the current wallet balance for the authenticated user. "
+            "Use this when the user asks 'what is my wallet balance?' or 'how much do I have in my wallet?'."
+        )
+    )
+    async def get_wallet_balance() -> str:
+        """Get wallet balance from backend API."""
+        nonlocal backend_client
+        if not backend_client:
+            return "I need you to be authenticated first. Please make sure you're logged into the app."
+
+        try:
+            async with aiohttp.ClientSession(timeout=backend_client.timeout) as session:
+                body = {
+                    'action': 'get_wallet_balance',
+                    'payload': {},
+                    'context': backend_client._get_context(),
+                }
+                async with session.post(
+                    f"{backend_client.base_url}/api/action/execute",
+                    json=body,
+                    headers=backend_client._get_headers(),
+                ) as resp:
+                    data = await resp.json()
+            if not isinstance(data, dict):
+                return "Sorry — I couldn't read your wallet balance right now."
+            if not data.get('ok') and not data.get('success'):
+                return "Sorry — I couldn't read your wallet balance right now."
+            result = data.get('result') or data.get('data') or {}
+            if isinstance(result, dict):
+                bal = str(result.get('balance') or result.get('wallet_balance') or '').strip()
+                if bal:
+                    return f"Your wallet balance is R{bal}."
+            return "Sorry — I couldn't read your wallet balance right now."
+        except Exception as e:
+            logger.warning(f"get_wallet_balance failed: {e}")
+            return "Sorry — I couldn't read your wallet balance right now."
 
     # Phase 2: Read-only backend tools
     @llm.function_tool(

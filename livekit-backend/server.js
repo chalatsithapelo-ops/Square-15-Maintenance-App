@@ -172,6 +172,14 @@ function isAllowedRole(role) {
 
 function ensureActionAllowed({ action, actorRole }) {
   const policies = {
+    // Read-only actions
+    get_booking_status: { roles: ['client', 'admin', 'artisan'] },
+    list_user_bookings: { roles: ['client', 'admin', 'artisan'] },
+    explain_rfq_quote: { roles: ['client', 'admin', 'artisan'] },
+    get_payment_status: { roles: ['client', 'admin', 'artisan'] },
+    get_wallet_balance: { roles: ['client', 'admin', 'artisan'] },
+
+    // Write actions
     create_order_booking: { roles: ['client', 'admin'] },
   };
 
@@ -402,6 +410,7 @@ const ACTION_TIERS = Object.freeze({
   list_user_bookings: 'A',
   explain_rfq_quote: 'A',
   get_payment_status: 'A',
+  get_wallet_balance: 'A',
   create_order_booking: 'B',
   create_order_booking_order: 'B',
   dispatch_artisan: 'B',
@@ -560,6 +569,7 @@ function validateActionExecuteBody(body) {
     'list_user_bookings',
     'explain_rfq_quote',
     'get_payment_status',
+    'get_wallet_balance',
     'create_order_booking',
   ]);
   if (action && !supportedActions.has(action)) {
@@ -923,6 +933,32 @@ async function handleGetPaymentStatus({ firestore, actorUid, actorRole, payload 
   };
 }
 
+async function handleGetWalletBalance({ firestore, actorUid, actorRole }) {
+  if (!actorUid) {
+    return { ok: false, status: 401, error: 'unauthorized' };
+  }
+
+  // Wallet balance lives on the user document as a legacy string field 'balance'.
+  const snap = await firestore.collection('users').doc(actorUid).get();
+  if (!snap.exists) {
+    return { ok: false, status: 404, error: 'user_not_found' };
+  }
+
+  const u = snap.data() || {};
+  const balanceRaw = (u.balance ?? u.wallet_balance ?? u.walletBalance ?? '0');
+  const balance = String(balanceRaw).trim() || '0';
+
+  return {
+    ok: true,
+    status: 200,
+    data: {
+      uid: actorUid,
+      role: actorRole || null,
+      balance,
+    },
+  };
+}
+
 async function handleCreateOrderBooking({ firestore, actorUid, actorRole, payload }) {
   if (!actorUid) {
     return { ok: false, status: 401, error: 'unauthorized' };
@@ -1018,6 +1054,7 @@ const ACTION_HANDLERS = {
   list_user_bookings: handleListUserBookings,
   explain_rfq_quote: handleExplainRfqQuote,
   get_payment_status: handleGetPaymentStatus,
+  get_wallet_balance: handleGetWalletBalance,
   create_order_booking: handleCreateOrderBooking,
 };
 
