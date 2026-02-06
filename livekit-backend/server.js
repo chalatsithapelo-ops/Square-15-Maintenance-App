@@ -21,6 +21,13 @@ function env(name) {
   return sanitizeEnvValue(process.env[name]);
 }
 
+function isEnvTruthy(name) {
+  const v = env(name);
+  if (v == null) return false;
+  const s = String(v).trim().toLowerCase();
+  return s === '1' || s === 'true' || s === 'yes' || s === 'y' || s === 'on';
+}
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
