@@ -355,6 +355,7 @@ async def entrypoint(ctx: JobContext):
             "   - 'Show my bookings' → CALL list_my_bookings(status='', limit=5)\n"
             "   - 'Explain my quote' → CALL explain_quote(booking_id='...')\n"
             "   - 'Did I pay?' → CALL check_payment(booking_id='...')\n"
+            "   - 'What's my wallet balance?' → CALL get_wallet_balance()\n"
             "   Then SPEAK the result naturally.\n"
             "2) CREATE BOOKING - Use backend tool:\n"
             "   - Identify category from symptoms. If unclear, ask ONE question.\n"
@@ -362,39 +363,85 @@ async def entrypoint(ctx: JobContext):
             "   - CALL create_booking(category_name='...', problem_description='...', ...)\n"
             "   - This handles proposal→confirmation automatically.\n"
             "   - For RFQ (complex/needs quote), use is_rfq='yes'.\n"
-            "3) UI NAVIGATION - Use ui_navigate:\n"
-            "   - Open RFQ photo upload: ui_navigate(action='open_rfq_upload')\n"
-            "   - Call artisan: ui_navigate(action='call_assigned_artisan')\n"
-            "   - Reschedule (UI flow): ui_navigate(action='reschedule_booking', booking_id='...', scheduled_date='...', scheduled_time='...')\n"
-            "   - Cancel (UI flow): ui_navigate(action='cancel_booking', booking_id='...', additional_notes='reason')\n"
-            "4) MESSAGING (Phase 3) - Use backend tools:\n"
-            "   - 'Contact my artisan' / 'Is the artisan on the way?' → CALL send_message_to_artisan(booking_id='...', message='...')\n"
-            "   - 'I need to talk to support' / 'File a complaint' → CALL send_message_to_admin(message='...', booking_id='...', subject='...')\n"
-            "   - 'Show my messages' / 'What did the artisan say?' → CALL get_messages(booking_id='...')\n"
+            "3) CANCEL / RESCHEDULE BOOKING - Use backend tools:\n"
+            "   - 'Cancel my booking' → CALL cancel_booking(booking_id='...', reason='...')\n"
+            "   - 'Reschedule my booking' → CALL reschedule_booking(booking_id='...', scheduled_date='...', scheduled_time='...')\n"
+            "4) UI NAVIGATION - Use ui_navigate with these exact action values:\n"
+            "   BOOKING SCREENS:\n"
+            "   - 'Show my bookings' → ui_navigate(action='open_bookings_tab')\n"
+            "   - 'Show future bookings' → ui_navigate(action='open_future_bookings')\n"
+            "   - 'Open photo upload for RFQ' → ui_navigate(action='open_rfq_upload')\n"
+            "   WALLET / PAYMENTS:\n"
+            "   - 'Open my wallet' → ui_navigate(action='open_wallet')\n"
+            "   COMMUNICATION:\n"
+            "   - 'Call my artisan' → ui_navigate(action='call_assigned_artisan', booking_id='...')\n"
+            "   - 'Open support chat' → ui_navigate(action='open_support')\n"
+            "   PROFILE / SETTINGS:\n"
+            "   - 'Open my profile' → ui_navigate(action='open_profile')\n"
+            "   - 'Open settings' → ui_navigate(action='open_settings')\n"
+            "   - 'Open notifications' → ui_navigate(action='open_notifications')\n"
+            "   CALENDAR / MAP:\n"
+            "   - 'Open my calendar' → ui_navigate(action='open_calendar')\n"
+            "   - 'Show the location on map' → ui_navigate(action='open_map', booking_id='...')\n"
+            "   GENERAL NAVIGATION:\n"
+            "   - 'Go to home screen' → ui_navigate(action='go_home')\n"
+            "   - 'Go back' → ui_navigate(action='go_back')\n"
+            "   - 'Close this window/dialog' → ui_navigate(action='close_window')\n"
+            "   - 'Open help / FAQ' → ui_navigate(action='open_help')\n"
+            "5) MESSAGING (Phase 3) - Use backend tools:\n"
+            "   - 'Contact my artisan' → CALL send_message_to_artisan(booking_id='...', message='...')\n"
+            "   - 'I need support' / 'File a complaint' → CALL send_message_to_admin(message='...', booking_id='...', subject='...')\n"
+            "   - 'Show my messages' → CALL get_messages(booking_id='...')\n"
             "   - 'Check my support case' → CALL get_case_status(case_id='...')\n"
             "\nExamples (client):\n"
             "- User: 'What's the status of booking 123?'\n"
             "  You: CALL get_booking_status('123'), then SPEAK: 'Your plumbing booking is in progress. John the plumber is on the way.'\n"
             "- User: 'Dispatch a plumber, my tap is leaking.'\n"
             "  You: CALL create_booking(category_name='Plumbing', problem_description='Leaking tap', ...)\n"
-            "- User: 'Is my artisan on the way?'\n"
-            "  You: CALL send_message_to_artisan(booking_id='123', message='Are you on your way?'), then SPEAK: 'Message sent to the artisan. They'll be notified immediately.'\n"
-            "- User: 'I need to complain about the service quality.'\n"
-            "  You: CALL send_message_to_admin(message='User complaint about service quality', subject='Service Quality Issue', booking_id='123'), then SPEAK: 'I've forwarded your complaint to support. They'll respond shortly.'\n"
+            "- User: 'Open my wallet'\n"
+            "  You: CALL ui_navigate(action='open_wallet'), then say 'Opening your wallet now.'\n"
+            "- User: 'What is my balance?'\n"
+            "  You: CALL get_wallet_balance(), then SPEAK: 'Your wallet balance is R150.'\n"
+            "- User: 'Cancel booking 456'\n"
+            "  You: CALL cancel_booking(booking_id='456', reason='User requested cancellation'), then SPEAK the result.\n"
+            "- User: 'Go back to the home screen'\n"
+            "  You: CALL ui_navigate(action='go_home'), then say 'Going to the home screen.'\n"
         )
 
         artisan_flow = (
             "Artisan workflow (tasks):\n"
-            "- If artisan asks to accept a job/request, you MUST CALL ui_navigate(action='accept_latest_request').\n"
-            "- If artisan asks to reject, you MUST CALL ui_navigate(action='reject_latest_request').\n"
-            "- If artisan asks to open requests, CALL ui_navigate(action='open_artisan_requests').\n"
-            "- If artisan asks for appointments/wallet, use open_artisan_appointments/open_artisan_wallet.\n"
-            "- If artisan says they are starting the job now, CALL ui_navigate(action='mark_booking_in_progress', booking_id='...').\n"
-            "- If artisan needs to cancel and reassign, confirm and CALL ui_navigate(action='artisan_cancel_and_reassign', booking_id='...', additional_notes='reason'). This triggers a reassignment request that may be handled by an admin.\n"
+            "1) JOB MANAGEMENT:\n"
+            "- If artisan asks to accept a job/request → CALL ui_navigate(action='accept_latest_request')\n"
+            "- If artisan asks to reject → CALL ui_navigate(action='reject_latest_request')\n"
+            "- If artisan says they are starting the job → CALL mark_booking_in_progress(booking_id='...')\n"
+            "- If artisan needs to cancel and reassign → CALL artisan_cancel_and_reassign(booking_id='...', reason='...')\n"
+            "2) UI NAVIGATION - Use ui_navigate with these exact action values:\n"
+            "   - 'Show my requests' → ui_navigate(action='open_artisan_requests')\n"
+            "   - 'Show my appointments' → ui_navigate(action='open_artisan_appointments')\n"
+            "   - 'Open my wallet' → ui_navigate(action='open_artisan_wallet')\n"
+            "   - 'Open my calendar' → ui_navigate(action='open_calendar')\n"
+            "   - 'Open my profile' → ui_navigate(action='open_profile')\n"
+            "   - 'Open settings' → ui_navigate(action='open_settings')\n"
+            "   - 'Open notifications' → ui_navigate(action='open_notifications')\n"
+            "   - 'Go home' → ui_navigate(action='go_home')\n"
+            "   - 'Go back' → ui_navigate(action='go_back')\n"
+            "   - 'Close this' → ui_navigate(action='close_window')\n"
+            "   - 'Show the location on map' → ui_navigate(action='open_map', booking_id='...')\n"
+            "3) INFORMATION QUERIES:\n"
+            "   - 'What's my wallet balance?' → CALL get_wallet_balance()\n"
+            "   - 'Show my bookings' → CALL list_my_bookings(status='', limit=5)\n"
+            "   - 'What's the status of booking X?' → CALL get_booking_status(booking_id='...')\n"
+            "4) MESSAGING:\n"
+            "   - 'Contact support' → CALL send_message_to_admin(message='...')\n"
+            "   - 'Show my messages' → CALL get_messages(booking_id='...')\n"
             "- Do not attempt to dispatch artisans while speaking to an artisan.\n"
             "\nExamples (artisan):\n"
             "- User: 'Accept the latest request.'\n"
             "  You: CALL ui_navigate(action='accept_latest_request'), then say 'Done — I accepted it.'\n"
+            "- User: 'What's my balance?'\n"
+            "  You: CALL get_wallet_balance(), then SPEAK the balance.\n"
+            "- User: 'Open my appointments'\n"
+            "  You: CALL ui_navigate(action='open_artisan_appointments'), then say 'Opening your appointments.'\n"
         )
 
         general = (
@@ -416,8 +463,13 @@ async def entrypoint(ctx: JobContext):
     @llm.function_tool(
         description=(
             "Send a UI navigation command to the Square 15 mobile app. "
-            "Use this to open the RFQ photo upload workflow or to ask the app to create an Order booking "
-            "(dispatch nearest artisan) once the user has provided enough details."
+            "Supported actions: create_order_booking, dispatch_artisan, open_rfq_upload, "
+            "open_bookings_tab, open_future_bookings, open_artisan_requests, open_artisan_appointments, "
+            "open_artisan_wallet, accept_latest_request, reject_latest_request, respond_to_request, "
+            "call_assigned_artisan, reschedule_booking, cancel_booking, reassign_booking, "
+            "mark_booking_in_progress, artisan_cancel_and_reassign, "
+            "open_notifications, open_profile, open_settings, open_support, open_wallet, "
+            "open_calendar, open_map, open_help, go_home, go_back, close_window, close_dialog, dismiss."
         )
     )
     async def ui_navigate(
@@ -505,6 +557,28 @@ async def entrypoint(ctx: JobContext):
                 text = "Marking that booking as in progress now."
             elif action == "artisan_cancel_and_reassign":
                 text = "Cancelling and reassigning now. If no nearby artisan is available, an admin will assign one."
+            elif action == "open_notifications":
+                text = "Opening your notifications."
+            elif action == "open_profile":
+                text = "Opening your profile."
+            elif action == "open_settings":
+                text = "Opening settings."
+            elif action in ("open_support", "open_chat_support"):
+                text = "Opening support chat."
+            elif action in ("open_wallet", "open_user_wallet"):
+                text = "Opening your wallet."
+            elif action in ("open_calendar", "open_artisan_calendar"):
+                text = "Opening your calendar."
+            elif action in ("open_map", "show_location"):
+                text = "Showing the location on the map."
+            elif action in ("open_help", "open_faq"):
+                text = "Here are some helpful tips."
+            elif action in ("go_home", "open_dashboard"):
+                text = "Going to the home screen."
+            elif action in ("go_back", "navigate_back"):
+                text = "Going back."
+            elif action in ("close_window", "close_dialog", "dismiss"):
+                text = "Closing that now."
             else:
                 text = "Working on that now."
             meta = {
@@ -937,6 +1011,149 @@ async def entrypoint(ctx: JobContext):
             logger.error(f"get_case_status error: {e}", exc_info=True)
             return "Sorry, I had trouble getting the case status. Please try again."
 
+    # =========================================
+    # Wallet & Booking Management Tools
+    # =========================================
+
+    @llm.function_tool(
+        description=(
+            "Get the user's wallet balance. "
+            "Use this when the user asks 'What's my balance?' or 'How much is in my wallet?'"
+        )
+    )
+    async def get_wallet_balance() -> str:
+        """Get user's wallet balance from backend API."""
+        nonlocal backend_client
+        if not backend_client:
+            return "I need you to be authenticated first. Please make sure you're logged into the app."
+
+        try:
+            result = await backend_client.call_backend_action('get_wallet_balance', {})
+
+            if not result.get('ok') and not result.get('success'):
+                error = result.get('error', 'unknown_error')
+                return f"I couldn't check your wallet balance: {error}"
+
+            data = result.get('data', {})
+            balance = data.get('balance', '0')
+            return f"Your wallet balance is R{balance}."
+
+        except Exception as e:
+            logger.error(f"get_wallet_balance error: {e}", exc_info=True)
+            return "Sorry, I had trouble checking your wallet balance. Please try again."
+
+    @llm.function_tool(
+        description=(
+            "Cancel a booking. Requires: booking_id and reason for cancellation. "
+            "Use this when user asks to cancel a booking."
+        )
+    )
+    async def cancel_booking(booking_id: str, reason: str = "") -> str:
+        """Cancel a booking via backend API."""
+        nonlocal backend_client
+        if not backend_client:
+            return "I need you to be authenticated first."
+
+        try:
+            payload = {'booking_id': booking_id, 'reason': reason or 'User requested cancellation'}
+            result = await backend_client.call_backend_action('cancel_booking', payload)
+
+            if not result.get('ok') and not result.get('success'):
+                error = result.get('error', 'unknown_error')
+                if error == 'booking_not_found':
+                    return f"I couldn't find booking {booking_id}."
+                return f"I couldn't cancel the booking: {error}"
+
+            return f"Booking {booking_id} has been cancelled successfully."
+        except Exception as e:
+            logger.error(f"cancel_booking error: {e}", exc_info=True)
+            return "Sorry, I had trouble cancelling the booking. Please try again."
+
+    @llm.function_tool(
+        description=(
+            "Reschedule a booking to a new date and/or time. "
+            "Requires: booking_id. Optional: scheduled_date, scheduled_time. "
+            "Use this when user wants to change the time of their booking."
+        )
+    )
+    async def reschedule_booking(booking_id: str, scheduled_date: str = "", scheduled_time: str = "") -> str:
+        """Reschedule a booking via backend API."""
+        nonlocal backend_client
+        if not backend_client:
+            return "I need you to be authenticated first."
+
+        if not scheduled_date and not scheduled_time:
+            return "I need at least a new date or time to reschedule. When would you like to reschedule to?"
+
+        try:
+            payload = {
+                'booking_id': booking_id,
+                'scheduled_date': scheduled_date or '',
+                'scheduled_time': scheduled_time or '',
+            }
+            result = await backend_client.call_backend_action('reschedule_booking', payload)
+
+            if not result.get('ok') and not result.get('success'):
+                error = result.get('error', 'unknown_error')
+                if error == 'booking_not_found':
+                    return f"I couldn't find booking {booking_id}."
+                return f"I couldn't reschedule: {error}"
+
+            return f"Booking {booking_id} has been rescheduled to {scheduled_date} {scheduled_time}."
+        except Exception as e:
+            logger.error(f"reschedule_booking error: {e}", exc_info=True)
+            return "Sorry, I had trouble rescheduling. Please try again."
+
+    @llm.function_tool(
+        description=(
+            "Mark a booking as in-progress. Use this when artisan says they are starting work. "
+            "Requires: booking_id."
+        )
+    )
+    async def mark_booking_in_progress(booking_id: str) -> str:
+        """Mark booking as in-progress via backend API."""
+        nonlocal backend_client
+        if not backend_client:
+            return "I need you to be authenticated first."
+
+        try:
+            payload = {'booking_id': booking_id}
+            result = await backend_client.call_backend_action('mark_booking_in_progress', payload)
+
+            if not result.get('ok') and not result.get('success'):
+                error = result.get('error', 'unknown_error')
+                return f"I couldn't update the booking: {error}"
+
+            return f"Booking {booking_id} is now marked as in-progress."
+        except Exception as e:
+            logger.error(f"mark_booking_in_progress error: {e}", exc_info=True)
+            return "Sorry, I had trouble updating the booking status. Please try again."
+
+    @llm.function_tool(
+        description=(
+            "Cancel current artisan assignment and request reassignment to a new artisan. "
+            "Use this when artisan needs to hand off a job. Requires: booking_id, reason."
+        )
+    )
+    async def artisan_cancel_and_reassign(booking_id: str, reason: str = "") -> str:
+        """Cancel artisan and reassign via backend API."""
+        nonlocal backend_client
+        if not backend_client:
+            return "I need you to be authenticated first."
+
+        try:
+            payload = {'booking_id': booking_id, 'reason': reason or 'Artisan requested reassignment'}
+            result = await backend_client.call_backend_action('artisan_cancel_and_reassign', payload)
+
+            if not result.get('ok') and not result.get('success'):
+                error = result.get('error', 'unknown_error')
+                return f"I couldn't reassign: {error}"
+
+            return f"Booking {booking_id} is being reassigned to a new artisan. If no one is available nearby, an admin will handle it."
+        except Exception as e:
+            logger.error(f"artisan_cancel_and_reassign error: {e}", exc_info=True)
+            return "Sorry, I had trouble with the reassignment. Please try again."
+
     agent = voice.Agent(
         vad=vad,
         stt=openai.STT(model="whisper-1", language="en"),
@@ -948,17 +1165,24 @@ async def entrypoint(ctx: JobContext):
     logger.info("🚀 Starting agent session...")
     session = voice.AgentSession(tools=[
         ui_navigate,
+        # Read-only backend tools
         get_booking_status,
         list_my_bookings,
         explain_quote,
         check_payment,
+        get_wallet_balance,
+        # Write backend tools
         create_booking,
+        cancel_booking,
+        reschedule_booking,
+        mark_booking_in_progress,
+        artisan_cancel_and_reassign,
         # Phase 3: Messaging tools
         send_message_to_artisan,
         send_message_to_admin,
         get_messages,
         # Phase 3: Case management
-        get_case_status
+        get_case_status,
     ])
 
     # Guardrail: never allow internal/tool narration to reach TTS.

@@ -178,9 +178,22 @@ function ensureActionAllowed({ action, actorRole }) {
     explain_rfq_quote: { roles: ['client', 'admin', 'artisan'] },
     get_payment_status: { roles: ['client', 'admin', 'artisan'] },
     get_wallet_balance: { roles: ['client', 'admin', 'artisan'] },
+    get_messages: { roles: ['client', 'admin', 'artisan'] },
+    get_case_status: { roles: ['client', 'admin', 'artisan'] },
 
     // Write actions
     create_order_booking: { roles: ['client', 'admin'] },
+    cancel_booking: { roles: ['client', 'admin'] },
+    reschedule_booking: { roles: ['client', 'admin'] },
+    dispatch_artisan: { roles: ['client', 'admin'] },
+    mark_booking_in_progress: { roles: ['artisan', 'admin'] },
+    request_reassignment: { roles: ['client', 'admin'] },
+    artisan_cancel_and_reassign: { roles: ['artisan', 'admin'] },
+    reassign_booking: { roles: ['admin'] },
+
+    // Messaging
+    send_message_to_artisan: { roles: ['client', 'admin'] },
+    send_message_to_admin: { roles: ['client', 'artisan'] },
   };
 
   const p = policies[action];
@@ -411,6 +424,8 @@ const ACTION_TIERS = Object.freeze({
   explain_rfq_quote: 'A',
   get_payment_status: 'A',
   get_wallet_balance: 'A',
+  get_messages: 'A',
+  get_case_status: 'A',
   create_order_booking: 'B',
   create_order_booking_order: 'B',
   dispatch_artisan: 'B',
@@ -420,6 +435,8 @@ const ACTION_TIERS = Object.freeze({
   request_reassignment: 'B',
   artisan_cancel_and_reassign: 'B',
   reassign_booking: 'B',
+  send_message_to_artisan: 'B',
+  send_message_to_admin: 'B',
 });
 
 function actionTier(action) {
@@ -571,6 +588,19 @@ function validateActionExecuteBody(body) {
     'get_payment_status',
     'get_wallet_balance',
     'create_order_booking',
+    // Write operations
+    'cancel_booking',
+    'reschedule_booking',
+    'mark_booking_in_progress',
+    'dispatch_artisan',
+    'request_reassignment',
+    'artisan_cancel_and_reassign',
+    'reassign_booking',
+    // Messaging & Cases
+    'send_message_to_artisan',
+    'send_message_to_admin',
+    'get_messages',
+    'get_case_status',
   ]);
   if (action && !supportedActions.has(action)) {
     errors.push({ field: 'action', message: `Unsupported action: ${action}` });
@@ -1049,6 +1079,382 @@ async function handleCreateOrderBooking({ firestore, actorUid, actorRole, payloa
   };
 }
 
+// =========================================
+// Phase 2+: Write operation handlers (Tier B)
+// =========================================
+
+async function handleCancelBooking({ firestore, actorUid, actorRole, payload }) {
+  if (!actorUid) return { ok: false, status: 401, error: 'unauthorized' };
+
+  const bookingId = String(payload.booking_id || payload.bookingId || '').trim();
+  if (!bookingId) return { ok: false, status: 400, error: 'missing_booking_id' };
+
+  const ref = firestore.collection('futureBookings').doc(bookingId);
+  const snap = await ref.get();
+  if (!snap.exists) return { ok: false, status: 404, error: 'booking_not_found' };
+
+  const booking = snap.data() || {};
+  const bookingUserId = String(booking.user_id || booking.client_id || '').trim();
+
+  // Only the booking owner or admin can cancel
+  if (actorRole !== 'admin' && bookingUserId !== actorUid) {
+    return { ok: false, status: 403, error: 'forbidden' };
+  }
+
+  const reason = safeTrimString(payload.reason || payload.additional_notes || '', { maxLen: 1000 });
+
+  await ref.update({
+    status: 'cancelled',
+    cancellation_reason: reason,
+    cancelled_by: actorUid,
+    cancelled_at: nowIso(),
+    updated_at: nowIso(),
+  });
+
+  await writeNotification({
+    firestore, userId: bookingUserId, userType: 'user',
+    title: 'Booking Cancelled',
+    message: `Booking ${bookingId} has been cancelled.${reason ? ' Reason: ' + reason : ''}`,
+    type: 'booking_update', data: { booking_id: bookingId, status: 'cancelled' },
+  });
+
+  return { ok: true, status: 200, data: { booking_id: bookingId, status: 'cancelled' } };
+}
+
+async function handleRescheduleBooking({ firestore, actorUid, actorRole, payload }) {
+  if (!actorUid) return { ok: false, status: 401, error: 'unauthorized' };
+
+  const bookingId = String(payload.booking_id || payload.bookingId || '').trim();
+  if (!bookingId) return { ok: false, status: 400, error: 'missing_booking_id' };
+
+  const ref = firestore.collection('futureBookings').doc(bookingId);
+  const snap = await ref.get();
+  if (!snap.exists) return { ok: false, status: 404, error: 'booking_not_found' };
+
+  const booking = snap.data() || {};
+  const bookingUserId = String(booking.user_id || booking.client_id || '').trim();
+
+  if (actorRole !== 'admin' && bookingUserId !== actorUid) {
+    return { ok: false, status: 403, error: 'forbidden' };
+  }
+
+  const scheduledDate = safeTrimString(payload.scheduled_date || '', { maxLen: 50 });
+  const scheduledTime = safeTrimString(payload.scheduled_time || '', { maxLen: 50 });
+
+  if (!scheduledDate && !scheduledTime) {
+    return { ok: false, status: 400, error: 'missing_schedule', message: 'Provide scheduled_date or scheduled_time' };
+  }
+
+  const updates = { updated_at: nowIso() };
+  if (scheduledDate) updates.scheduled_date = scheduledDate;
+  if (scheduledTime) updates.scheduled_time = scheduledTime;
+
+  await ref.update(updates);
+
+  // Notify artisan if assigned
+  const artisanId = String(booking.artisan_id || booking.assigned_artisan_id || '').trim();
+  if (artisanId) {
+    await writeNotification({
+      firestore, userId: artisanId, userType: 'artisan',
+      title: 'Booking Rescheduled',
+      message: `Booking ${bookingId} has been rescheduled to ${scheduledDate} ${scheduledTime}.`,
+      type: 'booking_update', data: { booking_id: bookingId },
+    });
+  }
+
+  await writeNotification({
+    firestore, userId: bookingUserId, userType: 'user',
+    title: 'Booking Rescheduled',
+    message: `Your booking has been rescheduled to ${scheduledDate} ${scheduledTime}.`,
+    type: 'booking_update', data: { booking_id: bookingId },
+  });
+
+  return { ok: true, status: 200, data: { booking_id: bookingId, scheduled_date: scheduledDate, scheduled_time: scheduledTime } };
+}
+
+async function handleMarkBookingInProgress({ firestore, actorUid, actorRole, payload }) {
+  if (!actorUid) return { ok: false, status: 401, error: 'unauthorized' };
+
+  const bookingId = String(payload.booking_id || payload.bookingId || '').trim();
+  if (!bookingId) return { ok: false, status: 400, error: 'missing_booking_id' };
+
+  const ref = firestore.collection('futureBookings').doc(bookingId);
+  const snap = await ref.get();
+  if (!snap.exists) return { ok: false, status: 404, error: 'booking_not_found' };
+
+  await ref.update({
+    status: 'in_progress',
+    started_at: nowIso(),
+    updated_at: nowIso(),
+  });
+
+  const booking = snap.data() || {};
+  const bookingUserId = String(booking.user_id || booking.client_id || '').trim();
+  await writeNotification({
+    firestore, userId: bookingUserId, userType: 'user',
+    title: 'Work Started',
+    message: `The artisan has started work on booking ${bookingId}.`,
+    type: 'booking_update', data: { booking_id: bookingId, status: 'in_progress' },
+  });
+
+  return { ok: true, status: 200, data: { booking_id: bookingId, status: 'in_progress' } };
+}
+
+async function handleDispatchArtisan({ firestore, actorUid, actorRole, payload }) {
+  // Alias for create_order_booking with dispatch semantics
+  return handleCreateOrderBooking({ firestore, actorUid, actorRole, payload });
+}
+
+async function handleRequestReassignment({ firestore, actorUid, actorRole, payload }) {
+  if (!actorUid) return { ok: false, status: 401, error: 'unauthorized' };
+
+  const bookingId = String(payload.booking_id || payload.bookingId || '').trim();
+  if (!bookingId) return { ok: false, status: 400, error: 'missing_booking_id' };
+
+  const ref = firestore.collection('futureBookings').doc(bookingId);
+  const snap = await ref.get();
+  if (!snap.exists) return { ok: false, status: 404, error: 'booking_not_found' };
+
+  const reason = safeTrimString(payload.reason || payload.additional_notes || '', { maxLen: 1000 });
+
+  await ref.update({
+    status: 'pending_reassignment',
+    reassignment_reason: reason,
+    reassignment_requested_by: actorUid,
+    reassignment_requested_at: nowIso(),
+    updated_at: nowIso(),
+  });
+
+  await writeNotification({
+    firestore, userId: 'admin', userType: 'admin',
+    title: 'Reassignment Requested',
+    message: `Reassignment requested for booking ${bookingId}.${reason ? ' Reason: ' + reason : ''}`,
+    type: 'reassignment', data: { booking_id: bookingId },
+  });
+
+  return { ok: true, status: 200, data: { booking_id: bookingId, status: 'pending_reassignment' } };
+}
+
+async function handleArtisanCancelAndReassign({ firestore, actorUid, actorRole, payload }) {
+  if (!actorUid) return { ok: false, status: 401, error: 'unauthorized' };
+
+  const bookingId = String(payload.booking_id || payload.bookingId || '').trim();
+  if (!bookingId) return { ok: false, status: 400, error: 'missing_booking_id' };
+
+  const ref = firestore.collection('futureBookings').doc(bookingId);
+  const snap = await ref.get();
+  if (!snap.exists) return { ok: false, status: 404, error: 'booking_not_found' };
+
+  const reason = safeTrimString(payload.reason || payload.additional_notes || '', { maxLen: 1000 });
+
+  await ref.update({
+    status: 'pending_reassignment',
+    previous_artisan_id: actorUid,
+    artisan_id: null,
+    assigned_artisan_id: null,
+    artisan_cancellation_reason: reason,
+    artisan_cancelled_at: nowIso(),
+    updated_at: nowIso(),
+  });
+
+  await writeNotification({
+    firestore, userId: 'admin', userType: 'admin',
+    title: 'Artisan Cancelled — Needs Reassignment',
+    message: `Artisan cancelled booking ${bookingId}. Needs reassignment.${reason ? ' Reason: ' + reason : ''}`,
+    type: 'reassignment', data: { booking_id: bookingId },
+  });
+
+  return { ok: true, status: 200, data: { booking_id: bookingId, status: 'pending_reassignment' } };
+}
+
+async function handleReassignBooking({ firestore, actorUid, actorRole, payload }) {
+  // Admin-only: reassign to specific artisan
+  if (actorRole !== 'admin') return { ok: false, status: 403, error: 'forbidden' };
+
+  const bookingId = String(payload.booking_id || payload.bookingId || '').trim();
+  if (!bookingId) return { ok: false, status: 400, error: 'missing_booking_id' };
+
+  const newArtisanId = String(payload.artisan_id || payload.new_artisan_id || '').trim();
+  if (!newArtisanId) return { ok: false, status: 400, error: 'missing_artisan_id' };
+
+  const ref = firestore.collection('futureBookings').doc(bookingId);
+  const snap = await ref.get();
+  if (!snap.exists) return { ok: false, status: 404, error: 'booking_not_found' };
+
+  await ref.update({
+    artisan_id: newArtisanId,
+    assigned_artisan_id: newArtisanId,
+    status: 'pending_assignment',
+    updated_at: nowIso(),
+  });
+
+  await writeNotification({
+    firestore, userId: newArtisanId, userType: 'artisan',
+    title: 'New Job Assignment',
+    message: `You have been assigned to booking ${bookingId}.`,
+    type: 'job_assignment', data: { booking_id: bookingId },
+  });
+
+  return { ok: true, status: 200, data: { booking_id: bookingId, artisan_id: newArtisanId } };
+}
+
+// =========================================
+// Phase 3: Messaging & Case Management handlers
+// =========================================
+
+async function handleSendMessageToArtisan({ firestore, actorUid, actorRole, payload }) {
+  if (!actorUid) return { ok: false, status: 401, error: 'unauthorized' };
+
+  const bookingId = String(payload.booking_id || payload.bookingId || '').trim();
+  if (!bookingId) return { ok: false, status: 400, error: 'missing_booking_id' };
+
+  const message = safeTrimString(payload.message || '', { maxLen: 2000 });
+  if (!message) return { ok: false, status: 400, error: 'missing_message' };
+
+  const bookingSnap = await firestore.collection('futureBookings').doc(bookingId).get();
+  if (!bookingSnap.exists) return { ok: false, status: 404, error: 'booking_not_found' };
+
+  const booking = bookingSnap.data() || {};
+  const artisanId = String(booking.artisan_id || booking.assigned_artisan_id || '').trim();
+  if (!artisanId) return { ok: false, status: 400, error: 'no_artisan_assigned' };
+
+  // Look up or create the tasks_management doc for chat
+  const tasksManagementId = String(booking.tasks_management_id || booking.tasksManagementId || '').trim();
+  let chatCollection;
+  if (tasksManagementId) {
+    chatCollection = firestore.collection('tasks_management').doc(tasksManagementId).collection('chat');
+  } else {
+    // Fallback: store chat under the booking itself
+    chatCollection = firestore.collection('futureBookings').doc(bookingId).collection('chat');
+  }
+
+  await chatCollection.add({
+    sender_id: actorUid,
+    receiver_id: artisanId,
+    message,
+    type: 'text',
+    read: false,
+    created_at: nowIso(),
+  });
+
+  await writeNotification({
+    firestore, userId: artisanId, userType: 'artisan',
+    title: 'New Message',
+    message: `Client sent you a message regarding booking ${bookingId}.`,
+    type: 'chat_message', data: { booking_id: bookingId },
+  });
+
+  return { ok: true, status: 200, data: { sent: true, to: artisanId } };
+}
+
+async function handleSendMessageToAdmin({ firestore, actorUid, actorRole, payload }) {
+  if (!actorUid) return { ok: false, status: 401, error: 'unauthorized' };
+
+  const message = safeTrimString(payload.message || '', { maxLen: 2000 });
+  if (!message) return { ok: false, status: 400, error: 'missing_message' };
+
+  const subject = safeTrimString(payload.subject || 'Support Request', { maxLen: 200 });
+  const bookingId = String(payload.booking_id || payload.bookingId || '').trim();
+
+  // Create a support case
+  const caseRef = firestore.collection('support_cases').doc();
+  const caseId = caseRef.id;
+  await caseRef.set({
+    case_id: caseId,
+    user_id: actorUid,
+    user_role: actorRole || 'client',
+    subject,
+    message,
+    booking_id: bookingId || null,
+    state: 'open',
+    created_at: nowIso(),
+    updated_at: nowIso(),
+  });
+
+  await writeNotification({
+    firestore, userId: 'admin', userType: 'admin',
+    title: `Support: ${subject}`,
+    message: `New support case from user. ${message.slice(0, 100)}${message.length > 100 ? '...' : ''}`,
+    type: 'support_case', data: { case_id: caseId, booking_id: bookingId },
+  });
+
+  return { ok: true, status: 200, data: { case_id: caseId, sent: true }, result: { case_id: caseId } };
+}
+
+async function handleGetMessages({ firestore, actorUid, actorRole, payload }) {
+  if (!actorUid) return { ok: false, status: 401, error: 'unauthorized' };
+
+  const bookingId = String(payload.booking_id || payload.bookingId || '').trim();
+  const tasksManagementId = String(payload.tasks_management_id || payload.tasksManagementId || '').trim();
+
+  if (!bookingId && !tasksManagementId) {
+    return { ok: false, status: 400, error: 'missing_booking_id', message: 'Provide booking_id or tasks_management_id' };
+  }
+
+  let chatCollection;
+  if (tasksManagementId) {
+    chatCollection = firestore.collection('tasks_management').doc(tasksManagementId).collection('chat');
+  } else if (bookingId) {
+    // Try to resolve tasks_management_id from booking
+    const bookingSnap = await firestore.collection('futureBookings').doc(bookingId).get();
+    if (!bookingSnap.exists) return { ok: false, status: 404, error: 'booking_not_found' };
+
+    const booking = bookingSnap.data() || {};
+    const tmId = String(booking.tasks_management_id || booking.tasksManagementId || '').trim();
+    if (tmId) {
+      chatCollection = firestore.collection('tasks_management').doc(tmId).collection('chat');
+    } else {
+      chatCollection = firestore.collection('futureBookings').doc(bookingId).collection('chat');
+    }
+  }
+
+  const limit = Math.min(Number(payload.limit) || 20, 50);
+  const snap = await chatCollection.orderBy('created_at', 'desc').limit(limit).get();
+  const messages = [];
+  snap.forEach(doc => {
+    messages.push({ id: doc.id, ...doc.data() });
+  });
+
+  return { ok: true, status: 200, data: { messages: messages.reverse(), count: messages.length }, result: { messages: messages.reverse() } };
+}
+
+async function handleGetCaseStatus({ firestore, actorUid, actorRole, payload }) {
+  if (!actorUid) return { ok: false, status: 401, error: 'unauthorized' };
+
+  const caseId = String(payload.case_id || payload.caseId || '').trim();
+  if (!caseId) return { ok: false, status: 400, error: 'missing_case_id' };
+
+  const snap = await firestore.collection('support_cases').doc(caseId).get();
+  if (!snap.exists) return { ok: false, status: 404, error: 'case_not_found' };
+
+  const caseData = snap.data() || {};
+
+  // Only the case owner or admin can view
+  if (actorRole !== 'admin' && String(caseData.user_id || '') !== actorUid) {
+    return { ok: false, status: 403, error: 'forbidden' };
+  }
+
+  return {
+    ok: true,
+    status: 200,
+    data: {
+      case_id: caseId,
+      state: caseData.state || 'unknown',
+      subject: caseData.subject || '',
+      type: caseData.type || 'support',
+      message: caseData.message || '',
+      created_at: caseData.created_at || '',
+      updated_at: caseData.updated_at || '',
+    },
+    result: {
+      case_id: caseId,
+      state: caseData.state || 'unknown',
+      subject: caseData.subject || '',
+      type: caseData.type || 'support',
+    },
+  };
+}
+
 const ACTION_HANDLERS = {
   get_booking_status: handleGetBookingStatus,
   list_user_bookings: handleListUserBookings,
@@ -1056,6 +1462,19 @@ const ACTION_HANDLERS = {
   get_payment_status: handleGetPaymentStatus,
   get_wallet_balance: handleGetWalletBalance,
   create_order_booking: handleCreateOrderBooking,
+  // Phase 2+: Write operations
+  cancel_booking: handleCancelBooking,
+  reschedule_booking: handleRescheduleBooking,
+  mark_booking_in_progress: handleMarkBookingInProgress,
+  dispatch_artisan: handleDispatchArtisan,
+  request_reassignment: handleRequestReassignment,
+  artisan_cancel_and_reassign: handleArtisanCancelAndReassign,
+  reassign_booking: handleReassignBooking,
+  // Phase 3: Messaging & Cases
+  send_message_to_artisan: handleSendMessageToArtisan,
+  send_message_to_admin: handleSendMessageToAdmin,
+  get_messages: handleGetMessages,
+  get_case_status: handleGetCaseStatus,
 };
 
 async function executeAction({ firestore, action, actorUid, actorRole, payload, context }) {
