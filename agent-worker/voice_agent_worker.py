@@ -18,6 +18,8 @@ from livekit.agents import llm
 from livekit.plugins import openai, silero
 from livekit import rtc
 import json
+import aiohttp
+from typing import Optional, Dict, Any
 
 
 logging.basicConfig(
@@ -35,6 +37,12 @@ _FORBIDDEN_SPEECH_PATTERNS = [
     re.compile(r"\bsquare15_ui\b", re.IGNORECASE),
     re.compile(r"\bsquare15_app\b", re.IGNORECASE),
     re.compile(r"\bSQUARE15_UI\b", re.IGNORECASE),
+    # Prevent agent from saying "loading/opening/opened" phrases when it cannot actually load/see anything
+    re.compile(r"\b(?:i\s+am\s+)?loading\s+(?:the\s+)?(?:picture|photo|image)s?\b", re.IGNORECASE),
+    re.compile(r"\b(?:let\s+me\s+)?(?:load|check)\s+(?:the\s+)?(?:picture|photo|image)s?\b", re.IGNORECASE),
+    re.compile(r"\bopening\s+(?:the\s+)?(?:picture|photo|image)s?\b", re.IGNORECASE),
+    re.compile(r"\b(?:i\s+have\s+)?opened\s+(?:the\s+)?(?:picture|photo|image)\s+(?:upload|screen)\b", re.IGNORECASE),
+    re.compile(r"\bopening\s+(?:picture|photo|image)\s+upload\b", re.IGNORECASE),
 ]
 
 
@@ -74,6 +82,136 @@ except Exception as e:
     logger.info(f"dotenv not loaded (ok on Render): {e}")
 
 
+# Backend API client for Square15
+class BackendAPIClient:
+    """Client for calling Square15 backend action endpoints."""
+
+    def __init__(self, base_url: str, firebase_token: Optional[str] = None, session_id: Optional[str] = None, session_nonce: Optional[str] = None):
+        self.base_url = base_url.rstrip('/')
+        self.firebase_token = firebase_token
+        self.session_id = session_id
+        self.session_nonce = session_nonce
+        self.timeout = aiohttp.ClientTimeout(total=30)
+
+    def _get_headers(self) -> Dict[str, str]:
+        headers = {
+            'Content-Type': 'application/json',
+        }
+        if self.firebase_token:
+            headers['Authorization'] = f'Bearer {self.firebase_token}'
+        return headers
+
+    def _get_context(self) -> Dict[str, Any]:
+        """Build context object for session binding."""
+        ctx = {}
+        if self.session_id:
+            ctx['session_id'] = self.session_id
+        if self.session_nonce:
+            ctx['session_nonce'] = self.session_nonce
+        return ctx
+
+    async def get_booking_status(self, booking_id: str) -> Dict[str, Any]:
+        """Get booking status from backend."""
+        async with aiohttp.ClientSession(timeout=self.timeout) as session:
+            payload = {
+                'action': 'get_booking_status',
+                'payload': {'booking_id': booking_id},
+                'context': self._get_context(),
+            }
+            async with session.post(
+                f'{self.base_url}/api/action/execute',
+                json=payload,
+                headers=self._get_headers()
+            ) as resp:
+                return await resp.json()
+
+    async def list_user_bookings(self, status: Optional[str] = None, limit: int = 10) -> Dict[str, Any]:
+        """List user's bookings."""
+        async with aiohttp.ClientSession(timeout=self.timeout) as session:
+            payload = {
+                'action': 'list_user_bookings',
+                'payload': {'status': status or '', 'limit': limit},
+                'context': self._get_context(),
+            }
+            async with session.post(
+                f'{self.base_url}/api/action/execute',
+                json=payload,
+                headers=self._get_headers()
+            ) as resp:
+                return await resp.json()
+
+    async def explain_rfq_quote(self, booking_id: str) -> Dict[str, Any]:
+        """Explain RFQ quote details."""
+        async with aiohttp.ClientSession(timeout=self.timeout) as session:
+            payload = {
+                'action': 'explain_rfq_quote',
+                'payload': {'booking_id': booking_id},
+                'context': self._get_context(),
+            }
+            async with session.post(
+                f'{self.base_url}/api/action/execute',
+                json=payload,
+                headers=self._get_headers()
+            ) as resp:
+                return await resp.json()
+
+    async def get_payment_status(self, booking_id: str) -> Dict[str, Any]:
+        """Get payment status."""
+        async with aiohttp.ClientSession(timeout=self.timeout) as session:
+            payload = {
+                'action': 'get_payment_status',
+                'payload': {'tasks_management_id': booking_id},
+                'context': self._get_context(),
+            }
+            async with session.post(
+                f'{self.base_url}/api/action/execute',
+                json=payload,
+                headers=self._get_headers()
+            ) as resp:
+                return await resp.json()
+
+    async def call_backend_action(self, action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Generic action executor via /api/action/execute."""
+        async with aiohttp.ClientSession(timeout=self.timeout) as session:
+            body = {
+                'action': action,
+                'payload': payload,
+                'context': self._get_context(),
+            }
+            async with session.post(
+                f'{self.base_url}/api/action/execute',
+                json=body,
+                headers=self._get_headers()
+            ) as resp:
+                return await resp.json()
+
+    async def propose_action(self, action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Propose an action (Phase 1 proposal)."""
+        async with aiohttp.ClientSession(timeout=self.timeout) as session:
+            body = {
+                'action': action,
+                'payload': payload,
+                'context': self._get_context(),
+            }
+            async with session.post(
+                f'{self.base_url}/api/action/propose',
+                json=body,
+                headers=self._get_headers()
+            ) as resp:
+                return await resp.json()
+
+    async def confirm_action(self, proposal_id: str) -> Dict[str, Any]:
+        """Confirm a proposed action (Phase 1 confirmation)."""
+        async with aiohttp.ClientSession(timeout=self.timeout) as session:
+            body = {'proposalId': proposal_id}
+            async with session.post(
+                f'{self.base_url}/api/action/confirm',
+                json=body,
+                headers=self._get_headers()
+            ) as resp:
+                return await resp.json()
+
+
 async def entrypoint(ctx: JobContext):
     room_name = ctx.room.name
     logger.info(f"🎯 New job received for room: {room_name}")
@@ -82,6 +220,16 @@ async def entrypoint(ctx: JobContext):
     if not openai_key:
         logger.error("❌ OPENAI_API_KEY not set!")
         return
+
+    # Backend API configuration
+    backend_url = os.getenv("BACKEND_API_URL", "https://square15-livekit-backend.onrender.com")
+    logger.info(f"📡 Backend API URL: {backend_url}")
+
+    # Initialize backend client (will be updated with token/session after voice start)
+    backend_client = None
+    firebase_token = None
+    session_id = None
+    session_nonce = None
 
     logger.info(f"📡 Connecting to room: {room_name}")
 
@@ -178,32 +326,61 @@ async def entrypoint(ctx: JobContext):
         # These rules are written to maximize tool-calling reliability.
         hard_rules = (
             "Hard rules (must follow):\n"
-            "- Always introduce yourself as Lizzy.\n"
-            "- If the user asks your name (e.g. 'what is your name?'), reply exactly: 'I am Lizzy, how can I help you today?'\n"
-            "- If the user asks you to DO something in the app, you MUST call ui_navigate.\n"
-            "- Never say you cannot access the app. The way you act in the app is by calling ui_navigate.\n"
-            "- When you are ready to dispatch/accept/reject/call, CALL ui_navigate immediately, then confirm in 1 sentence.\n"
-            "- Do NOT say 'I will open/dispatch...' unless you have called ui_navigate in that same turn.\n"
-            "- Never SAY or narrate tool calls. Do not say phrases like 'calling ui_navigate' or 'calling UI navigator'.\n"
+            "- Your name is Lizzy. Only state your name once at the start, never repeat it.\n"
+            "- CRITICAL: When the user asks you to DO something (perform a task, open a screen, check a booking, etc.), you MUST call the appropriate tool. NEVER just reply with your name or greeting.\n"
+            "- CRITICAL: NEVER repeat your introduction or greeting. If you already greeted the user, do NOT say 'I am Lizzy, how can I help you today?' again. Just help them.\n"
+            "- You have TWO types of tools: BACKEND tools (get info/execute actions) and UI tools (ui_navigate).\n"
+            "- For QUERIES (status/info requests), use BACKEND tools: get_booking_status, list_my_bookings, explain_quote, check_payment.\n"
+            "- For UI NAVIGATION (opening screens), use ui_navigate.\n"
+            "- For WRITE OPERATIONS (create/cancel bookings), use create_booking which handles propose→confirm automatically.\n"
+            "- For MESSAGING (contact artisan/support), use: send_message_to_artisan, send_message_to_admin, get_messages.\n"
+            "- For SUPPORT CASES, use: get_case_status.\n"
+            "- For WALLET BALANCE, use: get_wallet_balance.\n"
+            "- For CLOSING screens/dialogs, use: ui_navigate with action='close_window' or 'close_dialog' or 'dismiss'.\n"
+            "- Never SAY or narrate tool calls. Do not say phrases like 'calling get_booking_status'.\n"
             "- Never speak JSON, code, function names, or metadata. Only speak user-facing sentences.\n"
-            "- Never get stuck: do not say 'checking availability' unless you are calling ui_navigate in the SAME turn.\n"
+            "- CRITICAL: NEVER say you are 'loading', 'checking', 'opening', or 'opened' pictures/photos/images or upload screens.\n"
+            "- CRITICAL: NEVER claim a screen has opened unless you can verify it. Say 'When it appears' not 'I opened it'.\n"
+            "- If user asks about pictures, tell them to check the app directly. Do NOT pretend to see or open images.\n"
+            "- When backend tools return data, SPEAK the information naturally to the user.\n"
+            "- If backend auth fails, explain user needs to be logged in and try ui_navigate to help them.\n"
+            "- If the user says 'now', 'asap', 'urgent', or 'emergency', use scheduled_date='now' and scheduled_time='now'.\n"
             "- Speak naturally (not robotic). Keep it concise (1-3 short sentences).\n"
         )
 
         client_flow = (
-            "Client workflow (PHOTOS-FIRST dispatch):\n"
-            "1) Identify the trade/category from symptoms. If unclear, ask ONE clarifying question.\n"
-            "2) Collect the minimum details needed: category_name + problem_description.\n"
-            "3) CRITICAL: As soon as you have category + description, you MUST open photo upload FIRST.\n"
-            "   CALL ui_navigate(action='dispatch_artisan', category_name=..., problem_description=..., require_photos=True).\n"
-            "   The app will enforce minimum 3 photos, then automatically dispatch after photos are uploaded.\n"
-            "4) Only ask scheduling/location if the user specifically wants a different time or address.\n"
-            "   If needed, include scheduled_date/scheduled_time and/or service_address in the same ui_navigate call.\n"
-            "5) For RFQ (big/complex/needs quote/unclear), CALL ui_navigate(action='open_rfq_upload').\n"
-            "6) If the user asks to call the assigned artisan, CALL ui_navigate(action='call_assigned_artisan').\n"
+            "Client workflow:\n"
+            "1) INFORMATION QUERIES - Use backend tools:\n"
+            "   - 'What's my booking status?' → CALL get_booking_status(booking_id='...')\n"
+            "   - 'Show my bookings' → CALL list_my_bookings(status='', limit=5)\n"
+            "   - 'Explain my quote' → CALL explain_quote(booking_id='...')\n"
+            "   - 'Did I pay?' → CALL check_payment(booking_id='...')\n"
+            "   Then SPEAK the result naturally.\n"
+            "2) CREATE BOOKING - Use backend tool:\n"
+            "   - Identify category from symptoms. If unclear, ask ONE question.\n"
+            "   - Collect: category_name + problem_description.\n"
+            "   - CALL create_booking(category_name='...', problem_description='...', ...)\n"
+            "   - This handles proposal→confirmation automatically.\n"
+            "   - For RFQ (complex/needs quote), use is_rfq='yes'.\n"
+            "3) UI NAVIGATION - Use ui_navigate:\n"
+            "   - Open RFQ photo upload: ui_navigate(action='open_rfq_upload')\n"
+            "   - Call artisan: ui_navigate(action='call_assigned_artisan')\n"
+            "   - Reschedule (UI flow): ui_navigate(action='reschedule_booking', booking_id='...', scheduled_date='...', scheduled_time='...')\n"
+            "   - Cancel (UI flow): ui_navigate(action='cancel_booking', booking_id='...', additional_notes='reason')\n"
+            "4) MESSAGING (Phase 3) - Use backend tools:\n"
+            "   - 'Contact my artisan' / 'Is the artisan on the way?' → CALL send_message_to_artisan(booking_id='...', message='...')\n"
+            "   - 'I need to talk to support' / 'File a complaint' → CALL send_message_to_admin(message='...', booking_id='...', subject='...')\n"
+            "   - 'Show my messages' / 'What did the artisan say?' → CALL get_messages(booking_id='...')\n"
+            "   - 'Check my support case' → CALL get_case_status(case_id='...')\n"
             "\nExamples (client):\n"
-            "- User: 'I need a plumber, my tap is leaking.'\n"
-            "  You: CALL ui_navigate(action='dispatch_artisan', category_name='Plumbing', problem_description='Leaking tap', require_photos=True), then say 'Opening photo upload now.'\n"
+            "- User: 'What's the status of booking 123?'\n"
+            "  You: CALL get_booking_status('123'), then SPEAK: 'Your plumbing booking is in progress. John the plumber is on the way.'\n"
+            "- User: 'Dispatch a plumber, my tap is leaking.'\n"
+            "  You: CALL create_booking(category_name='Plumbing', problem_description='Leaking tap', ...)\n"
+            "- User: 'Is my artisan on the way?'\n"
+            "  You: CALL send_message_to_artisan(booking_id='123', message='Are you on your way?'), then SPEAK: 'Message sent to the artisan. They'll be notified immediately.'\n"
+            "- User: 'I need to complain about the service quality.'\n"
+            "  You: CALL send_message_to_admin(message='User complaint about service quality', subject='Service Quality Issue', booking_id='123'), then SPEAK: 'I've forwarded your complaint to support. They'll respond shortly.'\n"
         )
 
         artisan_flow = (
@@ -212,6 +389,8 @@ async def entrypoint(ctx: JobContext):
             "- If artisan asks to reject, you MUST CALL ui_navigate(action='reject_latest_request').\n"
             "- If artisan asks to open requests, CALL ui_navigate(action='open_artisan_requests').\n"
             "- If artisan asks for appointments/wallet, use open_artisan_appointments/open_artisan_wallet.\n"
+            "- If artisan says they are starting the job now, CALL ui_navigate(action='mark_booking_in_progress', booking_id='...').\n"
+            "- If artisan needs to cancel and reassign, confirm and CALL ui_navigate(action='artisan_cancel_and_reassign', booking_id='...', additional_notes='reason'). This triggers a reassignment request that may be handled by an admin.\n"
             "- Do not attempt to dispatch artisans while speaking to an artisan.\n"
             "\nExamples (artisan):\n"
             "- User: 'Accept the latest request.'\n"
@@ -252,7 +431,6 @@ async def entrypoint(ctx: JobContext):
         service_lng: str = "",
         scheduled_date: str = "",
         scheduled_time: str = "",
-        require_photos: bool = True,
         materials_responsibility: str = "",
         accept: str = "",
         request_id: str = "",
@@ -272,7 +450,6 @@ async def entrypoint(ctx: JobContext):
                 "service_lng": service_lng,
                 "scheduled_date": scheduled_date,
                 "scheduled_time": scheduled_time,
-                "require_photos": require_photos,
                 "materials_responsibility": materials_responsibility,
                 "accept": accept,
                 "request_id": request_id,
@@ -284,13 +461,19 @@ async def entrypoint(ctx: JobContext):
             if action == "create_order_booking":
                 text = (
                     "Creating your booking now and dispatching the nearest available artisan. "
-                    "Please keep the app open."
+                    "Please keep the app open. "
+                    "Once an artisan accepts, you will be asked to confirm the order with payment (wallet or card). "
+                    "If the payment options do not appear, open Bookings and tap 'Pay to confirm Order'."
                 )
             elif action == "dispatch_artisan":
-                text = "Dispatching the nearest available artisan now. Please keep the app open."
+                text = (
+                    "Dispatching the nearest available artisan now. Please keep the app open. "
+                    "Once an artisan accepts, you will be asked to confirm the order with payment (wallet or card). "
+                    "If the payment options do not appear, open Bookings and tap 'Pay to confirm Order'."
+                )
             elif action == "open_rfq_upload":
                 text = (
-                    "Opening the photo upload page now. Please add 2-3 clear photos of the work needed."
+                    "Please upload 3 clear photos of the work needed in the photo upload screen."
                 )
             elif action == "open_bookings_tab":
                 text = "Opening your bookings now."
@@ -310,6 +493,18 @@ async def entrypoint(ctx: JobContext):
                 text = "Updating that request now."
             elif action == "call_assigned_artisan" or action == "call_artisan":
                 text = "Calling the assigned artisan now."
+            elif action == "get_booking_status":
+                text = "Checking that booking status now."
+            elif action == "reschedule_booking":
+                text = "Rescheduling that booking now. Please confirm the new time in the app." 
+            elif action == "cancel_booking":
+                text = "Cancelling that booking now. Please confirm in the app." 
+            elif action == "reassign_booking":
+                text = "Reassigning that booking now. If no nearby artisan is available, an admin will assign one."
+            elif action == "mark_booking_in_progress":
+                text = "Marking that booking as in progress now."
+            elif action == "artisan_cancel_and_reassign":
+                text = "Cancelling and reassigning now. If no nearby artisan is available, an admin will assign one."
             else:
                 text = "Working on that now."
             meta = {
@@ -324,16 +519,447 @@ async def entrypoint(ctx: JobContext):
             logger.warning(f"ui_navigate failed: {e}")
             return "error"
 
+    # Phase 2: Read-only backend tools
+    @llm.function_tool(
+        description=(
+            "Get the current status of a booking by booking ID. "
+            "Returns status, scheduled time, artisan details, and payment info. "
+            "Use this when user asks 'What's my booking status?' or 'Where is my artisan?'"
+        )
+    )
+    async def get_booking_status(booking_id: str) -> str:
+        """Get booking status from backend API."""
+        nonlocal backend_client
+        if not backend_client:
+            return "I need you to be authenticated first. Please make sure you're logged into the app."
+
+        try:
+            result = await backend_client.get_booking_status(booking_id)
+            if not result.get('ok') and not result.get('success'):
+                error = result.get('error', 'unknown_error')
+                if error == 'booking_not_found':
+                    return f"I couldn't find booking {booking_id}. Please check the booking ID."
+                elif error == 'forbidden':
+                    return "You don't have permission to view that booking."
+                else:
+                    return f"There was an issue checking the booking: {error}"
+
+            data = result.get('data', {})
+            status = data.get('status', 'unknown')
+            category = data.get('category_name', 'service')
+            scheduled_date = data.get('scheduled_date', '')
+            scheduled_time = data.get('scheduled_time', '')
+            artisan_confirmed = data.get('artisan_confirmed', '')
+
+            response = f"Booking {booking_id} for {category}: Status is {status}."
+            if scheduled_date and scheduled_time:
+                response += f" Scheduled for {scheduled_date} at {scheduled_time}."
+            if artisan_confirmed:
+                response += f" Artisan confirmation: {artisan_confirmed}."
+
+            artisan = data.get('artisan')
+            if artisan and isinstance(artisan, dict):
+                name = artisan.get('name', '')
+                phone = artisan.get('phone', '')
+                if name:
+                    response += f" Artisan: {name}."
+                if phone:
+                    response += f" Contact: {phone}."
+
+            return response
+        except Exception as e:
+            logger.error(f"get_booking_status error: {e}", exc_info=True)
+            return "Sorry, I had trouble checking that booking. Please try again."
+
+    @llm.function_tool(
+        description=(
+            "List the user's recent bookings. Optionally filter by status (e.g., 'pending_assignment', 'in_progress', 'completed'). "
+            "Use this when user asks 'Show my bookings' or 'What bookings do I have?'"
+        )
+    )
+    async def list_my_bookings(status: str = "", limit: int = 5) -> str:
+        """List user's bookings from backend API."""
+        nonlocal backend_client
+        if not backend_client:
+            return "I need you to be authenticated first. Please make sure you're logged into the app."
+
+        try:
+            result = await backend_client.list_user_bookings(status=status or None, limit=min(limit, 10))
+            if not result.get('ok') and not result.get('success'):
+                error = result.get('error', 'unknown_error')
+                return f"There was an issue getting your bookings: {error}"
+
+            data = result.get('data', {})
+            bookings = data.get('bookings', [])
+            count = len(bookings)
+
+            if count == 0:
+                return "You don't have any bookings" + (f" with status {status}" if status else "") + "."
+
+            response = f"You have {count} booking" + ("s" if count > 1 else "") + ".\n"
+            for i, booking in enumerate(bookings[:5], 1):
+                booking_id = booking.get('booking_id', 'unknown')
+                booking_status = booking.get('status', 'unknown')
+                category = booking.get('category_name', 'service')
+                date = booking.get('scheduled_date', '')
+                time = booking.get('scheduled_time', '')
+                response += f"{i}. {category} booking {booking_id}: {booking_status}"
+                if date and time:
+                    response += f" on {date} at {time}"
+                response += ".\n"
+
+            return response.strip()
+        except Exception as e:
+            logger.error(f"list_my_bookings error: {e}", exc_info=True)
+            return "Sorry, I had trouble getting your bookings. Please try again."
+
+    @llm.function_tool(
+        description=(
+            "Explain the details of an RFQ quote for a booking. "
+            "Use this when user asks 'Explain my quote' or 'What's the quote for my RFQ?'"
+        )
+    )
+    async def explain_quote(booking_id: str) -> str:
+        """Explain RFQ quote from backend API."""
+        nonlocal backend_client
+        if not backend_client:
+            return "I need you to be authenticated first. Please make sure you're logged into the app."
+
+        try:
+            result = await backend_client.explain_rfq_quote(booking_id)
+            if not result.get('ok') and not result.get('success'):
+                error = result.get('error', 'unknown_error')
+                if error == 'booking_not_found':
+                    return f"I couldn't find booking {booking_id}."
+                elif error == 'not_an_rfq':
+                    return "That booking is not an RFQ request."
+                else:
+                    return f"There was an issue: {error}"
+
+            data = result.get('data', {})
+            quote_status = data.get('quote_status', 'pending')
+            explanation = data.get('explanation', '')
+            quoted_price = data.get('quoted_price', '')
+            quote_details = data.get('quote_details', '')
+
+            response = explanation or f"Quote status: {quote_status}."
+            if quoted_price:
+                response += f" Quoted price: {quoted_price}."
+            if quote_details:
+                response += f" Details: {quote_details}."
+
+            return response
+        except Exception as e:
+            logger.error(f"explain_quote error: {e}", exc_info=True)
+            return "Sorry, I had trouble getting that quote. Please try again."
+
+    @llm.function_tool(
+        description=(
+            "Check the payment status for a booking. "
+            "Use this when user asks 'Did I pay?' or 'What's the payment status?'"
+        )
+    )
+    async def check_payment(booking_id: str) -> str:
+        """Check payment status from backend API."""
+        nonlocal backend_client
+        if not backend_client:
+            return "I need you to be authenticated first. Please make sure you're logged into the app."
+
+        try:
+            result = await backend_client.get_payment_status(booking_id)
+            if not result.get('ok') and not result.get('success'):
+                error = result.get('error', 'unknown_error')
+                return f"There was an issue checking payment: {error}"
+
+            data = result.get('data', {})
+            payment_status = data.get('payment_status', 'unknown')
+            message = data.get('message', '')
+            transactions = data.get('transactions', [])
+
+            if payment_status == 'not_found':
+                return "I couldn't find any payment records for that booking."
+
+            response = message or f"Payment status: {payment_status}."
+            if transactions and len(transactions) > 0:
+                latest = transactions[0]
+                amount = latest.get('amount', '')
+                tx_status = latest.get('status', '')
+                if amount:
+                    response += f" Latest transaction: {amount}, status: {tx_status}."
+
+            return response
+        except Exception as e:
+            logger.error(f"check_payment error: {e}", exc_info=True)
+            return "Sorry, I had trouble checking payment. Please try again."
+
+    # Phase 1: Write operations with propose/confirm
+    @llm.function_tool(
+        description=(
+            "Create a new order booking and dispatch an artisan. "
+            "Requires: category_name, problem_description. "
+            "Optional: scheduled_date, scheduled_time, service_address. "
+            "This uses the propose-confirm workflow for safety."
+        )
+    )
+    async def create_booking(
+        category_name: str,
+        problem_description: str,
+        scheduled_date: str = "",
+        scheduled_time: str = "",
+        service_address: str = "",
+        is_rfq: str = "no"
+    ) -> str:
+        """Create a booking using backend propose/confirm workflow."""
+        nonlocal backend_client
+        if not backend_client:
+            return "I need you to be authenticated first. Please make sure you're logged into the app."
+
+        try:
+            # Phase 1: Propose the action
+            payload = {
+                'category_name': category_name,
+                'problem_description': problem_description,
+                'scheduled_date': scheduled_date or '',
+                'scheduled_time': scheduled_time or '',
+                'service_address': service_address or '',
+                'is_rfq': is_rfq,
+            }
+            proposal_result = await backend_client.propose_action('create_order_booking', payload)
+
+            if not proposal_result.get('success'):
+                error = proposal_result.get('error', 'unknown_error')
+                return f"I couldn't create the booking proposal: {error}"
+
+            proposal_id = proposal_result.get('proposalId')
+            if not proposal_id:
+                return "Booking proposal created but I didn't get a proposal ID. Please try again."
+
+            # Phase 1: Confirm the action
+            confirm_result = await backend_client.confirm_action(proposal_id)
+
+            if not confirm_result.get('success'):
+                error = confirm_result.get('error', 'unknown_error')
+                return f"Booking proposed but confirmation failed: {error}"
+
+            result_data = confirm_result.get('result', {})
+            booking_id = result_data.get('booking_id') or result_data.get('bookingId')
+            is_rfq_flag = result_data.get('is_rfq') or result_data.get('isRFQ')
+
+            if is_rfq_flag:
+                return f"Your RFQ request has been submitted (booking {booking_id}). Admin will review and provide a quote shortly."
+            else:
+                return f"Booking {booking_id} created successfully! Dispatching the nearest available artisan now. You'll be notified once an artisan accepts."
+
+        except Exception as e:
+            logger.error(f"create_booking error: {e}", exc_info=True)
+            return "Sorry, I had trouble creating the booking. Please try again or use the app directly."
+
+    # =========================================
+    # Phase 3: Messaging Tools
+    # =========================================
+
+    @llm.function_tool(
+        description=(
+            "Send a message to the artisan assigned to a booking. "
+            "Use this when the user wants to contact their artisan (ask about ETA, location, confirm details, etc.). "
+            "Requires: booking_id, message."
+        )
+    )
+    async def send_message_to_artisan(
+        booking_id: str,
+        message: str
+    ) -> str:
+        """Send a message to the artisan assigned to a booking."""
+        nonlocal backend_client
+        if not backend_client:
+            return "I need you to be authenticated first."
+
+        try:
+            payload = {'booking_id': booking_id, 'message': message}
+            result = await backend_client.call_backend_action('send_message_to_artisan', payload)
+
+            if not result.get('success'):
+                error = result.get('error', 'unknown_error')
+                if error == 'no_artisan_assigned':
+                    return "There's no artisan assigned to this booking yet. You can't send a message until an artisan accepts."
+                elif error == 'booking_not_found':
+                    return f"I couldn't find booking {booking_id}."
+                return f"I couldn't send the message: {error}"
+
+            return "Message sent to the artisan successfully. They'll be notified immediately."
+
+        except Exception as e:
+            logger.error(f"send_message_to_artisan error: {e}", exc_info=True)
+            return "Sorry, I had trouble sending the message. Please try again."
+
+    @llm.function_tool(
+        description=(
+            "Send a message to admin support. "
+            "Use this when the user needs help from support (complaints, escalations, complex issues). "
+            "Requires: message. Optional: booking_id, subject."
+        )
+    )
+    async def send_message_to_admin(
+        message: str,
+        booking_id: str = "",
+        subject: str = "Support Request"
+    ) -> str:
+        """Send a message to admin support, creates a support case."""
+        nonlocal backend_client
+        if not backend_client:
+            return "I need you to be authenticated first."
+
+        try:
+            payload = {
+                'message': message,
+                'subject': subject,
+                'booking_id': booking_id or None
+            }
+            result = await backend_client.call_backend_action('send_message_to_admin', payload)
+
+            if not result.get('success'):
+                error = result.get('error', 'unknown_error')
+                return f"I couldn't send your message to support: {error}"
+
+            case_id = (result.get('result') or {}).get('case_id', '')
+            if case_id:
+                return f"I've forwarded your message to our support team (case {case_id}). They'll respond shortly and you'll be notified."
+            else:
+                return "I've forwarded your message to our support team. They'll respond shortly."
+
+        except Exception as e:
+            logger.error(f"send_message_to_admin error: {e}", exc_info=True)
+            return "Sorry, I had trouble contacting support. Please try again."
+
+    @llm.function_tool(
+        description=(
+            "Get chat messages for a booking. "
+            "Use this when the user asks to see their messages or conversation with the artisan. "
+            "Requires: booking_id or tasks_management_id."
+        )
+    )
+    async def get_messages(
+        booking_id: str = "",
+        tasks_management_id: str = ""
+    ) -> str:
+        """Get chat messages for a booking."""
+        nonlocal backend_client
+        if not backend_client:
+            return "I need you to be authenticated first."
+
+        if not booking_id and not tasks_management_id:
+            return "I need either a booking ID or tasks management ID to get messages."
+
+        try:
+            payload = {
+                'booking_id': booking_id or None,
+                'tasks_management_id': tasks_management_id or None,
+                'limit': 10
+            }
+            result = await backend_client.call_backend_action('get_messages', payload)
+
+            if not result.get('success'):
+                error = result.get('error', 'unknown_error')
+                if error == 'booking_not_found':
+                    return f"I couldn't find booking {booking_id}."
+                elif error == 'no_tasks_management_id_for_booking':
+                    return "This booking doesn't have a chat yet. You can send a message once an artisan is assigned."
+                return f"I couldn't get the messages: {error}"
+
+            result_data = result.get('result', {})
+            messages = result_data.get('messages', [])
+            
+            if not messages:
+                return "There are no messages yet in this conversation."
+
+            # Format messages for readability
+            msg_list = []
+            for msg in messages[-5:]:  # Last 5 messages
+                sender = "You" if msg.get('sender_id') == backend_client.firebase_token else "Artisan"
+                text = msg.get('message', '')
+                msg_list.append(f"{sender}: {text}")
+
+            messages_text = "\n".join(msg_list)
+            return f"Recent messages:\n{messages_text}"
+
+        except Exception as e:
+            logger.error(f"get_messages error: {e}", exc_info=True)
+            return "Sorry, I had trouble getting the messages. Please try again."
+
+    # =========================================
+    # Phase 3: Case Management Tools
+    # =========================================
+
+    @llm.function_tool(
+        description=(
+            "Get the status of a support case. "
+            "Use this when the user asks about their support request or case. "
+            "Requires: case_id."
+        )
+    )
+    async def get_case_status(
+        case_id: str
+    ) -> str:
+        """Get the status of a support case."""
+        nonlocal backend_client
+        if not backend_client:
+            return "I need you to be authenticated first."
+
+        try:
+            payload = {'case_id': case_id}
+            result = await backend_client.call_backend_action('get_case_status', payload)
+
+            if not result.get('success'):
+                error = result.get('error', 'unknown_error')
+                if error == 'case_not_found':
+                    return f"I couldn't find case {case_id}."
+                return f"I couldn't get the case status: {error}"
+
+            result_data = result.get('result', {})
+            state = result_data.get('state', 'unknown')
+            case_type = result_data.get('type', 'support')
+            subject = result_data.get('subject', '')
+
+            state_messages = {
+                'open': "Your case is open and waiting for admin review.",
+                'pending_admin': "Your case is waiting for admin action.",
+                'in_progress': "Your case is being worked on by our team.",
+                'resolved': "Your case has been resolved.",
+                'closed': "Your case is closed."
+            }
+
+            status_msg = state_messages.get(state, f"Your case status is: {state}")
+            if subject:
+                return f"{subject} - {status_msg}"
+            return status_msg
+
+        except Exception as e:
+            logger.error(f"get_case_status error: {e}", exc_info=True)
+            return "Sorry, I had trouble getting the case status. Please try again."
+
     agent = voice.Agent(
         vad=vad,
         stt=openai.STT(model="whisper-1", language="en"),
-        llm=openai.LLM(model="gpt-4o-mini", temperature=0.0),
+        llm=openai.LLM(model="gpt-4o-mini", temperature=0.2),
         tts=openai.TTS(model="tts-1", voice="alloy"),
         instructions=_instructions_for_role(caller_role),
     )
 
     logger.info("🚀 Starting agent session...")
-    session = voice.AgentSession(tools=[ui_navigate])
+    session = voice.AgentSession(tools=[
+        ui_navigate,
+        get_booking_status,
+        list_my_bookings,
+        explain_quote,
+        check_payment,
+        create_booking,
+        # Phase 3: Messaging tools
+        send_message_to_artisan,
+        send_message_to_admin,
+        get_messages,
+        # Phase 3: Case management
+        get_case_status
+    ])
 
     # Guardrail: never allow internal/tool narration to reach TTS.
     _orig_say = session.say
@@ -345,7 +971,6 @@ async def entrypoint(ctx: JobContext):
         return await _orig_say(cleaned, *args, **kwargs)
 
     session.say = _say_sanitized
-
     await session.start(agent, room=ctx.room)
     logger.info("✅ Agent session started and running!")
 
@@ -355,6 +980,7 @@ async def entrypoint(ctx: JobContext):
     last_metadata_by_identity: dict[str, str] = {}
 
     def on_participant_metadata_changed(participant, old_metadata, new_metadata):
+        nonlocal backend_client, firebase_token, session_id, session_nonce
         try:
             if not new_metadata or not str(new_metadata).strip():
                 return
@@ -379,7 +1005,24 @@ async def entrypoint(ctx: JobContext):
             if not isinstance(msg, dict):
                 return
 
-            if (msg.get("type") or "").strip() != "square15_app":
+            msg_type = (msg.get("type") or "").strip()
+
+            # Handle voice session credentials from app
+            if msg_type == "square15_voice_credentials":
+                firebase_token = msg.get("firebase_token")
+                session_id = msg.get("session_id")
+                session_nonce = msg.get("session_nonce")
+                if firebase_token:
+                    backend_client = BackendAPIClient(
+                        base_url=backend_url,
+                        firebase_token=firebase_token,
+                        session_id=session_id,
+                        session_nonce=session_nonce
+                    )
+                    logger.info(f"✅ Backend client initialized with credentials (session: {session_id[:12] if session_id else 'none'}...)")
+                return
+
+            if msg_type != "square15_app":
                 return
 
             action = (msg.get("action") or "").strip()
@@ -422,23 +1065,7 @@ async def request_handler(ctx: JobContext):
 
 
 if __name__ == "__main__":
-    build_tag = "2026-01-03-photos-first-no-tool-narration"
-    render_commit = (
-        os.getenv("RENDER_GIT_COMMIT")
-        or os.getenv("RENDER_COMMIT")
-        or os.getenv("GIT_COMMIT")
-        or ""
-    ).strip()
-    logger.info(
-        "🚀 Starting Square 15 Voice Agent Worker... tag=%s%s",
-        build_tag,
-        f" commit={render_commit}" if render_commit else "",
-    )
-    logger.info(
-        "🧩 Worker build tag: %s%s",
-        build_tag,
-        f" (commit={render_commit})" if render_commit else "",
-    )
+    logger.info("🚀 Starting Square 15 Voice Agent Worker...")
     logger.info("📡 Listening for room join events...")
 
     agent_name = os.getenv("LIVEKIT_AGENT_NAME", "square15-voice-assistant")
