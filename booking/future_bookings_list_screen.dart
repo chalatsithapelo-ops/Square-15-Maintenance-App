@@ -428,9 +428,11 @@ class FutureBookingsListScreen extends StatelessWidget {
                       const SizedBox(height: 10),
                     ],
 
-                    // Action Buttons
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.end,
+                    // Action Buttons (Wrap avoids overflow on small screens)
+                    Wrap(
+                      alignment: WrapAlignment.end,
+                      spacing: 10,
+                      runSpacing: 8,
                       children: [
                         TextButton.icon(
                           onPressed: () => _cancelBooking(context, booking),
@@ -440,7 +442,6 @@ class FutureBookingsListScreen extends StatelessWidget {
                             foregroundColor: Colors.red,
                           ),
                         ),
-                        const SizedBox(width: 10),
                         if (isRfq && status == 'rfq_sent') ...[
                           TextButton.icon(
                             onPressed: () => _showQuoteDialog(
@@ -451,7 +452,6 @@ class FutureBookingsListScreen extends StatelessWidget {
                             icon: const Icon(Icons.receipt_long, size: 18),
                             label: const Text('View Quote'),
                           ),
-                          const SizedBox(width: 10),
                           ElevatedButton.icon(
                             onPressed: () => _approveQuote(
                               context: context,
@@ -464,7 +464,6 @@ class FutureBookingsListScreen extends StatelessWidget {
                               foregroundColor: Colors.white,
                             ),
                           ),
-                          const SizedBox(width: 10),
                           OutlinedButton.icon(
                             onPressed: () => _rejectQuote(
                               context: context,
@@ -677,89 +676,171 @@ class FutureBookingsListScreen extends StatelessWidget {
     final vatAmount = toDouble(adminQuote['vat_amount']);
     final total = adminTotal ?? toDouble(adminQuote['total']) ?? (subtotal + (vatAmount ?? 0));
 
+    Widget buildLineHeader() {
+      return DefaultTextStyle(
+        style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w700),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: const [
+            Expanded(flex: 6, child: Text('Item')),
+            SizedBox(width: 8),
+            Expanded(
+              flex: 2,
+              child: Align(alignment: Alignment.centerRight, child: Text('Qty')),
+            ),
+            SizedBox(width: 8),
+            Expanded(
+              flex: 3,
+              child: Align(alignment: Alignment.centerRight, child: Text('Unit')),
+            ),
+            SizedBox(width: 8),
+            Expanded(
+              flex: 3,
+              child: Align(alignment: Alignment.centerRight, child: Text('Total')),
+            ),
+          ],
+        ),
+      );
+    }
+
+    Widget buildLineRow(Map<String, dynamic> m, {bool stripMaterialsPrefix = false}) {
+      final rawDesc = (m['description'] ?? '').toString();
+      final desc = stripMaterialsPrefix
+          ? rawDesc.replaceFirst(
+              RegExp('^Materials:\\s*', caseSensitive: false),
+              '',
+            )
+          : rawDesc;
+      final qty = (m['qty'] ?? '').toString().trim();
+      final uom = (m['uom'] ?? '').toString().trim();
+      final qtyDisplay = (qty.isEmpty ? '1' : qty) + (uom.isEmpty ? '' : ' $uom');
+      final unit = fmtMoney(m['unit_price']);
+      final line = fmtMoney(m['line_total']);
+
+      return Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Expanded(
+            flex: 6,
+            child: Text(
+              desc.isEmpty ? '—' : desc,
+              style: const TextStyle(fontSize: 13),
+            ),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            flex: 2,
+            child: Align(
+              alignment: Alignment.centerRight,
+              child: Text(qtyDisplay, style: const TextStyle(fontSize: 13)),
+            ),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            flex: 3,
+            child: Align(
+              alignment: Alignment.centerRight,
+              child: Text('R$unit', style: const TextStyle(fontSize: 13)),
+            ),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            flex: 3,
+            child: Align(
+              alignment: Alignment.centerRight,
+              child: Text('R$line', style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+            ),
+          ),
+        ],
+      );
+    }
+
+    Widget buildSection(String title, List<Map<String, dynamic>> lines, {bool stripMaterialsPrefix = false}) {
+      if (lines.isEmpty) return const SizedBox.shrink();
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(title, style: const TextStyle(fontWeight: FontWeight.bold)),
+          const SizedBox(height: 8),
+          buildLineHeader(),
+          const SizedBox(height: 6),
+          const Divider(height: 1),
+          const SizedBox(height: 8),
+          ...lines.map((m) => Padding(
+                padding: const EdgeInsets.only(bottom: 10),
+                child: buildLineRow(m, stripMaterialsPrefix: stripMaterialsPrefix),
+              )),
+        ],
+      );
+    }
+
     showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('Quote Details'),
-        content: SizedBox(
-          width: double.maxFinite,
-          child: SingleChildScrollView(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                if (materialItems.isNotEmpty) ...[
-                  const Text('Materials', style: TextStyle(fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 8),
-                  ...materialItems.map((m) {
-                    final desc = (m['description'] ?? '').toString().replaceFirst(RegExp('^Materials:\\s*', caseSensitive: false), '');
-                    final qty = (m['qty'] ?? '').toString();
-                    final uom = (m['uom'] ?? '').toString();
-                    final unit = fmtMoney(m['unit_price']);
-                    final line = fmtMoney(m['line_total']);
-                    return Padding(
-                      padding: const EdgeInsets.only(bottom: 6),
-                      child: Text('- $desc (${qty.isNotEmpty ? qty : '1'}${uom.isNotEmpty ? ' $uom' : ''})  •  R$unit  •  R$line'),
-                    );
-                  }),
-                  const Divider(),
-                ],
+        content: ConstrainedBox(
+          constraints: BoxConstraints(
+            maxWidth: 560,
+            maxHeight: MediaQuery.of(ctx).size.height * 0.70,
+          ),
+          child: Scrollbar(
+            thumbVisibility: true,
+            child: SingleChildScrollView(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  buildSection('Materials', materialItems, stripMaterialsPrefix: true),
+                  if (materialItems.isNotEmpty && otherItems.isNotEmpty)
+                    const Padding(
+                      padding: EdgeInsets.symmetric(vertical: 6),
+                      child: Divider(),
+                    ),
+                  buildSection('Line Items', otherItems),
 
-                if (otherItems.isNotEmpty) ...[
-                  const Text('Line Items', style: TextStyle(fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 8),
-                  ...otherItems.map((m) {
-                    final desc = (m['description'] ?? '').toString();
-                    final qty = (m['qty'] ?? '').toString();
-                    final uom = (m['uom'] ?? '').toString();
-                    final unit = fmtMoney(m['unit_price']);
-                    final line = fmtMoney(m['line_total']);
-                    return Padding(
-                      padding: const EdgeInsets.only(bottom: 6),
-                      child: Text('- $desc (${qty.isNotEmpty ? qty : '1'}${uom.isNotEmpty ? ' $uom' : ''})  •  R$unit  •  R$line'),
-                    );
-                  }),
-                  const Divider(),
-                ],
+                  const Divider(height: 24),
 
-                // Totals (match admin formatting)
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    const Text('Subtotal', style: TextStyle(fontWeight: FontWeight.w600)),
-                    Text('R${subtotal.toStringAsFixed(2)}'),
-                  ],
-                ),
-                const SizedBox(height: 6),
-                if (vatPercent != null || vatAmount != null)
+                  // Totals (match admin formatting)
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
-                      Text(
-                        vatPercent != null
-                            ? 'VAT (${vatPercent.toStringAsFixed(vatPercent % 1 == 0 ? 0 : 1)}%)'
-                            : 'VAT',
-                        style: const TextStyle(fontWeight: FontWeight.w600),
-                      ),
-                      Text('R${(vatAmount ?? 0).toStringAsFixed(2)}'),
+                      const Text('Subtotal', style: TextStyle(fontWeight: FontWeight.w600)),
+                      Text('R${subtotal.toStringAsFixed(2)}'),
                     ],
                   ),
-                const SizedBox(height: 6),
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    const Text('Total', style: TextStyle(fontWeight: FontWeight.bold)),
-                    Text('R${total.toStringAsFixed(2)}', style: const TextStyle(fontWeight: FontWeight.bold)),
-                  ],
-                ),
-                if (notes.isNotEmpty) ...[
-                  const SizedBox(height: 10),
-                  const Text('Notes/Terms',
-                      style: TextStyle(fontWeight: FontWeight.bold)),
                   const SizedBox(height: 6),
-                  Text(notes),
-                ]
-              ],
+                  if (vatPercent != null || vatAmount != null)
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Text(
+                          vatPercent != null
+                              ? 'VAT (${vatPercent.toStringAsFixed(vatPercent % 1 == 0 ? 0 : 1)}%)'
+                              : 'VAT',
+                          style: const TextStyle(fontWeight: FontWeight.w600),
+                        ),
+                        Text('R${(vatAmount ?? 0).toStringAsFixed(2)}'),
+                      ],
+                    ),
+                  const SizedBox(height: 6),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      const Text('Total', style: TextStyle(fontWeight: FontWeight.bold)),
+                      Text(
+                        'R${total.toStringAsFixed(2)}',
+                        style: const TextStyle(fontWeight: FontWeight.bold),
+                      ),
+                    ],
+                  ),
+                  if (notes.isNotEmpty) ...[
+                    const SizedBox(height: 12),
+                    const Text('Notes/Terms', style: TextStyle(fontWeight: FontWeight.bold)),
+                    const SizedBox(height: 6),
+                    Text(notes),
+                  ]
+                ],
+              ),
             ),
           ),
         ),
