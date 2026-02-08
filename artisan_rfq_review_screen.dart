@@ -320,7 +320,9 @@ class _ArtisanRFQReviewScreenState extends State<ArtisanRFQReviewScreen> {
           .limit(1)
           .get();
 
+      String bridgeDocId = '';
       if (tmSnap.docs.isNotEmpty) {
+        bridgeDocId = tmSnap.docs.first.id;
         await tmSnap.docs.first.reference.update({
           'accept': '1',
           'status': 'pending_payment',
@@ -328,6 +330,13 @@ class _ArtisanRFQReviewScreenState extends State<ArtisanRFQReviewScreen> {
           'updated_at': now.toString(),
           'updated_by': artisanId,
         });
+
+        // Write bridge ID back so the client Pay button resolves immediately
+        await FirebaseFirestore.instance
+            .collection('futureBookings')
+            .doc(widget.bookingId)
+            .set({'tasks_management_id': bridgeDocId},
+                SetOptions(merge: true));
       }
 
       // 3. Notify the client to make payment

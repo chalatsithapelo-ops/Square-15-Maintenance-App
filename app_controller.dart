@@ -1270,7 +1270,7 @@ class AppController extends GetxController {
             'updated_at': now,
           });
 
-          // If this is an RFQ booking, mark it as ready for assignment.
+          // If this is an RFQ booking, set the correct rfq_status.
           try {
             final fbSnap = await FutureBookingService.futureBookingsRef
                 .doc(futureBookingId)
@@ -1278,14 +1278,46 @@ class AppController extends GetxController {
             final fb = fbSnap.data() ?? <String, dynamic>{};
             final isRfq = (fb['is_rfq'] ?? '').toString().toLowerCase() == 'yes' ||
                 (fb['order_type'] ?? '').toString().toLowerCase() == 'rfq' ||
-                (fb['status'] ?? '').toString().toLowerCase().startsWith('rfq_');
+                (fb['rfq_status'] ?? '').toString().toLowerCase().startsWith('rfq_') ||
+                (fb['rfq_status'] ?? '').toString().toLowerCase() == 'accepted_converted';
             if (isRfq) {
+              // If artisan already accepted, mark as active order; otherwise waiting assignment.
+              final artisanConfirmed =
+                  (fb['artisan_confirmed'] ?? '').toString().toLowerCase();
+              final oldRfqStatus =
+                  (fb['rfq_status'] ?? '').toString().toLowerCase();
+              final artisanAccepted = artisanConfirmed == 'yes' ||
+                  oldRfqStatus == 'accepted_converted';
+
               await FutureBookingService.futureBookingsRef
                   .doc(futureBookingId)
                   .set({
-                'rfq_status': 'rfq_approved_waiting_assignment',
+                'rfq_status': artisanAccepted
+                    ? 'rfq_order_active'
+                    : 'rfq_approved_waiting_assignment',
                 'rfq_paid_at': now,
               }, SetOptions(merge: true));
+            }
+          } catch (_) {
+            // Best-effort.
+          }
+
+          // Notify the artisan that payment was received so they can start work.
+          try {
+            final fb = (await FutureBookingService.futureBookingsRef
+                    .doc(futureBookingId)
+                    .get())
+                .data() ?? <String, dynamic>{};
+            final artisanId =
+                (fb['service_provider_id'] ?? '').toString().trim();
+            if (artisanId.isNotEmpty) {
+              await FutureBookingService.sendNotificationToArtisan(
+                artisanId: artisanId,
+                bookingId: futureBookingId,
+                message:
+                    'The client has completed payment for your accepted job. '
+                    'You can now proceed with the booking.',
+              );
             }
           } catch (_) {
             // Best-effort.
