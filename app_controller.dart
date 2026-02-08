@@ -1000,13 +1000,36 @@ class AppController extends GetxController {
         }
       }
 
-      // Deduplicate by taskId+userId to prevent duplicate grid entries.
-      final seen = <String>{};
-      final deduped = <ArtisanTaskModel>[];
+      // Deduplicate artisan tasks so each TASK appears only ONCE in the grid.
+      // Step 1: Keep only one artisan-task per taskId (first wins).
+      final seenTids = <String>{};
+      final dedupedByTid = <ArtisanTaskModel>[];
       for (final a in artisanTasks) {
-        final key = '${(a.taskId ?? '').toString().trim()}|${(a.userId ?? '').toString().trim()}';
-        if (key == '|' || seen.contains(key)) continue;
-        seen.add(key);
+        final tid = (a.taskId ?? '').toString().trim();
+        if (tid.isEmpty || seenTids.contains(tid)) continue;
+        seenTids.add(tid);
+        dedupedByTid.add(a);
+      }
+
+      // Step 2: Further dedup by resolved task NAME (handles different task
+      // docs with identical names, e.g. two "Install toilet and cistern").
+      final seenNames = <String>{};
+      final deduped = <ArtisanTaskModel>[];
+      for (final a in dedupedByTid) {
+        final tid = (a.taskId ?? '').toString().trim();
+        // Resolve to a TaskModel to get the display name
+        final t = tasks.cast<TaskModel?>().firstWhere(
+          (t) =>
+              (t?.id ?? '').toString().trim() == tid ||
+              (t?.docId ?? '').toString().trim() == tid,
+          orElse: () => null,
+        );
+        final name = (t?.name ?? '').toString().trim().toLowerCase();
+        if (name.isNotEmpty && seenNames.contains(name)) {
+          debugPrint('[getTaskRecord] SKIPPING artisan-task with duplicate name "$name" tid=$tid');
+          continue;
+        }
+        if (name.isNotEmpty) seenNames.add(name);
         deduped.add(a);
       }
 
