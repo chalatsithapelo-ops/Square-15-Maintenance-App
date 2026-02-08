@@ -35,14 +35,27 @@ class _ManagingUserState extends State<ManagingUser> {
   // ── helpers ────────────────────────────────────────────────────────────
 
   bool _isOnline(Map<String, dynamic> data) {
-    if (data['is_online'] == true) {
-      // Also check last_seen — if it's been more than 5 min, treat as offline
+    final onlineVal = data['is_online'];
+    final isMarkedOnline =
+        onlineVal == true || onlineVal == 'true' || onlineVal == 1;
+
+    if (isMarkedOnline) {
+      // Check last_seen — if it's been more than 15 min, treat as offline
       final lastSeen = _toDateTime(data['last_seen']);
       if (lastSeen != null) {
-        return DateTime.now().difference(lastSeen).inMinutes < 5;
+        return DateTime.now().difference(lastSeen).inMinutes < 15;
       }
+      // No last_seen but is_online is true → treat as online
       return true;
     }
+
+    // Fallback: even if is_online isn't set, a very recent last_seen
+    // (within 2 minutes) means the user just opened the app.
+    final lastSeen = _toDateTime(data['last_seen']);
+    if (lastSeen != null && DateTime.now().difference(lastSeen).inMinutes < 2) {
+      return true;
+    }
+
     return false;
   }
 
