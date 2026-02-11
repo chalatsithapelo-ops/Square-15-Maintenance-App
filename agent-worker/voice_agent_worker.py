@@ -352,11 +352,14 @@ async def entrypoint(ctx: JobContext):
             "Client workflow:\n"
             "1) INFORMATION QUERIES - Use backend tools:\n"
             "   - 'What's my booking status?' → CALL get_booking_status(booking_id='...')\n"
-            "   - 'Show my bookings' → CALL list_my_bookings(status='', limit=5)\n"
+            "   - 'Show my bookings' → CALL list_my_bookings(status='', limit=10)\n"
+            "   - 'Find my R67000 booking' → CALL list_my_bookings(limit=10) then find the booking with matching price and tell user about it.\n"
             "   - 'Explain my quote' → CALL explain_quote(booking_id='...')\n"
+            "   - 'Scope of work for RFQ-...' → CALL explain_quote(booking_id='RFQ-...') — you can pass RFQ numbers directly.\n"
             "   - 'Did I pay?' → CALL check_payment(booking_id='...')\n"
             "   - 'What's my wallet balance?' → CALL get_wallet_balance()\n"
             "   Then SPEAK the result naturally.\n"
+            "   IMPORTANT: If user refers to a booking by price/amount (like 'the R67000 one'), first CALL list_my_bookings(limit=10) to find the matching booking, then use its booking_id for further actions.\n"
             "2) CREATE BOOKING - Use backend tool:\n"
             "   - Identify category from symptoms. If unclear, ask ONE question.\n"
             "   - Collect: category_name + problem_description.\n"
@@ -366,6 +369,8 @@ async def entrypoint(ctx: JobContext):
             "3) CANCEL / RESCHEDULE BOOKING - Use backend tools:\n"
             "   - 'Cancel my booking' → CALL cancel_booking(booking_id='...', reason='...')\n"
             "   - 'Reschedule my booking' → CALL reschedule_booking(booking_id='...', scheduled_date='...', scheduled_time='...')\n"
+            "   - IMPORTANT: When user says 'reschedule to [date] at [time]', you MUST provide BOTH scheduled_date AND scheduled_time.\n"
+            "   - Date format: 'YYYY-MM-DD' (e.g., '2025-09-28'). Time format: 'HH:MM' (e.g., '09:00').\n"
             "4) UI NAVIGATION - Use ui_navigate with these exact action values:\n"
             "   BOOKING SCREENS:\n"
             "   - 'Show my bookings' → ui_navigate(action='open_bookings_tab')\n"
@@ -418,8 +423,9 @@ async def entrypoint(ctx: JobContext):
             "2) UI NAVIGATION - Use ui_navigate with these exact action values:\n"
             "   - 'Show my requests' → ui_navigate(action='open_artisan_requests')\n"
             "   - 'Show my appointments' → ui_navigate(action='open_artisan_appointments')\n"
-            "   - 'Open my wallet' → ui_navigate(action='open_artisan_wallet')\n"
+            "   - 'Open my schedule' → ui_navigate(action='open_schedule')\n"
             "   - 'Open my calendar' → ui_navigate(action='open_calendar')\n"
+            "   - 'Open my wallet' → ui_navigate(action='open_artisan_wallet')\n"
             "   - 'Open my profile' → ui_navigate(action='open_profile')\n"
             "   - 'Open settings' → ui_navigate(action='open_settings')\n"
             "   - 'Open notifications' → ui_navigate(action='open_notifications')\n"
@@ -648,10 +654,12 @@ async def entrypoint(ctx: JobContext):
     @llm.function_tool(
         description=(
             "List the user's recent bookings. Optionally filter by status (e.g., 'pending_assignment', 'in_progress', 'completed'). "
-            "Use this when user asks 'Show my bookings' or 'What bookings do I have?'"
+            "Returns booking IDs, categories, statuses, dates, prices, order numbers and RFQ numbers. "
+            "Use this when user asks 'Show my bookings', 'What bookings do I have?', "
+            "'Find my R67000 booking', or 'Which booking costs...' — then match by price/amount from the results."
         )
     )
-    async def list_my_bookings(status: str = "", limit: int = 5) -> str:
+    async def list_my_bookings(status: str = "", limit: int = 10) -> str:
         """List user's bookings from backend API."""
         nonlocal backend_client
         if not backend_client:
@@ -671,15 +679,30 @@ async def entrypoint(ctx: JobContext):
                 return "You don't have any bookings" + (f" with status {status}" if status else "") + "."
 
             response = f"You have {count} booking" + ("s" if count > 1 else "") + ".\n"
-            for i, booking in enumerate(bookings[:5], 1):
+            for i, booking in enumerate(bookings[:10], 1):
                 booking_id = booking.get('booking_id', 'unknown')
                 booking_status = booking.get('status', 'unknown')
                 category = booking.get('category_name', 'service')
                 date = booking.get('scheduled_date', '')
                 time = booking.get('scheduled_time', '')
+                price = booking.get('total_price', '')
+                rfq_no = booking.get('rfq_no', '')
+                order_no = booking.get('order_number', '')
+                order_type = booking.get('order_type', '')
+                rfq_status = booking.get('rfq_status', '')
                 response += f"{i}. {category} booking {booking_id}: {booking_status}"
+                if price:
+                    response += f", price R{price}"
+                if rfq_no:
+                    response += f", RFQ #{rfq_no}"
+                if order_no:
+                    response += f", order #{order_no}"
+                if rfq_status:
+                    response += f", RFQ status: {rfq_status}"
                 if date and time:
-                    response += f" on {date} at {time}"
+                    response += f", scheduled {date} at {time}"
+                elif date:
+                    response += f", scheduled {date}"
                 response += ".\n"
 
             return response.strip()
@@ -703,7 +726,7 @@ async def entrypoint(ctx: JobContext):
             return "I need you to be authenticated first. Please make sure you're logged into the app."
 
         try:
-            result = await backend_client.call_action("get_booking_analytics", {})
+            result = await backend_client.call_backend_action("get_booking_analytics", {})
             if not result.get('ok') and not result.get('success'):
                 error = result.get('error', 'unknown_error')
                 return f"There was an issue getting analytics: {error}"
@@ -744,8 +767,10 @@ async def entrypoint(ctx: JobContext):
 
     @llm.function_tool(
         description=(
-            "Explain the details of an RFQ quote for a booking. "
-            "Use this when user asks 'Explain my quote' or 'What's the quote for my RFQ?'"
+            "Explain the details of an RFQ quote, scope of work, or booking details. "
+            "Accepts either a booking_id or an RFQ number (e.g., 'RFQ-BE6A011A'). "
+            "Use this when user asks 'Explain my quote', 'What's the scope of work for RFQ-...', "
+            "'What's the quote for my RFQ?', or 'Tell me about RFQ-...'"
         )
     )
     async def explain_quote(booking_id: str) -> str:
@@ -770,14 +795,33 @@ async def entrypoint(ctx: JobContext):
             explanation = data.get('explanation', '')
             quoted_price = data.get('quoted_price', '')
             quote_details = data.get('quote_details', '')
+            scope_of_work = data.get('scope_of_work', '')
+            problem_desc = data.get('problem_description', '')
+            rfq_no = data.get('rfq_no', '')
+            category = data.get('category_name', '')
+            rfq_status = data.get('rfq_status', '')
 
-            response = explanation or f"Quote status: {quote_status}."
+            response = ''
+            if rfq_no:
+                response += f"RFQ number: {rfq_no}. "
+            if category:
+                response += f"Category: {category}. "
+            if rfq_status:
+                response += f"RFQ status: {rfq_status}. "
+            if scope_of_work:
+                response += f"Scope of work: {scope_of_work}. "
+            elif problem_desc:
+                response += f"Description: {problem_desc}. "
+            if explanation:
+                response += explanation
+            elif not response:
+                response = f"Quote status: {quote_status}."
             if quoted_price:
-                response += f" Quoted price: {quoted_price}."
+                response += f" Quoted price: R{quoted_price}."
             if quote_details:
                 response += f" Details: {quote_details}."
 
-            return response
+            return response.strip()
         except Exception as e:
             logger.error(f"explain_quote error: {e}", exc_info=True)
             return "Sorry, I had trouble getting that quote. Please try again."
