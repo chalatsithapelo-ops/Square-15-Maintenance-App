@@ -254,7 +254,15 @@ async def entrypoint(ctx: JobContext):
         raise RuntimeError(
             "Silero plugin not available (silero.VAD missing). Install 'livekit-plugins-silero'."
         )
-    vad = silero.VAD.load()
+    # Tuned for low-latency conversational feel:
+    #   min_silence_duration: 0.25s (default 0.55) – detect end-of-speech faster
+    #   prefix_padding_duration: 0.3s (default 0.5) – less audio buffering
+    #   activation_threshold: 0.4 (default 0.5) – slightly more sensitive
+    vad = silero.VAD.load(
+        min_silence_duration=0.25,
+        prefix_padding_duration=0.3,
+        activation_threshold=0.4,
+    )
 
     logger.info("🤖 Creating voice agent...")
 
@@ -318,153 +326,45 @@ async def entrypoint(ctx: JobContext):
 
     def _instructions_for_role(role: str) -> str:
         role = (role or "client").strip().lower()
-        role_banner = (
-            "You are Lizzy, the Square 15 Voice AI Assistant. "
-            f"You are currently speaking to a {role.upper()} user.\n"
+
+        base = (
+            f"You are Lizzy, the Square 15 Voice AI Assistant, speaking to a {role.upper()} user.\n\n"
+            "RULES:\n"
+            "- Greet once, then just help. Never repeat your introduction.\n"
+            "- When user asks to DO something, CALL the right tool immediately.\n"
+            "- BACKEND tools for data: get_booking_status, list_my_bookings, explain_quote, check_payment, get_wallet_balance, get_messages, get_case_status.\n"
+            "- ui_navigate for screens: open_bookings_tab, open_wallet, open_profile, open_settings, open_notifications, open_calendar, open_map, open_help, open_support, go_home, go_back, close_window.\n"
+            "- create_booking for new bookings (handles propose+confirm). cancel_booking, reschedule_booking for changes.\n"
+            "- send_message_to_artisan, send_message_to_admin for messaging.\n"
+            "- NEVER narrate tool calls. Never say JSON, function names, or metadata.\n"
+            "- NEVER claim you opened/loaded pictures or images.\n"
+            "- Speak naturally, 1-3 short sentences. Be concise.\n"
+            "- If user says 'now'/'asap'/'urgent', use scheduled_date='now', scheduled_time='now'.\n"
+            "- Date format: YYYY-MM-DD. Time format: HH:MM.\n"
+            "- If user refers to a booking by price, call list_my_bookings first to find it.\n"
         )
 
-        # These rules are written to maximize tool-calling reliability.
-        hard_rules = (
-            "Hard rules (must follow):\n"
-            "- Your name is Lizzy. Only state your name once at the start, never repeat it.\n"
-            "- CRITICAL: When the user asks you to DO something (perform a task, open a screen, check a booking, etc.), you MUST call the appropriate tool. NEVER just reply with your name or greeting.\n"
-            "- CRITICAL: NEVER repeat your introduction or greeting. If you already greeted the user, do NOT say 'I am Lizzy, how can I help you today?' again. Just help them.\n"
-            "- You have TWO types of tools: BACKEND tools (get info/execute actions) and UI tools (ui_navigate).\n"
-            "- For QUERIES (status/info requests), use BACKEND tools: get_booking_status, list_my_bookings, explain_quote, check_payment.\n"
-            "- For UI NAVIGATION (opening screens), use ui_navigate.\n"
-            "- For WRITE OPERATIONS (create/cancel bookings), use create_booking which handles propose→confirm automatically.\n"
-            "- For MESSAGING (contact artisan/support), use: send_message_to_artisan, send_message_to_admin, get_messages.\n"
-            "- For SUPPORT CASES, use: get_case_status.\n"
-            "- For WALLET BALANCE, use: get_wallet_balance.\n"
-            "- For CLOSING screens/dialogs, use: ui_navigate with action='close_window' or 'close_dialog' or 'dismiss'.\n"
-            "- Never SAY or narrate tool calls. Do not say phrases like 'calling get_booking_status'.\n"
-            "- Never speak JSON, code, function names, or metadata. Only speak user-facing sentences.\n"
-            "- CRITICAL: NEVER say you are 'loading', 'checking', 'opening', or 'opened' pictures/photos/images or upload screens.\n"
-            "- CRITICAL: NEVER claim a screen has opened unless you can verify it. Say 'When it appears' not 'I opened it'.\n"
-            "- If user asks about pictures, tell them to check the app directly. Do NOT pretend to see or open images.\n"
-            "- When backend tools return data, SPEAK the information naturally to the user.\n"
-            "- If backend auth fails, explain user needs to be logged in and try ui_navigate to help them.\n"
-            "- If the user says 'now', 'asap', 'urgent', or 'emergency', use scheduled_date='now' and scheduled_time='now'.\n"
-            "- Speak naturally (not robotic). Keep it concise (1-3 short sentences).\n"
-        )
+        if role == "artisan":
+            base += (
+                "\nARTISAN ACTIONS:\n"
+                "- Accept job → ui_navigate(action='accept_latest_request')\n"
+                "- Reject job → ui_navigate(action='reject_latest_request')\n"
+                "- Start job → mark_booking_in_progress(booking_id)\n"
+                "- Cancel+reassign → artisan_cancel_and_reassign(booking_id, reason)\n"
+                "- Artisan screens: open_artisan_requests, open_artisan_appointments, open_artisan_wallet, open_schedule.\n"
+                "- Do not dispatch artisans while talking to an artisan.\n"
+            )
+        else:
+            base += (
+                "\nCLIENT ACTIONS:\n"
+                "- Create booking: collect category + problem, call create_booking. Use is_rfq='yes' for complex jobs.\n"
+                "- Cancel: cancel_booking(booking_id, reason). Reschedule: reschedule_booking(booking_id, date, time).\n"
+                "- Call artisan → ui_navigate(action='call_assigned_artisan', booking_id)\n"
+                "- RFQ upload → ui_navigate(action='open_rfq_upload')\n"
+                "- Future bookings → ui_navigate(action='open_future_bookings')\n"
+            )
 
-        client_flow = (
-            "Client workflow:\n"
-            "1) INFORMATION QUERIES - Use backend tools:\n"
-            "   - 'What's my booking status?' → CALL get_booking_status(booking_id='...')\n"
-            "   - 'Show my bookings' → CALL list_my_bookings(status='', limit=10)\n"
-            "   - 'Find my R67000 booking' → CALL list_my_bookings(limit=10) then find the booking with matching price and tell user about it.\n"
-            "   - 'Explain my quote' → CALL explain_quote(booking_id='...')\n"
-            "   - 'Scope of work for RFQ-...' → CALL explain_quote(booking_id='RFQ-...') — you can pass RFQ numbers directly.\n"
-            "   - 'Did I pay?' → CALL check_payment(booking_id='...')\n"
-            "   - 'What's my wallet balance?' → CALL get_wallet_balance()\n"
-            "   Then SPEAK the result naturally.\n"
-            "   IMPORTANT: If user refers to a booking by price/amount (like 'the R67000 one'), first CALL list_my_bookings(limit=10) to find the matching booking, then use its booking_id for further actions.\n"
-            "2) CREATE BOOKING - Use backend tool:\n"
-            "   - Identify category from symptoms. If unclear, ask ONE question.\n"
-            "   - Collect: category_name + problem_description.\n"
-            "   - CALL create_booking(category_name='...', problem_description='...', ...)\n"
-            "   - This handles proposal→confirmation automatically.\n"
-            "   - For RFQ (complex/needs quote), use is_rfq='yes'.\n"
-            "3) CANCEL / RESCHEDULE BOOKING - Use backend tools:\n"
-            "   - 'Cancel my booking' → CALL cancel_booking(booking_id='...', reason='...')\n"
-            "   - 'Reschedule my booking' → CALL reschedule_booking(booking_id='...', scheduled_date='...', scheduled_time='...')\n"
-            "   - IMPORTANT: When user says 'reschedule to [date] at [time]', you MUST provide BOTH scheduled_date AND scheduled_time.\n"
-            "   - Date format: 'YYYY-MM-DD' (e.g., '2025-09-28'). Time format: 'HH:MM' (e.g., '09:00').\n"
-            "4) UI NAVIGATION - Use ui_navigate with these exact action values:\n"
-            "   BOOKING SCREENS:\n"
-            "   - 'Show my bookings' → ui_navigate(action='open_bookings_tab')\n"
-            "   - 'Show future bookings' → ui_navigate(action='open_future_bookings')\n"
-            "   - 'Open photo upload for RFQ' → ui_navigate(action='open_rfq_upload')\n"
-            "   WALLET / PAYMENTS:\n"
-            "   - 'Open my wallet' → ui_navigate(action='open_wallet')\n"
-            "   COMMUNICATION:\n"
-            "   - 'Call my artisan' → ui_navigate(action='call_assigned_artisan', booking_id='...')\n"
-            "   - 'Open support chat' → ui_navigate(action='open_support')\n"
-            "   PROFILE / SETTINGS:\n"
-            "   - 'Open my profile' → ui_navigate(action='open_profile')\n"
-            "   - 'Open settings' → ui_navigate(action='open_settings')\n"
-            "   - 'Open notifications' → ui_navigate(action='open_notifications')\n"
-            "   CALENDAR / MAP:\n"
-            "   - 'Open my calendar' → ui_navigate(action='open_calendar')\n"
-            "   - 'Show the location on map' → ui_navigate(action='open_map', booking_id='...')\n"
-            "   GENERAL NAVIGATION:\n"
-            "   - 'Go to home screen' → ui_navigate(action='go_home')\n"
-            "   - 'Go back' → ui_navigate(action='go_back')\n"
-            "   - 'Close this window/dialog' → ui_navigate(action='close_window')\n"
-            "   - 'Open help / FAQ' → ui_navigate(action='open_help')\n"
-            "5) MESSAGING (Phase 3) - Use backend tools:\n"
-            "   - 'Contact my artisan' → CALL send_message_to_artisan(booking_id='...', message='...')\n"
-            "   - 'I need support' / 'File a complaint' → CALL send_message_to_admin(message='...', booking_id='...', subject='...')\n"
-            "   - 'Show my messages' → CALL get_messages(booking_id='...')\n"
-            "   - 'Check my support case' → CALL get_case_status(case_id='...')\n"
-            "\nExamples (client):\n"
-            "- User: 'What's the status of booking 123?'\n"
-            "  You: CALL get_booking_status('123'), then SPEAK: 'Your plumbing booking is in progress. John the plumber is on the way.'\n"
-            "- User: 'Dispatch a plumber, my tap is leaking.'\n"
-            "  You: CALL create_booking(category_name='Plumbing', problem_description='Leaking tap', ...)\n"
-            "- User: 'Open my wallet'\n"
-            "  You: CALL ui_navigate(action='open_wallet'), then say 'Opening your wallet now.'\n"
-            "- User: 'What is my balance?'\n"
-            "  You: CALL get_wallet_balance(), then SPEAK: 'Your wallet balance is R150.'\n"
-            "- User: 'Cancel booking 456'\n"
-            "  You: CALL cancel_booking(booking_id='456', reason='User requested cancellation'), then SPEAK the result.\n"
-            "- User: 'Go back to the home screen'\n"
-            "  You: CALL ui_navigate(action='go_home'), then say 'Going to the home screen.'\n"
-        )
-
-        artisan_flow = (
-            "Artisan workflow (tasks):\n"
-            "1) JOB MANAGEMENT:\n"
-            "- If artisan asks to accept a job/request → CALL ui_navigate(action='accept_latest_request')\n"
-            "- If artisan asks to reject → CALL ui_navigate(action='reject_latest_request')\n"
-            "- If artisan says they are starting the job → CALL mark_booking_in_progress(booking_id='...')\n"
-            "- If artisan needs to cancel and reassign → CALL artisan_cancel_and_reassign(booking_id='...', reason='...')\n"
-            "2) UI NAVIGATION - Use ui_navigate with these exact action values:\n"
-            "   - 'Show my requests' → ui_navigate(action='open_artisan_requests')\n"
-            "   - 'Show my appointments' → ui_navigate(action='open_artisan_appointments')\n"
-            "   - 'Open my schedule' → ui_navigate(action='open_schedule')\n"
-            "   - 'Open my calendar' → ui_navigate(action='open_calendar')\n"
-            "   - 'Open my wallet' → ui_navigate(action='open_artisan_wallet')\n"
-            "   - 'Open my profile' → ui_navigate(action='open_profile')\n"
-            "   - 'Open settings' → ui_navigate(action='open_settings')\n"
-            "   - 'Open notifications' → ui_navigate(action='open_notifications')\n"
-            "   - 'Go home' → ui_navigate(action='go_home')\n"
-            "   - 'Go back' → ui_navigate(action='go_back')\n"
-            "   - 'Close this' → ui_navigate(action='close_window')\n"
-            "   - 'Show the location on map' → ui_navigate(action='open_map', booking_id='...')\n"
-            "3) INFORMATION QUERIES:\n"
-            "   - 'What's my wallet balance?' → CALL get_wallet_balance()\n"
-            "   - 'Show my bookings' → CALL list_my_bookings(status='', limit=5)\n"
-            "   - 'What's the status of booking X?' → CALL get_booking_status(booking_id='...')\n"
-            "4) MESSAGING:\n"
-            "   - 'Contact support' → CALL send_message_to_admin(message='...')\n"
-            "   - 'Show my messages' → CALL get_messages(booking_id='...')\n"
-            "- Do not attempt to dispatch artisans while speaking to an artisan.\n"
-            "\nExamples (artisan):\n"
-            "- User: 'Accept the latest request.'\n"
-            "  You: CALL ui_navigate(action='accept_latest_request'), then say 'Done — I accepted it.'\n"
-            "- User: 'What's my balance?'\n"
-            "  You: CALL get_wallet_balance(), then SPEAK the balance.\n"
-            "- User: 'Open my appointments'\n"
-            "  You: CALL ui_navigate(action='open_artisan_appointments'), then say 'Opening your appointments.'\n"
-        )
-
-        general = (
-            "General behavior:\n"
-            "- Speak naturally and professionally. You can answer general questions too.\n"
-            "- If user says 'how are you', answer briefly then return to helping.\n"
-            "- Always be helpful: acknowledge urgency, then take the next step.\n"
-        )
-
-        return "\n".join(
-            [
-                role_banner,
-                hard_rules,
-                client_flow if role != "artisan" else artisan_flow,
-                general,
-            ]
-        )
+        return base
 
     @llm.function_tool(
         description=(
@@ -1256,43 +1156,50 @@ async def entrypoint(ctx: JobContext):
     agent = voice.Agent(
         vad=vad,
         stt=openai.STT(model="whisper-1", language="en"),
-        llm=openai.LLM(model="gpt-4o-mini", temperature=0.2),
+        llm=openai.LLM(model="gpt-4o-mini", temperature=0.4),
         tts=openai.TTS(model="tts-1", voice="alloy"),
         instructions=_instructions_for_role(caller_role),
     )
 
     logger.info("🚀 Starting agent session...")
-    session = voice.AgentSession(tools=[
-        ui_navigate,
-        # Read-only backend tools
-        get_booking_status,
-        list_my_bookings,
-        get_booking_analytics,
-        explain_quote,
-        check_payment,
-        get_wallet_balance,
-        # Write backend tools
-        create_booking,
-        cancel_booking,
-        reschedule_booking,
-        mark_booking_in_progress,
-        artisan_cancel_and_reassign,
-        # Phase 3: Messaging tools
-        send_message_to_artisan,
-        send_message_to_admin,
-        get_messages,
-        # Phase 3: Case management
-        get_case_status,
-    ])
+    session = voice.AgentSession(
+        tools=[
+            ui_navigate,
+            # Read-only backend tools
+            get_booking_status,
+            list_my_bookings,
+            get_booking_analytics,
+            explain_quote,
+            check_payment,
+            get_wallet_balance,
+            # Write backend tools
+            create_booking,
+            cancel_booking,
+            reschedule_booking,
+            mark_booking_in_progress,
+            artisan_cancel_and_reassign,
+            # Phase 3: Messaging tools
+            send_message_to_artisan,
+            send_message_to_admin,
+            get_messages,
+            # Phase 3: Case management
+            get_case_status,
+        ],
+        # --- Latency optimizations ---
+        min_endpointing_delay=0.25,       # default 0.5 — faster turn completion
+        max_endpointing_delay=1.5,        # default 3.0 — don't wait too long
+        preemptive_generation=True,        # start LLM+TTS before turn confirmed
+        min_interruption_duration=0.4,     # default 0.5 — faster interruption
+    )
 
     # Guardrail: never allow internal/tool narration to reach TTS.
     _orig_say = session.say
 
-    async def _say_sanitized(text: str, *args, **kwargs):
+    def _say_sanitized(text: str, *args, **kwargs):
         cleaned = _sanitize_spoken_text(text)
         if not cleaned:
             return None
-        return await _orig_say(cleaned, *args, **kwargs)
+        return _orig_say(cleaned, *args, **kwargs)
 
     session.say = _say_sanitized
     await session.start(agent, room=ctx.room)
@@ -1358,7 +1265,7 @@ async def entrypoint(ctx: JobContext):
                 )
                 if not text:
                     return
-                asyncio.create_task(session.say(text, allow_interruptions=True))
+                session.say(text, allow_interruptions=True)
         except Exception as e:
             logger.info(f"metadata handler error (ignored): {e}")
 
@@ -1403,7 +1310,7 @@ async def entrypoint(ctx: JobContext):
         logger.warning(f"⚠️ Could not attach metadata listener: {e}")
 
     try:
-        await session.say(
+        session.say(
             "Hi, I am Lizzy, how can I help you today?",
             allow_interruptions=True,
         )

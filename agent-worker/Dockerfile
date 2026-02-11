@@ -9,7 +9,10 @@ RUN pip install --no-cache-dir --upgrade pip
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Copy worker script
+# Download Silero VAD model weights at build time (avoids first-run delay)
+RUN python -c "from livekit.plugins.silero import VAD; VAD.load()" 2>/dev/null || true
+
+# Copy worker script from agent-worker/ subdirectory
 COPY agent-worker/voice_agent_worker.py /app/voice_agent_worker.py
 
 # Runtime env vars are expected to be provided by your hosting platform:
