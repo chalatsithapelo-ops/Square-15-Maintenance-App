@@ -426,13 +426,9 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
       _attachArtisanRequestAnnouncements();
 
       // ── CRITICAL: send Firebase credentials so the agent can call backend tools ──
+      // Uses data channel (publishData) so it won't be overwritten by
+      // subsequent setMetadata calls for context/speak.
       await _sendCredentialsToAgent();
-
-      // Tell the agent it can start speaking (and confirm metadata path).
-      // This is best-effort and safe to ignore.
-      await _sendSpeakToAgent(
-        "Hello! I'm $_assistantName, your Square 15 voice assistant. You're connected — how can I help you today?",
-      );
 
       // Provide capabilities + in-app context so the agent can reliably
       // navigate and complete tasks via square15_ui actions.
@@ -662,15 +658,23 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
       'seq': ++_appMetadataSeq,
     });
 
+    // Use publishData (reliable data channel) instead of setMetadata.
+    // setMetadata gets overwritten by subsequent calls (speak, context)
+    // before the agent can read it — the data channel delivers independently.
     try {
       final dynamic lp = _room!.localParticipant!;
-      final dynamic result = lp.setMetadata(meta);
-      if (result is Future) {
-        await result;
-      }
-      print('[ai_app] credentials_sent to agent');
+      final bytes = utf8.encode(meta);
+      await lp.publishData(bytes, reliable: true);
+      print('[ai_app] credentials_sent via data channel');
     } catch (e) {
-      print('[ai_app] credentials_send_failed err=$e');
+      print('[ai_app] credentials_data_send_failed err=$e, falling back to metadata');
+      // Fallback: try setMetadata + delay so agent has time to read it
+      try {
+        final dynamic lp = _room!.localParticipant!;
+        final dynamic result = lp.setMetadata(meta);
+        if (result is Future) await result;
+        await Future.delayed(const Duration(milliseconds: 1500));
+      } catch (_) {}
     }
   }
 

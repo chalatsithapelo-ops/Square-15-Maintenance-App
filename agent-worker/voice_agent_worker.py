@@ -1362,9 +1362,43 @@ async def entrypoint(ctx: JobContext):
         except Exception as e:
             logger.info(f"metadata handler error (ignored): {e}")
 
+    def on_data_received(data_packet):
+        """Handle data channel messages — used for credentials delivery."""
+        nonlocal backend_client, firebase_token, session_id, session_nonce
+        try:
+            raw = None
+            if hasattr(data_packet, 'data'):
+                raw = data_packet.data
+            elif isinstance(data_packet, bytes):
+                raw = data_packet
+            if raw is None:
+                return
+            text = raw.decode('utf-8') if isinstance(raw, (bytes, bytearray)) else str(raw)
+            if not text or not text.strip():
+                return
+            msg = json.loads(text)
+            if not isinstance(msg, dict):
+                return
+            msg_type = (msg.get('type') or '').strip()
+            if msg_type == 'square15_voice_credentials':
+                firebase_token = msg.get('firebase_token')
+                session_id = msg.get('session_id')
+                session_nonce = msg.get('session_nonce')
+                if firebase_token:
+                    backend_client = BackendAPIClient(
+                        base_url=backend_url,
+                        firebase_token=firebase_token,
+                        session_id=session_id,
+                        session_nonce=session_nonce
+                    )
+                    logger.info(f"✅ Backend client initialized via DATA CHANNEL (session: {session_id[:12] if session_id else 'none'}...)")
+        except Exception as e:
+            logger.debug(f"data_received handler note: {e}")
+
     try:
         ctx.room.on("participant_metadata_changed", on_participant_metadata_changed)
-        logger.info("✅ Listening for app metadata (square15_app)")
+        ctx.room.on("data_received", on_data_received)
+        logger.info("✅ Listening for app metadata + data channel (square15_app)")
     except Exception as e:
         logger.warning(f"⚠️ Could not attach metadata listener: {e}")
 
