@@ -22,6 +22,7 @@ import 'package:maintenanceapp/screens/home/booking/ai_photo_upload_screen.dart'
 import 'package:maintenanceapp/screens/home/booking/client_calendar_screen.dart';
 import 'package:maintenanceapp/screens/home/booking/payment_method_sheet.dart';
 import 'package:maintenanceapp/screens/home/booking/voice_service_picker_screen.dart';
+import 'package:maintenanceapp/screens/home/rfq/rfq_workflow_screen.dart';
 import 'package:maintenanceapp/screens/service_provider_panel/Serviceprovider/artisan_appointments_screen.dart';
 import 'package:maintenanceapp/screens/service_provider_panel/service_provider_request_screen.dart';
 import 'package:maintenanceapp/screens/service_provider_panel/wallet_page.dart';
@@ -2549,50 +2550,212 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
         'electric': 'electrical',
         'power': 'electrical',
         'lights': 'electrical',
+        'light': 'electrical',
         'plug': 'electrical',
         'socket': 'electrical',
         'wiring': 'electrical',
+        'wire': 'electrical',
         'breaker': 'electrical',
         'trip': 'electrical',
+        'tripping': 'electrical',
+        'circuit': 'electrical',
+        'outlet': 'electrical',
+        'switch': 'electrical',
+        'fuse': 'electrical',
+        'fusebox': 'electrical',
+        'panel': 'electrical',
+        'generator': 'electrical',
+        'inverter': 'electrical',
+        'electrician': 'electrical',
+        'ceiling fan': 'electrical',
 
         // Plumbing
         'plumber': 'plumbing',
+        'plumbing': 'plumbing',
         'tap': 'plumbing',
+        'taps': 'plumbing',
+        'faucet': 'plumbing',
         'leak': 'plumbing',
         'leaking': 'plumbing',
+        'leaky': 'plumbing',
         'pipe': 'plumbing',
+        'pipes': 'plumbing',
         'toilet': 'plumbing',
         'geyser': 'plumbing',
         'drain': 'plumbing',
+        'drainage': 'plumbing',
         'blocked': 'plumbing',
+        'unblock': 'plumbing',
+        'clogged': 'plumbing',
+        'sewer': 'plumbing',
+        'sewage': 'plumbing',
+        'water heater': 'plumbing',
+        'burst': 'plumbing',
+        'basin': 'plumbing',
+        'sink': 'plumbing',
+        'shower': 'plumbing',
+        'bath': 'plumbing',
+        'bathtub': 'plumbing',
+        'cistern': 'plumbing',
+        'valve': 'plumbing',
+        'stopcock': 'plumbing',
+        'water pressure': 'plumbing',
+        'garbage disposal': 'plumbing',
 
         // Painting
         'paint': 'painting',
         'painting': 'painting',
         'repaint': 'painting',
-        'wall': 'painting',
-        'ceiling': 'painting',
+        'painter': 'painting',
+        'wall paint': 'painting',
+        'ceiling paint': 'painting',
+        'stain': 'painting',
+        'staining': 'painting',
+        'wallpaper': 'painting',
+        'primer': 'painting',
+        'varnish': 'painting',
+        'coating': 'painting',
 
         // Cleaning
         'clean': 'cleaning',
         'cleaning': 'cleaning',
         'dirty': 'cleaning',
         'deep clean': 'cleaning',
-        'carpet': 'cleaning',
+        'carpet clean': 'cleaning',
+        'window clean': 'cleaning',
+        'pressure wash': 'cleaning',
+        'powerwash': 'cleaning',
+        'sanitize': 'cleaning',
+        'disinfect': 'cleaning',
+        'maid': 'cleaning',
+        'domestic': 'cleaning',
+        'housekeeping': 'cleaning',
+        'move out clean': 'cleaning',
+        'move in clean': 'cleaning',
+        'post construction clean': 'cleaning',
 
         // Tiling
         'tile': 'tiling',
         'tiling': 'tiling',
         'tiles': 'tiling',
+        'retile': 'tiling',
+        'grout': 'tiling',
+        'grouting': 'tiling',
 
         // Roofing
         'roof': 'roofing',
         'roofing': 'roofing',
+        'gutter': 'roofing',
+        'gutters': 'roofing',
+        'shingle': 'roofing',
+        'shingles': 'roofing',
+        'skylight': 'roofing',
+        'roof leak': 'roofing',
+        'waterproofing': 'roofing',
+        'flashing': 'roofing',
 
-        // HVAC (if present)
+        // HVAC / Air Conditioning
         'aircon': 'air conditioning',
         'air con': 'air conditioning',
+        'air conditioner': 'air conditioning',
+        'air conditioning': 'air conditioning',
         'ac': 'air conditioning',
+        'hvac': 'air conditioning',
+        'furnace': 'air conditioning',
+        'heating': 'air conditioning',
+        'ventilation': 'air conditioning',
+        'thermostat': 'air conditioning',
+        'duct': 'air conditioning',
+        'ducting': 'air conditioning',
+        'cooling': 'air conditioning',
+
+        // Carpentry
+        'carpenter': 'carpentry',
+        'carpentry': 'carpentry',
+        'wood': 'carpentry',
+        'wooden': 'carpentry',
+        'door': 'carpentry',
+        'doors': 'carpentry',
+        'cabinet': 'carpentry',
+        'cabinets': 'carpentry',
+        'cupboard': 'carpentry',
+        'cupboards': 'carpentry',
+        'shelf': 'carpentry',
+        'shelves': 'carpentry',
+        'shelving': 'carpentry',
+        'deck': 'carpentry',
+        'decking': 'carpentry',
+        'furniture': 'carpentry',
+        'wardrobe': 'carpentry',
+        'trim': 'carpentry',
+        'skirting': 'carpentry',
+        'staircase': 'carpentry',
+        'stairs': 'carpentry',
+        'window frame': 'carpentry',
+
+        // Flooring
+        'floor': 'flooring',
+        'flooring': 'flooring',
+        'hardwood': 'flooring',
+        'laminate': 'flooring',
+        'vinyl': 'flooring',
+        'carpet': 'flooring',
+        'parquet': 'flooring',
+        'subfloor': 'flooring',
+        'baseboard': 'flooring',
+        'sanding': 'flooring',
+        'refinish': 'flooring',
+
+        // Landscaping
+        'garden': 'landscaping',
+        'gardener': 'landscaping',
+        'gardening': 'landscaping',
+        'landscaping': 'landscaping',
+        'lawn': 'landscaping',
+        'mowing': 'landscaping',
+        'tree': 'landscaping',
+        'trees': 'landscaping',
+        'trimming': 'landscaping',
+        'hedge': 'landscaping',
+        'hedges': 'landscaping',
+        'irrigation': 'landscaping',
+        'sprinkler': 'landscaping',
+        'fence': 'landscaping',
+        'fencing': 'landscaping',
+        'patio': 'landscaping',
+        'paving': 'landscaping',
+        'sod': 'landscaping',
+
+        // Car Detailing
+        'car wash': 'car detailing',
+        'car detailing': 'car detailing',
+        'car detail': 'car detailing',
+        'vehicle': 'car detailing',
+        'car clean': 'car detailing',
+        'car polish': 'car detailing',
+        'car valet': 'car detailing',
+        'valet': 'car detailing',
+        'auto detail': 'car detailing',
+        'car interior': 'car detailing',
+
+        // Solar Energy Solutions
+        'solar': 'solar energy solutions',
+        'solar panel': 'solar energy solutions',
+        'solar panels': 'solar energy solutions',
+        'solar geyser': 'solar energy solutions',
+        'pv solar': 'solar energy solutions',
+        'photovoltaic': 'solar energy solutions',
+        'solar installation': 'solar energy solutions',
+        'solar maintenance': 'solar energy solutions',
+        'solar energy': 'solar energy solutions',
+
+        // General Maintenance
+        'maintenance': 'general maintenance',
+        'general maintenance': 'general maintenance',
+        'handyman': 'general maintenance',
+        'odd job': 'general maintenance',
+        'odd jobs': 'general maintenance',
+        'emergency': 'general maintenance',
       };
 
       String inferred = normalizedInput;
@@ -2610,10 +2773,19 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
         normalize(inferred),
       };
 
-      if (candidates.contains('electrical')) candidates.addAll({'electrician'});
-      if (candidates.contains('plumbing')) candidates.addAll({'plumber'});
-      if (candidates.contains('painting')) candidates.addAll({'painter'});
-      if (candidates.contains('cleaning')) candidates.addAll({'cleaner'});
+      if (candidates.contains('electrical')) candidates.addAll({'electrician', 'electrics'});
+      if (candidates.contains('plumbing')) candidates.addAll({'plumber', 'plumbers'});
+      if (candidates.contains('painting')) candidates.addAll({'painter', 'painters'});
+      if (candidates.contains('cleaning')) candidates.addAll({'cleaner', 'cleaners'});
+      if (candidates.contains('carpentry')) candidates.addAll({'carpenter', 'carpenters'});
+      if (candidates.contains('roofing')) candidates.addAll({'roofer', 'roofers'});
+      if (candidates.contains('flooring')) candidates.addAll({'floor', 'floors'});
+      if (candidates.contains('landscaping')) candidates.addAll({'landscaper', 'gardener', 'garden'});
+      if (candidates.contains('tiling')) candidates.addAll({'tiler', 'tilers'});
+      if (candidates.contains('air conditioning')) candidates.addAll({'hvac', 'aircon', 'ac'});
+      if (candidates.contains('car detailing')) candidates.addAll({'car wash', 'valet'});
+      if (candidates.contains('solar energy solutions')) candidates.addAll({'solar', 'solar energy'});
+      if (candidates.contains('general maintenance')) candidates.addAll({'maintenance', 'handyman'});
 
       List<String> idsFromDoc(QueryDocumentSnapshot<Map<String, dynamic>> doc) {
         final data = doc.data();
@@ -2734,6 +2906,8 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
             .map((e) => e.trim())
             .where((e) => e.isNotEmpty)
             .toList();
+        // Only remove truly meaningless words; keep action words like
+        // fix/repair/install as they help match task names.
         const stop = <String>{
           'a',
           'an',
@@ -2747,19 +2921,194 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
           'at',
           'my',
           'our',
+          'i',
+          'me',
+          'we',
           'please',
           'need',
           'help',
           'with',
-          'fix',
-          'repair',
-          'replace',
-          'install',
-          'service',
-          'work',
-          'job',
+          'want',
+          'would',
+          'like',
+          'can',
+          'could',
+          'get',
+          'got',
+          'have',
+          'has',
+          'had',
+          'is',
+          'am',
+          'are',
+          'was',
+          'be',
+          'been',
+          'it',
+          'its',
+          'that',
+          'this',
+          'there',
+          'do',
+          'does',
+          'did',
+          'so',
+          'but',
+          'if',
+          'or',
+          'not',
+          'no',
         };
         return raw.where((t) => !stop.contains(t)).toList();
+      }
+
+      // Synonym groups: any word in a group matches any other in that group.
+      const List<Set<String>> synonymGroups = [
+        // ── Plumbing ──
+        {'unblock', 'unblocking', 'blocked', 'block', 'blockage', 'clogged', 'clog'},
+        {'toilet', 'toilets', 'loo', 'lavatory', 'wc'},
+        {'drain', 'drains', 'drainage', 'draining', 'drainpipe'},
+        {'sewer', 'sewage', 'sewerage', 'sewers'},
+        {'leak', 'leaking', 'leaky', 'leaks', 'leaked'},
+        {'pipe', 'pipes', 'piping', 'pipeline'},
+        {'tap', 'taps', 'faucet', 'faucets'},
+        {'geyser', 'geysers', 'water heater', 'boiler', 'boilers'},
+        {'burst', 'bursting', 'bursted', 'ruptured', 'rupture'},
+        {'valve', 'valves', 'stopcock', 'stopcocks'},
+        {'sink', 'sinks', 'basin', 'basins', 'washbasin'},
+        {'shower', 'showers', 'showerhead'},
+        {'cistern', 'cisterns', 'flush', 'flushing'},
+        {'plumbing', 'plumber', 'plumbers'},
+
+        // ── Electrical ──
+        {'electrical', 'electric', 'electrician', 'electrics', 'electricity'},
+        {'wiring', 'wire', 'wires', 'rewire', 'rewiring'},
+        {'breaker', 'breakers', 'circuit', 'circuits', 'trip', 'tripping', 'tripped'},
+        {'socket', 'sockets', 'outlet', 'outlets', 'plug', 'plugs'},
+        {'switch', 'switches', 'dimmer', 'dimmers'},
+        {'fuse', 'fuses', 'fusebox', 'fuseboard'},
+        {'light', 'lights', 'lighting', 'lamp', 'lamps', 'bulb', 'bulbs'},
+        {'panel', 'panels', 'distribution', 'db'},
+        {'generator', 'generators', 'genset'},
+        {'inverter', 'inverters', 'ups'},
+        {'ceiling fan', 'fan', 'fans', 'extractor'},
+
+        // ── Painting ──
+        {'paint', 'painting', 'repaint', 'repainting', 'painted'},
+        {'primer', 'priming', 'undercoat'},
+        {'varnish', 'varnishing', 'lacquer'},
+        {'stain', 'staining', 'stained', 'woodstain'},
+        {'wallpaper', 'wallpapering', 'wallpapers'},
+        {'coating', 'coatings', 'sealant'},
+        {'wall', 'walls'},
+        {'ceiling', 'ceilings'},
+        {'painter', 'painters'},
+
+        // ── Carpentry ──
+        {'carpenter', 'carpenters', 'carpentry', 'woodwork', 'woodworking'},
+        {'door', 'doors', 'doorframe', 'doorframes'},
+        {'cabinet', 'cabinets', 'cupboard', 'cupboards'},
+        {'shelf', 'shelves', 'shelving'},
+        {'furniture', 'furnishings'},
+        {'deck', 'decking', 'decks'},
+        {'wardrobe', 'wardrobes', 'closet', 'closets'},
+        {'staircase', 'staircases', 'stairs', 'stair', 'banister', 'banisters'},
+        {'skirting', 'baseboard', 'baseboards'},
+        {'trim', 'trimming', 'moulding', 'molding'},
+        {'window frame', 'window frames', 'windowsill'},
+
+        // ── Tiling ──
+        {'tile', 'tiling', 'tiles', 'retile', 'retiling', 'tiled'},
+        {'grout', 'grouting', 'regrouting', 'regrout'},
+        {'mosaic', 'mosaics'},
+
+        // ── Roofing ──
+        {'roof', 'roofing', 'roofs', 'rooftop'},
+        {'gutter', 'gutters', 'guttering', 'downpipe', 'downpipes'},
+        {'shingle', 'shingles'},
+        {'skylight', 'skylights'},
+        {'flashing', 'flashings'},
+        {'waterproof', 'waterproofing', 'damp', 'dampproofing'},
+        {'roofer', 'roofers'},
+
+        // ── HVAC / Air Conditioning ──
+        {'aircon', 'ac', 'hvac', 'air conditioner', 'air conditioning'},
+        {'furnace', 'furnaces', 'heater', 'heaters', 'heating'},
+        {'ventilation', 'ventilate', 'vent', 'vents'},
+        {'thermostat', 'thermostats'},
+        {'duct', 'ducts', 'ducting', 'ductwork'},
+        {'cooling', 'coolant', 'refrigerant'},
+        {'compressor', 'compressors', 'condenser'},
+
+        // ── Flooring ──
+        {'floor', 'floors', 'flooring'},
+        {'hardwood', 'timber', 'wooden'},
+        {'laminate', 'laminates', 'laminated'},
+        {'vinyl', 'vinyls', 'lino', 'linoleum'},
+        {'carpet', 'carpets', 'carpeting', 'rug', 'rugs'},
+        {'parquet', 'parquetry'},
+        {'subfloor', 'subfloors', 'underfloor'},
+        {'sanding', 'sand', 'sanded'},
+        {'refinish', 'refinishing', 'polishing', 'polish'},
+
+        // ── Landscaping ──
+        {'garden', 'gardens', 'gardening', 'gardener', 'gardeners'},
+        {'landscaping', 'landscape', 'landscaper', 'landscapers'},
+        {'lawn', 'lawns', 'grass'},
+        {'mow', 'mowing', 'mowed', 'mower'},
+        {'tree', 'trees', 'shrub', 'shrubs', 'bush', 'bushes'},
+        {'hedge', 'hedges', 'hedging'},
+        {'irrigation', 'irrigate', 'sprinkler', 'sprinklers'},
+        {'fence', 'fences', 'fencing'},
+        {'patio', 'patios', 'paving', 'pavers', 'paved'},
+        {'sod', 'turf', 'turfing'},
+
+        // ── Cleaning ──
+        {'clean', 'cleaning', 'cleaner', 'cleaners'},
+        {'deep clean', 'deep cleaning', 'thorough clean'},
+        {'pressure wash', 'pressure washing', 'powerwash', 'powerwashing'},
+        {'sanitize', 'sanitizing', 'sanitise', 'disinfect', 'disinfecting'},
+        {'housekeeping', 'housekeeper', 'domestic', 'maid'},
+
+        // ── Car Detailing ──
+        {'car wash', 'carwash', 'car cleaning'},
+        {'car detailing', 'car detail', 'auto detailing', 'auto detail'},
+        {'polish', 'polishing', 'buffing', 'buff'},
+        {'valet', 'valeting'},
+        {'wax', 'waxing'},
+
+        // ── Solar Energy Solutions ──
+        {'solar', 'solar panel', 'solar panels', 'photovoltaic', 'pv'},
+        {'solar geyser', 'solar heater', 'solar water heater'},
+        {'battery', 'batteries', 'powerwall', 'energy storage'},
+
+        // ── General Maintenance ──
+        {'maintenance', 'maintain', 'upkeep'},
+        {'handyman', 'handymen', 'odd job', 'odd jobs'},
+
+        // ── Common action synonyms ──
+        {'install', 'installation', 'installing', 'setup', 'set up'},
+        {'repair', 'repairing', 'repairs', 'mend', 'mending'},
+        {'replace', 'replacement', 'replacing', 'swap', 'swapping'},
+        {'fix', 'fixing', 'fixed'},
+        {'remove', 'removal', 'removing', 'demolish', 'demolition'},
+        {'inspect', 'inspection', 'inspecting', 'check', 'checking'},
+        {'upgrade', 'upgrading', 'upgrades'},
+        {'service', 'servicing', 'serviced'},
+        {'assembly', 'assemble', 'assembling'},
+      ];
+
+      /// Check if two tokens are synonyms of each other.
+      bool areSynonyms(String a, String b) {
+        if (a == b) return true;
+        for (final group in synonymGroups) {
+          if (group.contains(a) && group.contains(b)) return true;
+        }
+        // Stem-like: one starts with the other (min 4 chars).
+        if (a.length >= 4 && b.length >= 4) {
+          if (a.startsWith(b) || b.startsWith(a)) return true;
+        }
+        return false;
       }
 
       int scoreTask(String name, String hintLower, List<String> hintTokens) {
@@ -2772,25 +3121,100 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
 
         if (hintTokens.isEmpty) return 0;
         final nameTokens = tokens(n).toSet();
+        // Also include raw tokens from the name (without stop-word removal)
+        // to catch meaningful words like "repair", "install", etc.
+        final nameTokensRaw = n
+            .replaceAll(RegExp(r'[^a-z0-9\s]'), ' ')
+            .split(RegExp(r'\s+'))
+            .map((e) => e.trim())
+            .where((e) => e.isNotEmpty)
+            .toSet();
+        final allNameTokens = {...nameTokens, ...nameTokensRaw};
+
         int overlap = 0;
+        int synonymHits = 0;
         for (final t in hintTokens) {
-          if (nameTokens.contains(t)) overlap++;
+          if (allNameTokens.contains(t)) {
+            overlap++;
+          } else {
+            // Check synonym/stem match against all name tokens.
+            for (final nt in allNameTokens) {
+              if (areSynonyms(t, nt)) {
+                synonymHits++;
+                break;
+              }
+            }
+          }
         }
 
-        // Strong intent words for plumbing unblocks.
+        // Also check hint words against raw name tokens for substring matches.
+        int substringHits = 0;
+        for (final t in hintTokens) {
+          if (t.length < 4) continue;
+          for (final nt in allNameTokens) {
+            if (nt.length < 4) continue;
+            if (nt.contains(t) || t.contains(nt)) {
+              substringHits++;
+              break;
+            }
+          }
+        }
+
+        // Strong intent words for common service types across ALL categories.
         final strong = <String>{
-          'unblock',
-          'blocked',
-          'toilet',
-          'drain',
-          'sewer'
+          // Plumbing
+          'unblock', 'unblocking', 'blocked', 'blockage', 'clogged',
+          'toilet', 'drain', 'sewer', 'sewage',
+          'leak', 'leaking', 'burst', 'pipe', 'geyser',
+          'tap', 'faucet', 'cistern', 'valve',
+          // Electrical
+          'wiring', 'rewire', 'circuit', 'breaker', 'tripping',
+          'socket', 'outlet', 'fuse', 'fusebox',
+          'generator', 'inverter', 'panel',
+          // Painting
+          'paint', 'painting', 'repaint', 'wallpaper', 'varnish', 'stain',
+          // Carpentry
+          'door', 'cabinet', 'cupboard', 'shelf', 'shelving',
+          'deck', 'decking', 'wardrobe', 'staircase', 'furniture',
+          // Tiling
+          'tile', 'tiling', 'retile', 'grout', 'grouting',
+          // Roofing
+          'roof', 'roofing', 'gutter', 'shingle', 'skylight',
+          'waterproofing', 'flashing',
+          // HVAC
+          'aircon', 'hvac', 'furnace', 'thermostat', 'duct',
+          'ventilation', 'compressor',
+          // Flooring
+          'floor', 'flooring', 'hardwood', 'laminate', 'vinyl',
+          'carpet', 'parquet', 'sanding', 'refinish',
+          // Landscaping
+          'garden', 'lawn', 'mowing', 'tree', 'hedge',
+          'irrigation', 'fence', 'fencing', 'patio', 'paving',
+          // Cleaning
+          'deep clean', 'pressure wash', 'sanitize',
+          // Car Detailing
+          'car wash', 'car detailing', 'polish', 'valet',
+          // Solar
+          'solar', 'solar panel', 'solar geyser', 'photovoltaic',
+          // General
+          'emergency', 'handyman',
         };
         int strongHits = 0;
         for (final t in hintTokens) {
-          if (strong.contains(t) && nameTokens.contains(t)) strongHits++;
+          if (!strong.contains(t)) continue;
+          if (allNameTokens.contains(t)) {
+            strongHits++;
+          } else {
+            for (final nt in allNameTokens) {
+              if (areSynonyms(t, nt)) {
+                strongHits++;
+                break;
+              }
+            }
+          }
         }
 
-        return overlap * 10 + strongHits * 15;
+        return overlap * 10 + synonymHits * 12 + substringHits * 8 + strongHits * 15;
       }
 
       final hintTokens = tokens(hint);
@@ -3071,8 +3495,8 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
 
     // Smart time handling: use smart defaults if not specified
     // (Don't reject after photos uploaded - just use sensible defaults)
-    late final String effectiveDate;
-    late final String effectiveTime;
+    late String effectiveDate;
+    late String effectiveTime;
 
     final bool missingSchedule = scheduledDate.isEmpty ||
         scheduledTime.isEmpty ||
@@ -3119,8 +3543,49 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
         return; // Return early - wait for user response
       }
     } else {
-      effectiveDate = scheduledDate;
-      effectiveTime = scheduledTime;
+      // Validate the AI-provided date is not in the past.
+      // AI agents sometimes hallucinate old dates (e.g. October 2023).
+      DateTime? parsedScheduled;
+      try {
+        final dateParts = scheduledDate.split('-');
+        if (dateParts.length == 3) {
+          final y = int.tryParse(dateParts[0]) ?? 0;
+          final m = int.tryParse(dateParts[1]) ?? 0;
+          final d = int.tryParse(dateParts[2]) ?? 0;
+          if (y > 0 && m > 0 && d > 0) {
+            // Parse time too for full comparison.
+            final timeParts = scheduledTime.split(':');
+            final h = int.tryParse(timeParts.isNotEmpty ? timeParts[0] : '0') ?? 0;
+            final min = int.tryParse(timeParts.length > 1 ? timeParts[1] : '0') ?? 0;
+            parsedScheduled = DateTime(y, m, d, h, min);
+          }
+        }
+      } catch (_) {
+        // ignore parse errors
+      }
+
+      if (parsedScheduled != null && parsedScheduled.isBefore(now)) {
+        // Date is in the past — use smart defaults instead.
+        print('[booking_time] AI provided past date ($scheduledDate $scheduledTime), using smart default');
+        if (isEmergency) {
+          final dt = now.add(const Duration(hours: 1));
+          effectiveDate = _formatDate(dt);
+          final hh = dt.hour.toString().padLeft(2, '0');
+          final mm = dt.minute.toString().padLeft(2, '0');
+          effectiveTime = '$hh:$mm:00';
+        } else if (now.hour < 16) {
+          final roundHour = now.hour < 9 ? 9 : (now.hour + 1);
+          effectiveDate = _formatDate(now);
+          effectiveTime = '$roundHour:00:00'.padLeft(8, '0');
+        } else {
+          final tomorrow = now.add(const Duration(days: 1));
+          effectiveDate = _formatDate(tomorrow);
+          effectiveTime = '09:00:00';
+        }
+      } else {
+        effectiveDate = scheduledDate;
+        effectiveTime = scheduledTime;
+      }
     }
 
     final resolvedHint = taskNameHint.trim().isNotEmpty
@@ -3282,14 +3747,18 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
         '[dispatch_flow] Creating booking with jobIds=${jobIds.length} isRFQ=$isRFQRequested photos=${workImageUrls.length}');
 
     // If we still have no priced task, open the published services list for this category.
+    // The user can pick a priced service or confirm the service isn't listed → RFQ.
     if (jobIds.isEmpty && !isRFQRequested) {
       setState(() {
         _aiResponse =
-            'Please select a priced service from the catalog to continue, or request a quote.';
+            'I found available services in this category. Please select the one that matches your need, or confirm if it\'s not listed.';
       });
       _addToTranscript(
         'AI',
-        'Please select a priced service from the catalog to continue, or request a quote.',
+        'Opening services list for $categoryName. Please select the matching service or confirm it is not listed.',
+      );
+      await _sendSpeakToAgent(
+        'I found services in this category. Let me show you the available options so you can select the right one. If the service is not listed, you can request a quote.',
       );
 
       final picked = await Get.to<VoiceServicePickerResult>(
@@ -3310,6 +3779,7 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
       }
 
       if (picked.isRFQ) {
+        // User explicitly confirmed the service is not listed → RFQ route.
         isRFQRequested = true;
         rfqReason = rfqReason.isNotEmpty ? rfqReason : 'no_priced_service';
       } else {
@@ -3329,12 +3799,126 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
       }
     }
 
+    // ── Date/time picker ──
+    // After service selection (or when the AI provided an invalid date),
+    // let the user confirm/pick the correct date and time.
+    // For emergency orders, skip the picker and use the smart defaults.
+    if (!isEmergency) {
+      try {
+        final initialDate = DateTime.tryParse('$effectiveDate ${effectiveTime.replaceAll(RegExp(r'[^0-9:]'), '')}') ??
+            DateTime.tryParse(effectiveDate) ??
+            now;
+        // Ensure initialDate is not in the past for the picker.
+        final safeInitialDate = initialDate.isBefore(now) ? now : initialDate;
+
+        final pickedDate = await showDatePicker(
+          context: context,
+          initialDate: safeInitialDate,
+          firstDate: now,
+          lastDate: now.add(const Duration(days: 365)),
+          helpText: 'Select service date',
+        );
+
+        if (!mounted) return;
+
+        if (pickedDate != null) {
+          final pickedTime = await showTimePicker(
+            context: context,
+            initialTime: TimeOfDay(
+              hour: safeInitialDate.hour,
+              minute: safeInitialDate.minute,
+            ),
+            helpText: 'Select service time',
+          );
+
+          if (!mounted) return;
+
+          if (pickedTime != null) {
+            final chosenDateTime = DateTime(
+              pickedDate.year,
+              pickedDate.month,
+              pickedDate.day,
+              pickedTime.hour,
+              pickedTime.minute,
+            );
+            // Ensure the chosen date/time is in the future.
+            if (chosenDateTime.isBefore(DateTime.now())) {
+              Get.snackbar(
+                _assistantName,
+                'Selected time is in the past. Using the next available slot.',
+                backgroundColor: Colors.orange,
+                colorText: Colors.white,
+              );
+              final adjusted = DateTime.now().add(const Duration(hours: 1));
+              effectiveDate = _formatDate(adjusted);
+              effectiveTime =
+                  '${adjusted.hour.toString().padLeft(2, '0')}:${adjusted.minute.toString().padLeft(2, '0')}:00';
+            } else {
+              effectiveDate = _formatDate(chosenDateTime);
+              effectiveTime =
+                  '${pickedTime.hour.toString().padLeft(2, '0')}:${pickedTime.minute.toString().padLeft(2, '0')}:00';
+            }
+          }
+          // If time picker dismissed, keep the existing effectiveTime.
+        }
+        // If date picker dismissed, keep the existing effectiveDate/Time.
+      } catch (e) {
+        debugPrint('[booking_time] Date picker error: $e');
+        // Non-fatal: fall through with existing effectiveDate/Time.
+      }
+    }
+
     final locationSummary = serviceOnCurrentLocation
         ? 'at your current location'
         : (address.trim().isNotEmpty ? 'at $address' : 'at the provided location');
-    final modeSummary = isRFQRequested
-        ? 'Request a quote (RFQ)'
-        : 'Create an order booking';
+
+    // ── RFQ route: open the full AI RFQ workflow screen ──
+    // When the user confirms the service is not listed, redirect to the
+    // RFQ workflow which will trigger the AI quotation generation.
+    if (isRFQRequested) {
+      setState(() {
+        _aiResponse =
+            'Opening the RFQ workflow. Please provide the details for your quotation request.';
+      });
+      _addToTranscript('AI', 'Opening RFQ workflow for $categoryName.');
+      await _sendSpeakToAgent(
+        'Since the exact service is not listed, I am opening the quotation request form. '
+        'Please fill in the details and our AI will generate a quote for you.',
+      );
+
+      try {
+        await Get.to(
+          () => RFQWorkflowScreen(
+            categoryName: categoryName,
+            categoryId: categoryIds.isNotEmpty ? categoryIds.first : '',
+            initialProblemDescription: description.trim().isNotEmpty ? description : '',
+            initialAdditionalNotes: notes.trim().isNotEmpty ? notes : '',
+            initialServiceOnCurrentLocation: serviceOnCurrentLocation,
+            initialServiceAddress: address,
+            initialServiceLat: serviceOnCurrentLocation ? '' : lat,
+            initialServiceLng: serviceOnCurrentLocation ? '' : lng,
+          ),
+          transition: Transition.fadeIn,
+        );
+      } catch (e) {
+        debugPrint('[rfq_workflow] Failed to open RFQ screen: $e');
+        Get.snackbar(_assistantName, 'Could not open RFQ workflow: $e',
+            backgroundColor: Colors.red, colorText: Colors.white);
+      }
+
+      if (!mounted) return;
+
+      setState(() {
+        _aiResponse = 'RFQ workflow completed.';
+      });
+      _addToTranscript('System', 'RFQ workflow completed.');
+      await _sendSpeakToAgent(
+        'Your quotation request has been submitted. You will be notified once it is reviewed.',
+      );
+      return;
+    }
+
+    final modeSummary = 'Create an order booking';
 
     final okToProceed = await _confirmUiAction(
       title: 'Create booking?',
@@ -3379,7 +3963,8 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
               : materialsResponsibility,
           'is_rfq_requested': isRFQRequested,
           'rfq_reason': rfqReason,
-          'created_by': 'lizzy',
+          'require_photos': !isRFQRequested,
+          'created_by': 'voice_ai',
           'is_emergency': isEmergency,
         },
       );
