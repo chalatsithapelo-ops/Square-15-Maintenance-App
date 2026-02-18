@@ -457,19 +457,37 @@ class _ArtisanRFQReviewScreenState extends State<ArtisanRFQReviewScreen> {
 
       final rejectionCount = currentRejections.length;
 
+      final updateData = <String, dynamic>{
+        'rfq_artisan_rejections': currentRejections,
+        'rfq_artisan_rejection_count': rejectionCount,
+      };
+
+      // If 3 artisans have rejected, escalate to admin for manual review
+      if (rejectionCount >= 3) {
+        updateData['rfq_status'] = 'pending_admin_review';
+        updateData['rfq_submitted_to'] = 'admin';
+        updateData['rfq_artisan_rejection_threshold_reached'] = true;
+        updateData['status'] = 'rfq_pending';
+      }
+
       await FirebaseFirestore.instance
           .collection('futureBookings')
           .doc(widget.bookingId)
-          .update({
-        'rfq_artisan_rejections': currentRejections,
-        'rfq_artisan_rejection_count': rejectionCount,
-        // If 3 rejections, route to admin
-        if (rejectionCount >= 3) ...{
-          'rfq_status': 'pending_admin_review',
-          'rfq_submitted_to': 'admin',
-          'rfq_artisan_rejection_threshold_reached': true,
-        },
-      });
+          .update(updateData);
+
+      // Notify admin when rejection threshold reached
+      if (rejectionCount >= 3) {
+        try {
+          await FutureBookingService.sendNotificationToAdmin(
+            bookingId: widget.bookingId,
+            message: 'RFQ for ${widget.bookingData['category_name'] ?? 'service'} '
+                'has been rejected by $rejectionCount artisans. '
+                'Please review and manually assign.',
+          );
+        } catch (_) {
+          // Non-fatal: notification failure shouldn't block rejection
+        }
+      }
 
       Get.back();
       final message = rejectionCount >= 3

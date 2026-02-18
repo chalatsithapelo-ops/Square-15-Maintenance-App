@@ -2755,13 +2755,41 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
         'odd job': 'general maintenance',
         'odd jobs': 'general maintenance',
         'emergency': 'general maintenance',
+        // Compound phrases for common service requests
+        'blocked toilet': 'plumbing',
+        'blocked drain': 'plumbing',
+        'blocked sink': 'plumbing',
+        'blocked pipe': 'plumbing',
+        'blocked sewer': 'plumbing',
+        'unblock toilet': 'plumbing',
+        'unblock drain': 'plumbing',
+        'clogged toilet': 'plumbing',
+        'clogged drain': 'plumbing',
+        'leaking tap': 'plumbing',
+        'leaking pipe': 'plumbing',
+        'leaking geyser': 'plumbing',
+        'burst pipe': 'plumbing',
+        'burst geyser': 'plumbing',
+        'tripping power': 'electrical',
+        'tripping electricity': 'electrical',
+        'no power': 'electrical',
+        'no electricity': 'electrical',
+        'broken door': 'carpentry',
+        'broken window': 'carpentry',
+        'leaking roof': 'roofing',
       };
 
+      // Sort entries by key length descending so multi-word phrases
+      // (e.g. "blocked toilet") match before single words (e.g. "blocked").
+      final sortedEntries = symptomToCategory.entries.toList()
+        ..sort((a, b) => b.key.length.compareTo(a.key.length));
+
       String inferred = normalizedInput;
-      for (final entry in symptomToCategory.entries) {
+      for (final entry in sortedEntries) {
         if (normalizedInput == entry.key ||
             normalizedInput.contains(entry.key)) {
           inferred = entry.value;
+          print('[ai_cat] symptom "${entry.key}" → category "${entry.value}" from input "$normalizedInput"');
           break;
         }
       }
@@ -3233,6 +3261,8 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
             ) ??
             0.0;
 
+        print('[ai_task_score] name="$name" score=$s cost=$c hint="$hint"');
+
         if (s > bestScore) {
           best = data;
           bestScore = s;
@@ -3247,11 +3277,13 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
         }
       }
 
-      // Minimum score threshold: if the best match scored below 15,
+      print('[ai_task] Best score=$bestScore name="${best?['name']}" cost=$bestCost');
+
+      // Minimum score threshold: if the best match scored below 10,
       // the match is too weak to trust — return null so the user can
       // manually select the correct service via the future booking workflow.
-      if (bestScore >= 0 && bestScore < 15) {
-        print('[ai_task] Best score ($bestScore) below threshold 15 — no confident match');
+      if (bestScore >= 0 && bestScore < 10) {
+        print('[ai_task] Best score ($bestScore) below threshold 10 — no confident match');
         return null;
       }
       best ??= withId(snap.docs.first);
@@ -3594,14 +3626,35 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
       }
     }
 
-    final resolvedHint = taskNameHint.trim().isNotEmpty
-        ? taskNameHint
-        : (description.trim().isNotEmpty ? description : categoryName);
+    // Build a rich hint by combining all available text fields.
+    // Previously we only used ONE field (taskNameHint → description → categoryName),
+    // but the AI agent sometimes sends a generic task_name (e.g. "plumbing") while
+    // the specific words ("blocked toilet") are in categoryName or description.
+    // Combining all sources ensures the scoring algorithm has all keywords available.
+    final hintParts = <String>[
+      taskNameHint.trim(),
+      categoryName.trim(),
+      description.trim(),
+      notes.trim(),
+    ].where((s) => s.isNotEmpty).toSet(); // deduplicate identical values
+    final resolvedHint = hintParts.join(' ');
 
-    final task = await _resolveTaskForCategory(
+    print('[ai_task] resolvedHint="$resolvedHint" parts=${hintParts.length}');
+
+    var task = await _resolveTaskForCategory(
       categoryIds: categoryIds,
       taskNameHint: resolvedHint,
     );
+
+    // Retry with just categoryName if the combined hint didn't match
+    // (sometimes too many words dilute the score).
+    if (task == null && categoryName.trim().isNotEmpty && hintParts.length > 1) {
+      print('[ai_task] Retrying with categoryName only: "$categoryName"');
+      task = await _resolveTaskForCategory(
+        categoryIds: categoryIds,
+        taskNameHint: categoryName,
+      );
+    }
 
     double extractTaskCost(Map<String, dynamic> taskData) {
       return _toAmount(
