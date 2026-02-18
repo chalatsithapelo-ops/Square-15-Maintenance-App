@@ -21,8 +21,7 @@ import 'package:maintenanceapp/screens/home/booking/future_bookings_list_screen.
 import 'package:maintenanceapp/screens/home/booking/ai_photo_upload_screen.dart';
 import 'package:maintenanceapp/screens/home/booking/client_calendar_screen.dart';
 import 'package:maintenanceapp/screens/home/booking/payment_method_sheet.dart';
-import 'package:maintenanceapp/screens/home/booking/voice_service_picker_screen.dart';
-import 'package:maintenanceapp/screens/home/rfq/rfq_workflow_screen.dart';
+import 'package:maintenanceapp/screens/home/booking/create_future_booking_screen.dart';
 import 'package:maintenanceapp/screens/service_provider_panel/Serviceprovider/artisan_appointments_screen.dart';
 import 'package:maintenanceapp/screens/service_provider_panel/service_provider_request_screen.dart';
 import 'package:maintenanceapp/screens/service_provider_panel/wallet_page.dart';
@@ -3248,6 +3247,13 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
         }
       }
 
+      // Minimum score threshold: if the best match scored below 15,
+      // the match is too weak to trust — return null so the user can
+      // manually select the correct service via the future booking workflow.
+      if (bestScore >= 0 && bestScore < 15) {
+        print('[ai_task] Best score ($bestScore) below threshold 15 — no confident match');
+        return null;
+      }
       best ??= withId(snap.docs.first);
       return best;
     } catch (e) {
@@ -3746,57 +3752,49 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
     print(
         '[dispatch_flow] Creating booking with jobIds=${jobIds.length} isRFQ=$isRFQRequested photos=${workImageUrls.length}');
 
-    // If we still have no priced task, open the published services list for this category.
-    // The user can pick a priced service or confirm the service isn't listed → RFQ.
+    // If we still have no priced task, open the future booking page so the
+    // user can follow the full future-booking workflow: browse categories,
+    // pick a service, choose Order or RFQ, set date/time, etc.
+    // Lizzy must NOT auto-create an RFQ — the user decides.
     if (jobIds.isEmpty && !isRFQRequested) {
       setState(() {
         _aiResponse =
-            'I found available services in this category. Please select the one that matches your need, or confirm if it\'s not listed.';
+            'I could not find exact pricing for this service. Let me open the booking page so you can select the correct service.';
       });
       _addToTranscript(
         'AI',
-        'Opening services list for $categoryName. Please select the matching service or confirm it is not listed.',
+        'Opening the future booking page for $categoryName so you can select the service you need.',
       );
       await _sendSpeakToAgent(
-        'I found services in this category. Let me show you the available options so you can select the right one. If the service is not listed, you can request a quote.',
+        'I could not find the exact pricing for this service. '
+        'Let me open the booking page where you can browse and select the correct service. '
+        'If the service is not listed, you can request a quotation from there.',
       );
 
-      final picked = await Get.to<VoiceServicePickerResult>(
-        () => VoiceServicePickerScreen(
-          categoryScopeIds: categoryIds,
-          categoryName: categoryName,
-        ),
-      );
+      try {
+        await Get.to(
+          () => const CreateFutureBookingScreen(),
+          transition: Transition.fadeIn,
+        );
+      } catch (e) {
+        debugPrint('[voice_booking] Failed to open future booking screen: $e');
+        Get.snackbar(_assistantName, 'Could not open booking page: $e',
+            backgroundColor: Colors.red, colorText: Colors.white);
+      }
 
       if (!mounted) return;
 
-      if (picked == null) {
-        setState(() {
-          _aiResponse = 'No service selected. Booking not created.';
-        });
-        _addToTranscript('AI', 'No service selected. Booking not created.');
-        return;
-      }
-
-      if (picked.isRFQ) {
-        // User explicitly confirmed the service is not listed → RFQ route.
-        isRFQRequested = true;
-        rfqReason = rfqReason.isNotEmpty ? rfqReason : 'no_priced_service';
-      } else {
-        final id = (picked.taskId ?? '').toString().trim();
-        final name = (picked.taskName ?? '').toString().trim();
-        final cost = picked.cost ?? 0;
-
-        if (id.isEmpty || cost <= 0) {
-          isRFQRequested = true;
-          rfqReason = rfqReason.isNotEmpty ? rfqReason : 'unpriced_task';
-          jobIds = <String>[];
-        } else {
-          jobIds = <String>[id];
-          taskNamesById[id] = name.isNotEmpty ? name : categoryName;
-          taskCostsById[id] = cost;
-        }
-      }
+      // The CreateFutureBookingScreen handles everything internally
+      // (service selection, Order/RFQ toggle, date, location, submission).
+      // Nothing left for Lizzy to do — just acknowledge.
+      setState(() {
+        _aiResponse = 'Booking workflow completed.';
+      });
+      _addToTranscript('System', 'Future booking workflow completed.');
+      await _sendSpeakToAgent(
+        'Your booking has been handled. Is there anything else I can help you with?',
+      );
+      return;
     }
 
     // ── Date/time picker ──
@@ -3872,48 +3870,40 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
         ? 'at your current location'
         : (address.trim().isNotEmpty ? 'at $address' : 'at the provided location');
 
-    // ── RFQ route: open the full AI RFQ workflow screen ──
-    // When the user confirms the service is not listed, redirect to the
-    // RFQ workflow which will trigger the AI quotation generation.
+    // ── RFQ guard ──
+    // If isRFQRequested somehow ended up true (e.g. from an explicit user
+    // intent or backend flag), redirect to the full future booking page
+    // instead of auto-creating an RFQ.  The user must choose RFQ themselves.
     if (isRFQRequested) {
       setState(() {
         _aiResponse =
-            'Opening the RFQ workflow. Please provide the details for your quotation request.';
+            'Let me open the booking page so you can submit a quotation request.';
       });
-      _addToTranscript('AI', 'Opening RFQ workflow for $categoryName.');
+      _addToTranscript('AI', 'Redirecting to future booking page for RFQ.');
       await _sendSpeakToAgent(
-        'Since the exact service is not listed, I am opening the quotation request form. '
-        'Please fill in the details and our AI will generate a quote for you.',
+        'Let me open the booking page where you can request a quotation. '
+        'You will be able to describe the job, upload photos, and our system will generate a quote for you.',
       );
 
       try {
         await Get.to(
-          () => RFQWorkflowScreen(
-            categoryName: categoryName,
-            categoryId: categoryIds.isNotEmpty ? categoryIds.first : '',
-            initialProblemDescription: description.trim().isNotEmpty ? description : '',
-            initialAdditionalNotes: notes.trim().isNotEmpty ? notes : '',
-            initialServiceOnCurrentLocation: serviceOnCurrentLocation,
-            initialServiceAddress: address,
-            initialServiceLat: serviceOnCurrentLocation ? '' : lat,
-            initialServiceLng: serviceOnCurrentLocation ? '' : lng,
-          ),
+          () => const CreateFutureBookingScreen(),
           transition: Transition.fadeIn,
         );
       } catch (e) {
-        debugPrint('[rfq_workflow] Failed to open RFQ screen: $e');
-        Get.snackbar(_assistantName, 'Could not open RFQ workflow: $e',
+        debugPrint('[rfq_workflow] Failed to open future booking screen: $e');
+        Get.snackbar(_assistantName, 'Could not open booking page: $e',
             backgroundColor: Colors.red, colorText: Colors.white);
       }
 
       if (!mounted) return;
 
       setState(() {
-        _aiResponse = 'RFQ workflow completed.';
+        _aiResponse = 'Booking workflow completed.';
       });
-      _addToTranscript('System', 'RFQ workflow completed.');
+      _addToTranscript('System', 'Future booking workflow completed.');
       await _sendSpeakToAgent(
-        'Your quotation request has been submitted. You will be notified once it is reviewed.',
+        'Your request has been handled. Is there anything else I can help you with?',
       );
       return;
     }
