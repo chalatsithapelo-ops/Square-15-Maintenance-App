@@ -21,7 +21,6 @@ import 'package:maintenanceapp/screens/home/booking/future_bookings_list_screen.
 import 'package:maintenanceapp/screens/home/booking/ai_photo_upload_screen.dart';
 import 'package:maintenanceapp/screens/home/booking/client_calendar_screen.dart';
 import 'package:maintenanceapp/screens/home/booking/payment_method_sheet.dart';
-import 'package:maintenanceapp/screens/home/booking/create_future_booking_screen.dart';
 import 'package:maintenanceapp/screens/service_provider_panel/Serviceprovider/artisan_appointments_screen.dart';
 import 'package:maintenanceapp/screens/service_provider_panel/service_provider_request_screen.dart';
 import 'package:maintenanceapp/screens/service_provider_panel/wallet_page.dart';
@@ -1629,29 +1628,8 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
     if (action == 'create_order_booking' || action == 'dispatch_artisan') {
       if (_isCreatingOrderBooking) return;
 
-      // Check if photos are required
-      final map = payload is Map
-          ? payload.map((k, v) => MapEntry(k.toString(), v))
-          : <String, dynamic>{};
-      final requirePhotos = _boolValue(
-          map['require_photos'] ?? map['requirePhotos'],
-          defaultValue: true);
-
-      final workImageUrls = _stringListFromDynamic(
-        map['work_image_urls'] ??
-            map['workImageUrls'] ??
-            map['image_urls'] ??
-            map['imageUrls'] ??
-            map['images'],
-      );
-
-      if (requirePhotos && workImageUrls.length < 3) {
-        // Open photo upload first, then dispatch after photos are uploaded
-        await _openPhotoUploadThenDispatch(payload);
-        return;
-      }
-
-      // Direct dispatch without photos (legacy path)
+      // Voice-first flow: skip photo gate entirely.
+      // Photos are optional and can be added post-booking from booking history.
       _isCreatingOrderBooking = true;
       try {
         await _createOrderBookingFromPayload(payload);
@@ -3805,183 +3783,71 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
     print(
         '[dispatch_flow] Creating booking with jobIds=${jobIds.length} isRFQ=$isRFQRequested photos=${workImageUrls.length}');
 
-    // If we still have no priced task, open the future booking page so the
-    // user can follow the full future-booking workflow: browse categories,
-    // pick a service, choose Order or RFQ, set date/time, etc.
-    // Lizzy must NOT auto-create an RFQ — the user decides.
+    // Voice-first flow: if no priced task found, auto-create an RFQ
+    // instead of redirecting to a manual booking form.
+    // The user already described the job — we have all the data needed.
     if (jobIds.isEmpty && !isRFQRequested) {
+      isRFQRequested = true;
+      rfqReason = rfqReason.isEmpty ? 'no_matching_task' : rfqReason;
+      print('[voice_rfq] Auto-creating RFQ: reason=$rfqReason category=$categoryName');
+
       setState(() {
         _aiResponse =
-            'I could not find exact pricing for this service. Let me open the booking page so you can select the correct service.';
+            'I could not find exact pricing for $categoryName. Creating a request for quotes from available artisans...';
       });
       _addToTranscript(
         'AI',
-        'Opening the future booking page for $categoryName so you can select the service you need.',
+        'No exact pricing found for $categoryName. Auto-creating RFQ.',
       );
       await _sendSpeakToAgent(
-        'I could not find the exact pricing for this service. '
-        'Let me open the booking page where you can browse and select the correct service. '
-        'If the service is not listed, you can request a quotation from there.',
+        'I could not find the exact pricing for this service, '
+        'so I am creating a request for quotes. '
+        'Available artisans in your area will send you their prices.',
       );
-
-      try {
-        await Get.to(
-          () => const CreateFutureBookingScreen(),
-          transition: Transition.fadeIn,
-        );
-      } catch (e) {
-        debugPrint('[voice_booking] Failed to open future booking screen: $e');
-        Get.snackbar(_assistantName, 'Could not open booking page: $e',
-            backgroundColor: Colors.red, colorText: Colors.white);
-      }
-
-      if (!mounted) return;
-
-      // The CreateFutureBookingScreen handles everything internally
-      // (service selection, Order/RFQ toggle, date, location, submission).
-      // Nothing left for Lizzy to do — just acknowledge.
-      setState(() {
-        _aiResponse = 'Booking workflow completed.';
-      });
-      _addToTranscript('System', 'Future booking workflow completed.');
-      await _sendSpeakToAgent(
-        'Your booking has been handled. Is there anything else I can help you with?',
-      );
-      return;
+      // Fall through to the booking creation below with isRFQRequested = true
     }
 
-    // ── Date/time picker ──
-    // After service selection (or when the AI provided an invalid date),
-    // let the user confirm/pick the correct date and time.
-    // For emergency orders, skip the picker and use the smart defaults.
-    if (!isEmergency) {
-      try {
-        final initialDate = DateTime.tryParse('$effectiveDate ${effectiveTime.replaceAll(RegExp(r'[^0-9:]'), '')}') ??
-            DateTime.tryParse(effectiveDate) ??
-            now;
-        // Ensure initialDate is not in the past for the picker.
-        final safeInitialDate = initialDate.isBefore(now) ? now : initialDate;
-
-        final pickedDate = await showDatePicker(
-          context: context,
-          initialDate: safeInitialDate,
-          firstDate: now,
-          lastDate: now.add(const Duration(days: 365)),
-          helpText: 'Select service date',
-        );
-
-        if (!mounted) return;
-
-        if (pickedDate != null) {
-          final pickedTime = await showTimePicker(
-            context: context,
-            initialTime: TimeOfDay(
-              hour: safeInitialDate.hour,
-              minute: safeInitialDate.minute,
-            ),
-            helpText: 'Select service time',
-          );
-
-          if (!mounted) return;
-
-          if (pickedTime != null) {
-            final chosenDateTime = DateTime(
-              pickedDate.year,
-              pickedDate.month,
-              pickedDate.day,
-              pickedTime.hour,
-              pickedTime.minute,
-            );
-            // Ensure the chosen date/time is in the future.
-            if (chosenDateTime.isBefore(DateTime.now())) {
-              Get.snackbar(
-                _assistantName,
-                'Selected time is in the past. Using the next available slot.',
-                backgroundColor: Colors.orange,
-                colorText: Colors.white,
-              );
-              final adjusted = DateTime.now().add(const Duration(hours: 1));
-              effectiveDate = _formatDate(adjusted);
-              effectiveTime =
-                  '${adjusted.hour.toString().padLeft(2, '0')}:${adjusted.minute.toString().padLeft(2, '0')}:00';
-            } else {
-              effectiveDate = _formatDate(chosenDateTime);
-              effectiveTime =
-                  '${pickedTime.hour.toString().padLeft(2, '0')}:${pickedTime.minute.toString().padLeft(2, '0')}:00';
-            }
-          }
-          // If time picker dismissed, keep the existing effectiveTime.
-        }
-        // If date picker dismissed, keep the existing effectiveDate/Time.
-      } catch (e) {
-        debugPrint('[booking_time] Date picker error: $e');
-        // Non-fatal: fall through with existing effectiveDate/Time.
-      }
-    }
+    // Voice-first flow: trust AI-provided date/time.
+    // No date/time picker dialogs — the AI already extracted or defaulted them.
+    // The smart defaults above already handle missing/past dates.
+    print('[voice_booking] Using date=$effectiveDate time=$effectiveTime (emergency=$isEmergency)');
 
     final locationSummary = serviceOnCurrentLocation
         ? 'at your current location'
         : (address.trim().isNotEmpty ? 'at $address' : 'at the provided location');
 
-    // ── RFQ guard ──
-    // If isRFQRequested somehow ended up true (e.g. from an explicit user
-    // intent or backend flag), redirect to the full future booking page
-    // instead of auto-creating an RFQ.  The user must choose RFQ themselves.
-    if (isRFQRequested) {
-      setState(() {
-        _aiResponse =
-            'Let me open the booking page so you can submit a quotation request.';
-      });
-      _addToTranscript('AI', 'Redirecting to future booking page for RFQ.');
-      await _sendSpeakToAgent(
-        'Let me open the booking page where you can request a quotation. '
-        'You will be able to describe the job, upload photos, and our system will generate a quote for you.',
-      );
+    // Voice-first flow: no confirmation dialog.
+    // The AI reads a summary aloud and proceeds directly.
+    // The user already confirmed verbally during the conversation.
+    final modeSummary = isRFQRequested
+        ? 'Creating a request for quotes'
+        : 'Creating an order booking';
 
-      try {
-        await Get.to(
-          () => const CreateFutureBookingScreen(),
-          transition: Transition.fadeIn,
-        );
-      } catch (e) {
-        debugPrint('[rfq_workflow] Failed to open future booking screen: $e');
-        Get.snackbar(_assistantName, 'Could not open booking page: $e',
-            backgroundColor: Colors.red, colorText: Colors.white);
-      }
+    print('[voice_booking] $modeSummary for $categoryName on $effectiveDate at $effectiveTime');
 
-      if (!mounted) return;
+    // Build a human-readable summary for the voice readback.
+    final totalCost = taskCostsById.values.fold(0.0, (a, b) => a + b);
+    final taskNamesSummary = taskNamesById.values.isNotEmpty
+        ? taskNamesById.values.join(', ')
+        : categoryName;
+    final costSummary = totalCost > 0
+        ? 'for R${totalCost.toStringAsFixed(0)}'
+        : '';
+    final dateSummary = effectiveDate.isNotEmpty
+        ? 'on $effectiveDate at ${effectiveTime.substring(0, 5)}'
+        : 'as soon as possible';
 
-      setState(() {
-        _aiResponse = 'Booking workflow completed.';
-      });
-      _addToTranscript('System', 'Future booking workflow completed.');
-      await _sendSpeakToAgent(
-        'Your request has been handled. Is there anything else I can help you with?',
-      );
-      return;
-    }
-
-    final modeSummary = 'Create an order booking';
-
-    final okToProceed = await _confirmUiAction(
-      title: 'Create booking?',
-      message:
-          '$modeSummary for $categoryName on $effectiveDate at $effectiveTime, $locationSummary?',
-      confirmText: 'Create booking',
-    );
-    if (!okToProceed) return;
+    final voiceSummary = isRFQRequested
+        ? 'Creating a request for quotes for $taskNamesSummary $dateSummary $locationSummary. '
+          'Available artisans will send you their prices.'
+        : 'Creating your booking for $taskNamesSummary $costSummary $dateSummary $locationSummary. '
+          'I will send the request to the nearest available artisan.';
 
     setState(() {
-      _aiResponse =
-          'Creating your booking and sending your request to the nearest available artisan...';
+      _aiResponse = voiceSummary;
     });
-    _addToTranscript(
-      'AI',
-      'Creating your booking and sending your request to the nearest available artisan...',
-    );
-    await _sendSpeakToAgent(
-      'I am creating your booking now, and I will send your request to the nearest available artisan. I will update you as soon as someone accepts.',
-    );
+    _addToTranscript('AI', voiceSummary);
+    await _sendSpeakToAgent(voiceSummary);
 
     try {
       final backend = await _tryExecuteAssistantAction(
@@ -4006,7 +3872,7 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
               : materialsResponsibility,
           'is_rfq_requested': isRFQRequested,
           'rfq_reason': rfqReason,
-          'require_photos': !isRFQRequested,
+          'require_photos': false,
           'created_by': 'voice_ai',
           'is_emergency': isEmergency,
         },
