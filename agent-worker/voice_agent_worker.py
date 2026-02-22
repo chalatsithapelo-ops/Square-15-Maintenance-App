@@ -357,6 +357,7 @@ async def entrypoint(ctx: JobContext):
             "- Provide category_name (e.g. 'plumbing') and/or task_name (e.g. 'unblock toilet').\n"
             "- Read back the price from the results. If cost is null, say 'This service requires a quote from an artisan'.\n"
             "- NEVER guess or make up prices. Always use lookup_service_pricing to get actual prices.\n"
+            "- If lookup_service_pricing is not available or fails, tell the user: 'I'm having trouble retrieving our pricing right now. Please check the services section in the app or try again shortly.'\n"
             "\n"
             "BOOKING CREATION (IMPORTANT):\n"
             "- To create a new booking, ALWAYS use ui_navigate with action='create_order_booking'.\n"
