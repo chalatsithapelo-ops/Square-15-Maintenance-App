@@ -2503,9 +2503,31 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
     String categoryName,
   ) async {
     try {
-      final catSnap = await FirebaseService.categoryRef
-          .where('status', isEqualTo: 'publish')
-          .get();
+      // Try multiple status values to find published categories.
+      QuerySnapshot<Map<String, dynamic>>? catSnap;
+      for (final sv in ['publish', 'Published', 'active', 'Active']) {
+        try {
+          final r = await FirebaseService.categoryRef
+              .where('status', isEqualTo: sv)
+              .get();
+          if (r.docs.isNotEmpty) {
+            catSnap = r;
+            print('[ai_cat] Found ${r.docs.length} categories with status=$sv');
+            break;
+          }
+        } catch (_) {}
+      }
+      // Last resort: get all categories without status filter.
+      if (catSnap == null || catSnap.docs.isEmpty) {
+        try {
+          catSnap = await FirebaseService.categoryRef.get();
+          print('[ai_cat] Found ${catSnap.docs.length} categories (no status filter)');
+        } catch (_) {}
+      }
+      if (catSnap == null || catSnap.docs.isEmpty) {
+        print('[ai_cat] No categories found in Firestore');
+        return <String>[];
+      }
 
       String normalize(String s) {
         return s
@@ -2851,35 +2873,42 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
 
       QuerySnapshot<Map<String, dynamic>>? snap;
 
+      // Try a query with a specific field, value, and optional status filter.
       Future<QuerySnapshot<Map<String, dynamic>>?> tryQuery(
         String field,
-        String value,
-      ) async {
+        String value, {
+        String? statusValue,
+      }) async {
         try {
-          final r = await FirebaseService.taskRef
-              .where('status', isEqualTo: 'publish')
-              .where(field, isEqualTo: value)
-              .get();
-          print('[ai_task] try field=$field id=$value count=${r.docs.length}');
+          Query<Map<String, dynamic>> q = FirebaseService.taskRef;
+          if (statusValue != null) {
+            q = q.where('status', isEqualTo: statusValue);
+          }
+          q = q.where(field, isEqualTo: value);
+          final r = await q.get();
+          print('[ai_task] try field=$field id=$value status=${statusValue ?? 'any'} count=${r.docs.length}');
           return r;
-        } catch (_) {
+        } catch (e) {
+          print('[ai_task] query error field=$field id=$value: $e');
           return null;
         }
       }
 
-      // Try the most common schema first: tasks.categoryId
-      for (final id in ids) {
-        final r = await tryQuery('categoryId', id);
-        if (r != null && r.docs.isNotEmpty) {
-          snap = r;
-          break;
-        }
-      }
+      // All possible category ID field names in the tasks collection.
+      const categoryFields = [
+        'categoryId',
+        'category_id',
+        'subCategoryId',
+        'sub_category_id',
+        'subcategoryId',
+        'subcategory_id',
+      ];
 
-      // Fallback: some schemas use tasks.category_id
-      if (snap == null || snap.docs.isEmpty) {
+      // Phase 1: Try with status='publish' (the expected value).
+      for (final field in categoryFields) {
+        if (snap != null && snap.docs.isNotEmpty) break;
         for (final id in ids) {
-          final r = await tryQuery('category_id', id);
+          final r = await tryQuery(field, id, statusValue: 'publish');
           if (r != null && r.docs.isNotEmpty) {
             snap = r;
             break;
@@ -2887,7 +2916,45 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
         }
       }
 
-      if (snap == null || snap.docs.isEmpty) return null;
+      // Phase 2: Try other common status values.
+      if (snap == null || snap.docs.isEmpty) {
+        print('[ai_task] No tasks found with status=publish, trying other status values');
+        for (final statusVal in ['Published', 'active', 'Active']) {
+          if (snap != null && snap.docs.isNotEmpty) break;
+          for (final field in categoryFields) {
+            if (snap != null && snap.docs.isNotEmpty) break;
+            for (final id in ids) {
+              final r = await tryQuery(field, id, statusValue: statusVal);
+              if (r != null && r.docs.isNotEmpty) {
+                snap = r;
+                break;
+              }
+            }
+          }
+        }
+      }
+
+      // Phase 3: Try without any status filter as last resort.
+      if (snap == null || snap.docs.isEmpty) {
+        print('[ai_task] No tasks found with any status filter, trying without status');
+        for (final field in categoryFields) {
+          if (snap != null && snap.docs.isNotEmpty) break;
+          for (final id in ids) {
+            final r = await tryQuery(field, id);
+            if (r != null && r.docs.isNotEmpty) {
+              snap = r;
+              break;
+            }
+          }
+        }
+      }
+
+      if (snap == null || snap.docs.isEmpty) {
+        print('[ai_task] No tasks found for any category ID or field combination');
+        return null;
+      }
+
+      print('[ai_task] Found ${snap.docs.length} tasks for category lookup');
 
       Map<String, dynamic> withId(
           QueryDocumentSnapshot<Map<String, dynamic>> doc) {
@@ -3637,38 +3704,64 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
     Future<Map<String, dynamic>?> findFirstPricedTaskInCategories() async {
       QuerySnapshot<Map<String, dynamic>>? snap;
 
-      for (final catId in categoryIds) {
-        try {
-          final r = await FirebaseService.taskRef
-              .where('status', isEqualTo: 'publish')
-              .where('categoryId', isEqualTo: catId)
-              .limit(10)
-              .get();
-          if (r.docs.isNotEmpty) {
-            snap = r;
-            break;
-          }
-        } catch (_) {}
-      }
+      const catFields = [
+        'categoryId',
+        'category_id',
+        'subCategoryId',
+        'sub_category_id',
+        'subcategoryId',
+        'subcategory_id',
+      ];
+      const statusVals = ['publish', 'Published', 'active', 'Active'];
 
-      if (snap == null || snap.docs.isEmpty) {
-        for (final catId in categoryIds) {
-          try {
-            final r = await FirebaseService.taskRef
-                .where('status', isEqualTo: 'publish')
-                .where('category_id', isEqualTo: catId)
-                .limit(10)
-                .get();
-            if (r.docs.isNotEmpty) {
-              snap = r;
-              break;
-            }
-          } catch (_) {}
+      // Try each status+field combination.
+      for (final sv in statusVals) {
+        if (snap != null && snap.docs.isNotEmpty) break;
+        for (final field in catFields) {
+          if (snap != null && snap.docs.isNotEmpty) break;
+          for (final catId in categoryIds) {
+            try {
+              final r = await FirebaseService.taskRef
+                  .where('status', isEqualTo: sv)
+                  .where(field, isEqualTo: catId)
+                  .limit(20)
+                  .get();
+              if (r.docs.isNotEmpty) {
+                snap = r;
+                print('[ai_fallback] Found ${r.docs.length} tasks: status=$sv field=$field catId=$catId');
+                break;
+              }
+            } catch (_) {}
+          }
         }
       }
 
-      if (snap == null || snap.docs.isEmpty) return null;
+      // Last resort: try without status filter.
+      if (snap == null || snap.docs.isEmpty) {
+        for (final field in catFields) {
+          if (snap != null && snap.docs.isNotEmpty) break;
+          for (final catId in categoryIds) {
+            try {
+              final r = await FirebaseService.taskRef
+                  .where(field, isEqualTo: catId)
+                  .limit(20)
+                  .get();
+              if (r.docs.isNotEmpty) {
+                snap = r;
+                print('[ai_fallback] Found ${r.docs.length} tasks (no status filter): field=$field catId=$catId');
+                break;
+              }
+            } catch (_) {}
+          }
+        }
+      }
 
+      if (snap == null || snap.docs.isEmpty) {
+        print('[ai_fallback] No tasks found in any category field combination');
+        return null;
+      }
+
+      // Prefer priced tasks.
       for (final d in snap.docs) {
         final data = d.data();
         data['id'] ??= d.id;
@@ -3679,6 +3772,98 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
       final data = snap.docs.first.data();
       data['id'] ??= snap.docs.first.id;
       return data;
+    }
+
+    // Global name-based search: if category-based task lookup fails entirely,
+    // search ALL published tasks by name similarity to the hint text.
+    // This handles cases where category IDs don't match between collections.
+    Future<Map<String, dynamic>?> searchTasksByNameGlobally(String hint) async {
+      if (hint.trim().isEmpty) return null;
+      try {
+        // Fetch a batch of all published tasks (no category filter).
+        QuerySnapshot<Map<String, dynamic>>? allSnap;
+        for (final sv in ['publish', 'Published', 'active', 'Active']) {
+          try {
+            final r = await FirebaseService.taskRef
+                .where('status', isEqualTo: sv)
+                .limit(100)
+                .get();
+            if (r.docs.isNotEmpty) {
+              allSnap = r;
+              print('[ai_global_search] Found ${r.docs.length} total tasks with status=$sv');
+              break;
+            }
+          } catch (_) {}
+        }
+        // Also try without status filter.
+        if (allSnap == null || allSnap.docs.isEmpty) {
+          try {
+            final r = await FirebaseService.taskRef.limit(100).get();
+            if (r.docs.isNotEmpty) {
+              allSnap = r;
+              print('[ai_global_search] Found ${r.docs.length} total tasks (no status filter)');
+            }
+          } catch (_) {}
+        }
+        if (allSnap == null || allSnap.docs.isEmpty) return null;
+
+        // Score each task against the hint using simple token matching.
+        final hLower = hint.trim().toLowerCase();
+        final hTokens = hLower
+            .replaceAll(RegExp(r'[^a-z0-9\s]'), ' ')
+            .split(RegExp(r'\s+'))
+            .where((t) => t.length >= 3)
+            .toSet();
+
+        Map<String, dynamic>? bestMatch;
+        int bestScore = 0;
+        double bestCost = 0;
+
+        for (final doc in allSnap.docs) {
+          final data = Map<String, dynamic>.from(doc.data());
+          data['id'] ??= doc.id;
+          final name = (data['name'] ?? '').toString().toLowerCase().trim();
+          if (name.isEmpty) continue;
+
+          final nameTokens = name
+              .replaceAll(RegExp(r'[^a-z0-9\s]'), ' ')
+              .split(RegExp(r'\s+'))
+              .where((t) => t.length >= 2)
+              .toSet();
+
+          int score = 0;
+          // Exact match.
+          if (name == hLower) score = 100;
+          // Contains match.
+          else if (name.contains(hLower) || hLower.contains(name)) score = 80;
+          else {
+            // Token overlap.
+            for (final ht in hTokens) {
+              for (final nt in nameTokens) {
+                if (ht == nt) score += 15;
+                else if (ht.contains(nt) || nt.contains(ht)) score += 8;
+              }
+            }
+          }
+
+          final cost = extractTaskCost(data);
+          if (score > bestScore || (score == bestScore && cost > 0 && bestCost <= 0)) {
+            bestMatch = data;
+            bestScore = score;
+            bestCost = cost;
+          }
+        }
+
+        if (bestScore >= 10 && bestMatch != null) {
+          print('[ai_global_search] Best global match: name="${bestMatch['name']}" score=$bestScore cost=$bestCost');
+          return bestMatch;
+        }
+        print('[ai_global_search] No strong global match (bestScore=$bestScore)');
+        return null;
+      } catch (e) {
+        print('[ai_global_search] Error: $e');
+        return null;
+      }
     }
 
     print(
@@ -3716,13 +3901,28 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
           taskCostsById[taskId] = cost;
         }
       } else {
-        // No published task found
-        // IMPORTANT: Do not create RTBD/unknown-price orders.
-        // Let the user pick a priced service from the catalog or explicitly request RFQ.
-        print(
-            '[ai_task] No published task found for categories; require selection');
-        rfqReason = 'no_matching_task';
-        jobIds = <String>[];
+        // No published task found in any category field combination.
+        // Last resort: search ALL tasks globally by name similarity.
+        print('[ai_task] No published task found for categories; trying global name search');
+        final globalMatch = await searchTasksByNameGlobally(resolvedHint);
+        if (globalMatch != null) {
+          final gId = (globalMatch['id'] ?? '').toString().trim();
+          final gName = (globalMatch['name'] ?? categoryName).toString();
+          final gCost = extractTaskCost(globalMatch);
+          print('[ai_task] Global search found: task=$gId name=$gName cost=$gCost');
+          if (gId.isNotEmpty && gCost > 0) {
+            jobIds = <String>[gId];
+            taskNamesById[gId] = gName;
+            taskCostsById[gId] = gCost;
+          } else {
+            rfqReason = 'unpriced_task';
+            jobIds = <String>[];
+          }
+        } else {
+          print('[ai_task] Global search also found nothing; require RFQ');
+          rfqReason = 'no_matching_task';
+          jobIds = <String>[];
+        }
       }
     } else {
       final taskId = (task['id'] ?? '').toString();
@@ -3755,7 +3955,24 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
         }
 
         if (chosenCost <= 0) {
-          print('[ai_task] task has no saved price; require selection');
+          // Category-based fallback also had no price — try global name search.
+          print('[ai_task] task has no saved price; trying global name search');
+          final globalMatch = await searchTasksByNameGlobally(resolvedHint);
+          if (globalMatch != null) {
+            final gId = (globalMatch['id'] ?? '').toString().trim();
+            final gName = (globalMatch['name'] ?? '').toString().trim();
+            final gCost = extractTaskCost(globalMatch);
+            if (gId.isNotEmpty && gCost > 0) {
+              print('[ai_task] Global search found priced task: $gId cost=$gCost');
+              chosenTaskId = gId;
+              chosenTaskName = gName.isNotEmpty ? gName : categoryName;
+              chosenCost = gCost;
+            }
+          }
+        }
+
+        if (chosenCost <= 0) {
+          print('[ai_task] No priced task found anywhere; require RFQ');
           rfqReason = 'unpriced_task';
           jobIds = <String>[];
         } else {
