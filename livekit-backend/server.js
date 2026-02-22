@@ -2993,7 +2993,7 @@ app.get('/health', (req, res) => {
 // ── Public pricing test endpoint (no auth required) ──
 app.get('/api/test-pricing', async (req, res) => {
   try {
-    const firestore = (() => { initFirebaseIfPossible(); return _firestoreInstance; })();
+    const firestore = (() => { initFirebaseIfPossible(); if (firebaseInitError) return null; return admin.firestore(); })();
     if (!firestore) return res.status(500).json({ error: 'firebase_not_configured' });
 
     const q = String(req.query.q || req.query.query || '').trim().toLowerCase();
