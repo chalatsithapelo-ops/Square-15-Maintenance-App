@@ -1805,6 +1805,39 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       // Combine all search terms
       const searchTerms = [categoryName, taskName, searchQuery].filter(s => s.length > 0).join(' ');
 
+      // Synonym/related-terms expansion so broad queries like "plumbing" also
+      // match tasks stored under different category names (e.g. "Bathroom").
+      const SYNONYMS = {
+        plumbing:    ['toilet', 'cistern', 'basin', 'bath', 'tap', 'pipe', 'drain', 'geyser', 'shower', 'sink', 'plumb', 'blocked', 'leak', 'water', 'bathroom', 'kitchen'],
+        electrical:  ['light', 'switch', 'socket', 'wire', 'wiring', 'breaker', 'db board', 'plug', 'circuit', 'electric', 'power', 'volt'],
+        painting:    ['paint', 'wall', 'ceiling', 'enamel', 'pva', 'varnish', 'roof', 'garage', 'door'],
+        cleaning:    ['clean', 'wash', 'deep clean', 'carpet', 'window', 'scrub'],
+        tiling:      ['tile', 'floor', 'grout', 'ceramic'],
+        carpentry:   ['wood', 'cabinet', 'shelf', 'cupboard', 'door', 'frame', 'carpenter'],
+        solar:       ['panel', 'pv', 'inverter', 'battery', 'geyser', 'energy'],
+        maintenance: ['repair', 'fix', 'maintain', 'service', 'general'],
+        bathroom:    ['toilet', 'cistern', 'basin', 'bath', 'shower', 'tap', 'plumb', 'blocked', 'drain'],
+        kitchen:     ['tap', 'mixer', 'sink', 'faucet', 'cupboard'],
+        door:        ['lock', 'handle', 'hinge', 'frame', 'door'],
+        window:      ['glass', 'pane', 'frame', 'window'],
+        installation:['install', 'setup', 'mount', 'fit'],
+      };
+
+      // Expand search tokens with synonyms
+      let expandedTerms = searchTerms;
+      for (const [key, synonyms] of Object.entries(SYNONYMS)) {
+        if (searchTerms.includes(key)) {
+          expandedTerms += ' ' + synonyms.join(' ');
+        }
+        // Also expand if any synonym is in the search terms
+        for (const syn of synonyms) {
+          if (syn.length >= 3 && searchTerms.includes(syn) && !expandedTerms.includes(key)) {
+            expandedTerms += ' ' + key + ' ' + synonyms.join(' ');
+            break;
+          }
+        }
+      }
+
       // Load all categories
       const catSnap = await firestore.collection('categories').get();
       const categoryMap = {}; // id -> name
@@ -1843,10 +1876,13 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
 
       // Build services list with pricing
       const services = [];
-      const searchTokens = searchTerms
+      const allServices = []; // unfiltered list as fallback
+      const searchTokens = expandedTerms
         .replace(/[^a-z0-9\s]/g, ' ')
         .split(/\s+/)
         .filter(t => t.length >= 2);
+      // Deduplicate tokens
+      const uniqueTokens = [...new Set(searchTokens)];
 
       for (const doc of taskDocs) {
         const d = doc.data() || {};
@@ -1858,30 +1894,38 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         const catName = categoryMap[catId] || '';
         const taskId = String(d.id || doc.id).trim();
 
-        // If search terms provided, filter by relevance
-        if (searchTokens.length > 0) {
-          const nameL = name.toLowerCase();
-          const catL = catName.toLowerCase();
-          const combined = `${nameL} ${catL}`;
-          let matches = false;
-          for (const token of searchTokens) {
-            if (combined.includes(token)) { matches = true; break; }
-          }
-          if (!matches) continue;
-        }
-
-        services.push({
+        const entry = {
           task_id: taskId,
           name: name,
           cost: cost != null && cost > 0 ? cost : null,
           cost_formatted: cost != null && cost > 0 ? `R${cost.toFixed(2)}` : 'Quote on request',
           category_id: catId,
           category_name: catName,
-        });
+        };
+
+        allServices.push(entry);
+
+        // If search terms provided, filter by relevance
+        if (uniqueTokens.length > 0) {
+          const nameL = name.toLowerCase();
+          const catL = catName.toLowerCase();
+          const combined = `${nameL} ${catL}`;
+          let matches = false;
+          for (const token of uniqueTokens) {
+            if (combined.includes(token)) { matches = true; break; }
+          }
+          if (!matches) continue;
+        }
+
+        services.push(entry);
       }
 
+      // If filtered search found nothing, return ALL services so the agent
+      // can still answer pricing questions.
+      const finalServices = services.length > 0 ? services : allServices;
+
       // Sort by category then name
-      services.sort((a, b) => {
+      finalServices.sort((a, b) => {
         const catCmp = (a.category_name || '').localeCompare(b.category_name || '');
         if (catCmp !== 0) return catCmp;
         return (a.name || '').localeCompare(b.name || '');
@@ -1891,12 +1935,16 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         ok: true,
         success: true,
         data: {
-          services: services.slice(0, 50),
-          total_found: services.length,
+          services: finalServices.slice(0, 50),
+          total_found: finalServices.length,
+          filtered: services.length > 0,
           search_terms: searchTerms || 'all',
+          expanded_terms: expandedTerms !== searchTerms ? expandedTerms.trim() : undefined,
           message: services.length > 0
-            ? `Found ${services.length} service(s).`
-            : `No services found matching "${searchTerms}".`,
+            ? `Found ${services.length} service(s) matching "${searchTerms}".`
+            : allServices.length > 0
+              ? `No exact match for "${searchTerms}", showing all ${allServices.length} available services.`
+              : `No services found.`,
         },
       };
     } catch (e) {

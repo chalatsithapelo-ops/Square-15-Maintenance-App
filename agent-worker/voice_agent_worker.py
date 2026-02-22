@@ -798,25 +798,47 @@ async def entrypoint(ctx: JobContext):
     ) -> str:
         """Look up service pricing from the backend."""
         nonlocal backend_client
-        if not backend_client:
-            return "I need you to be authenticated first. Please make sure you're logged into the app."
+        search_q = query or f"{category_name} {task_name}".strip()
 
         try:
-            result = await backend_client.lookup_service_pricing(
-                category_name=category_name,
-                task_name=task_name,
-                query=query or f"{category_name} {task_name}".strip(),
-            )
+            result = None
+
+            # Try authenticated backend call first
+            if backend_client:
+                try:
+                    result = await backend_client.lookup_service_pricing(
+                        category_name=category_name,
+                        task_name=task_name,
+                        query=search_q,
+                    )
+                except Exception as e:
+                    logger.warning(f"Authenticated pricing lookup failed: {e}")
+
+            # Fallback: use public test-pricing endpoint (no auth required)
+            if not result or (not result.get('ok') and not result.get('success')):
+                try:
+                    import urllib.parse
+                    encoded_q = urllib.parse.quote(search_q)
+                    url = f"{backend_url}/api/test-pricing?q={encoded_q}"
+                    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
+                        async with session.get(url) as resp:
+                            result = await resp.json()
+                except Exception as e:
+                    logger.warning(f"Public pricing lookup fallback failed: {e}")
+
+            if not result:
+                return "Sorry, I couldn't look up pricing right now. Please try again in a moment."
+
             if not result.get('ok') and not result.get('success'):
                 error = result.get('error', 'unknown_error')
                 return f"Sorry, I couldn't look up pricing right now: {error}"
 
-            data = result.get('data', {})
+            data = result.get('data', result)
             services = data.get('services', [])
             message = data.get('message', '')
 
             if not services:
-                return message or "I couldn't find any services matching that description. Could you be more specific?"
+                return message or "I couldn't find any services matching that description. Could you try a different term?"
 
             # Format the pricing list for the agent to speak
             lines = []
