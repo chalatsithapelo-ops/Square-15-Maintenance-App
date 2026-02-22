@@ -3046,6 +3046,44 @@ app.get('/api/test-pricing', async (req, res) => {
 
     const q = String(req.query.q || req.query.query || '').trim().toLowerCase();
 
+    // Synonym/related-terms expansion (same as authenticated endpoint)
+    const SYNONYMS = {
+      plumbing:    ['toilet', 'cistern', 'basin', 'bath', 'tap', 'pipe', 'drain', 'geyser', 'shower', 'sink', 'plumb', 'blocked', 'leak', 'water', 'bathroom', 'kitchen'],
+      electrical:  ['light', 'switch', 'socket', 'wire', 'wiring', 'breaker', 'db board', 'plug', 'circuit', 'electric', 'power', 'volt'],
+      painting:    ['paint', 'wall', 'ceiling', 'enamel', 'pva', 'varnish', 'roof', 'garage', 'door'],
+      cleaning:    ['clean', 'wash', 'deep clean', 'carpet', 'window', 'scrub'],
+      tiling:      ['tile', 'floor', 'grout', 'ceramic'],
+      carpentry:   ['wood', 'cabinet', 'shelf', 'cupboard', 'door', 'frame', 'carpenter'],
+      solar:       ['panel', 'pv', 'inverter', 'battery', 'geyser', 'energy'],
+      maintenance: ['repair', 'fix', 'maintain', 'service', 'general'],
+      bathroom:    ['toilet', 'cistern', 'basin', 'bath', 'shower', 'tap', 'plumb', 'blocked', 'drain'],
+      kitchen:     ['tap', 'mixer', 'sink', 'faucet', 'cupboard'],
+      door:        ['lock', 'handle', 'hinge', 'frame', 'door'],
+      window:      ['glass', 'pane', 'frame', 'window'],
+      installation:['install', 'setup', 'mount', 'fit'],
+    };
+
+    let expandedQ = q;
+    if (q) {
+      for (const [key, synonyms] of Object.entries(SYNONYMS)) {
+        if (q.includes(key)) {
+          expandedQ += ' ' + synonyms.join(' ');
+        }
+        for (const syn of synonyms) {
+          if (syn.length >= 3 && q.includes(syn) && !expandedQ.includes(key)) {
+            expandedQ += ' ' + key + ' ' + synonyms.join(' ');
+            break;
+          }
+        }
+      }
+    }
+
+    const searchTokens = expandedQ
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .split(/\s+/)
+      .filter(t => t.length >= 2);
+    const uniqueTokens = [...new Set(searchTokens)];
+
     // Load categories
     const catSnap = await firestore.collection('categories').get();
     const categoryMap = {};
@@ -3067,6 +3105,7 @@ app.get('/api/test-pricing', async (req, res) => {
     taskDocs = taskSnap.docs;
 
     const services = [];
+    const allServices = [];
     for (const doc of taskDocs) {
       const d = doc.data() || {};
       const name = String(d.name || d.title || d.task_name || d.taskName || '').trim();
@@ -3082,9 +3121,7 @@ app.get('/api/test-pricing', async (req, res) => {
       const catId = String(d.categoryId || d.category_id || d.subCategoryId || d.sub_category_id || d.subcategoryId || d.subcategory_id || '').trim();
       const catName = categoryMap[catId] || '';
 
-      if (q && !`${name} ${catName}`.toLowerCase().includes(q)) continue;
-
-      services.push({
+      const entry = {
         task_id: doc.id,
         name,
         cost,
@@ -3092,20 +3129,40 @@ app.get('/api/test-pricing', async (req, res) => {
         category_id: catId,
         category_name: catName,
         status: d.status || null,
-        raw_fields: Object.keys(d).join(', '),
-      });
+      };
+
+      allServices.push(entry);
+
+      if (uniqueTokens.length > 0) {
+        const combined = `${name} ${catName}`.toLowerCase();
+        let matches = false;
+        for (const token of uniqueTokens) {
+          if (combined.includes(token)) { matches = true; break; }
+        }
+        if (!matches) continue;
+      }
+
+      services.push(entry);
     }
 
-    services.sort((a, b) => (a.category_name || '').localeCompare(b.category_name || '') || (a.name || '').localeCompare(b.name || ''));
+    const finalServices = services.length > 0 ? services : allServices;
+    finalServices.sort((a, b) => (a.category_name || '').localeCompare(b.category_name || '') || (a.name || '').localeCompare(b.name || ''));
 
     res.json({
       ok: true,
       categories_count: categoryList.length,
       tasks_count: taskDocs.length,
-      matched: services.length,
+      matched: finalServices.length,
+      filtered: services.length > 0,
       query: q || 'all',
+      expanded: expandedQ !== q ? expandedQ : undefined,
       categories: categoryList.slice(0, 20),
-      services: services.slice(0, 30),
+      services: finalServices.slice(0, 30),
+      message: services.length > 0
+        ? `Found ${services.length} service(s) matching "${q}".`
+        : allServices.length > 0
+          ? `No exact match for "${q}", showing all ${allServices.length} available services.`
+          : 'No services found.',
     });
   } catch (e) {
     res.status(500).json({ error: String(e) });
