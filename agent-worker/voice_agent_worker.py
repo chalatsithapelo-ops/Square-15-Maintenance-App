@@ -211,6 +211,14 @@ class BackendAPIClient:
             ) as resp:
                 return await resp.json()
 
+    async def lookup_service_pricing(self, category_name: str = "", task_name: str = "", query: str = "") -> Dict[str, Any]:
+        """Look up service pricing from the backend."""
+        return await self.call_backend_action('lookup_service_pricing', {
+            'category_name': category_name,
+            'task_name': task_name,
+            'query': query,
+        })
+
 
 async def entrypoint(ctx: JobContext):
     room_name = ctx.room.name
@@ -333,15 +341,30 @@ async def entrypoint(ctx: JobContext):
             "- Greet once, then just help. Never repeat your introduction.\n"
             "- When user asks to DO something, CALL the right tool immediately.\n"
             "- BACKEND tools for data: get_booking_status, list_my_bookings, explain_quote, check_payment, get_wallet_balance, get_messages, get_case_status.\n"
-            "- ui_navigate for screens: open_bookings_tab, open_wallet, open_profile, open_settings, open_notifications, open_calendar, open_map, open_help, open_support, go_home, go_back, close_window.\n"
-            "- create_booking for new bookings (handles propose+confirm). cancel_booking, reschedule_booking for changes.\n"
+            "- lookup_service_pricing for pricing: when user asks 'how much is...', 'what's the price for...', 'how much do you charge for...', call lookup_service_pricing with category_name or task_name.\n"
+            "- ui_navigate for screens: open_bookings_tab, open_wallet, open_profile, open_settings, open_notifications, open_calendar, open_help, open_support, go_home, go_back, close_window.\n"
             "- send_message_to_artisan, send_message_to_admin for messaging.\n"
             "- NEVER narrate tool calls. Never say JSON, function names, or metadata.\n"
             "- NEVER claim you opened/loaded pictures or images.\n"
+            "- NEVER claim you opened a map or showed a location. There is no map feature.\n"
             "- Speak naturally, 1-3 short sentences. Be concise.\n"
             "- If user says 'now'/'asap'/'urgent', use scheduled_date='now', scheduled_time='now'.\n"
             "- Date format: YYYY-MM-DD. Time format: HH:MM.\n"
             "- If user refers to a booking by price, call list_my_bookings first to find it.\n"
+            "\n"
+            "PRICING ENQUIRIES (IMPORTANT):\n"
+            "- When user asks how much a service costs, ALWAYS call lookup_service_pricing first.\n"
+            "- Provide category_name (e.g. 'plumbing') and/or task_name (e.g. 'unblock toilet').\n"
+            "- Read back the price from the results. If cost is null, say 'This service requires a quote from an artisan'.\n"
+            "- NEVER guess or make up prices. Always use lookup_service_pricing to get actual prices.\n"
+            "\n"
+            "BOOKING CREATION (IMPORTANT):\n"
+            "- To create a new booking, ALWAYS use ui_navigate with action='create_order_booking'.\n"
+            "- Provide: category_name, problem_description, and optionally scheduled_date, scheduled_time, service_address.\n"
+            "- Do NOT use create_booking tool. ONLY use ui_navigate(action='create_order_booking').\n"
+            "- After calling ui_navigate, say 'I am processing your booking now, please keep the app open.' Do NOT say an artisan has been sent or dispatched until the app confirms it.\n"
+            "- NEVER open photo upload, map, or any other screen during booking creation. The app handles everything automatically.\n"
+            "- Do NOT use open_map or show_location actions. They do not exist.\n"
         )
 
         if role == "artisan":
@@ -357,10 +380,9 @@ async def entrypoint(ctx: JobContext):
         else:
             base += (
                 "\nCLIENT ACTIONS:\n"
-                "- Create booking: collect category + problem, call create_booking. Use is_rfq='yes' for complex jobs.\n"
+                "- Create booking: collect category + problem, then call ui_navigate(action='create_order_booking') with category_name and problem_description. The app handles pricing, RFQ creation, and artisan dispatch automatically.\n"
                 "- Cancel: cancel_booking(booking_id, reason). Reschedule: reschedule_booking(booking_id, date, time).\n"
                 "- Call artisan → ui_navigate(action='call_assigned_artisan', booking_id)\n"
-                "- RFQ upload → ui_navigate(action='open_rfq_upload')\n"
                 "- Future bookings → ui_navigate(action='open_future_bookings')\n"
             )
 
@@ -369,13 +391,13 @@ async def entrypoint(ctx: JobContext):
     @llm.function_tool(
         description=(
             "Send a UI navigation command to the Square 15 mobile app. "
-            "Supported actions: create_order_booking, dispatch_artisan, open_rfq_upload, "
+            "Supported actions: create_order_booking, dispatch_artisan, "
             "open_bookings_tab, open_future_bookings, open_artisan_requests, open_artisan_appointments, "
             "open_artisan_wallet, accept_latest_request, reject_latest_request, respond_to_request, "
             "call_assigned_artisan, reschedule_booking, cancel_booking, reassign_booking, "
             "mark_booking_in_progress, artisan_cancel_and_reassign, "
             "open_notifications, open_profile, open_settings, open_support, open_wallet, "
-            "open_calendar, open_map, open_help, go_home, go_back, close_window, close_dialog, dismiss."
+            "open_calendar, open_help, go_home, go_back, close_window, close_dialog, dismiss."
         )
     )
     async def ui_navigate(
@@ -418,16 +440,11 @@ async def entrypoint(ctx: JobContext):
             text = ""
             if action == "create_order_booking":
                 text = (
-                    "Creating your booking now and dispatching the nearest available artisan. "
-                    "Please keep the app open. "
-                    "Once an artisan accepts, you will be asked to confirm the order with payment (wallet or card). "
-                    "If the payment options do not appear, open Bookings and tap 'Pay to confirm Order'."
+                    "Processing your booking request now. Please keep the app open."
                 )
             elif action == "dispatch_artisan":
                 text = (
-                    "Dispatching the nearest available artisan now. Please keep the app open. "
-                    "Once an artisan accepts, you will be asked to confirm the order with payment (wallet or card). "
-                    "If the payment options do not appear, open Bookings and tap 'Pay to confirm Order'."
+                    "Processing your booking request now. Please keep the app open."
                 )
             elif action == "open_rfq_upload":
                 text = (
@@ -476,7 +493,7 @@ async def entrypoint(ctx: JobContext):
             elif action in ("open_calendar", "open_artisan_calendar"):
                 text = "Opening your calendar."
             elif action in ("open_map", "show_location"):
-                text = "Showing the location on the map."
+                text = "I don't have a map feature available right now."
             elif action in ("open_help", "open_faq"):
                 text = "Here are some helpful tips."
             elif action in ("go_home", "open_dashboard"):
@@ -764,6 +781,67 @@ async def entrypoint(ctx: JobContext):
         except Exception as e:
             logger.error(f"check_payment error: {e}", exc_info=True)
             return "Sorry, I had trouble checking payment. Please try again."
+
+    @llm.function_tool(
+        description=(
+            "Look up the price of a service. Use this when the user asks "
+            "'how much is...', 'what's the price for...', 'how much do you charge for...', "
+            "'what does ... cost?'. Provide category_name (e.g. 'plumbing', 'electrical') "
+            "and/or task_name (e.g. 'unblock toilet', 'install geyser'). "
+            "You can also pass a general query string."
+        )
+    )
+    async def lookup_service_pricing(
+        category_name: str = "",
+        task_name: str = "",
+        query: str = ""
+    ) -> str:
+        """Look up service pricing from the backend."""
+        nonlocal backend_client
+        if not backend_client:
+            return "I need you to be authenticated first. Please make sure you're logged into the app."
+
+        try:
+            result = await backend_client.lookup_service_pricing(
+                category_name=category_name,
+                task_name=task_name,
+                query=query or f"{category_name} {task_name}".strip(),
+            )
+            if not result.get('ok') and not result.get('success'):
+                error = result.get('error', 'unknown_error')
+                return f"Sorry, I couldn't look up pricing right now: {error}"
+
+            data = result.get('data', {})
+            services = data.get('services', [])
+            message = data.get('message', '')
+
+            if not services:
+                return message or "I couldn't find any services matching that description. Could you be more specific?"
+
+            # Format the pricing list for the agent to speak
+            lines = []
+            current_category = None
+            for svc in services[:15]:  # Limit to 15 for voice readability
+                cat = svc.get('category_name', 'Other')
+                name = svc.get('name', 'Unknown')
+                cost_str = svc.get('cost_formatted', 'Quote on request')
+
+                if cat != current_category:
+                    current_category = cat
+                    if cat:
+                        lines.append(f"\n{cat}:")
+
+                lines.append(f"  - {name}: {cost_str}")
+
+            total = data.get('total_found', len(services))
+            header = f"Found {total} service(s)."
+            if total > 15:
+                header += " Here are the first 15:"
+
+            return header + "\n" + "\n".join(lines)
+        except Exception as e:
+            logger.error(f"lookup_service_pricing error: {e}", exc_info=True)
+            return "Sorry, I had trouble looking up pricing. Please try again."
 
     # Phase 1: Write operations with propose/confirm
     @llm.function_tool(

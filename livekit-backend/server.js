@@ -375,6 +375,8 @@ const ACTION_TIERS = Object.freeze({
   check_payment: 'A',
   get_wallet_balance: 'A',
   get_case_status: 'A',
+  lookup_service_pricing: 'A',
+  list_services: 'A',
   create_order_booking: 'B',
   create_order_booking_order: 'B',
   dispatch_artisan: 'B',
@@ -1791,6 +1793,115 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
 
   if (action === 'update_case') {
     return await handleUpdateCase({ firestore, actorUid, actorRole, payload });
+  }
+
+  // ── Service Pricing Lookup ──
+  if (action === 'lookup_service_pricing' || action === 'list_services') {
+    try {
+      const categoryName = String(payload.category_name || payload.categoryName || '').trim().toLowerCase();
+      const taskName = String(payload.task_name || payload.taskName || '').trim().toLowerCase();
+      const searchQuery = String(payload.query || payload.search || '').trim().toLowerCase();
+
+      // Combine all search terms
+      const searchTerms = [categoryName, taskName, searchQuery].filter(s => s.length > 0).join(' ');
+
+      // Load all categories
+      const catSnap = await firestore.collection('categories').get();
+      const categoryMap = {}; // id -> name
+      for (const doc of catSnap.docs) {
+        const d = doc.data() || {};
+        const name = String(d.name || '').trim();
+        const id = String(d.id || doc.id).trim();
+        if (name) {
+          categoryMap[id] = name;
+          categoryMap[doc.id] = name;
+        }
+      }
+
+      // Load tasks - try with different status values
+      let taskDocs = [];
+      for (const sv of ['publish', 'Published', 'active', 'Active']) {
+        try {
+          const r = await firestore.collection('tasks').where('status', '==', sv).get();
+          if (r.docs.length > 0) {
+            taskDocs = r.docs;
+            break;
+          }
+        } catch (_) {}
+      }
+      // Fallback: all tasks without status filter
+      if (taskDocs.length === 0) {
+        try {
+          const r = await firestore.collection('tasks').limit(200).get();
+          taskDocs = r.docs;
+        } catch (_) {}
+      }
+
+      if (taskDocs.length === 0) {
+        return { ok: true, success: true, data: { services: [], message: 'No services found in the system.' } };
+      }
+
+      // Build services list with pricing
+      const services = [];
+      const searchTokens = searchTerms
+        .replace(/[^a-z0-9\s]/g, ' ')
+        .split(/\s+/)
+        .filter(t => t.length >= 2);
+
+      for (const doc of taskDocs) {
+        const d = doc.data() || {};
+        const name = String(d.name || d.title || d.task_name || d.taskName || '').trim();
+        if (!name) continue;
+
+        const cost = toNumber(d.cost ?? d.price ?? d.amount ?? d.unit_price);
+        const catId = String(d.categoryId || d.category_id || d.subCategoryId || d.sub_category_id || d.subcategoryId || d.subcategory_id || '').trim();
+        const catName = categoryMap[catId] || '';
+        const taskId = String(d.id || doc.id).trim();
+
+        // If search terms provided, filter by relevance
+        if (searchTokens.length > 0) {
+          const nameL = name.toLowerCase();
+          const catL = catName.toLowerCase();
+          const combined = `${nameL} ${catL}`;
+          let matches = false;
+          for (const token of searchTokens) {
+            if (combined.includes(token)) { matches = true; break; }
+          }
+          if (!matches) continue;
+        }
+
+        services.push({
+          task_id: taskId,
+          name: name,
+          cost: cost != null && cost > 0 ? cost : null,
+          cost_formatted: cost != null && cost > 0 ? `R${cost.toFixed(2)}` : 'Quote on request',
+          category_id: catId,
+          category_name: catName,
+        });
+      }
+
+      // Sort by category then name
+      services.sort((a, b) => {
+        const catCmp = (a.category_name || '').localeCompare(b.category_name || '');
+        if (catCmp !== 0) return catCmp;
+        return (a.name || '').localeCompare(b.name || '');
+      });
+
+      return {
+        ok: true,
+        success: true,
+        data: {
+          services: services.slice(0, 50),
+          total_found: services.length,
+          search_terms: searchTerms || 'all',
+          message: services.length > 0
+            ? `Found ${services.length} service(s).`
+            : `No services found matching "${searchTerms}".`,
+        },
+      };
+    } catch (e) {
+      return { ok: false, success: false, error: 'pricing_lookup_failed', message: String(e) };
+    }
   }
 
   // ── Booking Analytics ──
