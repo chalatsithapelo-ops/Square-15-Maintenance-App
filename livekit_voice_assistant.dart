@@ -1731,10 +1731,9 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
     }
 
     if (action == 'open_map' || action == 'show_location') {
-      if (_shouldDebounceUiAction(action)) return;
-      Get.toNamed('/map');
-      Get.snackbar(_assistantName, 'Opening map',
-          backgroundColor: Colors.green, colorText: Colors.white);
+      // Map screen is not implemented — ignore silently.
+      // The agent instructions have been updated to not use this action.
+      print('[voice] open_map action ignored — no map route registered');
       return;
     }
 
@@ -3327,14 +3326,8 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
         isNowToken(scheduledTime);
     final bool isEmergency = emergencyFromPayload || emergencyFromText;
 
-    final requirePhotosRaw = map['require_photos'] ?? map['requirePhotos'];
-    final bool requirePhotos = requirePhotosRaw == null
-        ? true
-        : (requirePhotosRaw == true ||
-            (requirePhotosRaw ?? '').toString().trim().toLowerCase() ==
-                'true' ||
-            (requirePhotosRaw ?? '').toString().trim() == '1' ||
-            (requirePhotosRaw ?? '').toString().trim().toLowerCase() == 'yes');
+    // Voice-first flow: requirePhotos is always false.
+    // Photos are optional and can be added post-booking.
 
     List<String> extractStringList(dynamic v) {
       if (v == null) return <String>[];
@@ -3499,12 +3492,9 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
       }
     }
 
-    // Photos-first workflow: once the AI has all job info, it should open upload
-    // and require at least 3 photos before dispatch.
-    if (requirePhotos && workImageUrls.length < 3) {
-      await _openPhotoUploadThenDispatch(map);
-      return;
-    }
+    // Voice-first flow: photos are optional.
+    // Users can add photos post-booking from booking history.
+    // The photo gate is completely bypassed.
 
     // Default schedule if AI did not provide.
     final now = DateTime.now();
