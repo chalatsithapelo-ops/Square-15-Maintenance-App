@@ -2990,6 +2990,80 @@ app.get('/health', (req, res) => {
   });
 });
 
+// ── Public pricing test endpoint (no auth required) ──
+app.get('/api/test-pricing', async (req, res) => {
+  try {
+    const firestore = (() => { initFirebaseIfPossible(); return _firestoreInstance; })();
+    if (!firestore) return res.status(500).json({ error: 'firebase_not_configured' });
+
+    const q = String(req.query.q || req.query.query || '').trim().toLowerCase();
+
+    // Load categories
+    const catSnap = await firestore.collection('categories').get();
+    const categoryMap = {};
+    const categoryList = [];
+    for (const doc of catSnap.docs) {
+      const d = doc.data() || {};
+      const name = String(d.name || '').trim();
+      const id = String(d.id || doc.id).trim();
+      if (name) {
+        categoryMap[id] = name;
+        categoryMap[doc.id] = name;
+        categoryList.push({ docId: doc.id, id, name, status: d.status || null });
+      }
+    }
+
+    // Load tasks
+    let taskDocs = [];
+    const taskSnap = await firestore.collection('tasks').limit(200).get();
+    taskDocs = taskSnap.docs;
+
+    const services = [];
+    for (const doc of taskDocs) {
+      const d = doc.data() || {};
+      const name = String(d.name || d.title || d.task_name || d.taskName || '').trim();
+      if (!name) continue;
+
+      const costRaw = d.cost ?? d.price ?? d.amount ?? d.unit_price;
+      const cost = (() => {
+        if (costRaw == null) return null;
+        const n = Number.parseFloat(String(costRaw).replace(/[^0-9.\-]/g, ''));
+        return Number.isFinite(n) ? n : null;
+      })();
+
+      const catId = String(d.categoryId || d.category_id || d.subCategoryId || d.sub_category_id || d.subcategoryId || d.subcategory_id || '').trim();
+      const catName = categoryMap[catId] || '';
+
+      if (q && !`${name} ${catName}`.toLowerCase().includes(q)) continue;
+
+      services.push({
+        task_id: doc.id,
+        name,
+        cost,
+        cost_formatted: cost != null && cost > 0 ? `R${cost.toFixed(2)}` : 'Quote on request',
+        category_id: catId,
+        category_name: catName,
+        status: d.status || null,
+        raw_fields: Object.keys(d).join(', '),
+      });
+    }
+
+    services.sort((a, b) => (a.category_name || '').localeCompare(b.category_name || '') || (a.name || '').localeCompare(b.name || ''));
+
+    res.json({
+      ok: true,
+      categories_count: categoryList.length,
+      tasks_count: taskDocs.length,
+      matched: services.length,
+      query: q || 'all',
+      categories: categoryList.slice(0, 20),
+      services: services.slice(0, 30),
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
 /**
  * Start a voice session (recommended for mobile)
  * POST /api/voice/start
