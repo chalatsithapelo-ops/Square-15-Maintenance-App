@@ -797,49 +797,38 @@ async def entrypoint(ctx: JobContext):
         task_name: str = "",
         query: str = ""
     ) -> str:
-        """Look up service pricing from the backend."""
-        nonlocal backend_client
+        """Look up service pricing from the backend (public endpoint, no auth needed)."""
         search_q = query or f"{category_name} {task_name}".strip()
+        if not search_q:
+            search_q = "all"
+
+        logger.info(f"🔍 lookup_service_pricing called: category={category_name}, task={task_name}, query={search_q}")
 
         try:
-            result = None
+            import urllib.parse
+            encoded_q = urllib.parse.quote(search_q)
+            url = f"{backend_url}/api/test-pricing?q={encoded_q}"
+            logger.info(f"🔍 Calling public pricing endpoint: {url}")
 
-            # Try authenticated backend call first
-            if backend_client:
-                try:
-                    result = await backend_client.lookup_service_pricing(
-                        category_name=category_name,
-                        task_name=task_name,
-                        query=search_q,
-                    )
-                except Exception as e:
-                    logger.warning(f"Authenticated pricing lookup failed: {e}")
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=25)) as http_session:
+                async with http_session.get(url) as resp:
+                    logger.info(f"🔍 Pricing response status: {resp.status}")
+                    if resp.status != 200:
+                        body_text = await resp.text()
+                        logger.warning(f"🔍 Pricing endpoint returned {resp.status}: {body_text[:200]}")
+                        return f"Sorry, I couldn't look up pricing right now. The service returned an error. Please try again."
+                    result = await resp.json()
 
-            # Fallback: use public test-pricing endpoint (no auth required)
-            if not result or (not result.get('ok') and not result.get('success')):
-                try:
-                    import urllib.parse
-                    encoded_q = urllib.parse.quote(search_q)
-                    url = f"{backend_url}/api/test-pricing?q={encoded_q}"
-                    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
-                        async with session.get(url) as resp:
-                            result = await resp.json()
-                except Exception as e:
-                    logger.warning(f"Public pricing lookup fallback failed: {e}")
+            logger.info(f"🔍 Pricing result ok={result.get('ok')}, matched={result.get('matched')}")
 
-            if not result:
+            if not result.get('ok'):
                 return "Sorry, I couldn't look up pricing right now. Please try again in a moment."
 
-            if not result.get('ok') and not result.get('success'):
-                error = result.get('error', 'unknown_error')
-                return f"Sorry, I couldn't look up pricing right now: {error}"
-
-            data = result.get('data', result)
-            services = data.get('services', [])
-            message = data.get('message', '')
+            services = result.get('services', [])
+            message = result.get('message', '')
 
             if not services:
-                return message or "I couldn't find any services matching that description. Could you try a different term?"
+                return message or "I couldn't find any services matching that description. Could you try a different term like 'plumbing', 'painting', or 'bathroom'?"
 
             # Format the pricing list for the agent to speak
             lines = []
@@ -856,15 +845,38 @@ async def entrypoint(ctx: JobContext):
 
                 lines.append(f"  - {name}: {cost_str}")
 
-            total = data.get('total_found', len(services))
+            total = result.get('matched', len(services))
             header = f"Found {total} service(s)."
             if total > 15:
                 header += " Here are the first 15:"
 
-            return header + "\n" + "\n".join(lines)
+            response = header + "\n" + "\n".join(lines)
+            logger.info(f"🔍 Returning pricing with {total} services to agent")
+            return response
         except Exception as e:
             logger.error(f"lookup_service_pricing error: {e}", exc_info=True)
-            return "Sorry, I had trouble looking up pricing. Please try again."
+            # Last resort: return hardcoded pricing so Lizzy can ALWAYS answer
+            return (
+                "I'm having a temporary connection issue, but here are our current prices from my records:\n\n"
+                "Bathroom:\n"
+                "  - Install a bath tub: R1890.00\n"
+                "  - Install basin: R1220.00\n"
+                "  - Install toilet and cistern: R1575.00\n"
+                "  - Unblock a blocked toilet: R1575.00\n\n"
+                "Kitchen:\n"
+                "  - Install kitchen mixer tap (L): R950.00\n\n"
+                "Painting:\n"
+                "  - Ceiling: R44.00 per sqm\n"
+                "  - Enamel painting of Ceiling and walls: R105.00 per sqm\n"
+                "  - Garage Door: R750.00\n"
+                "  - PVA Wall Paint and ceiling: R95.00 per sqm\n"
+                "  - Roof: R200.00 per sqm\n"
+                "  - Varnish door frame Labour only: R480.00\n"
+                "  - Wall: R100.00 per sqm\n\n"
+                "Tiling:\n"
+                "  - Tiling Task: R15.00 per sqm\n\n"
+                "Note: These prices may not reflect the very latest updates. Please check the app for the most current pricing."
+            )
 
     # Phase 1: Write operations with propose/confirm
     @llm.function_tool(
