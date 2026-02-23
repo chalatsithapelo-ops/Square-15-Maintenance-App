@@ -1273,6 +1273,7 @@ async def entrypoint(ctx: JobContext):
             explain_quote,
             check_payment,
             get_wallet_balance,
+            lookup_service_pricing,
             # Write backend tools
             create_booking,
             cancel_booking,
