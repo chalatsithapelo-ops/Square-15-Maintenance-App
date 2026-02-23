@@ -28,6 +28,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Module-level pricing cache — updated on every successful pricing lookup.
+# Used as fallback when the backend is unreachable.
+_pricing_cache: Optional[str] = None
+
 
 _FORBIDDEN_SPEECH_PATTERNS = [
     # Tool call narration / internal jargon (including the common typo "nagivation")
@@ -852,30 +856,20 @@ async def entrypoint(ctx: JobContext):
 
             response = header + "\n" + "\n".join(lines)
             logger.info(f"🔍 Returning pricing with {total} services to agent")
+            # Cache the successful response for fallback use
+            global _pricing_cache
+            _pricing_cache = response
             return response
         except Exception as e:
             logger.error(f"lookup_service_pricing error: {e}", exc_info=True)
-            # Last resort: return hardcoded pricing so Lizzy can ALWAYS answer
+            # Use cached pricing from a previous successful call if available
+            if _pricing_cache:
+                logger.info("🔍 Using cached pricing as fallback")
+                return "I'm having a brief connection issue, but here are our prices from my recent records:\n" + _pricing_cache
+            # Absolute last resort — generic message (should rarely happen)
             return (
-                "I'm having a temporary connection issue, but here are our current prices from my records:\n\n"
-                "Bathroom:\n"
-                "  - Install a bath tub: R1890.00\n"
-                "  - Install basin: R1220.00\n"
-                "  - Install toilet and cistern: R1575.00\n"
-                "  - Unblock a blocked toilet: R1575.00\n\n"
-                "Kitchen:\n"
-                "  - Install kitchen mixer tap (L): R950.00\n\n"
-                "Painting:\n"
-                "  - Ceiling: R44.00 per sqm\n"
-                "  - Enamel painting of Ceiling and walls: R105.00 per sqm\n"
-                "  - Garage Door: R750.00\n"
-                "  - PVA Wall Paint and ceiling: R95.00 per sqm\n"
-                "  - Roof: R200.00 per sqm\n"
-                "  - Varnish door frame Labour only: R480.00\n"
-                "  - Wall: R100.00 per sqm\n\n"
-                "Tiling:\n"
-                "  - Tiling Task: R15.00 per sqm\n\n"
-                "Note: These prices may not reflect the very latest updates. Please check the app for the most current pricing."
+                "I'm having a temporary connection issue retrieving our latest prices. "
+                "Please check the services section in the app for current pricing, or try asking me again in a moment."
             )
 
     # Phase 1: Write operations with propose/confirm
