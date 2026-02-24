@@ -1769,30 +1769,249 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     return await createOrderBookingFromPayload();
   }
 
-  // Phase 3: Messaging actions (don't require booking_id)
+  // ═══════════════════════════════════════════════════════════════
+  // Phase 3: Messaging & Case Management (inlined to access scope)
+  // ═══════════════════════════════════════════════════════════════
+
   if (action === 'get_messages') {
-    return await handleGetMessages({ firestore, actorUid, actorRole, payload });
+    const msgBookingId = String(payload.booking_id || payload.bookingId || '').trim();
+    const msgTmIdRaw = String(payload.tasks_management_id || payload.tasksManagementId || payload.tm_id || '').trim();
+    const msgLimit = Math.max(1, Math.min(100, Number(payload.limit || 50)));
+
+    if (!msgTmIdRaw && !msgBookingId) {
+      return { ok: false, status: 400, error: 'missing_tasks_management_id_or_booking_id' };
+    }
+
+    let msgTmId = msgTmIdRaw;
+    if (!msgTmId && msgBookingId) {
+      const bRef = firestore.collection('futureBookings').doc(msgBookingId);
+      const bSnap = await bRef.get();
+      if (!bSnap.exists) return { ok: false, status: 404, error: 'booking_not_found' };
+      const bData = bSnap.data() || {};
+      msgTmId = String(bData.tasks_management_id || '').trim();
+      if (!msgTmId) return { ok: false, status: 400, error: 'no_tasks_management_id_for_booking' };
+    }
+
+    const tmRef2 = firestore.collection('tasksManagement').doc(msgTmId);
+    const tmSnap2 = await tmRef2.get();
+    if (!tmSnap2.exists) return { ok: false, status: 404, error: 'tasks_management_not_found' };
+
+    const tmData2 = tmSnap2.data() || {};
+    const tmUserId = String(tmData2.user_id || tmData2.userId || '').trim();
+    const tmArtisanId = String(tmData2.service_provider_id || tmData2.serviceProviderId || '').trim();
+    const msgAllowed = actorRole === 'admin' ||
+      (actorRole === 'client' && tmUserId === actorUid) ||
+      (actorRole === 'artisan' && tmArtisanId === actorUid);
+    if (!msgAllowed) return { ok: false, status: 403, error: 'forbidden' };
+
+    const messagesQuery = await tmRef2.collection('chat').orderBy('timestamp', 'desc').limit(msgLimit).get();
+    const messages = messagesQuery.docs.map((doc) => {
+      const d = doc.data() || {};
+      return {
+        id: doc.id,
+        sender_id: String(d.sender_id || d.senderId || ''),
+        receiver_id: String(d.receiver_id || d.receiverId || ''),
+        message: String(d.message || ''),
+        timestamp: d.timestamp || null,
+        read: Boolean(d.read),
+      };
+    });
+
+    return {
+      ok: true, status: 200,
+      data: { tasks_management_id: msgTmId, messages: messages.reverse(), count: messages.length },
+    };
   }
 
   if (action === 'send_message_to_artisan') {
-    return await handleSendMessageToArtisan({ firestore, actorUid, actorRole, payload });
+    const smBookingId = String(payload.booking_id || payload.bookingId || '').trim();
+    const smMessage = String(payload.message || '').trim();
+    if (!smBookingId || !smMessage) return { ok: false, status: 400, error: 'missing_booking_id_or_message' };
+    if (smMessage.length > 1000) return { ok: false, status: 400, error: 'message_too_long', message: 'Message must be under 1000 characters' };
+
+    const smBookingRef = firestore.collection('futureBookings').doc(smBookingId);
+    const smBookingSnap = await smBookingRef.get();
+    if (!smBookingSnap.exists) return { ok: false, status: 404, error: 'booking_not_found' };
+
+    const smBookingData = smBookingSnap.data() || {};
+    const smUserId = String(smBookingData.user_id || '').trim();
+    const smArtisanId = String(smBookingData.service_provider_id || '').trim();
+    const smTmId = String(smBookingData.tasks_management_id || '').trim();
+
+    if (actorRole !== 'admin' && !(actorRole === 'client' && smUserId === actorUid)) {
+      return { ok: false, status: 403, error: 'forbidden' };
+    }
+    if (!smArtisanId || smArtisanId === 'admin') return { ok: false, status: 400, error: 'no_artisan_assigned' };
+    if (!smTmId) return { ok: false, status: 400, error: 'no_tasks_management_id' };
+
+    const chatRef = firestore.collection('tasksManagement').doc(smTmId).collection('chat').doc();
+    await chatRef.set({
+      id: chatRef.id,
+      sender_id: actorUid,
+      receiver_id: smArtisanId,
+      message: smMessage,
+      timestamp: now,
+      read: false,
+      created_at: now,
+    });
+
+    try {
+      const providerDoc = await getServiceProviderDocByAnyId(smArtisanId);
+      await writePersonalNotificationForProviderDoc(
+        providerDoc,
+        'New message from client',
+        smMessage.substring(0, 100),
+        { booking_id: smBookingId, tasks_management_id: smTmId, type: 'chat_message' }
+      );
+    } catch (_notifErr) { /* best-effort notification */ }
+
+    return {
+      ok: true, status: 200,
+      data: { message_id: chatRef.id, tasks_management_id: smTmId, sent: true },
+    };
   }
 
   if (action === 'send_message_to_admin') {
-    return await handleSendMessageToAdmin({ firestore, actorUid, actorRole, payload });
+    const saBookingId = String(payload.booking_id || payload.bookingId || '').trim();
+    const saMessage = String(payload.message || '').trim();
+    const saSubject = String(payload.subject || 'Support Request').trim();
+    if (!saMessage) return { ok: false, status: 400, error: 'missing_message' };
+    if (saMessage.length > 2000) return { ok: false, status: 400, error: 'message_too_long', message: 'Message must be under 2000 characters' };
+
+    const caseRef = firestore.collection('assistant_cases').doc();
+    await caseRef.set({
+      case_id: caseRef.id,
+      type: 'support_message',
+      booking_id: saBookingId || null,
+      client_uid: actorUid,
+      subject: saSubject,
+      message: saMessage,
+      state: 'open',
+      priority: 'normal',
+      created_at: now,
+      updated_at: now,
+      sla_deadline: new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString(),
+      timeline: [{ timestamp: now, actor: actorUid, action: 'case_created', notes: saMessage }],
+    });
+
+    try {
+      await writeAdminNotification({
+        title: `Support Request${saBookingId ? ` (Booking ${saBookingId})` : ''}`,
+        message: `${saSubject}: ${saMessage.substring(0, 150)}`,
+        data: { case_id: caseRef.id, booking_id: saBookingId || null, type: 'support_request' },
+      });
+      await writePersonalNotification({
+        userId: actorUid,
+        userType: 'user',
+        title: 'Support request received',
+        message: 'Our team will respond shortly. You will be notified when we reply.',
+        data: { case_id: caseRef.id, booking_id: saBookingId || null },
+      });
+    } catch (_notifErr) { /* best-effort */ }
+
+    return {
+      ok: true, status: 200,
+      data: { case_id: caseRef.id, message: 'Support request submitted successfully' },
+    };
   }
 
-  // Phase 3: Case management actions (don't require booking_id)
   if (action === 'get_case_status') {
-    return await handleGetCaseStatus({ firestore, actorUid, actorRole, payload });
+    const csCaseId = String(payload.case_id || payload.caseId || '').trim();
+    if (!csCaseId) return { ok: false, status: 400, error: 'missing_case_id' };
+
+    const csRef = firestore.collection('assistant_cases').doc(csCaseId);
+    const csSnap = await csRef.get();
+    if (!csSnap.exists) return { ok: false, status: 404, error: 'case_not_found' };
+
+    const csData = csSnap.data() || {};
+    const csClientUid = String(csData.client_uid || '').trim();
+    if (actorRole !== 'admin' && csClientUid !== actorUid) return { ok: false, status: 403, error: 'forbidden' };
+
+    return {
+      ok: true, status: 200,
+      data: {
+        case_id: csCaseId,
+        type: String(csData.type || ''),
+        state: String(csData.state || ''),
+        priority: String(csData.priority || 'normal'),
+        subject: String(csData.subject || ''),
+        booking_id: String(csData.booking_id || ''),
+        created_at: csData.created_at || null,
+        updated_at: csData.updated_at || null,
+        resolved_at: csData.resolved_at || null,
+        timeline: csData.timeline || [],
+      },
+    };
   }
 
   if (action === 'create_case') {
-    return await handleCreateCase({ firestore, actorUid, actorRole, payload });
+    const ccType = String(payload.type || 'general').trim();
+    const ccBookingId = String(payload.booking_id || payload.bookingId || '').trim();
+    const ccDesc = String(payload.description || payload.message || '').trim();
+    const ccPriority = String(payload.priority || 'normal').trim();
+    if (!ccDesc) return { ok: false, status: 400, error: 'missing_description' };
+
+    const validTypes = ['late_artisan', 'dispute', 'reschedule_request', 'reassignment', 'quality_issue', 'support_message', 'general'];
+    if (!validTypes.includes(ccType)) return { ok: false, status: 400, error: 'invalid_case_type', valid_types: validTypes };
+
+    const validPriorities = ['low', 'normal', 'high', 'urgent'];
+    const safePriority = validPriorities.includes(ccPriority) ? ccPriority : 'normal';
+    const slaHours = { urgent: 1, high: 2, normal: 4, low: 24 };
+    const slaDeadline = new Date(Date.now() + (slaHours[safePriority] || 4) * 60 * 60 * 1000).toISOString();
+
+    const ccRef = firestore.collection('assistant_cases').doc();
+    await ccRef.set({
+      case_id: ccRef.id, type: ccType, booking_id: ccBookingId || null, client_uid: actorUid,
+      description: ccDesc, state: 'open', priority: safePriority,
+      created_at: now, updated_at: now, sla_deadline: slaDeadline,
+      timeline: [{ timestamp: now, actor: actorUid, action: 'case_created', notes: ccDesc }],
+    });
+
+    try {
+      await writeAdminNotification({
+        title: `New Case: ${ccType}${ccBookingId ? ` (Booking ${ccBookingId})` : ''}`,
+        message: ccDesc.substring(0, 150),
+        data: { case_id: ccRef.id, type: ccType, priority: safePriority, booking_id: ccBookingId || null },
+      });
+    } catch (_notifErr) { /* best-effort */ }
+
+    return {
+      ok: true, status: 200,
+      data: { case_id: ccRef.id, state: 'open', sla_deadline: slaDeadline },
+    };
   }
 
   if (action === 'update_case') {
-    return await handleUpdateCase({ firestore, actorUid, actorRole, payload });
+    const ucCaseId = String(payload.case_id || payload.caseId || '').trim();
+    const ucNewState = String(payload.state || '').trim();
+    const ucNotes = String(payload.notes || '').trim();
+    if (!ucCaseId) return { ok: false, status: 400, error: 'missing_case_id' };
+
+    const ucRef = firestore.collection('assistant_cases').doc(ucCaseId);
+    const ucSnap = await ucRef.get();
+    if (!ucSnap.exists) return { ok: false, status: 404, error: 'case_not_found' };
+
+    const ucData = ucSnap.data() || {};
+    const ucClientUid = String(ucData.client_uid || '').trim();
+    if (actorRole !== 'admin' && ucClientUid !== actorUid) return { ok: false, status: 403, error: 'forbidden' };
+
+    const ucValidStates = ['open', 'pending_artisan', 'pending_admin', 'in_progress', 'resolved', 'closed'];
+    const ucUpdates = { updated_at: now };
+    if (ucNewState) {
+      if (!ucValidStates.includes(ucNewState)) return { ok: false, status: 400, error: 'invalid_state', valid_states: ucValidStates };
+      ucUpdates.state = ucNewState;
+      if (ucNewState === 'resolved' || ucNewState === 'closed') ucUpdates.resolved_at = now;
+    }
+
+    const ucTimeline = ucData.timeline || [];
+    ucTimeline.push({ timestamp: now, actor: actorUid, action: ucNewState ? `state_changed_to_${ucNewState}` : 'case_updated', notes: ucNotes || '' });
+    ucUpdates.timeline = ucTimeline;
+    await ucRef.set(ucUpdates, { merge: true });
+
+    return {
+      ok: true, status: 200,
+      data: { case_id: ucCaseId, state: ucNewState || ucData.state, updated_at: now },
+    };
   }
 
   // ── Service Pricing Lookup ──
@@ -2184,18 +2403,44 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       actorRole === 'admin';
     if (!allowed) return { ok: false, status: 403, error: 'forbidden' };
 
+    // Enrich with artisan name/phone from serviceProvider collection
+    let artisanInfo = null;
+    if (artisanId && artisanId !== 'admin') {
+      try {
+        const providerDoc = await getServiceProviderDocByAnyId(artisanId);
+        if (providerDoc && providerDoc.exists) {
+          const pd = providerDoc.data() || {};
+          artisanInfo = {
+            name: String(pd.name || pd.full_name || pd.displayName || pd.firstName || '').trim() || null,
+            phone: String(pd.phone || pd.phoneNumber || pd.phone_number || pd.mobile || '').trim() || null,
+            trade: String(pd.profession || pd.trade || pd.specialization || '').trim() || null,
+          };
+        }
+      } catch (_) { /* best-effort */ }
+    }
+
     return {
       ok: true,
       status: 200,
       data: {
         booking_id: bookingId,
         status: String(data.status || ''),
+        category_name: String(data.category_name || '').trim(),
+        problem_description: String(data.problem_description || '').trim(),
         scheduled_date: String(data.scheduled_date || ''),
         scheduled_time: String(data.scheduled_time || ''),
         payment_status: String(data.payment_status || ''),
+        total_price: String(data.total_price || data.quoted_price || data.price || '').trim(),
         artisan_confirmed: String(data.artisan_confirmed || ''),
         service_provider_id: artisanId,
+        artisan: artisanInfo,
         tasks_management_id: String(data.tasks_management_id || '').trim(),
+        order_number: String(data.order_number || '').trim(),
+        rfq_no: String(data.rfq_no || '').trim(),
+        rfq_status: String(data.rfq_status || '').trim(),
+        order_type: String(data.is_rfq || '').toLowerCase() === 'yes' ? 'rfq' : 'order',
+        created_at: String(data.created_at || '').trim(),
+        service_address: String(data.service_address || data.address || '').trim(),
       },
     };
   }
@@ -2557,397 +2802,10 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
   return { ok: false, status: 400, error: 'unknown_action' };
 }
 
-// =========================================
-// Phase 3: Messaging & Case Management Handlers
-// =========================================
-
-async function handleGetMessages({ firestore, actorUid, actorRole, payload }) {
-  const bookingId = String(payload.booking_id || payload.bookingId || '').trim();
-  const tasksManagementId = String(payload.tasks_management_id || payload.tasksManagementId || payload.tm_id || '').trim();
-  const limit = Math.max(1, Math.min(100, Number(payload.limit || 50)));
-
-  if (!tasksManagementId && !bookingId) {
-    return { ok: false, status: 400, error: 'missing_tasks_management_id_or_booking_id' };
-  }
-
-  // Get tasks_management_id from booking if not provided
-  let tmId = tasksManagementId;
-  if (!tmId && bookingId) {
-    const bookingRef = firestore.collection('bookings').doc(bookingId);
-    const bookingSnap = await bookingRef.get();
-    if (!bookingSnap.exists) {
-      return { ok: false, status: 404, error: 'booking_not_found' };
-    }
-    const bookingData = bookingSnap.data() || {};
-    tmId = String(bookingData.tasks_management_id || '').trim();
-    if (!tmId) {
-      return { ok: false, status: 400, error: 'no_tasks_management_id_for_booking' };
-    }
-  }
-
-  // Verify user has access to this chat
-  const tmRef = firestore.collection('tasksManagement').doc(tmId);
-  const tmSnap = await tmRef.get();
-  if (!tmSnap.exists) {
-    return { ok: false, status: 404, error: 'tasks_management_not_found' };
-  }
-
-  const tmData = tmSnap.data() || {};
-  const userId = String(tmData.user_id || tmData.userId || '').trim();
-  const artisanId = String(tmData.service_provider_id || tmData.serviceProviderId || '').trim();
-  
-  const allowed =
-    actorRole === 'admin' ||
-    (actorRole === 'client' && userId === actorUid) ||
-    (actorRole === 'artisan' && artisanId === actorUid);
-
-  if (!allowed) {
-    return { ok: false, status: 403, error: 'forbidden' };
-  }
-
-  // Get messages
-  const messagesQuery = await tmRef
-    .collection('chat')
-    .orderBy('timestamp', 'desc')
-    .limit(limit)
-    .get();
-
-  const messages = messagesQuery.docs.map((doc) => {
-    const data = doc.data() || {};
-    return {
-      id: doc.id,
-      sender_id: String(data.sender_id || data.senderId || ''),
-      receiver_id: String(data.receiver_id || data.receiverId || ''),
-      message: String(data.message || ''),
-      timestamp: data.timestamp || null,
-      read: Boolean(data.read),
-    };
-  });
-
-  return {
-    ok: true,
-    status: 200,
-    data: {
-      tasks_management_id: tmId,
-      messages: messages.reverse(), // Return in chronological order
-      count: messages.length,
-    },
-  };
-}
-
-async function handleSendMessageToArtisan({ firestore, actorUid, actorRole, payload }) {
-  const bookingId = String(payload.booking_id || payload.bookingId || '').trim();
-  const message = String(payload.message || '').trim();
-
-  if (!bookingId || !message) {
-    return { ok: false, status: 400, error: 'missing_booking_id_or_message' };
-  }
-
-  if (message.length > 1000) {
-    return { ok: false, status: 400, error: 'message_too_long', message: 'Message must be under 1000 characters' };
-  }
-
-  // Get booking to find artisan and tasks_management_id
-  const bookingRef = firestore.collection('bookings').doc(bookingId);
-  const bookingSnap = await bookingRef.get();
-  if (!bookingSnap.exists) {
-    return { ok: false, status: 404, error: 'booking_not_found' };
-  }
-
-  const bookingData = bookingSnap.data() || {};
-  const userId = String(bookingData.user_id || '').trim();
-  const artisanId = String(bookingData.service_provider_id || '').trim();
-  const tmId = String(bookingData.tasks_management_id || '').trim();
-
-  // Verify user owns this booking
-  if (actorRole !== 'admin' && !(actorRole === 'client' && userId === actorUid)) {
-    return { ok: false, status: 403, error: 'forbidden' };
-  }
-
-  if (!artisanId || artisanId === 'admin') {
-    return { ok: false, status: 400, error: 'no_artisan_assigned' };
-  }
-
-  if (!tmId) {
-    return { ok: false, status: 400, error: 'no_tasks_management_id' };
-  }
-
-  // Add message to chat
-  const chatRef = firestore
-    .collection('tasksManagement')
-    .doc(tmId)
-    .collection('chat')
-    .doc();
-
-  await chatRef.set({
-    id: chatRef.id,
-    sender_id: actorUid,
-    receiver_id: artisanId,
-    message,
-    timestamp: now,
-    read: false,
-    created_at: now,
-  });
-
-  // Notify artisan
-  const providerDoc = await getServiceProviderDocByAnyId(artisanId);
-  await writePersonalNotificationForProviderDoc(
-    providerDoc,
-    'New message from client',
-    message.substring(0, 100),
-    { booking_id: bookingId, tasks_management_id: tmId, type: 'chat_message' }
-  );
-
-  return {
-    ok: true,
-    status: 200,
-    data: {
-      message_id: chatRef.id,
-      tasks_management_id: tmId,
-      sent: true,
-    },
-  };
-}
-
-async function handleSendMessageToAdmin({ firestore, actorUid, actorRole, payload }) {
-  const bookingId = String(payload.booking_id || payload.bookingId || '').trim();
-  const message = String(payload.message || '').trim();
-  const subject = String(payload.subject || 'Support Request').trim();
-
-  if (!message) {
-    return { ok: false, status: 400, error: 'missing_message' };
-  }
-
-  if (message.length > 2000) {
-    return { ok: false, status: 400, error: 'message_too_long', message: 'Message must be under 2000 characters' };
-  }
-
-  // Create a support case for this message
-  const caseRef = firestore.collection('assistant_cases').doc();
-  await caseRef.set({
-    case_id: caseRef.id,
-    type: 'support_message',
-    booking_id: bookingId || null,
-    client_uid: actorUid,
-    subject,
-    message,
-    state: 'open',
-    priority: 'normal',
-    created_at: now,
-    updated_at: now,
-    sla_deadline: new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString(), // 2 hours
-    timeline: [
-      {
-        timestamp: now,
-        actor: actorUid,
-        action: 'case_created',
-        notes: message,
-      },
-    ],
-  });
-
-  // Notify admin
-  await writeAdminNotification({
-    title: `Support Request${bookingId ? ` (Booking ${bookingId})` : ''}`,
-    message: `${subject}: ${message.substring(0, 150)}`,
-    data: {
-      case_id: caseRef.id,
-      booking_id: bookingId || null,
-      type: 'support_request',
-    },
-  });
-
-  // Acknowledge to user
-  await writePersonalNotification({
-    userId: actorUid,
-    userType: 'user',
-    title: 'Support request received',
-    message: 'Our team will respond shortly. You will be notified when we reply.',
-    data: {
-      case_id: caseRef.id,
-      booking_id: bookingId || null,
-    },
-  });
-
-  return {
-    ok: true,
-    status: 200,
-    data: {
-      case_id: caseRef.id,
-      message: 'Support request submitted successfully',
-    },
-  };
-}
-
-async function handleGetCaseStatus({ firestore, actorUid, actorRole, payload }) {
-  const caseId = String(payload.case_id || payload.caseId || '').trim();
-
-  if (!caseId) {
-    return { ok: false, status: 400, error: 'missing_case_id' };
-  }
-
-  const caseRef = firestore.collection('assistant_cases').doc(caseId);
-  const caseSnap = await caseRef.get();
-
-  if (!caseSnap.exists) {
-    return { ok: false, status: 404, error: 'case_not_found' };
-  }
-
-  const caseData = caseSnap.data() || {};
-  const clientUid = String(caseData.client_uid || '').trim();
-
-  // Verify access
-  if (actorRole !== 'admin' && clientUid !== actorUid) {
-    return { ok: false, status: 403, error: 'forbidden' };
-  }
-
-  return {
-    ok: true,
-    status: 200,
-    data: {
-      case_id: caseId,
-      type: String(caseData.type || ''),
-      state: String(caseData.state || ''),
-      priority: String(caseData.priority || 'normal'),
-      subject: String(caseData.subject || ''),
-      booking_id: String(caseData.booking_id || ''),
-      created_at: caseData.created_at || null,
-      updated_at: caseData.updated_at || null,
-      resolved_at: caseData.resolved_at || null,
-      timeline: caseData.timeline || [],
-    },
-  };
-}
-
-async function handleCreateCase({ firestore, actorUid, actorRole, payload }) {
-  const type = String(payload.type || 'general').trim();
-  const bookingId = String(payload.booking_id || payload.bookingId || '').trim();
-  const description = String(payload.description || payload.message || '').trim();
-  const priority = String(payload.priority || 'normal').trim();
-
-  if (!description) {
-    return { ok: false, status: 400, error: 'missing_description' };
-  }
-
-  // Validate type
-  const validTypes = ['late_artisan', 'dispute', 'reschedule_request', 'reassignment', 'quality_issue', 'support_message', 'general'];
-  if (!validTypes.includes(type)) {
-    return { ok: false, status: 400, error: 'invalid_case_type', valid_types: validTypes };
-  }
-
-  // Validate priority
-  const validPriorities = ['low', 'normal', 'high', 'urgent'];
-  const safePriority = validPriorities.includes(priority) ? priority : 'normal';
-
-  // Calculate SLA deadline based on priority
-  const slaHours = { urgent: 1, high: 2, normal: 4, low: 24 };
-  const slaDeadline = new Date(Date.now() + (slaHours[safePriority] || 4) * 60 * 60 * 1000).toISOString();
-
-  const caseRef = firestore.collection('assistant_cases').doc();
-  await caseRef.set({
-    case_id: caseRef.id,
-    type,
-    booking_id: bookingId || null,
-    client_uid: actorUid,
-    description,
-    state: 'open',
-    priority: safePriority,
-    created_at: now,
-    updated_at: now,
-    sla_deadline: slaDeadline,
-    timeline: [
-      {
-        timestamp: now,
-        actor: actorUid,
-        action: 'case_created',
-        notes: description,
-      },
-    ],
-  });
-
-  // Notify admin
-  await writeAdminNotification({
-    title: `New Case: ${type}${bookingId ? ` (Booking ${bookingId})` : ''}`,
-    message: description.substring(0, 150),
-    data: {
-      case_id: caseRef.id,
-      type,
-      priority: safePriority,
-      booking_id: bookingId || null,
-    },
-  });
-
-  return {
-    ok: true,
-    status: 200,
-    data: {
-      case_id: caseRef.id,
-      state: 'open',
-      sla_deadline: slaDeadline,
-    },
-  };
-}
-
-async function handleUpdateCase({ firestore, actorUid, actorRole, payload }) {
-  const caseId = String(payload.case_id || payload.caseId || '').trim();
-  const newState = String(payload.state || '').trim();
-  const notes = String(payload.notes || '').trim();
-
-  if (!caseId) {
-    return { ok: false, status: 400, error: 'missing_case_id' };
-  }
-
-  const caseRef = firestore.collection('assistant_cases').doc(caseId);
-  const caseSnap = await caseRef.get();
-
-  if (!caseSnap.exists) {
-    return { ok: false, status: 404, error: 'case_not_found' };
-  }
-
-  const caseData = caseSnap.data() || {};
-  const clientUid = String(caseData.client_uid || '').trim();
-
-  // Only admin or case owner can update
-  if (actorRole !== 'admin' && clientUid !== actorUid) {
-    return { ok: false, status: 403, error: 'forbidden' };
-  }
-
-  const validStates = ['open', 'pending_artisan', 'pending_admin', 'in_progress', 'resolved', 'closed'];
-  const updates = { updated_at: now };
-
-  if (newState) {
-    if (!validStates.includes(newState)) {
-      return { ok: false, status: 400, error: 'invalid_state', valid_states: validStates };
-    }
-    updates.state = newState;
-
-    if (newState === 'resolved' || newState === 'closed') {
-      updates.resolved_at = now;
-    }
-  }
-
-  // Add timeline entry
-  const timeline = caseData.timeline || [];
-  timeline.push({
-    timestamp: now,
-    actor: actorUid,
-    action: newState ? `state_changed_to_${newState}` : 'case_updated',
-    notes: notes || '',
-  });
-  updates.timeline = timeline;
-
-  await caseRef.set(updates, { merge: true });
-
-  return {
-    ok: true,
-    status: 200,
-    data: {
-      case_id: caseId,
-      state: newState || caseData.state,
-      updated_at: now,
-    },
-  };
-}
+// Phase 3 handlers (handleGetMessages, handleSendMessageToArtisan, handleSendMessageToAdmin,
+// handleGetCaseStatus, handleCreateCase, handleUpdateCase) have been inlined into
+// executeBookingAction() above for correct access to scoped helpers (now, writeAdminNotification,
+// writePersonalNotification, writePersonalNotificationForProviderDoc, getServiceProviderDocByAnyId).
 
 function getLiveKitWsUrl() {
   return env('LIVEKIT_WS_URL') || env('LIVEKIT_URL');
@@ -3514,10 +3372,12 @@ app.post('/api/action/execute', assistantLimiter, async (req, res) => {
     });
 
     return res.json({
+      ok: true,
       success: true,
       idempotencyKey,
       action,
       result: result.data || null,
+      data: result.data || null,
       request_id: req.requestId || null,
     });
   } catch (e) {
@@ -3893,11 +3753,13 @@ app.post('/api/action/confirm', assistantLimiter, async (req, res) => {
     await proposalRef.set({ status: 'confirmed', updated_at: nowIso(), confirmed_at: nowIso() }, { merge: true });
 
     return res.json({
+      ok: true,
       success: true,
       proposalId,
       idempotencyKey,
       action,
       result: result.data || null,
+      data: result.data || null,
       request_id: req.requestId || null,
     });
   } catch (e) {

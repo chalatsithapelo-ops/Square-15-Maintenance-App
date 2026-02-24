@@ -615,25 +615,44 @@ async def entrypoint(ctx: JobContext):
                 else:
                     return f"There was an issue checking the booking: {error}"
 
-            data = result.get('data', {})
+            data = result.get('data', result.get('result', {}))
             status = data.get('status', 'unknown')
             category = data.get('category_name', 'service')
+            problem = data.get('problem_description', '')
             scheduled_date = data.get('scheduled_date', '')
             scheduled_time = data.get('scheduled_time', '')
             artisan_confirmed = data.get('artisan_confirmed', '')
+            price = data.get('total_price', '')
+            address = data.get('service_address', '')
+            rfq_no = data.get('rfq_no', '')
+            rfq_status = data.get('rfq_status', '')
+            order_type = data.get('order_type', '')
 
             response = f"Booking {booking_id} for {category}: Status is {status}."
+            if problem:
+                response += f" Description: {problem}."
             if scheduled_date and scheduled_time:
                 response += f" Scheduled for {scheduled_date} at {scheduled_time}."
+            elif scheduled_date:
+                response += f" Scheduled for {scheduled_date}."
+            if price:
+                response += f" Price: R{price}."
+            if rfq_no:
+                response += f" RFQ #{rfq_no}, RFQ status: {rfq_status}."
             if artisan_confirmed:
                 response += f" Artisan confirmation: {artisan_confirmed}."
+            if address:
+                response += f" Location: {address}."
 
             artisan = data.get('artisan')
             if artisan and isinstance(artisan, dict):
                 name = artisan.get('name', '')
                 phone = artisan.get('phone', '')
+                trade = artisan.get('trade', '')
                 if name:
                     response += f" Artisan: {name}."
+                if trade:
+                    response += f" Trade: {trade}."
                 if phone:
                     response += f" Contact: {phone}."
 
@@ -691,7 +710,7 @@ async def entrypoint(ctx: JobContext):
                 error = result.get('error', 'unknown_error')
                 return f"There was an issue getting your bookings: {error}"
 
-            data = result.get('data', {})
+            data = result.get('data', result.get('result', {}))
             bookings = data.get('bookings', [])
             count = len(bookings)
 
@@ -703,6 +722,7 @@ async def entrypoint(ctx: JobContext):
                 booking_id = booking.get('booking_id', 'unknown')
                 booking_status = booking.get('status', 'unknown')
                 category = booking.get('category_name', 'service')
+                problem = booking.get('problem_description', '')
                 date = booking.get('scheduled_date', '')
                 time = booking.get('scheduled_time', '')
                 price = booking.get('total_price', '')
@@ -711,6 +731,8 @@ async def entrypoint(ctx: JobContext):
                 order_type = booking.get('order_type', '')
                 rfq_status = booking.get('rfq_status', '')
                 response += f"{i}. {category} booking {booking_id}: {booking_status}"
+                if problem:
+                    response += f" — {problem}"
                 if price:
                     response += f", price R{price}"
                 if rfq_no:
@@ -752,7 +774,7 @@ async def entrypoint(ctx: JobContext):
                 error = result.get('error', 'unknown_error')
                 return f"There was an issue getting analytics: {error}"
 
-            data = result.get('data', {})
+            data = result.get('data', result.get('result', {}))
             total = data.get('total_bookings', 0)
             by_status = data.get('by_status', {})
             urgent = data.get('urgent_bookings', [])
@@ -812,7 +834,7 @@ async def entrypoint(ctx: JobContext):
                 else:
                     return f"There was an issue: {error}"
 
-            data = result.get('data', {})
+            data = result.get('data', result.get('result', {}))
             quote_status = data.get('quote_status', 'pending')
             explanation = data.get('explanation', '')
             quoted_price = data.get('quoted_price', '')
@@ -867,7 +889,7 @@ async def entrypoint(ctx: JobContext):
                 error = result.get('error', 'unknown_error')
                 return f"There was an issue checking payment: {error}"
 
-            data = result.get('data', {})
+            data = result.get('data', result.get('result', {}))
             payment_status = data.get('payment_status', 'unknown')
             message = data.get('message', '')
             transactions = data.get('transactions', [])
@@ -1061,7 +1083,7 @@ async def entrypoint(ctx: JobContext):
             payload = {'booking_id': booking_id, 'message': message}
             result = await backend_client.call_backend_action('send_message_to_artisan', payload)
 
-            if not result.get('success'):
+            if not result.get('ok') and not result.get('success'):
                 error = result.get('error', 'unknown_error')
                 if error == 'no_artisan_assigned':
                     return "There's no artisan assigned to this booking yet. You can't send a message until an artisan accepts."
@@ -1101,11 +1123,11 @@ async def entrypoint(ctx: JobContext):
             }
             result = await backend_client.call_backend_action('send_message_to_admin', payload)
 
-            if not result.get('success'):
+            if not result.get('ok') and not result.get('success'):
                 error = result.get('error', 'unknown_error')
                 return f"I couldn't send your message to support: {error}"
 
-            case_id = (result.get('result') or {}).get('case_id', '')
+            case_id = (result.get('data') or result.get('result') or {}).get('case_id', '')
             if case_id:
                 return f"I've forwarded your message to our support team (case {case_id}). They'll respond shortly and you'll be notified."
             else:
@@ -1143,7 +1165,7 @@ async def entrypoint(ctx: JobContext):
             }
             result = await backend_client.call_backend_action('get_messages', payload)
 
-            if not result.get('success'):
+            if not result.get('ok') and not result.get('success'):
                 error = result.get('error', 'unknown_error')
                 if error == 'booking_not_found':
                     return f"I couldn't find booking {booking_id}."
@@ -1151,7 +1173,7 @@ async def entrypoint(ctx: JobContext):
                     return "This booking doesn't have a chat yet. You can send a message once an artisan is assigned."
                 return f"I couldn't get the messages: {error}"
 
-            result_data = result.get('result', {})
+            result_data = result.get('data', result.get('result', {}))
             messages = result_data.get('messages', [])
             
             if not messages:
@@ -1195,13 +1217,13 @@ async def entrypoint(ctx: JobContext):
             payload = {'case_id': case_id}
             result = await backend_client.call_backend_action('get_case_status', payload)
 
-            if not result.get('success'):
+            if not result.get('ok') and not result.get('success'):
                 error = result.get('error', 'unknown_error')
                 if error == 'case_not_found':
                     return f"I couldn't find case {case_id}."
                 return f"I couldn't get the case status: {error}"
 
-            result_data = result.get('result', {})
+            result_data = result.get('data', result.get('result', {}))
             state = result_data.get('state', 'unknown')
             case_type = result_data.get('type', 'support')
             subject = result_data.get('subject', '')
@@ -1247,7 +1269,7 @@ async def entrypoint(ctx: JobContext):
                 error = result.get('error', 'unknown_error')
                 return f"I couldn't check your wallet balance: {error}"
 
-            data = result.get('data', {})
+            data = result.get('data', result.get('result', {}))
             balance = data.get('balance', '0')
             return f"Your wallet balance is R{balance}."
 
