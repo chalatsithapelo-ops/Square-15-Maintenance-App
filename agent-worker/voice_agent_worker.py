@@ -346,10 +346,11 @@ async def entrypoint(ctx: JobContext):
             f"You are Lizzy, the Square 15 Voice AI Assistant, speaking to a {role.upper()} user.\n\n"
             "RULES:\n"
             "- Greet once, then just help. Never repeat your introduction.\n"
-            "- When user asks to DO something, CALL the right tool immediately.\n"
+            "- When user asks to DO something, CALL the right tool immediately. Do NOT describe what you would do — just do it.\n"
+            "- NEVER say 'I cannot access', 'I am unable to', 'I don't have access to', or 'I need you to be authenticated'. ALWAYS try calling the relevant tool.\n"
             "- BACKEND tools for data: get_booking_status, list_my_bookings, explain_quote, check_payment, get_wallet_balance, get_messages, get_case_status.\n"
-            "- lookup_service_pricing for pricing: when user asks 'how much is...', 'what's the price for...', 'how much do you charge for...', call lookup_service_pricing with category_name or task_name.\n"
-            "- ui_navigate for screens: open_bookings_tab, open_wallet, open_profile, open_settings, open_notifications, open_calendar, open_help, open_support, go_home, go_back, close_window.\n"
+            "- lookup_service_pricing for pricing: when user asks 'how much is...', 'what's the price for...', call lookup_service_pricing.\n"
+            "- ui_navigate for screens: open_bookings_tab, open_future_bookings, open_wallet, open_profile, open_settings, open_notifications, open_calendar, open_help, open_support, go_home, go_back, close_window.\n"
             "- send_message_to_artisan, send_message_to_admin for messaging.\n"
             "- NEVER narrate tool calls. Never say JSON, function names, or metadata.\n"
             "- NEVER claim you opened/loaded pictures or images.\n"
@@ -361,25 +362,40 @@ async def entrypoint(ctx: JobContext):
             "\n"
             "BOOKING LOOKUP (CRITICAL — MUST USE TOOLS):\n"
             "- When user asks about a booking, 'where is my artisan/plumber?', 'what's the status of my booking?', or similar:\n"
-            "  1. FIRST call list_my_bookings() to get their bookings. Do NOT say you can't access bookings.\n"
-            "  2. THEN call get_booking_status(booking_id) with the relevant booking ID to get full details.\n"
-            "  3. Tell the user the booking status, artisan name, and any relevant info.\n"
-            "- You may also receive 'active_bookings' in the app context metadata. Use that data if available to answer quickly.\n"
-            "- NEVER say 'I cannot access your bookings' or 'I am unable to retrieve that information'. ALWAYS try calling list_my_bookings first.\n"
+            "  1. FIRST call list_my_bookings() to get their bookings.\n"
+            "  2. Find the relevant booking from the results (match by category, artisan, date, or pick the most recent active one).\n"
+            "  3. THEN call get_booking_status(booking_id) with the relevant booking ID to get full details.\n"
+            "  4. Tell the user the booking status, artisan name, and any relevant info.\n"
+            "- NEVER say you 'can't access bookings' or 'unable to retrieve'. ALWAYS call list_my_bookings first. Even if there's an error, try the tool.\n"
+            "\n"
+            "MESSAGING & CHAT (IMPORTANT):\n"
+            "- 'Open chat' / 'open messages' / 'contact support' → call ui_navigate(action='open_support')\n"
+            "- 'Send message to artisan' / 'tell artisan ...' → call send_message_to_artisan(booking_id, message). Get booking_id from list_my_bookings if needed.\n"
+            "- 'Contact admin' / 'send message to support' → call send_message_to_admin(message, subject)\n"
+            "- 'Show messages' / 'read messages for booking' → call get_messages(booking_id)\n"
+            "\n"
+            "BOOKING MANAGEMENT (IMPORTANT):\n"
+            "- When user asks to cancel, reschedule, check status, or do anything with a booking:\n"
+            "  1. If they don't give a booking ID, call list_my_bookings() first to find it.\n"
+            "  2. Then use the specific tool: cancel_booking, reschedule_booking, get_booking_status, etc.\n"
+            "- Cancel: cancel_booking(booking_id, reason)\n"
+            "- Reschedule: reschedule_booking(booking_id, scheduled_date, scheduled_time)\n"
+            "- Check status: get_booking_status(booking_id)\n"
+            "- Call artisan: ui_navigate(action='call_assigned_artisan', booking_id=...)\n"
             "\n"
             "PRICING ENQUIRIES (CRITICAL — MUST USE TOOL):\n"
-            "- When user asks how much a service costs, you MUST call lookup_service_pricing. Do NOT answer pricing questions without calling this tool first.\n"
+            "- When user asks how much a service costs, MUST call lookup_service_pricing. Do NOT answer without calling this tool.\n"
             "- Pass query with the service name (e.g. query='plumbing', query='unblock toilet', query='painting').\n"
-            "- The tool ALWAYS returns pricing data — it never fails. Read back the prices from the results.\n"
+            "- The tool ALWAYS returns pricing data. Read back the prices from the results.\n"
             "- If cost is null for a service, say 'This service requires a quote from an artisan'.\n"
-            "- NEVER guess or make up prices. NEVER say you cannot look up prices. ALWAYS call lookup_service_pricing.\n"
+            "- NEVER guess or make up prices. ALWAYS call lookup_service_pricing.\n"
             "\n"
             "BOOKING CREATION (IMPORTANT):\n"
             "- To create a new booking, ALWAYS use ui_navigate with action='create_order_booking'.\n"
             "- Provide: category_name, problem_description, and optionally scheduled_date, scheduled_time, service_address.\n"
             "- Do NOT use create_booking tool. ONLY use ui_navigate(action='create_order_booking').\n"
-            "- After calling ui_navigate, say 'I am processing your booking now, please keep the app open.' Do NOT say an artisan has been sent or dispatched until the app confirms it.\n"
-            "- NEVER open photo upload, map, or any other screen during booking creation. The app handles everything automatically.\n"
+            "- After calling ui_navigate, say 'I am processing your booking now, please keep the app open.' Do NOT say an artisan has been dispatched until confirmed.\n"
+            "- NEVER open photo upload, map, or any other screen during booking creation. The app handles everything.\n"
             "- Do NOT use open_map or show_location actions. They do not exist.\n"
         )
 
@@ -532,6 +548,23 @@ async def entrypoint(ctx: JobContext):
             logger.warning(f"ui_navigate failed: {e}")
             return "error"
 
+    # ── Helper: retry credential scan before giving up ──
+    async def _ensure_backend_or_retry() -> bool:
+        """Last-ditch attempt to initialize backend_client if not set."""
+        nonlocal backend_client
+        if backend_client:
+            return True
+        # Try one more participant scan
+        _scan_participants_for_credentials()
+        if backend_client:
+            return True
+        # Brief wait and retry once
+        await asyncio.sleep(2)
+        _scan_participants_for_credentials()
+        return backend_client is not None
+
+    _CONNECTION_RETRY_MSG = "I'm still connecting to your account. Please try again in a moment."
+
     # Phase 2: Read-only backend tools
     @llm.function_tool(
         description=(
@@ -568,7 +601,8 @@ async def entrypoint(ctx: JobContext):
                             response += f" Description: {desc}."
                         return response
                 return f"I couldn't find booking {booking_id} in your recent bookings."
-            return "I need you to be authenticated first. Please make sure you're logged into the app."
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
 
         try:
             result = await backend_client.get_booking_status(booking_id)
@@ -648,7 +682,8 @@ async def entrypoint(ctx: JobContext):
                         response += f", scheduled {date}"
                     response += ".\n"
                 return response.strip()
-            return "I need you to be authenticated first. Please make sure you're logged into the app."
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
 
         try:
             result = await backend_client.list_user_bookings(status=status or None, limit=min(limit, 10))
@@ -708,7 +743,8 @@ async def entrypoint(ctx: JobContext):
         """Get analytics summary from backend API."""
         nonlocal backend_client
         if not backend_client:
-            return "I need you to be authenticated first. Please make sure you're logged into the app."
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
 
         try:
             result = await backend_client.call_backend_action("get_booking_analytics", {})
@@ -762,7 +798,8 @@ async def entrypoint(ctx: JobContext):
         """Explain RFQ quote from backend API."""
         nonlocal backend_client
         if not backend_client:
-            return "I need you to be authenticated first. Please make sure you're logged into the app."
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
 
         try:
             result = await backend_client.explain_rfq_quote(booking_id)
@@ -821,7 +858,8 @@ async def entrypoint(ctx: JobContext):
         """Check payment status from backend API."""
         nonlocal backend_client
         if not backend_client:
-            return "I need you to be authenticated first. Please make sure you're logged into the app."
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
 
         try:
             result = await backend_client.get_payment_status(booking_id)
@@ -955,7 +993,8 @@ async def entrypoint(ctx: JobContext):
         """Create a booking using backend propose/confirm workflow."""
         nonlocal backend_client
         if not backend_client:
-            return "I need you to be authenticated first. Please make sure you're logged into the app."
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
 
         try:
             # Phase 1: Propose the action
@@ -1015,7 +1054,8 @@ async def entrypoint(ctx: JobContext):
         """Send a message to the artisan assigned to a booking."""
         nonlocal backend_client
         if not backend_client:
-            return "I need you to be authenticated first."
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
 
         try:
             payload = {'booking_id': booking_id, 'message': message}
@@ -1050,7 +1090,8 @@ async def entrypoint(ctx: JobContext):
         """Send a message to admin support, creates a support case."""
         nonlocal backend_client
         if not backend_client:
-            return "I need you to be authenticated first."
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
 
         try:
             payload = {
@@ -1088,7 +1129,8 @@ async def entrypoint(ctx: JobContext):
         """Get chat messages for a booking."""
         nonlocal backend_client
         if not backend_client:
-            return "I need you to be authenticated first."
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
 
         if not booking_id and not tasks_management_id:
             return "I need either a booking ID or tasks management ID to get messages."
@@ -1146,7 +1188,8 @@ async def entrypoint(ctx: JobContext):
         """Get the status of a support case."""
         nonlocal backend_client
         if not backend_client:
-            return "I need you to be authenticated first."
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
 
         try:
             payload = {'case_id': case_id}
@@ -1194,7 +1237,8 @@ async def entrypoint(ctx: JobContext):
         """Get user's wallet balance from backend API."""
         nonlocal backend_client
         if not backend_client:
-            return "I need you to be authenticated first. Please make sure you're logged into the app."
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
 
         try:
             result = await backend_client.call_backend_action('get_wallet_balance', {})
@@ -1221,7 +1265,8 @@ async def entrypoint(ctx: JobContext):
         """Cancel a booking via backend API."""
         nonlocal backend_client
         if not backend_client:
-            return "I need you to be authenticated first."
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
 
         try:
             payload = {'booking_id': booking_id, 'reason': reason or 'User requested cancellation'}
@@ -1249,7 +1294,8 @@ async def entrypoint(ctx: JobContext):
         """Reschedule a booking via backend API."""
         nonlocal backend_client
         if not backend_client:
-            return "I need you to be authenticated first."
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
 
         if not scheduled_date and not scheduled_time:
             return "I need at least a new date or time to reschedule. When would you like to reschedule to?"
@@ -1283,7 +1329,8 @@ async def entrypoint(ctx: JobContext):
         """Mark booking as in-progress via backend API."""
         nonlocal backend_client
         if not backend_client:
-            return "I need you to be authenticated first."
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
 
         try:
             payload = {'booking_id': booking_id}
@@ -1308,7 +1355,8 @@ async def entrypoint(ctx: JobContext):
         """Cancel artisan and reassign via backend API."""
         nonlocal backend_client
         if not backend_client:
-            return "I need you to be authenticated first."
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
 
         try:
             payload = {'booking_id': booking_id, 'reason': reason or 'Artisan requested reassignment'}
@@ -1487,39 +1535,60 @@ async def entrypoint(ctx: JobContext):
         logger.warning(f"⚠️ Could not attach metadata listener: {e}")
 
     # ── Scan existing participants for credentials that arrived before we joined ──
-    try:
-        for p in ctx.room.remote_participants.values():
-            md = getattr(p, 'metadata', None)
-            if md and str(md).strip():
+    # The backend embeds firebase_token in the participant's access token metadata,
+    # so we can read it directly from any remote participant's metadata JSON.
+    def _scan_participants_for_credentials():
+        """Scan all remote participants for firebase_token in metadata."""
+        nonlocal backend_client, app_context_bookings, app_context_user_id
+        try:
+            participants = ctx.room.remote_participants
+            # Handle both dict.values() and direct iteration
+            items = participants.values() if hasattr(participants, 'values') else participants
+            for p in items:
+                if backend_client:
+                    break  # Already initialized
+                md = getattr(p, 'metadata', None)
+                if not md or not str(md).strip():
+                    continue
                 try:
                     msg = json.loads(md)
-                    if isinstance(msg, dict) and msg.get('type') == 'square15_voice_credentials':
-                        if _try_init_backend_from_msg(msg):
-                            logger.info("✅ Backend client initialized from EXISTING participant metadata")
+                    if not isinstance(msg, dict):
+                        continue
+                    # Check for firebase_token — either from access token metadata (backend-embedded)
+                    # or from square15_voice_credentials (app-sent)
+                    ft = msg.get('firebase_token')
+                    if ft and not backend_client:
+                        sid = msg.get('voice_session_id') or msg.get('session_id')
+                        snonce = msg.get('voice_session_nonce') or msg.get('session_nonce')
+                        if _try_init_backend_from_msg({
+                            'firebase_token': ft,
+                            'session_id': sid,
+                            'session_nonce': snonce,
+                        }):
+                            logger.info("✅ Backend client initialized from participant metadata")
+                    # Also extract app context data
+                    bookings = msg.get('active_bookings')
+                    if isinstance(bookings, list) and bookings:
+                        app_context_bookings = bookings
+                    uid = (msg.get('user_id') or '').strip()
+                    if uid:
+                        app_context_user_id = uid
                 except Exception:
                     pass
-    except Exception as e:
-        logger.debug(f"Participant scan note: {e}")
+        except Exception as e:
+            logger.debug(f"Participant scan note: {e}")
+
+    _scan_participants_for_credentials()
 
     await session.start(agent, room=ctx.room)
     logger.info("✅ Agent session started and running!")
 
-    # ── Post-start: re-scan participants in case metadata arrived during start ──
+    # ── Post-start: re-scan in case metadata arrived during start ──
     if not backend_client:
-        try:
-            for p in ctx.room.remote_participants.values():
-                md = getattr(p, 'metadata', None)
-                if md and str(md).strip():
-                    try:
-                        msg = json.loads(md)
-                        if isinstance(msg, dict) and msg.get('type') == 'square15_voice_credentials':
-                            if _try_init_backend_from_msg(msg):
-                                logger.info("✅ Backend client initialized from post-start participant scan")
-                                break
-                    except Exception:
-                        pass
-        except Exception as e:
-            logger.debug(f"Post-start scan note: {e}")
+        await asyncio.sleep(0.5)  # Brief wait for late-arriving metadata
+        _scan_participants_for_credentials()
+        if backend_client:
+            logger.info("✅ Backend client initialized from post-start scan")
 
     try:
         session.say(
@@ -1529,6 +1598,21 @@ async def entrypoint(ctx: JobContext):
         logger.info("✅ Greeting sent")
     except Exception as e:
         logger.warning(f"⚠️ Could not send greeting: {e}")
+
+    # ── Background: periodically retry credential scan until backend_client is set ──
+    async def _credential_retry_loop():
+        for i in range(20):  # Try for ~30 seconds
+            if backend_client:
+                return
+            await asyncio.sleep(1.5)
+            _scan_participants_for_credentials()
+            if backend_client:
+                logger.info(f"✅ Backend client initialized from retry loop (attempt {i+1})")
+                return
+        if not backend_client:
+            logger.warning("⚠️ Backend client never initialized — booking tools will use app context fallback only")
+
+    asyncio.ensure_future(_credential_retry_loop())
 
     while ctx.room.connection_state != rtc.ConnectionState.CONN_DISCONNECTED:
         await asyncio.sleep(1)

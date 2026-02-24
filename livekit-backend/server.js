@@ -3259,11 +3259,33 @@ app.post('/api/voice/start', assistantLimiter, async (req, res) => {
     }
     const metadata = typeof req.body.metadata === 'string' ? req.body.metadata : '';
 
+    // ── Enrich participant metadata with Firebase credentials ──
+    // The agent worker reads firebase_token from the participant metadata
+    // to initialize its backend API client. This eliminates race conditions
+    // from in-band credential delivery via data channel / setMetadata.
+    let enrichedMetadata = metadata;
+    try {
+      const parsed = metadata ? JSON.parse(metadata) : {};
+      if (idToken) {
+        parsed.firebase_token = idToken;
+      }
+      parsed.voice_session_id = sessionId;
+      parsed.voice_session_nonce = sessionNonce;
+      enrichedMetadata = JSON.stringify(parsed);
+    } catch (_) {
+      // If metadata isn't valid JSON, create a fresh object
+      enrichedMetadata = JSON.stringify({
+        firebase_token: idToken || '',
+        voice_session_id: sessionId,
+        voice_session_nonce: sessionNonce,
+      });
+    }
+
     // 1) Generate access token (server-side)
     const at = new AccessToken(env.apiKey, env.apiSecret, {
       identity: participantName,
       name: participantName,
-      metadata,
+      metadata: enrichedMetadata,
     });
 
     at.addGrant({
