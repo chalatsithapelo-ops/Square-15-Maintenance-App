@@ -141,6 +141,9 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
   String _lastAssignedArtisanId = '';
   String _watchBookingLastProviderId = '';
 
+  // Cached active bookings summary for agent context
+  List<Map<String, dynamic>> _cachedActiveBookings = [];
+
   StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>?
       _bookingStatusSubscription;
 
@@ -508,11 +511,21 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
     // Give the agent a moment to finish joining + attach metadata listeners.
     Future.delayed(const Duration(milliseconds: 700), () async {
       try {
+        // ── CRITICAL: Re-send credentials now that agent has joined ──
+        // The initial publishData may have been lost if the agent wasn't
+        // listening yet. This guarantees the agent gets our Firebase token.
+        await _sendCredentialsToAgent();
+
         await _sendSpeakToAgent(
           'I am $_assistantName, how can I help you today?',
         );
+
+        // Also re-send app context with active bookings for the agent.
+        await _sendAppContextToAgent(reason: 'agent_joined');
+
         // Retry once in case the first metadata update was missed.
         await Future.delayed(const Duration(seconds: 3));
+        await _sendCredentialsToAgent();
         await _sendSpeakToAgent(
           'I am $_assistantName, how can I help you today?',
         );
@@ -584,6 +597,62 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
     };
   }
 
+  /// Fetch user's recent/active bookings from Firestore so the agent
+  /// knows about them without needing a backend API call.
+  Future<void> _refreshActiveBookingsForContext() async {
+    try {
+      String userId = '';
+      try {
+        if (Get.isRegistered<AppController>()) {
+          userId = Get.find<AppController>().userId.value.toString().trim();
+        }
+      } catch (_) {}
+      if (userId.isEmpty) {
+        final u = FirebaseAuth.instance.currentUser;
+        if (u != null) userId = u.uid;
+      }
+      if (userId.isEmpty) return;
+
+      // Query recent bookings for this user (last 10, any status)
+      final snap = await FutureBookingService.futureBookingsRef
+          .where('user_id', isEqualTo: userId)
+          .orderBy('created_at', descending: true)
+          .limit(10)
+          .get();
+
+      final bookings = <Map<String, dynamic>>[];
+      for (final doc in snap.docs) {
+        final d = doc.data();
+        final status = (d['status'] ?? '').toString().trim();
+        final category = (d['category_name'] ?? d['category'] ?? '').toString().trim();
+        final artisanName = (d['artisan_name'] ?? d['service_provider_name'] ?? '').toString().trim();
+        final artisanId = (d['artisan_id'] ?? d['service_provider_id'] ?? '').toString().trim();
+        final scheduledDate = (d['scheduled_date'] ?? '').toString().trim();
+        final scheduledTime = (d['scheduled_time'] ?? '').toString().trim();
+        final price = (d['price'] ?? d['total_price'] ?? '').toString().trim();
+        final description = (d['problem_description'] ?? d['description'] ?? '').toString().trim();
+
+        bookings.add({
+          'booking_id': doc.id,
+          'status': status,
+          'category': category,
+          'artisan_name': artisanName,
+          'artisan_id': artisanId,
+          'scheduled_date': scheduledDate,
+          'scheduled_time': scheduledTime,
+          'price': price,
+          'description': description.length > 100
+              ? '${description.substring(0, 100)}...'
+              : description,
+        });
+      }
+      _cachedActiveBookings = bookings;
+      debugPrint('[ai_app] refreshed ${bookings.length} active bookings for context');
+    } catch (e) {
+      debugPrint('[ai_app] _refreshActiveBookingsForContext error: $e');
+    }
+  }
+
   Map<String, dynamic> _buildAppContext({required String reason}) {
     final role = widget.role.toLowerCase().trim();
     final route = Get.currentRoute.toString();
@@ -620,6 +689,7 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
       'last_created_booking_id': _lastCreatedBookingId,
       'last_assigned_artisan_id': _lastAssignedArtisanId,
       'pending_requests_count': pendingRequests,
+      'active_bookings': _cachedActiveBookings,
       'capabilities': _buildAgentCapabilities(),
       'ts': DateTime.now().toIso8601String(),
     };
@@ -680,6 +750,9 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
   Future<void> _sendAppContextToAgent({required String reason}) async {
     if (!mounted) return;
     if (_room == null || _room!.localParticipant == null) return;
+
+    // Refresh active bookings so the agent has up-to-date info
+    await _refreshActiveBookingsForContext();
 
     final meta = jsonEncode({
       'type': 'square15_app',
@@ -4054,7 +4127,150 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
       _aiResponse = voiceSummary;
     });
     _addToTranscript('AI', voiceSummary);
-    await _sendSpeakToAgent(voiceSummary);
+    await _sendSpeakToAgent(
+      isRFQRequested
+          ? 'I will create a request for quotes for $taskNamesSummary $dateSummary $locationSummary. Please confirm on the screen.'
+          : 'Your booking for $taskNamesSummary will cost $costSummary, scheduled $dateSummary $locationSummary. Please confirm on the screen.',
+    );
+
+    // ── Price Confirmation Dialog ──────────────────────────────────────────
+    // Show a visual dialog so the client sees and confirms the charge.
+    final bool? confirmed = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) {
+        return AlertDialog(
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          title: Row(
+            children: [
+              Icon(Icons.receipt_long, color: Colors.amber.shade700, size: 28),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  isRFQRequested ? 'Confirm Quote Request' : 'Confirm Booking',
+                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 18),
+                ),
+              ),
+            ],
+          ),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _confirmationRow(Icons.build, 'Service', taskNamesSummary),
+                if (!isRFQRequested && totalCost > 0)
+                  _confirmationRow(Icons.payments, 'Price', 'R${totalCost.toStringAsFixed(2)}'),
+                if (isRFQRequested)
+                  _confirmationRow(Icons.request_quote, 'Type', 'Request for Quotes'),
+                _confirmationRow(Icons.calendar_today, 'Date', effectiveDate),
+                _confirmationRow(Icons.access_time, 'Time', effectiveTime.length >= 5 ? effectiveTime.substring(0, 5) : effectiveTime),
+                _confirmationRow(Icons.location_on, 'Location',
+                    serviceOnCurrentLocation ? 'Your current location' : (address.isNotEmpty ? address : 'Provided location')),
+                if (description.trim().isNotEmpty)
+                  _confirmationRow(Icons.description, 'Description', description),
+                if (isEmergency)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 8),
+                    child: Row(
+                      children: [
+                        Icon(Icons.warning_amber_rounded, color: Colors.red.shade700, size: 20),
+                        const SizedBox(width: 6),
+                        Text('EMERGENCY REQUEST', style: TextStyle(color: Colors.red.shade700, fontWeight: FontWeight.bold)),
+                      ],
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(false),
+              child: const Text('Cancel', style: TextStyle(color: Colors.red, fontSize: 16)),
+            ),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFFc5a520),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+              ),
+              onPressed: () => Navigator.of(ctx).pop(true),
+              child: const Text('Confirm & Continue', style: TextStyle(color: Colors.white, fontSize: 16)),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (confirmed != true) {
+      const cancelMsg = 'Booking cancelled. Let me know if you want to try again.';
+      setState(() { _aiResponse = cancelMsg; });
+      _addToTranscript('AI', cancelMsg);
+      await _sendSpeakToAgent(cancelMsg);
+      Get.snackbar(_assistantName, 'Booking cancelled.',
+          backgroundColor: Colors.orange, colorText: Colors.white);
+      return;
+    }
+
+    // ── Photo Upload Step ──────────────────────────────────────────────────
+    // After price confirmation, ask the client to upload photos so the
+    // artisan knows what to expect and what materials/equipment to bring.
+    List<String> finalImageUrls = List<String>.from(workImageUrls);
+    if (finalImageUrls.length < 3) {
+      await _sendSpeakToAgent(
+        'Great! Now please upload at least 3 photos of the issue so the artisan knows what materials and equipment to bring.',
+      );
+
+      List<String>? uploadedUrls;
+      try {
+        uploadedUrls = await Get.to<List<String>>(
+          () => AiPhotoUploadScreen(
+            categoryName: categoryName,
+            problemDescription: description,
+            additionalNotes: notes,
+            serviceOnCurrentLocation: serviceOnCurrentLocation,
+            serviceAddress: address,
+            minPhotos: 3,
+          ),
+          transition: Transition.fadeIn,
+        );
+      } catch (e) {
+        // Fallback: try Navigator.push
+        try {
+          final ctx2 = Get.context ?? context;
+          uploadedUrls = await Navigator.of(ctx2).push<List<String>>(
+            MaterialPageRoute(
+              builder: (_) => AiPhotoUploadScreen(
+                categoryName: categoryName,
+                problemDescription: description,
+                additionalNotes: notes,
+                serviceOnCurrentLocation: serviceOnCurrentLocation,
+                serviceAddress: address,
+                minPhotos: 3,
+              ),
+            ),
+          );
+        } catch (_) {}
+      }
+
+      if (uploadedUrls == null || uploadedUrls.length < 3) {
+        const photoMsg = 'Photo upload cancelled or incomplete. Please upload at least 3 photos so the artisan can prepare properly.';
+        setState(() { _aiResponse = photoMsg; });
+        _addToTranscript('AI', photoMsg);
+        Get.snackbar(_assistantName, 'Please upload at least 3 photos.',
+            backgroundColor: Colors.orange, colorText: Colors.white);
+        await _sendSpeakToAgent(photoMsg);
+        return;
+      }
+
+      finalImageUrls = uploadedUrls;
+      setState(() {
+        _aiResponse = 'Photos uploaded! Sending your request to the nearest artisan...';
+      });
+      _addToTranscript('AI', 'Photos uploaded successfully.');
+      await _sendSpeakToAgent(
+        'Photos uploaded successfully. I am now sending the request to the nearest available artisan.',
+      );
+    }
 
     try {
       final backend = await _tryExecuteAssistantAction(
@@ -4069,7 +4285,7 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
           'provided_address': address,
           'other_lat': lat,
           'other_lng': lng,
-          'work_image_urls': workImageUrls,
+          'work_image_urls': finalImageUrls,
           'problem_description': effectiveDescription,
           'additional_notes': notes,
           'category_id': categoryIds.first,
@@ -4989,6 +5205,27 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
             ],
           ),
         ),
+      ),
+    );
+  }
+
+  /// Helper row for the price-confirmation dialog.
+  Widget _confirmationRow(IconData icon, String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(icon, size: 20, color: Colors.grey.shade600),
+          const SizedBox(width: 8),
+          SizedBox(
+            width: 80,
+            child: Text('$label:', style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 14)),
+          ),
+          Expanded(
+            child: Text(value, style: const TextStyle(fontSize: 14)),
+          ),
+        ],
       ),
     );
   }

@@ -242,6 +242,9 @@ async def entrypoint(ctx: JobContext):
     firebase_token = None
     session_id = None
     session_nonce = None
+    # Bookings sent from the app context (fallback when backend_client is not yet initialized)
+    app_context_bookings = []
+    app_context_user_id = ""
 
     logger.info(f"📡 Connecting to room: {room_name}")
 
@@ -356,7 +359,15 @@ async def entrypoint(ctx: JobContext):
             "- Date format: YYYY-MM-DD. Time format: HH:MM.\n"
             "- If user refers to a booking by price, call list_my_bookings first to find it.\n"
             "\n"
-            "PRICING ENQUIRIES (CRITICAL - MUST USE TOOL):\n"
+            "BOOKING LOOKUP (CRITICAL — MUST USE TOOLS):\n"
+            "- When user asks about a booking, 'where is my artisan/plumber?', 'what's the status of my booking?', or similar:\n"
+            "  1. FIRST call list_my_bookings() to get their bookings. Do NOT say you can't access bookings.\n"
+            "  2. THEN call get_booking_status(booking_id) with the relevant booking ID to get full details.\n"
+            "  3. Tell the user the booking status, artisan name, and any relevant info.\n"
+            "- You may also receive 'active_bookings' in the app context metadata. Use that data if available to answer quickly.\n"
+            "- NEVER say 'I cannot access your bookings' or 'I am unable to retrieve that information'. ALWAYS try calling list_my_bookings first.\n"
+            "\n"
+            "PRICING ENQUIRIES (CRITICAL — MUST USE TOOL):\n"
             "- When user asks how much a service costs, you MUST call lookup_service_pricing. Do NOT answer pricing questions without calling this tool first.\n"
             "- Pass query with the service name (e.g. query='plumbing', query='unblock toilet', query='painting').\n"
             "- The tool ALWAYS returns pricing data — it never fails. Read back the prices from the results.\n"
@@ -531,8 +542,32 @@ async def entrypoint(ctx: JobContext):
     )
     async def get_booking_status(booking_id: str) -> str:
         """Get booking status from backend API."""
-        nonlocal backend_client
+        nonlocal backend_client, app_context_bookings
         if not backend_client:
+            # Fallback: check app context bookings if available
+            if app_context_bookings:
+                for b in app_context_bookings:
+                    if b.get('booking_id') == booking_id:
+                        status = b.get('status', 'unknown')
+                        category = b.get('category', 'service')
+                        artisan_name = b.get('artisan_name', '')
+                        date = b.get('scheduled_date', '')
+                        time = b.get('scheduled_time', '')
+                        price = b.get('price', '')
+                        desc = b.get('description', '')
+                        response = f"Booking {booking_id} for {category}: Status is {status}."
+                        if date and time:
+                            response += f" Scheduled for {date} at {time}."
+                        elif date:
+                            response += f" Scheduled for {date}."
+                        if artisan_name:
+                            response += f" Artisan: {artisan_name}."
+                        if price:
+                            response += f" Price: R{price}."
+                        if desc:
+                            response += f" Description: {desc}."
+                        return response
+                return f"I couldn't find booking {booking_id} in your recent bookings."
             return "I need you to be authenticated first. Please make sure you're logged into the app."
 
         try:
@@ -583,8 +618,36 @@ async def entrypoint(ctx: JobContext):
     )
     async def list_my_bookings(status: str = "", limit: int = 10) -> str:
         """List user's bookings from backend API."""
-        nonlocal backend_client
+        nonlocal backend_client, app_context_bookings
         if not backend_client:
+            # Fallback: use app context bookings if available
+            if app_context_bookings:
+                filtered = app_context_bookings
+                if status:
+                    filtered = [b for b in filtered if b.get('status', '').lower() == status.lower()]
+                count = len(filtered)
+                if count == 0:
+                    return "You don't have any bookings" + (f" with status {status}" if status else "") + "."
+                response = f"You have {count} booking" + ("s" if count > 1 else "") + ".\n"
+                for i, b in enumerate(filtered[:limit], 1):
+                    bid = b.get('booking_id', 'unknown')
+                    bstatus = b.get('status', 'unknown')
+                    category = b.get('category', 'service')
+                    artisan = b.get('artisan_name', '')
+                    date = b.get('scheduled_date', '')
+                    time = b.get('scheduled_time', '')
+                    price = b.get('price', '')
+                    response += f"{i}. {category} booking {bid}: {bstatus}"
+                    if artisan:
+                        response += f", artisan: {artisan}"
+                    if price:
+                        response += f", price R{price}"
+                    if date and time:
+                        response += f", scheduled {date} at {time}"
+                    elif date:
+                        response += f", scheduled {date}"
+                    response += ".\n"
+                return response.strip()
             return "I need you to be authenticated first. Please make sure you're logged into the app."
 
         try:
@@ -1310,16 +1373,31 @@ async def entrypoint(ctx: JobContext):
         return _orig_say(cleaned, *args, **kwargs)
 
     session.say = _say_sanitized
-    await session.start(agent, room=ctx.room)
-    logger.info("✅ Agent session started and running!")
 
-    # Listen for app -> agent metadata messages (e.g. booking updates).
-    # The Flutter app will set its own participant metadata to JSON:
-    #   {"type":"square15_app","action":"speak","payload":{"text":"..."},...}
+    # ── CRITICAL: Register event handlers BEFORE session.start() ──
+    # The app sends credentials via publishData immediately after connecting.
+    # If we register handlers after session.start(), we miss the data packet.
     last_metadata_by_identity: dict[str, str] = {}
 
-    def on_participant_metadata_changed(participant, old_metadata, new_metadata):
+    def _try_init_backend_from_msg(msg: dict):
+        """Shared helper to initialize backend_client from a credentials message."""
         nonlocal backend_client, firebase_token, session_id, session_nonce
+        ft = msg.get("firebase_token")
+        if not ft:
+            return False
+        firebase_token = ft
+        session_id = msg.get("session_id")
+        session_nonce = msg.get("session_nonce")
+        backend_client = BackendAPIClient(
+            base_url=backend_url,
+            firebase_token=firebase_token,
+            session_id=session_id,
+            session_nonce=session_nonce
+        )
+        return True
+
+    def on_participant_metadata_changed(participant, old_metadata, new_metadata):
+        nonlocal backend_client, firebase_token, session_id, session_nonce, app_context_bookings, app_context_user_id
         try:
             if not new_metadata or not str(new_metadata).strip():
                 return
@@ -1348,16 +1426,7 @@ async def entrypoint(ctx: JobContext):
 
             # Handle voice session credentials from app
             if msg_type == "square15_voice_credentials":
-                firebase_token = msg.get("firebase_token")
-                session_id = msg.get("session_id")
-                session_nonce = msg.get("session_nonce")
-                if firebase_token:
-                    backend_client = BackendAPIClient(
-                        base_url=backend_url,
-                        firebase_token=firebase_token,
-                        session_id=session_id,
-                        session_nonce=session_nonce
-                    )
+                if _try_init_backend_from_msg(msg):
                     logger.info(f"✅ Backend client initialized with credentials (session: {session_id[:12] if session_id else 'none'}...)")
                 return
 
@@ -1374,6 +1443,15 @@ async def entrypoint(ctx: JobContext):
                 if not text:
                     return
                 session.say(text, allow_interruptions=True)
+            elif action == "context":
+                # Store app context data (active bookings, user_id) for tool fallback
+                bookings = payload.get("active_bookings")
+                if isinstance(bookings, list) and bookings:
+                    app_context_bookings = bookings
+                    logger.info(f"📋 Received {len(bookings)} active bookings from app context")
+                uid = (payload.get("user_id") or "").strip()
+                if uid:
+                    app_context_user_id = uid
         except Exception as e:
             logger.info(f"metadata handler error (ignored): {e}")
 
@@ -1396,16 +1474,7 @@ async def entrypoint(ctx: JobContext):
                 return
             msg_type = (msg.get('type') or '').strip()
             if msg_type == 'square15_voice_credentials':
-                firebase_token = msg.get('firebase_token')
-                session_id = msg.get('session_id')
-                session_nonce = msg.get('session_nonce')
-                if firebase_token:
-                    backend_client = BackendAPIClient(
-                        base_url=backend_url,
-                        firebase_token=firebase_token,
-                        session_id=session_id,
-                        session_nonce=session_nonce
-                    )
+                if _try_init_backend_from_msg(msg):
                     logger.info(f"✅ Backend client initialized via DATA CHANNEL (session: {session_id[:12] if session_id else 'none'}...)")
         except Exception as e:
             logger.debug(f"data_received handler note: {e}")
@@ -1416,6 +1485,41 @@ async def entrypoint(ctx: JobContext):
         logger.info("✅ Listening for app metadata + data channel (square15_app)")
     except Exception as e:
         logger.warning(f"⚠️ Could not attach metadata listener: {e}")
+
+    # ── Scan existing participants for credentials that arrived before we joined ──
+    try:
+        for p in ctx.room.remote_participants.values():
+            md = getattr(p, 'metadata', None)
+            if md and str(md).strip():
+                try:
+                    msg = json.loads(md)
+                    if isinstance(msg, dict) and msg.get('type') == 'square15_voice_credentials':
+                        if _try_init_backend_from_msg(msg):
+                            logger.info("✅ Backend client initialized from EXISTING participant metadata")
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.debug(f"Participant scan note: {e}")
+
+    await session.start(agent, room=ctx.room)
+    logger.info("✅ Agent session started and running!")
+
+    # ── Post-start: re-scan participants in case metadata arrived during start ──
+    if not backend_client:
+        try:
+            for p in ctx.room.remote_participants.values():
+                md = getattr(p, 'metadata', None)
+                if md and str(md).strip():
+                    try:
+                        msg = json.loads(md)
+                        if isinstance(msg, dict) and msg.get('type') == 'square15_voice_credentials':
+                            if _try_init_backend_from_msg(msg):
+                                logger.info("✅ Backend client initialized from post-start participant scan")
+                                break
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.debug(f"Post-start scan note: {e}")
 
     try:
         session.say(
