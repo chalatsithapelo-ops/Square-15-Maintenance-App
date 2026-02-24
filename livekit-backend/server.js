@@ -3211,11 +3211,13 @@ app.post('/api/voice/start', assistantLimiter, async (req, res) => {
     const sessionNonce = crypto.randomBytes(24).toString('hex');
     const expiresAt = new Date(Date.now() + voiceSessionTtlMinutes * 60_000).toISOString();
 
+    // Extract idToken BEFORE the try block so it's accessible in the metadata enrichment below
+    const idToken = getBearerToken(req);
+
     try {
       initFirebaseIfPossible();
       if (!firebaseInitError) {
         const firestore = admin.firestore();
-        const idToken = getBearerToken(req);
         if (!idToken) {
           if (requireSessionBinding) {
             return res.status(401).json({
