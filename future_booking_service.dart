@@ -444,6 +444,7 @@ class FutureBookingService {
           'task_id': (bookingData['task_id'] ?? '').toString(),
           'task_name': (bookingData['task_name'] ?? '').toString(),
           'transaction_by': userId,
+          'user_id': userId,
           'type': 'wallet',
           'subtype': 'future_booking_hold',
           'direction': 'out',
@@ -451,6 +452,8 @@ class FutureBookingService {
           'profit': '0.00',
           'schema_version': 2,
           'balance': _moneyString(newBalance),
+          'balance_after': _moneyString(newBalance),
+          'previous_balance': _moneyString(currentBalance),
         });
 
         return true;
@@ -541,6 +544,7 @@ class FutureBookingService {
           'task_id': (bookingData['task_id'] ?? '').toString(),
           'task_name': (bookingData['task_name'] ?? '').toString(),
           'transaction_by': userId,
+          'user_id': userId,
           'type': 'wallet',
           'subtype': 'future_booking_refund',
           'direction': 'out',
@@ -549,6 +553,8 @@ class FutureBookingService {
           'schema_version': 2,
           'reason': reason,
           'balance': _moneyString(newBalance),
+          'balance_after': _moneyString(newBalance),
+          'previous_balance': _moneyString(currentBalance),
         });
 
         return true;

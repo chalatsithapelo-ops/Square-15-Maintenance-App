@@ -284,6 +284,17 @@ class _TransactionHistoryScreenState extends State<TransactionHistoryScreen>
               color: item.amountColor,
             ),
           ),
+          if (item.balanceAfter.isNotEmpty) ...[
+            const SizedBox(height: 1),
+            Text(
+              'Bal: ${item.balanceAfter}',
+              style: GoogleFonts.roboto(
+                fontSize: 10,
+                color: Colors.grey.shade600,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+          ],
           const SizedBox(height: 2),
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
@@ -328,6 +339,7 @@ class _TransactionHistoryScreenState extends State<TransactionHistoryScreen>
             mainAxisSize: MainAxisSize.min,
             children: [
               _detailRow('Amount', item.amountText),
+              if (item.balanceAfter.isNotEmpty) _detailRow('Balance', item.balanceAfter),
               _detailRow('Status', item.statusLabel),
               _detailRow('Date', item.formattedDate),
               if (item.type.isNotEmpty) _detailRow('Type', item.type),
@@ -391,6 +403,7 @@ class _TxItem {
   final String direction;
   final String bookingId;
   final String taskName;
+  final String balanceAfter; // Running balance after this transaction
 
   _TxItem({
     required this.id,
@@ -409,6 +422,7 @@ class _TxItem {
     required this.direction,
     required this.bookingId,
     required this.taskName,
+    this.balanceAfter = '',
   });
 
   /// Parse a transactionLogs document.
@@ -448,6 +462,10 @@ class _TxItem {
 
     final statusColor = _statusColor(status);
 
+    // Running balance: try balance_after, balance, new_balance
+    final balRaw = (d['balance_after'] ?? d['balance'] ?? d['new_balance'] ?? '').toString().trim();
+    final balAfter = balRaw.isNotEmpty ? 'R${_parseAmount(balRaw).toStringAsFixed(2)}' : '';
+
     return _TxItem(
       id: doc.id,
       title: title,
@@ -465,6 +483,7 @@ class _TxItem {
       direction: direction,
       bookingId: bookingId,
       taskName: taskName,
+      balanceAfter: balAfter,
     );
   }
 
@@ -497,6 +516,7 @@ class _TxItem {
       direction: 'in',
       bookingId: '',
       taskName: '',
+      balanceAfter: '',
     );
   }
 
