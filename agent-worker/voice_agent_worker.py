@@ -1393,10 +1393,235 @@ async def entrypoint(ctx: JobContext):
             logger.error(f"artisan_cancel_and_reassign error: {e}", exc_info=True)
             return "Sorry, I had trouble with the reassignment. Please try again."
 
+    # ── New tools ─────────────────────────────────────────────────
+
+    @llm.function_tool(
+        description=(
+            "Get the user's recent transaction history from their wallet. "
+            "Shows deposits, payments, refunds and other wallet activity. "
+            "Optional: limit (number of records, default 20)."
+        )
+    )
+    async def get_transaction_history(limit: int = 20) -> str:
+        """Fetch recent transaction logs for the user."""
+        nonlocal backend_client
+        if not backend_client:
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
+        try:
+            result = await backend_client.call_backend_action('get_transaction_history', {'limit': limit})
+            if not result.get('ok') and not result.get('success'):
+                return f"Could not fetch transactions: {result.get('error', 'unknown')}"
+            data = result.get('data', {})
+            txns = data.get('transactions', [])
+            if not txns:
+                return "You have no recent transactions."
+            lines = []
+            for t in txns[:10]:  # Summarize top 10 for voice
+                amt = t.get('amount', '0')
+                typ = t.get('subtype') or t.get('type') or 'transaction'
+                direction = t.get('direction', '')
+                status = t.get('status', '')
+                date = (t.get('transaction_at') or '')[:10]
+                arrow = "received" if direction == 'in' else "spent"
+                lines.append(f"R{amt} {typ.replace('_', ' ')} ({arrow}) on {date} — {status}")
+            summary = "; ".join(lines)
+            return f"Here are your recent transactions: {summary}"
+        except Exception as e:
+            logger.error(f"get_transaction_history error: {e}", exc_info=True)
+            return "Sorry, I couldn't fetch your transaction history right now."
+
+    @llm.function_tool(
+        description=(
+            "Get the user's deposit/top-up requests. Shows pending, approved and rejected deposit requests."
+        )
+    )
+    async def get_deposit_requests(limit: int = 10) -> str:
+        """Fetch deposit requests for the user."""
+        nonlocal backend_client
+        if not backend_client:
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
+        try:
+            result = await backend_client.call_backend_action('get_deposit_requests', {'limit': limit})
+            if not result.get('ok') and not result.get('success'):
+                return f"Could not fetch deposits: {result.get('error', 'unknown')}"
+            data = result.get('data', {})
+            deposits = data.get('deposits', [])
+            if not deposits:
+                return "You have no deposit requests."
+            lines = []
+            for d in deposits:
+                amt = d.get('amount', '0')
+                status = d.get('status', 'pending')
+                date = (d.get('created_at') or '')[:10]
+                lines.append(f"R{amt} — {status} ({date})")
+            return f"Your deposit requests: {'; '.join(lines)}"
+        except Exception as e:
+            logger.error(f"get_deposit_requests error: {e}", exc_info=True)
+            return "Sorry, I couldn't fetch your deposit requests right now."
+
+    @llm.function_tool(
+        description=(
+            "Get available service categories. Lists all services that can be booked through the app."
+        )
+    )
+    async def get_service_categories() -> str:
+        """Fetch available service categories."""
+        nonlocal backend_client
+        if not backend_client:
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
+        try:
+            result = await backend_client.call_backend_action('get_service_categories', {})
+            if not result.get('ok') and not result.get('success'):
+                return f"Could not fetch categories: {result.get('error', 'unknown')}"
+            data = result.get('data', {})
+            cats = data.get('categories', [])
+            if not cats:
+                return "No service categories found."
+            names = [c.get('name', 'Unknown') for c in cats]
+            return f"Available service categories: {', '.join(names)}"
+        except Exception as e:
+            logger.error(f"get_service_categories error: {e}", exc_info=True)
+            return "Sorry, I couldn't fetch service categories right now."
+
+    @llm.function_tool(
+        description=(
+            "Get the user's recent notifications. Shows alerts about bookings, payments and updates."
+        )
+    )
+    async def get_notifications(limit: int = 10) -> str:
+        """Fetch recent notifications for the user."""
+        nonlocal backend_client
+        if not backend_client:
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
+        try:
+            result = await backend_client.call_backend_action('get_notifications', {'limit': limit})
+            if not result.get('ok') and not result.get('success'):
+                return "Could not fetch notifications."
+            data = result.get('data', {})
+            notifs = data.get('notifications', [])
+            if not notifs:
+                return "You have no recent notifications."
+            lines = []
+            for n in notifs[:5]:  # Top 5 for voice
+                title = n.get('title', 'Notification')
+                msg = n.get('message', '')
+                lines.append(f"{title}: {msg}" if msg else title)
+            return f"Your recent notifications: {'; '.join(lines)}"
+        except Exception as e:
+            logger.error(f"get_notifications error: {e}", exc_info=True)
+            return "Sorry, I couldn't fetch your notifications right now."
+
+    @llm.function_tool(
+        description=(
+            "Get the user's upcoming/scheduled bookings. Shows future bookings that haven't been completed or cancelled."
+        )
+    )
+    async def get_scheduled_bookings() -> str:
+        """Fetch upcoming scheduled bookings."""
+        nonlocal backend_client
+        if not backend_client:
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
+        try:
+            result = await backend_client.call_backend_action('get_scheduled_bookings', {})
+            if not result.get('ok') and not result.get('success'):
+                return f"Could not fetch bookings: {result.get('error', 'unknown')}"
+            data = result.get('data', {})
+            bookings = data.get('bookings', [])
+            if not bookings:
+                return "You have no upcoming scheduled bookings."
+            lines = []
+            for b in bookings:
+                name = b.get('task_name') or 'Service'
+                date = b.get('scheduled_date') or 'TBD'
+                time = b.get('scheduled_time') or ''
+                status = b.get('status') or ''
+                lines.append(f"{name} on {date} {time} ({status})")
+            return f"Your upcoming bookings: {'; '.join(lines)}"
+        except Exception as e:
+            logger.error(f"get_scheduled_bookings error: {e}", exc_info=True)
+            return "Sorry, I couldn't fetch your scheduled bookings right now."
+
+    @llm.function_tool(
+        description=(
+            "Get information about an artisan/service provider. "
+            "Requires: artisan_id (the service provider's ID)."
+        )
+    )
+    async def get_artisan_info(artisan_id: str) -> str:
+        """Fetch details about a specific artisan."""
+        nonlocal backend_client
+        if not backend_client:
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
+        try:
+            result = await backend_client.call_backend_action('get_artisan_info', {'artisan_id': artisan_id})
+            if not result.get('ok') and not result.get('success'):
+                return f"Could not find artisan: {result.get('error', 'unknown')}"
+            data = result.get('data', {})
+            name = data.get('name', 'Unknown')
+            rating = data.get('rating')
+            location = data.get('location', '')
+            rating_text = f", rated {rating}/5" if rating else ""
+            location_text = f", based in {location}" if location else ""
+            return f"Artisan {name}{rating_text}{location_text}"
+        except Exception as e:
+            logger.error(f"get_artisan_info error: {e}", exc_info=True)
+            return "Sorry, I couldn't fetch artisan information right now."
+
+    @llm.function_tool(
+        description=(
+            "Submit a rating for a completed booking. "
+            "Requires: booking_id, rating (1-5). Optional: review (text comment)."
+        )
+    )
+    async def submit_rating(booking_id: str, rating: int, review: str = "") -> str:
+        """Rate an artisan after service completion."""
+        nonlocal backend_client
+        if not backend_client:
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
+        try:
+            payload = {'booking_id': booking_id, 'rating': rating, 'review': review}
+            result = await backend_client.call_backend_action('submit_rating', payload)
+            if not result.get('ok') and not result.get('success'):
+                return f"Could not submit rating: {result.get('error', 'unknown')}"
+            return f"Thank you! Your {rating}-star rating has been submitted for booking {booking_id}."
+        except Exception as e:
+            logger.error(f"submit_rating error: {e}", exc_info=True)
+            return "Sorry, I couldn't submit your rating right now."
+
+    @llm.function_tool(
+        description=(
+            "Submit a complaint about a service or experience. "
+            "Requires: description (what went wrong). Optional: subject, booking_id."
+        )
+    )
+    async def submit_complaint(description: str, subject: str = "Complaint", booking_id: str = "") -> str:
+        """File a complaint with the admin team."""
+        nonlocal backend_client
+        if not backend_client:
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
+        try:
+            payload = {'description': description, 'subject': subject, 'booking_id': booking_id}
+            result = await backend_client.call_backend_action('submit_complaint', payload)
+            if not result.get('ok') and not result.get('success'):
+                return f"Could not submit complaint: {result.get('error', 'unknown')}"
+            complaint_id = result.get('data', {}).get('complaint_id', '')
+            return f"Your complaint has been submitted (ref: {complaint_id}). Our team will review it shortly."
+        except Exception as e:
+            logger.error(f"submit_complaint error: {e}", exc_info=True)
+            return "Sorry, I couldn't submit your complaint right now."
+
     agent = voice.Agent(
         vad=vad,
         stt=openai.STT(model="whisper-1", language="en"),
-        llm=openai.LLM(model="gpt-4o-mini", temperature=0.4),
+        llm=openai.LLM(model="gpt-4o", temperature=0.4),
         tts=openai.TTS(model="tts-1", voice="alloy"),
         instructions=_instructions_for_role(caller_role),
     )
@@ -1413,12 +1638,20 @@ async def entrypoint(ctx: JobContext):
             check_payment,
             get_wallet_balance,
             lookup_service_pricing,
+            get_transaction_history,
+            get_deposit_requests,
+            get_service_categories,
+            get_notifications,
+            get_scheduled_bookings,
+            get_artisan_info,
             # Write backend tools
             create_booking,
             cancel_booking,
             reschedule_booking,
             mark_booking_in_progress,
             artisan_cancel_and_reassign,
+            submit_rating,
+            submit_complaint,
             # Phase 3: Messaging tools
             send_message_to_artisan,
             send_message_to_admin,

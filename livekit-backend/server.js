@@ -324,6 +324,8 @@ async function resolveRole({ firestore, uid, decodedToken }) {
     const userSnap = await firestore.collection('users').doc(uid).get();
     if (userSnap.exists) {
       const data = userSnap.data() || {};
+
+      // Check string role fields first
       const v =
         data.role ||
         data.user_role ||
@@ -339,6 +341,15 @@ async function resolveRole({ firestore, uid, decodedToken }) {
         console.warn(`⚠️ User ${uid} has admin role in Firestore but NOT in custom claims — denying admin access`);
         return 'client';
       }
+
+      // Check boolean flag schema (isAdmin, isServiceProvider, isUser)
+      // This handles apps that use boolean flags instead of string roles.
+      if (data.isAdmin === true) {
+        console.warn(`⚠️ User ${uid} has isAdmin=true in Firestore but NOT in custom claims — denying admin access`);
+        return 'client';
+      }
+      if (data.isServiceProvider === true) return 'artisan';
+      if (data.isUser === true) return 'client';
     }
   } catch (_) {
     // ignore
@@ -393,6 +404,12 @@ const ACTION_TIERS = Object.freeze({
   get_case_status: 'A',
   lookup_service_pricing: 'A',
   list_services: 'A',
+  get_transaction_history: 'A',
+  get_deposit_requests: 'A',
+  get_service_categories: 'A',
+  get_notifications: 'A',
+  get_scheduled_bookings: 'A',
+  get_artisan_info: 'A',
   create_order_booking: 'B',
   create_order_booking_order: 'B',
   dispatch_artisan: 'B',
@@ -406,6 +423,8 @@ const ACTION_TIERS = Object.freeze({
   send_message_to_admin: 'B',
   create_case: 'B',
   update_case: 'B',
+  submit_rating: 'B',
+  submit_complaint: 'B',
 });
 
 function actionTier(action) {
@@ -2816,6 +2835,266 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         tasks_management_id: newTmId || null,
       },
     };
+  }
+
+  // ── New Tier A: get_transaction_history ──────────────────────────
+  if (action === 'get_transaction_history') {
+    try {
+      const limit = Math.min(Math.max(Number(payload.limit) || 20, 1), 50);
+      const snap1 = await firestore.collection('transactionLogs')
+        .where('transaction_by', '==', actorUid)
+        .limit(limit)
+        .get();
+      const snap2 = await firestore.collection('transactionLogs')
+        .where('user_id', '==', actorUid)
+        .limit(limit)
+        .get();
+      const seen = new Set();
+      const items = [];
+      for (const doc of [...snap1.docs, ...snap2.docs]) {
+        if (seen.has(doc.id)) continue;
+        seen.add(doc.id);
+        const d = doc.data() || {};
+        items.push({
+          id: doc.id,
+          amount: d.amount || '0',
+          type: d.type || '',
+          subtype: d.subtype || '',
+          direction: d.direction || '',
+          status: d.status || '',
+          transaction_at: d.transaction_at || '',
+          booking_id: d.booking_id || '',
+          task_name: d.task_name || '',
+        });
+      }
+      items.sort((a, b) => (b.transaction_at || '').localeCompare(a.transaction_at || ''));
+      return { ok: true, status: 200, data: { transactions: items.slice(0, limit) } };
+    } catch (e) {
+      return { ok: false, status: 500, error: e.message || 'failed' };
+    }
+  }
+
+  // ── New Tier A: get_deposit_requests ────────────────────────────
+  if (action === 'get_deposit_requests') {
+    try {
+      const limit = Math.min(Math.max(Number(payload.limit) || 20, 1), 50);
+      const snap = await firestore.collection('requests')
+        .where('requestBy', '==', actorUid)
+        .limit(limit)
+        .get();
+      const items = snap.docs.map((doc) => {
+        const d = doc.data() || {};
+        return {
+          id: doc.id,
+          amount: d.amount || '0',
+          status: d.status || 'pending',
+          created_at: d.createdAt || d.created_at || '',
+          proof_url: d.image || d.proof_url || '',
+        };
+      });
+      return { ok: true, status: 200, data: { deposits: items } };
+    } catch (e) {
+      return { ok: false, status: 500, error: e.message || 'failed' };
+    }
+  }
+
+  // ── New Tier A: get_service_categories ──────────────────────────
+  if (action === 'get_service_categories') {
+    try {
+      const snap = await firestore.collection('tasksCategories').limit(50).get();
+      const cats = snap.docs.map((doc) => {
+        const d = doc.data() || {};
+        return {
+          id: doc.id,
+          name: d.name || d.category_name || d.title || doc.id,
+          description: d.description || '',
+          status: d.status || 'published',
+        };
+      }).filter(c => {
+        const s = String(c.status).toLowerCase();
+        return !s || s === 'publish' || s === 'published' || s === 'approved';
+      });
+      return { ok: true, status: 200, data: { categories: cats } };
+    } catch (e) {
+      return { ok: false, status: 500, error: e.message || 'failed' };
+    }
+  }
+
+  // ── New Tier A: get_notifications ──────────────────────────────
+  if (action === 'get_notifications') {
+    try {
+      const limit = Math.min(Math.max(Number(payload.limit) || 15, 1), 30);
+      // Try user-specific notifications collection
+      const snap = await firestore.collection('users').doc(actorUid)
+        .collection('notifications')
+        .orderBy('created_at', 'desc')
+        .limit(limit)
+        .get();
+      const items = snap.docs.map((doc) => {
+        const d = doc.data() || {};
+        return {
+          id: doc.id,
+          title: d.title || '',
+          message: d.message || d.body || '',
+          read: d.read || false,
+          created_at: d.created_at || '',
+        };
+      });
+      return { ok: true, status: 200, data: { notifications: items, count: items.length } };
+    } catch (e) {
+      // Notifications subcollection may not exist — return empty
+      return { ok: true, status: 200, data: { notifications: [], count: 0 } };
+    }
+  }
+
+  // ── New Tier A: get_scheduled_bookings ─────────────────────────
+  if (action === 'get_scheduled_bookings') {
+    try {
+      const snap = await firestore.collection('futureBookings')
+        .where('user_id', '==', actorUid)
+        .limit(30)
+        .get();
+      const upcoming = [];
+      const nowMs = Date.now();
+      for (const doc of snap.docs) {
+        const d = doc.data() || {};
+        const status = String(d.status || '').toLowerCase();
+        if (status === 'cancelled' || status === 'done' || status === 'completed') continue;
+        const scheduledDate = d.scheduled_date || d.scheduledDate || '';
+        const scheduledTime = d.scheduled_time || d.scheduledTime || '';
+        upcoming.push({
+          booking_id: doc.id,
+          task_name: d.task_name || d.taskName || '',
+          status: d.status || '',
+          scheduled_date: scheduledDate,
+          scheduled_time: scheduledTime,
+          artisan_id: d.service_provider_id || '',
+          order_no: d.order_no || '',
+        });
+      }
+      // Sort by scheduled_date ascending
+      upcoming.sort((a, b) => (a.scheduled_date || '').localeCompare(b.scheduled_date || ''));
+      return { ok: true, status: 200, data: { bookings: upcoming } };
+    } catch (e) {
+      return { ok: false, status: 500, error: e.message || 'failed' };
+    }
+  }
+
+  // ── New Tier A: get_artisan_info ───────────────────────────────
+  if (action === 'get_artisan_info') {
+    const artisanIdInput = String(payload.artisan_id || payload.service_provider_id || '').trim();
+    if (!artisanIdInput) return { ok: false, status: 400, error: 'artisan_id required' };
+    try {
+      const doc = await getServiceProviderDocByAnyId(artisanIdInput);
+      if (!doc) return { ok: false, status: 404, error: 'artisan_not_found' };
+      const d = doc.data() || {};
+      return {
+        ok: true,
+        status: 200,
+        data: {
+          id: doc.id,
+          name: d.name || d.displayName || d.full_name || '',
+          phone: d.phone || d.phoneNumber || '',
+          rating: d.rating || d.averageRating || null,
+          reviews_count: d.reviews_count || d.reviewsCount || 0,
+          skills: d.skills || d.services || [],
+          location: d.location || d.address || '',
+          active: d.isActive ?? d.active ?? true,
+        },
+      };
+    } catch (e) {
+      return { ok: false, status: 500, error: e.message || 'failed' };
+    }
+  }
+
+  // ── New Tier B: submit_rating ──────────────────────────────────
+  if (action === 'submit_rating') {
+    const targetBookingId = String(payload.booking_id || bookingId || '').trim();
+    if (!targetBookingId) return { ok: false, status: 400, error: 'booking_id required' };
+
+    const rating = Number(payload.rating);
+    if (!Number.isFinite(rating) || rating < 1 || rating > 5) {
+      return { ok: false, status: 400, error: 'rating must be 1-5' };
+    }
+
+    const review = String(payload.review || payload.comment || '').trim();
+
+    try {
+      const bRef = firestore.collection('futureBookings').doc(targetBookingId);
+      const bSnap = await bRef.get();
+      if (!bSnap.exists) return { ok: false, status: 404, error: 'booking_not_found' };
+      const bData = bSnap.data() || {};
+
+      if (String(bData.user_id || '').trim() !== actorUid) {
+        return { ok: false, status: 403, error: 'only booking owner can rate' };
+      }
+
+      const artisanToRate = String(bData.service_provider_id || '').trim();
+      if (!artisanToRate) return { ok: false, status: 400, error: 'no artisan assigned' };
+
+      // Save rating on booking
+      await bRef.set({
+        rating: rating,
+        review: review,
+        rated_at: now,
+        updated_at: now,
+      }, { merge: true });
+
+      // Save review in reviews subcollection on artisan
+      try {
+        const providerDoc = await getServiceProviderDocByAnyId(artisanToRate);
+        if (providerDoc) {
+          await firestore.collection('serviceProvider').doc(providerDoc.id)
+            .collection('reviews')
+            .doc(targetBookingId)
+            .set({
+              booking_id: targetBookingId,
+              user_id: actorUid,
+              rating: rating,
+              review: review,
+              created_at: now,
+            });
+        }
+      } catch (_) { /* best effort */ }
+
+      return { ok: true, status: 200, data: { rated: true, booking_id: targetBookingId, rating } };
+    } catch (e) {
+      return { ok: false, status: 500, error: e.message || 'failed' };
+    }
+  }
+
+  // ── New Tier B: submit_complaint ───────────────────────────────
+  if (action === 'submit_complaint') {
+    const subject = String(payload.subject || payload.title || 'Complaint').trim();
+    const description = String(payload.description || payload.message || '').trim();
+    if (!description) return { ok: false, status: 400, error: 'description required' };
+
+    const relatedBookingId = String(payload.booking_id || bookingId || '').trim();
+
+    try {
+      const complaintId = randomId('complaint-');
+      await firestore.collection('complaints').doc(complaintId).set({
+        id: complaintId,
+        user_id: actorUid,
+        subject,
+        description,
+        booking_id: relatedBookingId || null,
+        status: 'open',
+        created_at: now,
+        updated_at: now,
+      });
+
+      // Notify admin
+      await writeAdminNotification(
+        'New complaint',
+        `Complaint from user: ${subject}`,
+        { complaint_id: complaintId, user_id: actorUid }
+      );
+
+      return { ok: true, status: 200, data: { complaint_id: complaintId, status: 'open' } };
+    } catch (e) {
+      return { ok: false, status: 500, error: e.message || 'failed' };
+    }
   }
 
   return { ok: false, status: 400, error: 'unknown_action' };

@@ -2,11 +2,11 @@ import 'dart:convert';
 import 'dart:math';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
-import 'package:googleapis_auth/auth_io.dart';
 import 'package:maintenanceapp/model/future_booking_model.dart';
+import 'package:maintenanceapp/services/backend_fcm_service.dart';
 import 'package:maintenanceapp/services/rfq_ai_service.dart';
 import 'package:uuid/uuid.dart';
 
@@ -446,7 +446,7 @@ class FutureBookingService {
           'transaction_by': userId,
           'type': 'wallet',
           'subtype': 'future_booking_hold',
-          'direction': 'in',
+          'direction': 'out',
           'cash_movement': false,
           'profit': '0.00',
           'schema_version': 2,
@@ -3318,53 +3318,14 @@ class FutureBookingService {
     Map<String, dynamic>? data,
   }) async {
     try {
-      // Load service account JSON from assets
-      final serviceAccount = json
-          .decode(await rootBundle.loadString('assets/firebase-adminsdk.json'));
-      final credentials = ServiceAccountCredentials.fromJson(serviceAccount);
-
-      final client = await clientViaServiceAccount(
-        credentials,
-        ['https://www.googleapis.com/auth/firebase.messaging'],
+      await BackendFcmService.sendNotification(
+        token: token,
+        title: title,
+        body: body,
+        data: data,
       );
-
-      final projectId = serviceAccount['project_id'];
-
-      final response = await client.post(
-        Uri.parse(
-            'https://fcm.googleapis.com/v1/projects/$projectId/messages:send'),
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: jsonEncode({
-          'message': {
-            'token': token,
-            'notification': {
-              'title': title,
-              'body': body,
-            },
-            'data': data ?? {},
-            'android': {
-              'priority': 'high',
-            },
-            'apns': {
-              'headers': {
-                'apns-priority': '10',
-              },
-            },
-          }
-        }),
-      );
-
-      client.close();
-
-      if (response.statusCode == 200) {
-        debugPrint('Notification sent successfully');
-      } else {
-        debugPrint('Failed to send notification: ${response.body}');
-      }
     } catch (e) {
-      debugPrint('Error sending FCM notification: $e');
+      if (kDebugMode) debugPrint('Error sending FCM notification: $e');
     }
   }
 

@@ -115,6 +115,7 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
   bool _isDisconnecting = false;
   Timer? _disconnectDebounce;
   Timer? _metadataPoller;
+  Timer? _firebaseTokenRefreshTimer;
 
   // Conversation Transcript
   final List<Map<String, String>> _transcript = [];
@@ -432,6 +433,19 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
       // subsequent setMetadata calls for context/speak.
       await _sendCredentialsToAgent();
 
+      // ── Periodic Firebase token refresh (tokens expire after ~1 hour) ──
+      // Re-send credentials every 45 minutes so long-running sessions
+      // don't lose backend access when the token expires.
+      _firebaseTokenRefreshTimer?.cancel();
+      _firebaseTokenRefreshTimer = Timer.periodic(
+        const Duration(minutes: 45),
+        (_) async {
+          if (!mounted || !_isConnected) return;
+          debugPrint('🔄 Refreshing Firebase token for agent session...');
+          await _sendCredentialsToAgent();
+        },
+      );
+
       // Provide capabilities + in-app context so the agent can reliably
       // navigate and complete tasks via square15_ui actions.
       await _sendAppContextToAgent(reason: 'connected');
@@ -482,6 +496,11 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
       'payload': {
         'text': t,
       },
+      // Keep credentials in every metadata update so the agent always has
+      // access, even if earlier credential deliveries were lost.
+      'firebase_token': _firebaseIdToken.trim(),
+      'voice_session_id': _voiceSessionId,
+      'voice_session_nonce': _voiceSessionNonce,
       'ts': now.toIso8601String(),
       'seq': ++_appMetadataSeq,
     });
@@ -758,6 +777,12 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
       'type': 'square15_app',
       'action': 'context',
       'payload': _buildAppContext(reason: reason),
+      // Include credentials in EVERY metadata update so the agent can always
+      // pick up firebase_token, even if prior credential-only messages were
+      // lost or overwritten.
+      'firebase_token': _firebaseIdToken.trim(),
+      'voice_session_id': _voiceSessionId,
+      'voice_session_nonce': _voiceSessionNonce,
       'ts': DateTime.now().toIso8601String(),
       'seq': ++_appMetadataSeq,
     });
@@ -5091,6 +5116,9 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
 
     _metadataPoller?.cancel();
     _metadataPoller = null;
+
+    _firebaseTokenRefreshTimer?.cancel();
+    _firebaseTokenRefreshTimer = null;
 
     _disposeTypedRoomListener();
     await _disposeRoomEventsListener();
