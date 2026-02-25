@@ -5,6 +5,10 @@ This file is a copy of the app worker script, placed in agent-worker/ so you can
 upload/deploy a minimal set of files to GitHub/Render.
 """
 
+# ── Version tag — bump this on every deploy so we can verify Render runs the
+# latest code.  Check Render logs for the startup banner.
+WORKER_VERSION = "2026-02-26-v4"
+
 import os
 import asyncio
 import logging
@@ -314,7 +318,7 @@ class BackendAPIClient:
 
 async def entrypoint(ctx: JobContext):
     room_name = ctx.room.name
-    logger.info(f"🎯 New job received for room: {room_name}")
+    logger.info(f"🎯 New job received for room: {room_name}  [worker v{WORKER_VERSION}]")
 
     openai_key = os.getenv("OPENAI_API_KEY")
     if not openai_key:
@@ -2195,7 +2199,9 @@ async def request_handler(ctx: JobContext):
 
 
 if __name__ == "__main__":
-    logger.info("🚀 Starting Square 15 Voice Agent Worker...")
+    logger.info("=" * 60)
+    logger.info(f"🚀 Square 15 Voice Agent Worker  v{WORKER_VERSION}")
+    logger.info("=" * 60)
     logger.info("📡 Listening for room join events...")
 
     agent_name = os.getenv("LIVEKIT_AGENT_NAME", "square15-voice-assistant")
