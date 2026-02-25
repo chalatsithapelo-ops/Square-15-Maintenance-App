@@ -730,7 +730,7 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
       if (route.contains('wallet') || route.contains('Wallet')) {
         if (Get.isRegistered<AppController>()) {
           final ctrl = Get.find<AppController>();
-          final balance = ctrl.userModel.value?.balance ?? '0';
+          final balance = ctrl.userBalance.value.isNotEmpty ? ctrl.userBalance.value : (ctrl.userData?.balance ?? '0');
           screenInfo['screen_data'] = {
             'wallet_balance': balance.toString(),
           };
@@ -741,7 +741,7 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
         if (Get.isRegistered<AppController>()) {
           final ctrl = Get.find<AppController>();
           screenInfo['screen_data'] = {
-            'user_name': ctrl.userModel.value?.name ?? '',
+            'user_name': ctrl.userName.value.isNotEmpty ? ctrl.userName.value : (ctrl.userData?.name ?? ''),
             'active_bookings_count': _cachedActiveBookings.length,
           };
         }
