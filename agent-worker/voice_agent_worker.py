@@ -58,7 +58,95 @@ def _sanitize_spoken_text(text: str) -> str:
     for pat in _FORBIDDEN_SPEECH_PATTERNS:
         if pat.search(t):
             return ""
+    # Convert currency amounts to TTS-friendly spoken text
+    t = _format_currency_for_speech(t)
     return t
+
+
+def _format_currency_for_speech(text: str) -> str:
+    """Convert South African Rand currency amounts to natural spoken language.
+    
+    Converts patterns like:
+      R1,000,000   → 1 million rand
+      R1000000     → 1 million rand
+      R1,000       → 1 thousand rand
+      R250.50      → 250 rand and 50 cents
+      R100         → 100 rand
+      R0.50        → 50 cents
+    """
+    import re as _re
+
+    def _number_to_words(n: float) -> str:
+        """Convert a number to a spoken word representation for currency."""
+        if n < 0:
+            return "negative " + _number_to_words(-n)
+
+        # Handle cents
+        whole = int(n)
+        cents = round((n - whole) * 100)
+
+        parts = []
+
+        if whole == 0 and cents > 0:
+            parts.append(f"{cents} cents")
+            return " ".join(parts)
+
+        if whole >= 1_000_000_000:
+            billions = whole // 1_000_000_000
+            remainder = whole % 1_000_000_000
+            parts.append(f"{billions} billion")
+            if remainder >= 1_000_000:
+                millions = remainder // 1_000_000
+                remainder = remainder % 1_000_000
+                parts.append(f"{millions} million")
+            if remainder >= 1_000:
+                thousands = remainder // 1_000
+                remainder = remainder % 1_000
+                parts.append(f"{thousands} thousand")
+            if remainder > 0:
+                parts.append(str(remainder))
+        elif whole >= 1_000_000:
+            millions = whole // 1_000_000
+            remainder = whole % 1_000_000
+            parts.append(f"{millions} million")
+            if remainder >= 1_000:
+                thousands = remainder // 1_000
+                remainder = remainder % 1_000
+                parts.append(f"{thousands} thousand")
+            if remainder > 0:
+                parts.append(str(remainder))
+        elif whole >= 1_000:
+            thousands = whole // 1_000
+            remainder = whole % 1_000
+            parts.append(f"{thousands} thousand")
+            if remainder > 0:
+                parts.append(str(remainder))
+        else:
+            parts.append(str(whole))
+
+        result = " ".join(parts) + " rand"
+        if cents > 0:
+            result += f" and {cents} cents"
+        return result
+
+    def _replace_match(m: _re.Match) -> str:
+        raw = m.group(1)
+        # Remove commas and spaces from the number
+        cleaned = raw.replace(",", "").replace(" ", "")
+        try:
+            value = float(cleaned)
+        except ValueError:
+            return m.group(0)  # Return original if can't parse
+        return _number_to_words(value)
+
+    # Match R followed by digits (with optional commas, spaces, decimal)
+    # Handles: R1,000,000  R1000000  R250.50  R100  R0.50
+    result = _re.sub(
+        r'R\s*([\d,]+(?:\.\d{1,2})?)',
+        _replace_match,
+        text
+    )
+    return result
 
 
 # Load environment variables (optional locally; Render uses service env vars)
@@ -349,13 +437,17 @@ async def entrypoint(ctx: JobContext):
             "- When user asks to DO something, CALL the right tool immediately. Do NOT describe what you would do — just do it.\n"
             "- NEVER say 'I cannot access', 'I am unable to', 'I don't have access to', or 'I need you to be authenticated'. ALWAYS try calling the relevant tool.\n"
             "- BACKEND tools for data: get_booking_status, list_my_bookings, explain_quote, check_payment, get_wallet_balance, get_messages, get_case_status.\n"
+            "- BACKEND tools for ACTIONS: cancel_booking, reschedule_booking, send_message_to_artisan, send_message_to_admin, mark_booking_in_progress, artisan_cancel_and_reassign, submit_rating, submit_complaint. These tools EXECUTE real actions on the backend — use them, NOT ui_navigate.\n"
             "- lookup_service_pricing for pricing: when user asks 'how much is...', 'what's the price for...', call lookup_service_pricing.\n"
-            "- ui_navigate for screens: open_bookings_tab, open_future_bookings, open_wallet, open_profile, open_settings, open_notifications, open_calendar, open_help, open_support, go_home, go_back, close_window.\n"
-            "- send_message_to_artisan, send_message_to_admin for messaging.\n"
+            "- ui_navigate ONLY for opening screens/navigation: open_bookings_tab, open_future_bookings, open_wallet, open_profile, open_settings, open_notifications, open_calendar, open_help, open_support, go_home, go_back, close_window, create_order_booking, call_assigned_artisan.\n"
+            "- NEVER use ui_navigate for cancel_booking, reschedule_booking, send_message_to_artisan, send_message_to_admin, mark_booking_in_progress, artisan_cancel_and_reassign. Use the dedicated tools instead.\n"
             "- NEVER narrate tool calls. Never say JSON, function names, or metadata.\n"
             "- NEVER claim you opened/loaded pictures or images.\n"
             "- NEVER claim you opened a map or showed a location. There is no map feature.\n"
             "- Speak naturally, 1-3 short sentences. Be concise.\n"
+            "- CURRENCY: When speaking amounts, say the full words. Say 'one million rand' NOT 'R1000000'. "
+            "Say 'five hundred rand' NOT 'R500'. Say 'one thousand five hundred rand and fifty cents' NOT 'R1500.50'. "
+            "NEVER say the letter 'R' before a number. Always use 'rand' after the amount.\n"
             "- If user says 'now'/'asap'/'urgent', use scheduled_date='now', scheduled_time='now'.\n"
             "- Date format: YYYY-MM-DD. Time format: HH:MM.\n"
             "- If user refers to a booking by price, call list_my_bookings first to find it.\n"
@@ -368,20 +460,22 @@ async def entrypoint(ctx: JobContext):
             "  4. Tell the user the booking status, artisan name, and any relevant info.\n"
             "- NEVER say you 'can't access bookings' or 'unable to retrieve'. ALWAYS call list_my_bookings first. Even if there's an error, try the tool.\n"
             "\n"
-            "MESSAGING & CHAT (IMPORTANT):\n"
+            "MESSAGING & CHAT (IMPORTANT — USE BACKEND TOOLS, NOT ui_navigate):\n"
             "- 'Open chat' / 'open messages' / 'contact support' → call ui_navigate(action='open_support')\n"
-            "- 'Send message to artisan' / 'tell artisan ...' → call send_message_to_artisan(booking_id, message). Get booking_id from list_my_bookings if needed.\n"
-            "- 'Contact admin' / 'send message to support' → call send_message_to_admin(message, subject)\n"
+            "- 'Send message to artisan' / 'tell artisan ...' → call send_message_to_artisan(booking_id, message). Get booking_id from list_my_bookings if needed. This SENDS the message via the backend.\n"
+            "- 'Contact admin' / 'send message to support' → call send_message_to_admin(message, subject). This SENDS the message via the backend.\n"
             "- 'Show messages' / 'read messages for booking' → call get_messages(booking_id)\n"
             "\n"
-            "BOOKING MANAGEMENT (IMPORTANT):\n"
+            "BOOKING MANAGEMENT (CRITICAL — USE DEDICATED TOOLS, NOT ui_navigate):\n"
             "- When user asks to cancel, reschedule, check status, or do anything with a booking:\n"
             "  1. If they don't give a booking ID, call list_my_bookings() first to find it.\n"
-            "  2. Then use the specific tool: cancel_booking, reschedule_booking, get_booking_status, etc.\n"
-            "- Cancel: cancel_booking(booking_id, reason)\n"
-            "- Reschedule: reschedule_booking(booking_id, scheduled_date, scheduled_time)\n"
+            "  2. Then CALL the specific BACKEND tool — these EXECUTE the action:\n"
+            "- Cancel: cancel_booking(booking_id, reason) — actually cancels the booking on the server\n"
+            "- Reschedule: reschedule_booking(booking_id, scheduled_date, scheduled_time) — actually reschedules on the server\n"
             "- Check status: get_booking_status(booking_id)\n"
             "- Call artisan: ui_navigate(action='call_assigned_artisan', booking_id=...)\n"
+            "- Send message to artisan: send_message_to_artisan(booking_id, message) — actually sends the message\n"
+            "- IMPORTANT: NEVER use ui_navigate for cancel, reschedule, or messaging. Those only open screens. Use the dedicated tools to execute the action.\n"
             "\n"
             "PRICING ENQUIRIES (CRITICAL — MUST USE TOOL):\n"
             "- When user asks how much a service costs, MUST call lookup_service_pricing. Do NOT answer without calling this tool.\n"
@@ -397,6 +491,14 @@ async def entrypoint(ctx: JobContext):
             "- After calling ui_navigate, say 'I am processing your booking now, please keep the app open.' Do NOT say an artisan has been dispatched until confirmed.\n"
             "- NEVER open photo upload, map, or any other screen during booking creation. The app handles everything.\n"
             "- Do NOT use open_map or show_location actions. They do not exist.\n"
+            "\n"
+            "SCREEN AWARENESS & APP CONTROL (IMPORTANT):\n"
+            "- You can see what screen the user is on and what actions are available.\n"
+            "- When user asks 'what's on my screen?', 'where am I?', 'what can I do here?' → call get_current_screen()\n"
+            "- When user asks 'analyze this', 'explain this page', 'what does this mean?' → call analyze_screen()\n"
+            "- When user asks 'what can you do?', 'what features are available?' → call list_app_features()\n"
+            "- You control the app completely: navigate to any screen, execute any action, check any data.\n"
+            "- Think of yourself as the user's personal app assistant — they talk, you do.\n"
         )
 
         if role == "artisan":
@@ -423,13 +525,16 @@ async def entrypoint(ctx: JobContext):
     @llm.function_tool(
         description=(
             "Send a UI navigation command to the Square 15 mobile app. "
+            "Use ONLY for navigation and screen-opening actions. "
             "Supported actions: create_order_booking, dispatch_artisan, "
             "open_bookings_tab, open_future_bookings, open_artisan_requests, open_artisan_appointments, "
             "open_artisan_wallet, accept_latest_request, reject_latest_request, respond_to_request, "
-            "call_assigned_artisan, reschedule_booking, cancel_booking, reassign_booking, "
-            "mark_booking_in_progress, artisan_cancel_and_reassign, "
+            "call_assigned_artisan, "
             "open_notifications, open_profile, open_settings, open_support, open_wallet, "
-            "open_calendar, open_help, go_home, go_back, close_window, close_dialog, dismiss."
+            "open_calendar, open_help, go_home, go_back, close_window, close_dialog, dismiss. "
+            "DO NOT use for cancel_booking, reschedule_booking, send_message_to_artisan, "
+            "send_message_to_admin, mark_booking_in_progress, artisan_cancel_and_reassign — "
+            "use the dedicated action tools instead."
         )
     )
     async def ui_navigate(
@@ -452,6 +557,22 @@ async def entrypoint(ctx: JobContext):
     ) -> str:
         """Triggers an in-app navigation action."""
         try:
+            # ── Redirect action calls to dedicated backend tools ──
+            # If the LLM accidentally calls ui_navigate for actions that should use
+            # the dedicated backend tools, redirect to those tools instead.
+            if action in ("cancel_booking",) and booking_id:
+                logger.info(f"↪ Redirecting ui_navigate({action}) → cancel_booking tool")
+                return await cancel_booking(booking_id=booking_id, reason=additional_notes or "User requested cancellation")
+            if action in ("reschedule_booking",) and booking_id:
+                logger.info(f"↪ Redirecting ui_navigate({action}) → reschedule_booking tool")
+                return await reschedule_booking(booking_id=booking_id, scheduled_date=scheduled_date, scheduled_time=scheduled_time)
+            if action in ("mark_booking_in_progress",) and booking_id:
+                logger.info(f"↪ Redirecting ui_navigate({action}) → mark_booking_in_progress tool")
+                return await mark_booking_in_progress(booking_id=booking_id)
+            if action in ("artisan_cancel_and_reassign", "reassign_booking") and booking_id:
+                logger.info(f"↪ Redirecting ui_navigate({action}) → artisan_cancel_and_reassign tool")
+                return await artisan_cancel_and_reassign(booking_id=booking_id, reason=additional_notes or "Reassignment requested")
+
             payload = {
                 "category_name": category_name,
                 "task_name": task_name,
@@ -1618,6 +1739,174 @@ async def entrypoint(ctx: JobContext):
             logger.error(f"submit_complaint error: {e}", exc_info=True)
             return "Sorry, I couldn't submit your complaint right now."
 
+    # =========================================
+    # Screen Awareness Tools (OpenClaw-like)
+    # =========================================
+
+    # Live screen context from the app (updated via metadata on every navigation)
+    _current_screen_context: Dict[str, Any] = {}
+
+    @llm.function_tool(
+        description=(
+            "Get information about what screen the user is currently viewing in the app. "
+            "Returns the screen name, description, available actions, and any visible data. "
+            "Use this when user asks 'What am I looking at?', 'What's on my screen?', "
+            "'Where am I in the app?', 'What can I do here?', or when you need to understand "
+            "the current context before taking an action."
+        )
+    )
+    async def get_current_screen() -> str:
+        """Get the current screen context from the app."""
+        nonlocal _current_screen_context
+
+        if not _current_screen_context:
+            # Try to get context from app by requesting a context update
+            await _set_agent_metadata({
+                "type": "square15_ui",
+                "action": "request_context",
+                "payload": {},
+                "text": "",
+            })
+            await asyncio.sleep(1)  # Brief wait for app to respond
+
+        if not _current_screen_context:
+            return "You are currently in the Square 15 app. I can navigate to any screen for you. Just tell me where you'd like to go or what you'd like to do."
+
+        screen_name = _current_screen_context.get('screen_name', 'App Screen')
+        screen_desc = _current_screen_context.get('screen_description', '')
+        actions = _current_screen_context.get('available_actions', [])
+        screen_data = _current_screen_context.get('screen_data', {})
+        route = _current_screen_context.get('current_route', '')
+
+        response = f"You are on the {screen_name} screen."
+        if screen_desc:
+            response += f" {screen_desc}"
+        if screen_data:
+            for key, val in screen_data.items():
+                readable_key = key.replace('_', ' ')
+                response += f" {readable_key}: {val}."
+        if actions:
+            action_names = [a.replace('_', ' ') for a in actions[:8]]  # Top 8 for voice
+            response += f" Available actions: {', '.join(action_names)}."
+
+        return response
+
+    @llm.function_tool(
+        description=(
+            "Analyze and interpret what's displayed on the user's current screen. "
+            "Provides a detailed summary of the visible information and suggests "
+            "what actions the user might want to take. "
+            "Use this when user says 'Analyze this page', 'What does this mean?', "
+            "'Explain what I'm seeing', 'Help me understand this screen'."
+        )
+    )
+    async def analyze_screen() -> str:
+        """Analyze the current screen and provide intelligent insights."""
+        nonlocal _current_screen_context, app_context_bookings
+
+        screen = _current_screen_context.get('screen_name', 'App Screen')
+        screen_data = _current_screen_context.get('screen_data', {})
+        route = _current_screen_context.get('current_route', '')
+
+        # Build analysis based on screen type and available data
+        parts = [f"Analyzing the {screen} screen for you."]
+
+        r = (route or '').lower()
+        if 'wallet' in r:
+            balance = screen_data.get('wallet_balance', '')
+            if balance:
+                parts.append(f"Your current wallet balance is {balance} rand.")
+            parts.append("From here you can view transaction history, check deposit requests, or go back to the home screen.")
+            parts.append("Would you like me to show your transaction history or check if you have any pending deposits?")
+
+        elif 'dashboard' in r or r == '/':
+            name = screen_data.get('user_name', '')
+            count = screen_data.get('active_bookings_count', 0)
+            if name:
+                parts.append(f"Welcome {name}.")
+            if count and int(str(count)) > 0:
+                parts.append(f"You have {count} active booking{'s' if int(str(count)) > 1 else ''}.")
+                parts.append("Would you like me to show your bookings, check their status, or create a new one?")
+            else:
+                parts.append("You have no active bookings right now.")
+                parts.append("Would you like to create a new booking, check your wallet, or look at service pricing?")
+
+        elif 'booking' in r or 'future' in r:
+            if app_context_bookings:
+                parts.append(f"I can see {len(app_context_bookings)} booking{'s' if len(app_context_bookings) > 1 else ''}.")
+                for b in app_context_bookings[:3]:
+                    cat = b.get('category', 'service')
+                    status = b.get('status', 'unknown')
+                    parts.append(f"• {cat}: {status}")
+                parts.append("Would you like to check a specific booking, reschedule, cancel, or contact the artisan?")
+            else:
+                parts.append("I can help you manage your bookings from here. Would you like to check a booking status or create a new one?")
+
+        elif 'notification' in r:
+            parts.append("This shows your notifications about bookings, payments, and system updates.")
+            parts.append("Would you like me to read your recent notifications?")
+
+        elif 'profile' in r:
+            parts.append("This is your profile page where you can view and update your personal information.")
+
+        elif 'support' in r or 'chat' in r:
+            parts.append("This is the support chat where you can contact the admin team.")
+            parts.append("Would you like me to send a message to support?")
+
+        elif 'calendar' in r:
+            parts.append("This is your calendar showing scheduled services and upcoming appointments.")
+
+        else:
+            parts.append("I can see you're in the app. Tell me what you'd like to do and I'll help you.")
+
+        return " ".join(parts)
+
+    @llm.function_tool(
+        description=(
+            "Get a complete list of all screens and features available in the Square 15 app. "
+            "Use this when user asks 'What can you do?', 'What features are available?', "
+            "'Show me everything', 'What screens are there?'"
+        )
+    )
+    async def list_app_features() -> str:
+        """List all available screens and features in the app."""
+        return (
+            "Here are all the screens and features available in the Square 15 app:\n\n"
+            "NAVIGATION:\n"
+            "• Home Dashboard — main screen with service categories and quick actions\n"
+            "• Future Bookings — view all your upcoming bookings\n"
+            "• Wallet — check balance, deposits, and transaction history\n"
+            "• Notifications — booking updates, payment alerts, system messages\n"
+            "• Profile — your personal information\n"
+            "• Settings — app preferences and account management\n"
+            "• Support Chat — contact admin team\n"
+            "• Calendar — scheduled services and appointments\n\n"
+            "BOOKING ACTIONS:\n"
+            "• Create a new booking with any service category\n"
+            "• Cancel a booking\n"
+            "• Reschedule a booking to a new date/time\n"
+            "• Check booking status and details\n"
+            "• Call the assigned artisan\n"
+            "• Send a message to an artisan\n"
+            "• View RFQ quote details\n"
+            "• Submit a rating after service\n\n"
+            "WALLET & PAYMENTS:\n"
+            "• Check wallet balance\n"
+            "• View transaction history\n"
+            "• Check deposit request status\n\n"
+            "COMMUNICATION:\n"
+            "• Send messages to artisans\n"
+            "• Contact admin support\n"
+            "• Submit complaints\n"
+            "• View chat messages\n\n"
+            "INFORMATION:\n"
+            "• Look up service pricing\n"
+            "• View service categories\n"
+            "• Check artisan information\n"
+            "• View notifications\n\n"
+            "Just tell me what you'd like to do and I'll help you."
+        )
+
     agent = voice.Agent(
         vad=vad,
         stt=openai.STT(model="whisper-1", language="en"),
@@ -1658,6 +1947,10 @@ async def entrypoint(ctx: JobContext):
             get_messages,
             # Phase 3: Case management
             get_case_status,
+            # Screen awareness tools (OpenClaw-like)
+            get_current_screen,
+            analyze_screen,
+            list_app_features,
         ],
         # --- Latency optimizations ---
         min_endpointing_delay=0.25,       # default 0.5 — faster turn completion
@@ -1770,6 +2063,12 @@ async def entrypoint(ctx: JobContext):
                 uid = (payload.get("user_id") or "").strip()
                 if uid:
                     app_context_user_id = uid
+                # Store screen context for OpenClaw-like screen awareness
+                screen_ctx = payload.get("screen_context")
+                if isinstance(screen_ctx, dict):
+                    _current_screen_context.clear()
+                    _current_screen_context.update(screen_ctx)
+                    logger.info(f"📱 Screen context updated: {screen_ctx.get('screen_name', 'unknown')}")
         except Exception as e:
             logger.info(f"metadata handler error (ignored): {e}")
 

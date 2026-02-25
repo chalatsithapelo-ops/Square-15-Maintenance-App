@@ -710,8 +710,108 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
       'pending_requests_count': pendingRequests,
       'active_bookings': _cachedActiveBookings,
       'capabilities': _buildAgentCapabilities(),
+      'screen_context': _buildCurrentScreenContext(route: route, role: role),
       'ts': DateTime.now().toIso8601String(),
     };
+  }
+
+  /// Build a description of what's currently visible on the screen.
+  /// This allows the voice agent to understand and interpret the current page.
+  Map<String, dynamic> _buildCurrentScreenContext({required String route, required String role}) {
+    final screenInfo = <String, dynamic>{
+      'current_route': route,
+      'screen_name': _routeToScreenName(route),
+      'screen_description': _routeToScreenDescription(route),
+      'available_actions': _routeToAvailableActions(route, role),
+    };
+
+    // Add screen-specific data when available
+    try {
+      if (route.contains('wallet') || route.contains('Wallet')) {
+        if (Get.isRegistered<AppController>()) {
+          final ctrl = Get.find<AppController>();
+          final balance = ctrl.userModel.value?.balance ?? '0';
+          screenInfo['screen_data'] = {
+            'wallet_balance': balance.toString(),
+          };
+        }
+      }
+
+      if (route.contains('dashboard') || route == '/') {
+        if (Get.isRegistered<AppController>()) {
+          final ctrl = Get.find<AppController>();
+          screenInfo['screen_data'] = {
+            'user_name': ctrl.userModel.value?.name ?? '',
+            'active_bookings_count': _cachedActiveBookings.length,
+          };
+        }
+      }
+    } catch (_) {}
+
+    return screenInfo;
+  }
+
+  String _routeToScreenName(String route) {
+    final r = route.toLowerCase().trim();
+    if (r.contains('dashboard') || r == '/') return 'Home Dashboard';
+    if (r.contains('wallet')) return 'Wallet';
+    if (r.contains('profile')) return 'Profile';
+    if (r.contains('settings')) return 'Settings';
+    if (r.contains('notifications')) return 'Notifications';
+    if (r.contains('support') || r.contains('chat')) return 'Support Chat';
+    if (r.contains('future_bookings') || r.contains('futureBookings')) return 'Future Bookings';
+    if (r.contains('bookings') || r.contains('booking')) return 'Bookings';
+    if (r.contains('calendar')) return 'Calendar';
+    if (r.contains('requests')) return 'Service Requests';
+    if (r.contains('appointments')) return 'Appointments';
+    if (r.contains('history') || r.contains('transaction')) return 'Transaction History';
+    return 'App Screen';
+  }
+
+  String _routeToScreenDescription(String route) {
+    final r = route.toLowerCase().trim();
+    if (r.contains('dashboard') || r == '/') return 'Main home screen showing service categories, quick actions, and booking summary.';
+    if (r.contains('wallet')) return 'Wallet screen showing current balance, deposit options, and transaction history.';
+    if (r.contains('profile')) return 'User profile with name, email, phone, and account settings.';
+    if (r.contains('settings')) return 'App settings including notifications preferences and account management.';
+    if (r.contains('notifications')) return 'List of all notifications including booking updates, payment confirmations, and system messages.';
+    if (r.contains('support') || r.contains('chat')) return 'Customer support chat for contacting admin and getting help.';
+    if (r.contains('future_bookings') || r.contains('futureBookings')) return 'List of upcoming scheduled bookings with status, artisan, and pricing details.';
+    if (r.contains('bookings') || r.contains('booking')) return 'All bookings including active, completed, and cancelled ones.';
+    if (r.contains('calendar')) return 'Calendar view of scheduled services and upcoming appointments.';
+    if (r.contains('requests')) return 'Incoming service requests waiting for artisan response.';
+    if (r.contains('appointments')) return 'Confirmed appointments and scheduled work.';
+    if (r.contains('history') || r.contains('transaction')) return 'Transaction history showing deposits, payments, and refunds.';
+    return 'Application screen.';
+  }
+
+  List<String> _routeToAvailableActions(String route, String role) {
+    final r = route.toLowerCase().trim();
+    final actions = <String>[];
+
+    // Global actions always available
+    actions.addAll(['go_home', 'go_back', 'open_notifications', 'open_profile', 'open_settings', 'open_wallet']);
+
+    if (r.contains('dashboard') || r == '/') {
+      actions.addAll(['open_future_bookings', 'open_bookings_tab', 'create_order_booking', 'open_support', 'open_calendar']);
+      if (role == 'artisan') {
+        actions.addAll(['open_artisan_requests', 'open_artisan_appointments', 'open_artisan_wallet']);
+      }
+    }
+    if (r.contains('wallet')) {
+      actions.addAll(['get_wallet_balance', 'get_transaction_history', 'get_deposit_requests']);
+    }
+    if (r.contains('booking') || r.contains('future_bookings')) {
+      actions.addAll(['get_booking_status', 'cancel_booking', 'reschedule_booking', 'send_message_to_artisan', 'call_assigned_artisan']);
+    }
+    if (r.contains('requests') && role == 'artisan') {
+      actions.addAll(['accept_latest_request', 'reject_latest_request', 'respond_to_request']);
+    }
+    if (r.contains('appointments') && role == 'artisan') {
+      actions.addAll(['mark_booking_in_progress', 'artisan_cancel_and_reassign']);
+    }
+
+    return actions;
   }
 
   /// Send Firebase credentials to the agent so it can authenticate
@@ -1785,6 +1885,7 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
       Get.toNamed('/notifications');
       Get.snackbar(_assistantName, 'Opening notifications',
           backgroundColor: Colors.green, colorText: Colors.white);
+      _sendAppContextToAgent(reason: 'navigated_to_notifications');
       return;
     }
 
@@ -1793,6 +1894,7 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
       Get.toNamed('/profile');
       Get.snackbar(_assistantName, 'Opening your profile',
           backgroundColor: Colors.green, colorText: Colors.white);
+      _sendAppContextToAgent(reason: 'navigated_to_profile');
       return;
     }
 
@@ -1801,6 +1903,7 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
       Get.toNamed('/settings');
       Get.snackbar(_assistantName, 'Opening settings',
           backgroundColor: Colors.green, colorText: Colors.white);
+      _sendAppContextToAgent(reason: 'navigated_to_settings');
       return;
     }
 
@@ -1809,6 +1912,7 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
       Get.toNamed('/support');
       Get.snackbar(_assistantName, 'Opening customer support',
           backgroundColor: Colors.green, colorText: Colors.white);
+      _sendAppContextToAgent(reason: 'navigated_to_support');
       return;
     }
 
@@ -1817,6 +1921,7 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
       Get.toNamed('/wallet');
       Get.snackbar(_assistantName, 'Opening your wallet',
           backgroundColor: Colors.green, colorText: Colors.white);
+      _sendAppContextToAgent(reason: 'navigated_to_wallet');
       return;
     }
 
@@ -1825,6 +1930,7 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
       Get.to(() => const ClientCalendarScreen());
       Get.snackbar(_assistantName, 'Opening calendar',
           backgroundColor: Colors.green, colorText: Colors.white);
+      _sendAppContextToAgent(reason: 'navigated_to_calendar');
       return;
     }
 
@@ -1850,6 +1956,7 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
       Get.offAllNamed('/dashboard');
       Get.snackbar(_assistantName, 'Going to home screen',
           backgroundColor: Colors.green, colorText: Colors.white);
+      _sendAppContextToAgent(reason: 'navigated_to_home');
       return;
     }
 
