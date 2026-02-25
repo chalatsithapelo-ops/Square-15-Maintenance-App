@@ -1500,6 +1500,21 @@ async def entrypoint(ctx: JobContext):
                     logger.info(f"✅ Backend client initialized with credentials (session: {session_id[:12] if session_id else 'none'}...)")
                 return
 
+            # ALWAYS extract firebase_token from ANY metadata if backend_client not yet set.
+            # The access-token metadata and context messages both embed the token,
+            # so we must check every incoming metadata update.
+            if not backend_client:
+                ft = msg.get('firebase_token')
+                if ft:
+                    sid = msg.get('voice_session_id') or msg.get('session_id')
+                    snonce = msg.get('voice_session_nonce') or msg.get('session_nonce')
+                    if _try_init_backend_from_msg({
+                        'firebase_token': ft,
+                        'session_id': sid,
+                        'session_nonce': snonce,
+                    }):
+                        logger.info("✅ Backend client initialized from embedded metadata token")
+
             if msg_type != "square15_app":
                 return
 
