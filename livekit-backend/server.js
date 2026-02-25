@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
 const { AccessToken, AgentDispatchClient } = require('livekit-server-sdk');
 const admin = require('firebase-admin');
 const crypto = require('crypto');
@@ -98,6 +99,12 @@ const corsOrigins = corsOriginsRaw
   ? corsOriginsRaw.split(',').map((s) => s.trim()).filter(Boolean)
   : '*';
 const corsOriginOption = corsOrigins === '*' ? true : corsOrigins;
+
+// Security headers
+app.use(helmet({
+  contentSecurityPolicy: false, // API server, no HTML
+  crossOriginEmbedderPolicy: false,
+}));
 
 // Middleware
 app.use(cors({
@@ -304,6 +311,9 @@ async function verifyFirebaseAppCheck(req, res, { required = false } = {}) {
 }
 
 async function resolveRole({ firestore, uid, decodedToken }) {
+  // SECURITY: Only trust Firebase custom claims for admin role.
+  // Firestore fallback is allowed for 'artisan' and 'client' but NOT 'admin'
+  // to prevent privilege escalation via self-editable Firestore documents.
   const fromClaims =
     (decodedToken && (decodedToken.role || decodedToken.user_role || decodedToken.user_type)) ||
     '';
@@ -322,7 +332,13 @@ async function resolveRole({ firestore, uid, decodedToken }) {
         data.type ||
         data.account_type;
       const r = String(v || '').trim().toLowerCase();
-      if (r === 'admin' || r === 'artisan' || r === 'client') return r;
+      // Only allow non-admin roles from Firestore to prevent privilege escalation
+      if (r === 'artisan' || r === 'client') return r;
+      // If Firestore says admin, require custom claims confirmation
+      if (r === 'admin') {
+        console.warn(`⚠️ User ${uid} has admin role in Firestore but NOT in custom claims — denying admin access`);
+        return 'client';
+      }
     }
   } catch (_) {
     // ignore
@@ -2171,10 +2187,13 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     }
   }
 
-  // ── Booking Analytics ──
+  // ── Booking Analytics (admin only, capped at 500 docs) ──
   if (action === 'get_booking_analytics') {
+    if (actorRole !== 'admin') {
+      return { ok: false, success: false, error: 'forbidden', message: 'Booking analytics is restricted to admin users.' };
+    }
     try {
-      const snap = await firestore.collection('futureBookings').get();
+      const snap = await firestore.collection('futureBookings').orderBy('created_at', 'desc').limit(500).get();
       const byStatus = {};
       const urgentBookings = [];
       const recentBookings = [];
@@ -2889,15 +2908,17 @@ app.get('/health', (req, res) => {
       wsUrl: wsUrl || null,
       httpUrl: httpUrl || null,
       agentName: getAgentName(),
-      apiKeyPrefix: apiKey ? apiKey.slice(0, 6) : null,
-      apiKeyLength: apiKey ? apiKey.length : 0,
-      apiSecretLength: apiSecret ? apiSecret.length : 0,
+      apiKeyConfigured: !!apiKey,
+      apiSecretConfigured: !!apiSecret,
     },
   });
 });
 
-// ── Public pricing test endpoint (no auth required) ──
+// ── Public pricing test endpoint (dev only) ──
 app.get('/api/test-pricing', async (req, res) => {
+  if (process.env.NODE_ENV === 'production') {
+    return res.status(404).json({ error: 'Not found' });
+  }
   try {
     const firestore = (() => { initFirebaseIfPossible(); if (firebaseInitError) return null; return admin.firestore(); })();
     if (!firestore) return res.status(500).json({ error: 'firebase_not_configured' });
@@ -3135,17 +3156,17 @@ app.post('/api/voice/start', assistantLimiter, async (req, res) => {
     } catch (_) {
       // If metadata isn't valid JSON, create a fresh object
       enrichedMetadata = JSON.stringify({
-        firebase_token: idToken || '',
         voice_session_id: sessionId,
         voice_session_nonce: sessionNonce,
       });
     }
 
-    // 1) Generate access token (server-side)
+    // 1) Generate access token (server-side) with 15-minute TTL
     const at = new AccessToken(env.apiKey, env.apiSecret, {
       identity: participantName,
       name: participantName,
       metadata: enrichedMetadata,
+      ttl: '15m',
     });
 
     at.addGrant({
@@ -3174,7 +3195,7 @@ app.post('/api/voice/start', assistantLimiter, async (req, res) => {
       agentName,
       dispatch,
       sessionId,
-      sessionNonce,
+      // sessionNonce kept server-side only for security
       sessionExpiresAt: expiresAt,
       request_id: req.requestId || null,
     });
@@ -4203,12 +4224,103 @@ app.post('/api/admin/fix/service-provider-uid-mapping', async (req, res) => {
   });
 });
 
+// ── Server-side FCM Notification Endpoint ──
+// Replaces client-side admin SDK usage — clients call this instead of loading firebase-adminsdk.json
+app.post('/api/notifications/send', verifyFirebaseAuth, assistantLimiter, async (req, res) => {
+  try {
+    initFirebaseIfPossible();
+    if (firebaseInitError) {
+      return res.status(503).json({ error: 'Firebase not configured on backend' });
+    }
+    const { token, title, body, data, userId, userType, bookingId, type } = req.body;
+
+    if (!token || !title || !body) {
+      return res.status(400).json({ error: 'Missing required fields: token, title, body' });
+    }
+
+    // Send FCM via Admin SDK (server-side — no private key exposed to clients)
+    const message = {
+      token: String(token).trim(),
+      notification: { title: String(title), body: String(body) },
+      data: data && typeof data === 'object' ? Object.fromEntries(
+        Object.entries(data).map(([k, v]) => [String(k), String(v)])
+      ) : {},
+      android: { priority: 'high' },
+      apns: { headers: { 'apns-priority': '10' } },
+    };
+
+    const result = await admin.messaging().send(message);
+    console.log(`✅ FCM sent via backend: ${result}`);
+
+    // Optionally store in-app notification doc
+    if (userId) {
+      const firestore = admin.firestore();
+      await firestore.collection('notifications').add({
+        user_id: userId,
+        user_type: userType || 'user',
+        title: String(title),
+        message: String(body),
+        ...(bookingId ? { booking_id: bookingId } : {}),
+        type: type || 'general',
+        read: false,
+        view: false,
+        created_at: new Date().toISOString(),
+      });
+    }
+
+    res.json({ ok: true, success: true, messageId: result });
+  } catch (error) {
+    console.error('❌ FCM send error:', error);
+    res.status(500).json({ error: 'Failed to send notification' });
+  }
+});
+
+// ── Server-side PayFast Payment Initiation ──
+// Replaces client-side hardcoded merchant credentials
+app.post('/api/payment/initiate', verifyFirebaseAuth, assistantLimiter, async (req, res) => {
+  try {
+    const merchantId = env('PAYFAST_MERCHANT_ID');
+    const merchantKey = env('PAYFAST_MERCHANT_KEY');
+    const payfastUrl = env('PAYFAST_URL') || 'https://www.payfast.co.za/eng/process';
+
+    if (!merchantId || !merchantKey) {
+      return res.status(503).json({ error: 'Payment credentials not configured on server' });
+    }
+
+    const { amount, item_name, return_url, cancel_url, notify_url, custom_str1 } = req.body;
+
+    if (!amount || !item_name) {
+      return res.status(400).json({ error: 'Missing required fields: amount, item_name' });
+    }
+
+    const paymentData = {
+      merchant_id: merchantId,
+      merchant_key: merchantKey,
+      amount: String(amount),
+      item_name: String(item_name),
+      ...(return_url ? { return_url } : {}),
+      ...(cancel_url ? { cancel_url } : {}),
+      ...(notify_url ? { notify_url } : {}),
+      ...(custom_str1 ? { custom_str1 } : {}),
+    };
+
+    res.json({
+      ok: true,
+      payfast_url: payfastUrl,
+      payment_data: paymentData,
+    });
+  } catch (error) {
+    console.error('❌ Payment initiation error:', error);
+    res.status(500).json({ error: 'Payment initiation failed' });
+  }
+});
+
 /**
- * Generate Livekit Access Token
+ * Generate Livekit Access Token (requires auth in production)
  * POST /api/token
  * Body: { roomName: string, participantName: string, metadata?: string }
  */
-app.post('/api/token', async (req, res) => {
+app.post('/api/token', verifyFirebaseAuth, async (req, res) => {
   try {
     const { roomName, participantName, metadata } = req.body;
 
@@ -4223,7 +4335,7 @@ app.post('/api/token', async (req, res) => {
     const env = validateLiveKitEnv(res);
     if (!env) return;
 
-    // Create access token
+    // Create access token with 15-minute TTL
     const at = new AccessToken(
       env.apiKey,
       env.apiSecret,
@@ -4231,6 +4343,7 @@ app.post('/api/token', async (req, res) => {
         identity: participantName,
         name: participantName,
         metadata: metadata || '',
+        ttl: '15m',
       }
     );
 
@@ -4269,7 +4382,7 @@ app.post('/api/token', async (req, res) => {
  * POST /api/create-room
  * Body: { roomName?: string }
  */
-app.post('/api/create-room', async (req, res) => {
+app.post('/api/create-room', verifyFirebaseAuth, async (req, res) => {
   try {
     const roomName = req.body.roomName || `voice-assistant-${Date.now()}`;
     
@@ -4293,7 +4406,7 @@ app.post('/api/create-room', async (req, res) => {
  * POST /api/dispatch-agent
  * Body: { roomName: string }
  */
-app.post('/api/dispatch-agent', async (req, res) => {
+app.post('/api/dispatch-agent', verifyFirebaseAuth, async (req, res) => {
   try {
     const { roomName, metadata } = req.body;
 
@@ -4348,7 +4461,7 @@ app.use((err, req, res, next) => {
   console.error('❌ Server error:', err);
   res.status(500).json({
     error: 'Internal server error',
-    message: err.message
+    message: process.env.NODE_ENV !== 'production' ? err.message : 'An unexpected error occurred'
   });
 });
 
