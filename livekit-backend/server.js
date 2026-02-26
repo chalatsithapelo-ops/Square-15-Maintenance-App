@@ -2287,33 +2287,49 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       query = query.where('status', '==', statusFilter);
     }
 
+    // Helper to extract booking fields from a Firestore doc
+    const _extractBooking = (doc) => {
+      const b = doc.data() || {};
+      return {
+        booking_id: doc.id,
+        status: String(b.status || '').trim(),
+        rfq_status: String(b.rfq_status || '').trim(),
+        order_type: String(b.is_rfq || '').toLowerCase() === 'yes' ? 'rfq' : 'order',
+        rfq_no: String(b.rfq_no || '').trim(),
+        order_number: String(b.order_number || '').trim(),
+        category_name: String(b.category_name || '').trim(),
+        problem_description: String(b.problem_description || '').trim(),
+        scheduled_date: String(b.scheduled_date || '').trim(),
+        scheduled_time: String(b.scheduled_time || '').trim(),
+        total_price: String(b.total_price || b.quoted_price || b.price || '').trim(),
+        created_at: String(b.created_at || '').trim(),
+      };
+    };
+
+    // Try with orderBy (requires composite index); fallback without it
+    let bookings = [];
     try {
-      query = query.orderBy('created_at', 'desc').limit(limit);
-      const qs = await query.get();
-      const bookings = [];
-
-      for (const doc of qs.docs) {
-        const b = doc.data() || {};
-        bookings.push({
-          booking_id: doc.id,
-          status: String(b.status || '').trim(),
-          rfq_status: String(b.rfq_status || '').trim(),
-          order_type: String(b.is_rfq || '').toLowerCase() === 'yes' ? 'rfq' : 'order',
-          rfq_no: String(b.rfq_no || '').trim(),
-          order_number: String(b.order_number || '').trim(),
-          category_name: String(b.category_name || '').trim(),
-          problem_description: String(b.problem_description || '').trim(),
-          scheduled_date: String(b.scheduled_date || '').trim(),
-          scheduled_time: String(b.scheduled_time || '').trim(),
-          total_price: String(b.total_price || b.quoted_price || b.price || '').trim(),
-          created_at: String(b.created_at || '').trim(),
-        });
-      }
-
-      return { ok: true, status: 200, data: { bookings, count: bookings.length } };
+      const orderedQuery = query.orderBy('created_at', 'desc').limit(limit);
+      const qs = await orderedQuery.get();
+      bookings = qs.docs.map(_extractBooking);
     } catch (err) {
-      return { ok: false, status: 500, error: `list_bookings_error: ${err.message}` };
+      // Composite index missing – fall back to unordered query + JS sort
+      if (err.code === 9 || (err.message && err.message.includes('index'))) {
+        console.warn('[list_bookings] composite index missing, falling back to JS sort');
+        try {
+          const qs = await query.limit(limit * 2).get();   // fetch a bit more to compensate for no ordering
+          bookings = qs.docs.map(_extractBooking);
+          bookings.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+          bookings = bookings.slice(0, limit);
+        } catch (err2) {
+          return { ok: false, status: 500, error: `list_bookings_error: ${err2.message}` };
+        }
+      } else {
+        return { ok: false, status: 500, error: `list_bookings_error: ${err.message}` };
+      }
     }
+
+    return { ok: true, status: 200, data: { bookings, count: bookings.length } };
   }
 
   // ── Get Wallet Balance ──
