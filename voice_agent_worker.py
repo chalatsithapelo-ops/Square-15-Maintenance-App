@@ -7,7 +7,7 @@ upload/deploy a minimal set of files to GitHub/Render.
 
 # ── Version tag — bump this on every deploy so we can verify Render runs the
 # latest code.  Check Render logs for the startup banner.
-WORKER_VERSION = "2026-02-26-v4"
+WORKER_VERSION = "2026-02-26-v5"
 
 import os
 import asyncio
@@ -679,14 +679,22 @@ async def entrypoint(ctx: JobContext):
         nonlocal backend_client
         if backend_client:
             return True
-        # Try one more participant scan
+        logger.info("🔄 _ensure_backend_or_retry: backend_client is None, scanning...")
+        # Try multiple scans with increasing waits
+        for attempt in range(5):
+            _scan_participants_for_credentials()
+            if backend_client:
+                logger.info(f"✅ _ensure_backend_or_retry: got client on attempt {attempt + 1}")
+                return True
+            wait_time = 1.0 + attempt * 0.5  # 1.0, 1.5, 2.0, 2.5, 3.0
+            logger.info(f"⏳ _ensure_backend_or_retry: attempt {attempt + 1}/5 failed, waiting {wait_time}s...")
+            await asyncio.sleep(wait_time)
         _scan_participants_for_credentials()
         if backend_client:
+            logger.info("✅ _ensure_backend_or_retry: got client on final scan")
             return True
-        # Brief wait and retry once
-        await asyncio.sleep(2)
-        _scan_participants_for_credentials()
-        return backend_client is not None
+        logger.warning("❌ _ensure_backend_or_retry: FAILED after 5 attempts — no firebase_token found in any participant metadata")
+        return False
 
     _CONNECTION_RETRY_MSG = "I'm still connecting to your account. Please try again in a moment."
 
@@ -701,6 +709,7 @@ async def entrypoint(ctx: JobContext):
     async def get_booking_status(booking_id: str) -> str:
         """Get booking status from backend API."""
         nonlocal backend_client, app_context_bookings
+        logger.info(f"📋 get_booking_status called: booking_id={booking_id}, backend_client={'SET' if backend_client else 'NONE'}, app_bookings={len(app_context_bookings)}")
         if not backend_client:
             # Fallback: check app context bookings if available
             if app_context_bookings:
@@ -797,6 +806,7 @@ async def entrypoint(ctx: JobContext):
     async def list_my_bookings(status: str = "", limit: int = 10) -> str:
         """List user's bookings from backend API."""
         nonlocal backend_client, app_context_bookings
+        logger.info(f"📋 list_my_bookings called: status={status!r}, limit={limit}, backend_client={'SET' if backend_client else 'NONE'}, app_bookings={len(app_context_bookings)}")
         if not backend_client:
             # Fallback: use app context bookings if available
             if app_context_bookings:
@@ -830,9 +840,12 @@ async def entrypoint(ctx: JobContext):
                 return _CONNECTION_RETRY_MSG
 
         try:
+            logger.info(f"📡 Calling backend list_user_bookings (status={status!r}, limit={min(limit, 10)})")
             result = await backend_client.list_user_bookings(status=status or None, limit=min(limit, 10))
+            logger.info(f"📡 Backend response: ok={result.get('ok')}, success={result.get('success')}, error={result.get('error', 'none')}")
             if not result.get('ok') and not result.get('success'):
                 error = result.get('error', 'unknown_error')
+                logger.warning(f"❌ list_my_bookings backend error: {error}")
                 return f"There was an issue getting your bookings: {error}"
 
             data = result.get('data', result.get('result', {}))
@@ -1200,6 +1213,7 @@ async def entrypoint(ctx: JobContext):
     ) -> str:
         """Send a message to the artisan assigned to a booking."""
         nonlocal backend_client
+        logger.info(f"📨 send_message_to_artisan called: booking_id={booking_id}, message={message!r}, backend_client={'SET' if backend_client else 'NONE'}")
         if not backend_client:
             if not await _ensure_backend_or_retry():
                 return _CONNECTION_RETRY_MSG
@@ -1984,7 +1998,9 @@ async def entrypoint(ctx: JobContext):
         nonlocal backend_client, firebase_token, session_id, session_nonce
         ft = msg.get("firebase_token")
         if not ft:
+            logger.debug("_try_init_backend_from_msg: no firebase_token in msg")
             return False
+        logger.info(f"🔑 _try_init_backend_from_msg: got token (len={len(ft)}, starts={ft[:20]}...)")
         firebase_token = ft
         session_id = msg.get("session_id")
         session_nonce = msg.get("session_nonce")
@@ -2086,10 +2102,12 @@ async def entrypoint(ctx: JobContext):
             elif isinstance(data_packet, bytes):
                 raw = data_packet
             if raw is None:
+                logger.debug("📦 data_received: no data attribute")
                 return
             text = raw.decode('utf-8') if isinstance(raw, (bytes, bytearray)) else str(raw)
             if not text or not text.strip():
                 return
+            logger.info(f"📦 data_received: len={len(text)}, preview={text[:100]}...")
             msg = json.loads(text)
             if not isinstance(msg, dict):
                 return
@@ -2117,12 +2135,17 @@ async def entrypoint(ctx: JobContext):
             participants = ctx.room.remote_participants
             # Handle both dict.values() and direct iteration
             items = participants.values() if hasattr(participants, 'values') else participants
+            participant_count = 0
             for p in items:
+                participant_count += 1
                 if backend_client:
                     break  # Already initialized
+                ident = getattr(p, 'identity', '???')
                 md = getattr(p, 'metadata', None)
                 if not md or not str(md).strip():
+                    logger.debug(f"🔍 Participant {ident}: no metadata")
                     continue
+                logger.info(f"🔍 Participant {ident}: metadata len={len(md)}, preview={md[:120]}...")
                 try:
                     msg = json.loads(md)
                     if not isinstance(msg, dict):
@@ -2148,8 +2171,9 @@ async def entrypoint(ctx: JobContext):
                         app_context_user_id = uid
                 except Exception:
                     pass
+            logger.info(f"🔍 Scan complete: {participant_count} participants scanned, backend_client={'SET' if backend_client else 'NONE'}, app_bookings={len(app_context_bookings)}")
         except Exception as e:
-            logger.debug(f"Participant scan note: {e}")
+            logger.warning(f"⚠️ Participant scan error: {e}")
 
     _scan_participants_for_credentials()
 
@@ -2174,16 +2198,19 @@ async def entrypoint(ctx: JobContext):
 
     # ── Background: periodically retry credential scan until backend_client is set ──
     async def _credential_retry_loop():
-        for i in range(20):  # Try for ~30 seconds
+        for i in range(40):  # Try for ~60 seconds
             if backend_client:
+                logger.info(f"✅ Backend client confirmed initialized (retry loop check {i+1})")
                 return
             await asyncio.sleep(1.5)
             _scan_participants_for_credentials()
             if backend_client:
                 logger.info(f"✅ Backend client initialized from retry loop (attempt {i+1})")
                 return
+            if i % 5 == 4:
+                logger.info(f"⏳ Credential retry loop: {i+1}/40 attempts, still no backend_client")
         if not backend_client:
-            logger.warning("⚠️ Backend client never initialized — booking tools will use app context fallback only")
+            logger.warning("⚠️ Backend client never initialized after 60s — booking tools will use app context fallback only")
 
     asyncio.ensure_future(_credential_retry_loop())
 
