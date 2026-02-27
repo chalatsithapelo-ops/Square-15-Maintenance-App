@@ -511,6 +511,13 @@ async def entrypoint(ctx: JobContext):
             "- When user asks 'what can you do?', 'what features are available?' → call list_app_features()\n"
             "- You control the app completely: navigate to any screen, execute any action, check any data.\n"
             "- Think of yourself as the user's personal app assistant — they talk, you do.\n"
+            "\n"
+            "SERVICE AREA RESTRICTIONS:\n"
+            "- Square 15 currently operates in specific service areas only (phased launch).\n"
+            "- If a booking is rejected because the user's location is outside our service area, explain politely: "
+            "'Sorry, Square 15 is not yet available in your area. We are currently serving select areas and expanding soon.'\n"
+            "- Do NOT promise service in areas we don't cover yet.\n"
+            "- The app automatically checks the user's location against active service areas.\n"
         )
 
         if role == "artisan":

@@ -26,6 +26,7 @@ import 'package:maintenanceapp/screens/service_provider_panel/service_provider_r
 import 'package:maintenanceapp/screens/service_provider_panel/wallet_page.dart';
 import 'package:maintenanceapp/services/booking_monitor_service.dart';
 import 'package:maintenanceapp/services/future_booking_service.dart';
+import 'package:maintenanceapp/services/service_area_checker.dart';
 import 'package:maintenanceapp/services/firestore_services/firebase_services.dart';
 
 /// Professional Livekit Voice AI Assistant Integration
@@ -4403,6 +4404,19 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
       await _sendSpeakToAgent(
         'Photos uploaded successfully. I am now sending the request to the nearest available artisan.',
       );
+    }
+
+    // ── Geo-fence check ─────────────────────────────────────────────────
+    final double geoLat = double.tryParse(
+        serviceOnCurrentLocation ? app.userLat.value : (lat.isNotEmpty ? lat : app.userLat.value)) ?? 0;
+    final double geoLng = double.tryParse(
+        serviceOnCurrentLocation ? app.userLng.value : (lng.isNotEmpty ? lng : app.userLng.value)) ?? 0;
+    final geoBlock = await ServiceAreaChecker.checkLocation(lat: geoLat, lng: geoLng);
+    if (geoBlock != null) {
+      setState(() { _aiResponse = geoBlock; });
+      _addToTranscript('AI', geoBlock);
+      await _sendSpeakToAgent(geoBlock);
+      return;
     }
 
     try {
