@@ -1928,7 +1928,7 @@ async def entrypoint(ctx: JobContext):
     agent = voice.Agent(
         vad=vad,
         stt=openai.STT(model="whisper-1", language="en"),
-        llm=openai.LLM(model="gpt-4o", temperature=0.4),
+        llm=openai.LLM(model="gpt-4o-mini", temperature=0.4),
         tts=openai.TTS(model="tts-1", voice="alloy"),
         instructions=_instructions_for_role(caller_role),
     )
