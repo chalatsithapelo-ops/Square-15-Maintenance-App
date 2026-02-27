@@ -355,6 +355,20 @@ async function resolveRole({ firestore, uid, decodedToken }) {
     // ignore
   }
 
+  // Fallback: check the serviceProvider collection — artisan profiles live
+  // there keyed by UID (or linked via user_id/uid fields), not in 'users'.
+  try {
+    const spSnap = await firestore.collection('serviceProvider').doc(uid).get();
+    if (spSnap.exists) return 'artisan';
+    // Also try querying by user_id field in case doc ID differs from auth UID
+    for (const field of ['user_id', 'uid', 'userId', 'provider_id']) {
+      const q = await firestore.collection('serviceProvider').where(field, '==', uid).limit(1).get();
+      if (!q.empty) return 'artisan';
+    }
+  } catch (_) {
+    // ignore
+  }
+
   return 'client';
 }
 
