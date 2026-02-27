@@ -420,9 +420,14 @@ const ACTION_TIERS = Object.freeze({
   artisan_cancel_and_reassign: 'B',
   reassign_booking: 'B',
   send_message_to_artisan: 'B',
+  send_message_to_client: 'B',
   send_message_to_admin: 'B',
   create_case: 'B',
   update_case: 'B',
+  reply_to_case: 'B',
+  list_my_cases: 'A',
+  list_cases: 'A',
+  check_sla_escalation: 'B',
   submit_rating: 'B',
   submit_complaint: 'B',
 });
@@ -1906,6 +1911,55 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     };
   }
 
+  if (action === 'send_message_to_client') {
+    const scBookingId = String(payload.booking_id || payload.bookingId || '').trim();
+    const scMessage = String(payload.message || '').trim();
+    if (!scBookingId || !scMessage) return { ok: false, status: 400, error: 'missing_booking_id_or_message' };
+    if (scMessage.length > 1000) return { ok: false, status: 400, error: 'message_too_long', message: 'Message must be under 1000 characters' };
+
+    const scBookingRef = firestore.collection('futureBookings').doc(scBookingId);
+    const scBookingSnap = await scBookingRef.get();
+    if (!scBookingSnap.exists) return { ok: false, status: 404, error: 'booking_not_found' };
+
+    const scBookingData = scBookingSnap.data() || {};
+    const scClientId = String(scBookingData.user_id || '').trim();
+    const scArtisanId = String(scBookingData.service_provider_id || '').trim();
+    const scTmId = String(scBookingData.tasks_management_id || '').trim();
+
+    // Only the assigned artisan or admin can message the client
+    if (actorRole !== 'admin' && !(actorRole === 'artisan' && scArtisanId === actorUid)) {
+      return { ok: false, status: 403, error: 'forbidden' };
+    }
+    if (!scClientId) return { ok: false, status: 400, error: 'no_client_on_booking' };
+    if (!scTmId) return { ok: false, status: 400, error: 'no_tasks_management_id' };
+
+    const scChatRef = firestore.collection('tasksManagement').doc(scTmId).collection('chat').doc();
+    await scChatRef.set({
+      id: scChatRef.id,
+      sender_id: actorUid,
+      receiver_id: scClientId,
+      message: scMessage,
+      timestamp: now,
+      read: false,
+      created_at: now,
+    });
+
+    try {
+      await writePersonalNotification({
+        userId: scClientId,
+        userType: 'user',
+        title: 'Message from your artisan',
+        message: scMessage.substring(0, 100),
+        data: { booking_id: scBookingId, tasks_management_id: scTmId, type: 'chat_message' },
+      });
+    } catch (_notifErr) { /* best-effort notification */ }
+
+    return {
+      ok: true, status: 200,
+      data: { message_id: scChatRef.id, tasks_management_id: scTmId, sent: true },
+    };
+  }
+
   if (action === 'send_message_to_admin') {
     const saBookingId = String(payload.booking_id || payload.bookingId || '').trim();
     const saMessage = String(payload.message || '').trim();
@@ -2047,6 +2101,194 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       ok: true, status: 200,
       data: { case_id: ucCaseId, state: ucNewState || ucData.state, updated_at: now },
     };
+  }
+
+  // ── Reply to Case (threaded conversation) ──
+  if (action === 'reply_to_case') {
+    const rcCaseId = String(payload.case_id || payload.caseId || '').trim();
+    const rcMessage = String(payload.message || '').trim();
+    if (!rcCaseId) return { ok: false, status: 400, error: 'missing_case_id' };
+    if (!rcMessage) return { ok: false, status: 400, error: 'missing_message' };
+    if (rcMessage.length > 2000) return { ok: false, status: 400, error: 'message_too_long' };
+
+    const rcRef = firestore.collection('assistant_cases').doc(rcCaseId);
+    const rcSnap = await rcRef.get();
+    if (!rcSnap.exists) return { ok: false, status: 404, error: 'case_not_found' };
+
+    const rcData = rcSnap.data() || {};
+    const rcClientUid = String(rcData.client_uid || '').trim();
+    if (actorRole !== 'admin' && rcClientUid !== actorUid) return { ok: false, status: 403, error: 'forbidden' };
+
+    const rcTimeline = rcData.timeline || [];
+    rcTimeline.push({
+      timestamp: now,
+      actor: actorUid,
+      actor_role: actorRole,
+      action: 'reply',
+      notes: rcMessage,
+    });
+
+    const rcUpdates = { updated_at: now, timeline: rcTimeline };
+    // If admin is replying to an open case, mark it in_progress
+    if (actorRole === 'admin' && rcData.state === 'open') {
+      rcUpdates.state = 'in_progress';
+    }
+
+    await rcRef.set(rcUpdates, { merge: true });
+
+    // Notify the other party
+    try {
+      if (actorRole === 'admin' && rcClientUid) {
+        await writePersonalNotification({
+          userId: rcClientUid,
+          userType: 'user',
+          title: `Support reply (Case ${rcCaseId.substring(0, 8)})`,
+          message: rcMessage.substring(0, 150),
+          data: { case_id: rcCaseId, type: 'case_reply' },
+        });
+      } else {
+        await writeAdminNotification({
+          title: `Client reply (Case ${rcCaseId.substring(0, 8)})`,
+          message: rcMessage.substring(0, 150),
+          data: { case_id: rcCaseId, type: 'case_reply' },
+        });
+      }
+    } catch (_) { /* best-effort */ }
+
+    return {
+      ok: true, status: 200,
+      data: { case_id: rcCaseId, replies: rcTimeline.length },
+    };
+  }
+
+  // ── List My Cases ──
+  if (action === 'list_my_cases' || action === 'list_cases') {
+    const lcState = String(payload.state || payload.status || '').trim().toLowerCase();
+    const lcLimit = Math.min(Math.max(parseInt(payload.limit || '10', 10) || 10, 1), 50);
+
+    try {
+      let query = firestore.collection('assistant_cases')
+        .where('client_uid', '==', actorUid)
+        .orderBy('updated_at', 'desc')
+        .limit(lcLimit);
+
+      if (lcState && ['open', 'pending_admin', 'in_progress', 'resolved', 'closed'].includes(lcState)) {
+        query = firestore.collection('assistant_cases')
+          .where('client_uid', '==', actorUid)
+          .where('state', '==', lcState)
+          .orderBy('updated_at', 'desc')
+          .limit(lcLimit);
+      }
+
+      const lcSnap = await query.get();
+      const cases = lcSnap.docs.map(doc => {
+        const d = doc.data() || {};
+        return {
+          case_id: d.case_id || doc.id,
+          type: d.type || 'general',
+          state: d.state || 'open',
+          priority: d.priority || 'normal',
+          subject: d.subject || d.description || '',
+          booking_id: d.booking_id || null,
+          created_at: d.created_at || null,
+          updated_at: d.updated_at || null,
+          sla_deadline: d.sla_deadline || null,
+          reply_count: (d.timeline || []).length,
+        };
+      });
+
+      return {
+        ok: true, status: 200,
+        data: { cases, total: cases.length },
+      };
+    } catch (lcErr) {
+      // Fallback: query without ordering if index is missing
+      try {
+        const lcSnap = await firestore.collection('assistant_cases')
+          .where('client_uid', '==', actorUid)
+          .get();
+
+        let cases = lcSnap.docs.map(doc => {
+          const d = doc.data() || {};
+          return {
+            case_id: d.case_id || doc.id,
+            type: d.type || 'general',
+            state: d.state || 'open',
+            priority: d.priority || 'normal',
+            subject: d.subject || d.description || '',
+            booking_id: d.booking_id || null,
+            created_at: d.created_at || null,
+            updated_at: d.updated_at || null,
+            sla_deadline: d.sla_deadline || null,
+            reply_count: (d.timeline || []).length,
+          };
+        });
+
+        if (lcState) cases = cases.filter(c => c.state === lcState);
+        cases.sort((a, b) => (b.updated_at || '').localeCompare(a.updated_at || ''));
+        cases = cases.slice(0, lcLimit);
+
+        return { ok: true, status: 200, data: { cases, total: cases.length } };
+      } catch (e2) {
+        return { ok: false, status: 500, error: String(e2.message || e2) };
+      }
+    }
+  }
+
+  // ── Auto-Escalation Check ──
+  if (action === 'check_sla_escalation') {
+    // Admin-only: check for overdue cases and escalate their priority
+    if (actorRole !== 'admin') return { ok: false, status: 403, error: 'admin_only' };
+
+    try {
+      const nowMs = Date.now();
+      const openSnap = await firestore.collection('assistant_cases')
+        .where('state', 'in', ['open', 'pending_admin', 'in_progress'])
+        .get();
+
+      let escalated = 0;
+      const batch = firestore.batch();
+
+      for (const doc of openSnap.docs) {
+        const d = doc.data() || {};
+        const deadline = d.sla_deadline ? new Date(d.sla_deadline).getTime() : 0;
+        if (!deadline || deadline > nowMs) continue; // not overdue
+
+        const current = d.priority || 'normal';
+        const escalation = { low: 'normal', normal: 'high', high: 'urgent' };
+        const next = escalation[current];
+        if (!next) continue; // already urgent
+
+        const timeline = d.timeline || [];
+        timeline.push({
+          timestamp: now,
+          actor: 'system',
+          action: 'auto_escalated',
+          notes: `SLA deadline passed. Priority escalated from ${current} to ${next}.`,
+        });
+
+        // Extend SLA by the new priority window
+        const slaHours = { urgent: 1, high: 2, normal: 4, low: 24 };
+        const newDeadline = new Date(nowMs + (slaHours[next] || 2) * 60 * 60 * 1000).toISOString();
+
+        batch.update(doc.ref, {
+          priority: next,
+          sla_deadline: newDeadline,
+          updated_at: now,
+          timeline,
+        });
+        escalated++;
+      }
+
+      if (escalated > 0) await batch.commit();
+
+      return {
+        ok: true, status: 200,
+        data: { escalated, message: `${escalated} case(s) auto-escalated due to SLA breach.` },
+      };
+    } catch (e) {
+      return { ok: false, status: 500, error: String(e.message || e) };
+    }
   }
 
   // ── Service Pricing Lookup ──

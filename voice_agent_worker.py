@@ -441,10 +441,10 @@ async def entrypoint(ctx: JobContext):
             "- When user asks to DO something, CALL the right tool immediately. Do NOT describe what you would do — just do it.\n"
             "- NEVER say 'I cannot access', 'I am unable to', 'I don't have access to', or 'I need you to be authenticated'. ALWAYS try calling the relevant tool.\n"
             "- BACKEND tools for data: get_booking_status, list_my_bookings, explain_quote, check_payment, get_wallet_balance, get_messages, get_case_status.\n"
-            "- BACKEND tools for ACTIONS: cancel_booking, reschedule_booking, send_message_to_artisan, send_message_to_admin, mark_booking_in_progress, artisan_cancel_and_reassign, submit_rating, submit_complaint. These tools EXECUTE real actions on the backend — use them, NOT ui_navigate.\n"
+            "- BACKEND tools for ACTIONS: cancel_booking, reschedule_booking, send_message_to_artisan, send_message_to_client, send_message_to_admin, mark_booking_in_progress, artisan_cancel_and_reassign, submit_rating, submit_complaint. These tools EXECUTE real actions on the backend — use them, NOT ui_navigate.\n"
             "- lookup_service_pricing for pricing: when user asks 'how much is...', 'what's the price for...', call lookup_service_pricing.\n"
             "- ui_navigate ONLY for opening screens/navigation: open_bookings_tab, open_future_bookings, open_wallet, open_profile, open_settings, open_notifications, open_calendar, open_help, open_support, go_home, go_back, close_window, create_order_booking, call_assigned_artisan.\n"
-            "- NEVER use ui_navigate for cancel_booking, reschedule_booking, send_message_to_artisan, send_message_to_admin, mark_booking_in_progress, artisan_cancel_and_reassign. Use the dedicated tools instead.\n"
+            "- NEVER use ui_navigate for cancel_booking, reschedule_booking, send_message_to_artisan, send_message_to_client, send_message_to_admin, mark_booking_in_progress, artisan_cancel_and_reassign. Use the dedicated tools instead.\n"
             "- NEVER narrate tool calls. Never say JSON, function names, or metadata.\n"
             "- NEVER claim you opened/loaded pictures or images.\n"
             "- NEVER claim you opened a map or showed a location. There is no map feature.\n"
@@ -467,8 +467,16 @@ async def entrypoint(ctx: JobContext):
             "MESSAGING & CHAT (IMPORTANT — USE BACKEND TOOLS, NOT ui_navigate):\n"
             "- 'Open chat' / 'open messages' / 'contact support' → call ui_navigate(action='open_support')\n"
             "- 'Send message to artisan' / 'tell artisan ...' → call send_message_to_artisan(booking_id, message). Get booking_id from list_my_bookings if needed. This SENDS the message via the backend.\n"
+            "- 'Send message to client' / 'tell client ...' / 'message the client' → call send_message_to_client(booking_id, message). Get booking_id from list_my_bookings if needed. This SENDS the message via the backend.\n"
             "- 'Contact admin' / 'send message to support' → call send_message_to_admin(message, subject). This SENDS the message via the backend.\n"
             "- 'Show messages' / 'read messages for booking' → call get_messages(booking_id)\n"
+            "\n"
+            "SUPPORT CASES:\n"
+            "- 'Show my cases' / 'do I have open tickets?' → call list_my_cases(state='open') or list_my_cases() for all\n"
+            "- 'Reply to case' / 'follow up on my ticket' → call reply_to_case(case_id, message)\n"
+            "- 'Check case status' → call get_case_status(case_id)\n"
+            "- When a user has an issue and wants admin help, first create a case with send_message_to_admin(message, subject).\n"
+            "- If they want to follow up, use reply_to_case with the case_id.\n"
             "\n"
             "BOOKING MANAGEMENT (CRITICAL — USE DEDICATED TOOLS, NOT ui_navigate):\n"
             "- When user asks to cancel, reschedule, check status, or do anything with a booking:\n"
@@ -512,6 +520,9 @@ async def entrypoint(ctx: JobContext):
                 "- Reject job → ui_navigate(action='reject_latest_request')\n"
                 "- Start job → mark_booking_in_progress(booking_id)\n"
                 "- Cancel+reassign → artisan_cancel_and_reassign(booking_id, reason)\n"
+                "  IMPORTANT: Before calling artisan_cancel_and_reassign, you MUST ask the artisan to confirm. "
+                "Say something like 'Are you sure you want to cancel this job and have it reassigned to another artisan?' "
+                "Only proceed if the artisan explicitly says yes.\n"
                 "- Artisan screens: open_artisan_requests, open_artisan_appointments, open_artisan_wallet, open_schedule.\n"
                 "- Do not dispatch artisans while talking to an artisan.\n"
             )
@@ -1238,6 +1249,42 @@ async def entrypoint(ctx: JobContext):
 
     @llm.function_tool(
         description=(
+            "Send a message to the client who booked. "
+            "Use this when the artisan wants to contact their client (update on arrival, request info, etc.). "
+            "Requires: booking_id, message."
+        )
+    )
+    async def send_message_to_client(
+        booking_id: str,
+        message: str
+    ) -> str:
+        """Send a message to the client who made a booking."""
+        nonlocal backend_client
+        logger.info(f"📨 send_message_to_client called: booking_id={booking_id}, message={message!r}, backend_client={'SET' if backend_client else 'NONE'}")
+        if not backend_client:
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
+
+        try:
+            payload = {'booking_id': booking_id, 'message': message}
+            result = await backend_client.call_backend_action('send_message_to_client', payload)
+
+            if not result.get('ok') and not result.get('success'):
+                error = result.get('error', 'unknown_error')
+                if error == 'no_client_on_booking':
+                    return "There's no client associated with this booking."
+                elif error == 'booking_not_found':
+                    return f"I couldn't find booking {booking_id}."
+                return f"I couldn't send the message: {error}"
+
+            return "Message sent to the client successfully. They'll be notified immediately."
+
+        except Exception as e:
+            logger.error(f"send_message_to_client error: {e}", exc_info=True)
+            return "Sorry, I had trouble sending the message. Please try again."
+
+    @llm.function_tool(
+        description=(
             "Send a message to admin support. "
             "Use this when the user needs help from support (complaints, escalations, complex issues). "
             "Requires: message. Optional: booking_id, subject."
@@ -1384,6 +1431,77 @@ async def entrypoint(ctx: JobContext):
             logger.error(f"get_case_status error: {e}", exc_info=True)
             return "Sorry, I had trouble getting the case status. Please try again."
 
+    @llm.function_tool(
+        description=(
+            "Reply to an existing support case to add a follow-up message. "
+            "Use when the user says 'reply to my case' or 'add a message to case XYZ'. "
+            "Requires: case_id, message."
+        )
+    )
+    async def reply_to_case(case_id: str, message: str) -> str:
+        """Add a reply to an existing support case thread."""
+        nonlocal backend_client
+        if not backend_client:
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
+
+        try:
+            payload = {'case_id': case_id, 'message': message}
+            result = await backend_client.call_backend_action('reply_to_case', payload)
+
+            if not result.get('ok') and not result.get('success'):
+                error = result.get('error', 'unknown_error')
+                return f"I couldn't add your reply: {error}"
+
+            replies = (result.get('data') or {}).get('replies', 0)
+            return f"Your reply has been added to case {case_id}. The support team will be notified. (Total messages: {replies})"
+        except Exception as e:
+            logger.error(f"reply_to_case error: {e}", exc_info=True)
+            return "Sorry, I had trouble replying to your case. Please try again."
+
+    @llm.function_tool(
+        description=(
+            "List the user's support cases. "
+            "Use when user says 'show my cases', 'what are my open tickets?', 'do I have pending support requests?'. "
+            "Optional: state filter ('open', 'in_progress', 'resolved', 'closed')."
+        )
+    )
+    async def list_my_cases(state: str = "") -> str:
+        """List user's support cases, optionally filtered by state."""
+        nonlocal backend_client
+        if not backend_client:
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
+
+        try:
+            payload = {}
+            if state:
+                payload['state'] = state
+            result = await backend_client.call_backend_action('list_my_cases', payload)
+
+            if not result.get('ok') and not result.get('success'):
+                error = result.get('error', 'unknown_error')
+                return f"I couldn't fetch your cases: {error}"
+
+            cases = (result.get('data') or {}).get('cases', [])
+            if not cases:
+                filter_msg = f' with status "{state}"' if state else ''
+                return f"You don't have any support cases{filter_msg}."
+
+            lines = [f"You have {len(cases)} case(s):"]
+            for c in cases[:10]:
+                cid = str(c.get('case_id', ''))[:8]
+                subj = c.get('subject', c.get('type', 'General'))
+                st = c.get('state', 'open')
+                pri = c.get('priority', 'normal')
+                replies = c.get('reply_count', 0)
+                lines.append(f"• Case {cid}: {subj} — {st} (priority: {pri}, {replies} messages)")
+
+            return "\n".join(lines)
+        except Exception as e:
+            logger.error(f"list_my_cases error: {e}", exc_info=True)
+            return "Sorry, I had trouble fetching your cases. Please try again."
+
     # =========================================
     # Wallet & Booking Management Tools
     # =========================================
@@ -1509,7 +1627,9 @@ async def entrypoint(ctx: JobContext):
     @llm.function_tool(
         description=(
             "Cancel current artisan assignment and request reassignment to a new artisan. "
-            "Use this when artisan needs to hand off a job. Requires: booking_id, reason."
+            "Use this when artisan needs to hand off a job. Requires: booking_id, reason. "
+            "IMPORTANT: You MUST verbally confirm with the artisan BEFORE calling this tool. "
+            "Ask 'Are you sure you want to cancel and reassign?' and only call if they say yes."
         )
     )
     async def artisan_cancel_and_reassign(booking_id: str, reason: str = "") -> str:
@@ -1928,7 +2048,7 @@ async def entrypoint(ctx: JobContext):
     agent = voice.Agent(
         vad=vad,
         stt=openai.STT(model="whisper-1", language="en"),
-        llm=openai.LLM(model="gpt-4o", temperature=0.4),
+        llm=openai.LLM(model="gpt-4o-mini", temperature=0.4),
         tts=openai.TTS(model="tts-1", voice="alloy"),
         instructions=_instructions_for_role(caller_role),
     )
@@ -1961,10 +2081,13 @@ async def entrypoint(ctx: JobContext):
             submit_complaint,
             # Phase 3: Messaging tools
             send_message_to_artisan,
+            send_message_to_client,
             send_message_to_admin,
             get_messages,
             # Phase 3: Case management
             get_case_status,
+            reply_to_case,
+            list_my_cases,
             # Screen awareness tools (OpenClaw-like)
             get_current_screen,
             analyze_screen,

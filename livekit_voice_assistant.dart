@@ -24,6 +24,7 @@ import 'package:maintenanceapp/screens/home/booking/payment_method_sheet.dart';
 import 'package:maintenanceapp/screens/service_provider_panel/Serviceprovider/artisan_appointments_screen.dart';
 import 'package:maintenanceapp/screens/service_provider_panel/service_provider_request_screen.dart';
 import 'package:maintenanceapp/screens/service_provider_panel/wallet_page.dart';
+import 'package:maintenanceapp/services/booking_monitor_service.dart';
 import 'package:maintenanceapp/services/future_booking_service.dart';
 import 'package:maintenanceapp/services/firestore_services/firebase_services.dart';
 
@@ -4455,8 +4456,15 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
 
       await _sendAppContextToAgent(reason: 'booking_created');
 
-      if (!isRFQ && bookingId.trim().isNotEmpty) {
-        _watchBookingUntilConfirmed(bookingId: bookingId);
+      if (bookingId.trim().isNotEmpty) {
+        // Always register with background monitor (covers both RFQ and direct bookings)
+        if (Get.isRegistered<BookingMonitorService>()) {
+          Get.find<BookingMonitorService>().watchBooking(bookingId);
+        }
+        // In-voice-assistant real-time feedback (spoken + payment screen) — only for non-RFQ
+        if (!isRFQ) {
+          _watchBookingUntilConfirmed(bookingId: bookingId);
+        }
       }
 
       final msg = isRFQ
@@ -4745,6 +4753,12 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
   }
 
   void _watchBookingUntilConfirmed({required String bookingId}) {
+    // Register with the persistent background monitor service so the user
+    // gets local notifications even after leaving this screen.
+    if (Get.isRegistered<BookingMonitorService>()) {
+      Get.find<BookingMonitorService>().watchBooking(bookingId);
+    }
+
     _bookingStatusSubscription?.cancel();
     _watchBookingLastProviderId = '';
     String lastSpokenStatus = '';
