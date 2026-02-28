@@ -5039,6 +5039,45 @@ app.use((err, req, res, next) => {
   });
 });
 
+/**
+ * Bootstrap admin custom claims.
+ * POST /api/admin/bootstrap-claims
+ * Body: { "uid": "<firebaseAuthUid>" }
+ * Header: x-bootstrap-key: <matches ADMIN_BOOTSTRAP_KEY env var>
+ *
+ * Sets { role: 'admin' } custom claim on the user so resolveRole() grants
+ * admin access for backend endpoints.
+ */
+app.post('/api/admin/bootstrap-claims', async (req, res) => {
+  const firestore = requireFirebase(res);
+  if (!firestore) return;
+
+  const bootstrapKey = (process.env.ADMIN_BOOTSTRAP_KEY || '').trim();
+  const providedKey = (req.headers['x-bootstrap-key'] || '').trim();
+
+  if (!bootstrapKey) {
+    return res.status(500).json({ error: 'ADMIN_BOOTSTRAP_KEY not configured on server' });
+  }
+  if (!providedKey || providedKey !== bootstrapKey) {
+    return res.status(403).json({ error: 'Invalid bootstrap key' });
+  }
+
+  const uid = String(req.body?.uid || '').trim();
+  if (!uid) {
+    return res.status(400).json({ error: 'Missing uid in request body' });
+  }
+
+  try {
+    const admin = require('firebase-admin');
+    await admin.auth().setCustomUserClaims(uid, { role: 'admin' });
+    console.log(`✅ Admin custom claims set for UID: ${uid}`);
+    return res.json({ success: true, uid, message: 'Admin claims set. User must re-login for claims to take effect.' });
+  } catch (e) {
+    console.error('❌ Failed to set admin claims:', e);
+    return res.status(500).json({ error: 'Failed to set claims', message: e.message });
+  }
+});
+
 // 404 handler
 app.use((req, res) => {
   res.status(404).json({
