@@ -1052,6 +1052,15 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     if (!tokens || tokens.length === 0) return { attempted: 0, success: 0, failure: 0 };
     try {
       // sendEachForMulticast returns per-token responses.
+      const notifType = (data && data.type) ? String(data.type) : '';
+      const ORDER_REQUEST_SET = new Set([
+        'Order Request', 'order_request', 'rfq_broadcast', 'rfq_assignment',
+        'future_booking', 'booking_request', 'new_booking',
+      ]);
+      const cId = ORDER_REQUEST_SET.has(notifType)
+        ? 'order_request_channel'
+        : 'high_importance_channel';
+
       const resp = await admin.messaging().sendEachForMulticast({
         tokens,
         notification: {
@@ -1059,6 +1068,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
           body: String(body || '').trim() || undefined,
         },
         data: toStringMap(data),
+        android: { priority: 'high', notification: { channelId: cId } },
       });
       return {
         attempted: tokens.length,
@@ -4789,6 +4799,16 @@ app.post('/api/notifications/send', verifyFirebaseAuth, assistantLimiter, async 
       return res.status(400).json({ error: 'Missing required fields: token, title, body' });
     }
 
+    // Determine notification channel based on type
+    const notifType = (data && data.type) ? String(data.type) : (type || '');
+    const ORDER_REQUEST_TYPES = new Set([
+      'Order Request', 'order_request', 'rfq_broadcast', 'rfq_assignment',
+      'future_booking', 'booking_request', 'new_booking',
+    ]);
+    const channelId = ORDER_REQUEST_TYPES.has(notifType)
+      ? 'order_request_channel'
+      : 'high_importance_channel';
+
     // Send FCM via Admin SDK (server-side — no private key exposed to clients)
     const message = {
       token: String(token).trim(),
@@ -4796,7 +4816,10 @@ app.post('/api/notifications/send', verifyFirebaseAuth, assistantLimiter, async 
       data: data && typeof data === 'object' ? Object.fromEntries(
         Object.entries(data).map(([k, v]) => [String(k), String(v)])
       ) : {},
-      android: { priority: 'high' },
+      android: {
+        priority: 'high',
+        notification: { channelId },
+      },
       apns: { headers: { 'apns-priority': '10' } },
     };
 

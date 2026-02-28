@@ -470,6 +470,28 @@ class FutureBookingService {
         }();
       }
 
+      // Notify the artisan that the client has paid.
+      if (ok) {
+        () async {
+          try {
+            final snap = await futureBookingsRef.doc(id).get();
+            final bData = snap.data() ?? <String, dynamic>{};
+            final artisanId =
+                (bData['service_provider_id'] ?? '').toString().trim();
+            if (artisanId.isNotEmpty && artisanId.toLowerCase() != 'admin') {
+              await sendNotificationToArtisan(
+                artisanId: artisanId,
+                bookingId: id,
+                message:
+                    'Client has made payment for the booking. You may now proceed with the job.',
+              );
+            }
+          } catch (_) {
+            // Best-effort
+          }
+        }();
+      }
+
       return ok;
     } catch (e) {
       debugPrint('deductWalletOnBookingConfirmation error: $e');
