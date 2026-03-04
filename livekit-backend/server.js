@@ -568,13 +568,30 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
   const bookingId = normalizeBookingId(payload);
   const now = nowIso();
 
-  const bookingRef = bookingId ? firestore.collection('futureBookings').doc(bookingId) : null;
+  let bookingRef = bookingId ? firestore.collection('futureBookings').doc(bookingId) : null;
 
   async function loadBooking() {
     if (!bookingRef) return null;
     const snap = await bookingRef.get();
-    if (!snap.exists) return null;
-    return snap.data() || {};
+    if (snap.exists) return snap.data() || {};
+
+    // Fallback: try to find booking by order_no or rfq_no (user may provide short ID like "0519B50E")
+    if (bookingId) {
+      const candidates = [bookingId, `ORD-${bookingId}`, `RFQ-${bookingId}`, bookingId.toUpperCase()];
+      for (const candidate of candidates) {
+        for (const field of ['order_no', 'rfq_no']) {
+          try {
+            const q = await firestore.collection('futureBookings')
+              .where(field, '==', candidate).limit(1).get();
+            if (!q.empty) {
+              bookingRef = q.docs[0].ref;
+              return q.docs[0].data() || {};
+            }
+          } catch (_) { /* ignore */ }
+        }
+      }
+    }
+    return null;
   }
 
   // Helpers mirrored from app-side logic.
@@ -993,7 +1010,8 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
   }
 
   async function writeAdminNotification({ title, message, data }) {
-    return await _writeNotificationImpl({
+    // Write notification doc for admin UI
+    await _writeNotificationImpl({
       userId: 'admin',
       userType: 'admin',
       title,
@@ -1001,6 +1019,38 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       data,
       sendPush: false,
     });
+
+    // Also send FCM push to admin devices
+    if (isEnvTruthy('ENABLE_FCM_PUSH')) {
+      try {
+        const adminSnap = await firestore.collection('users')
+          .where('isAdmin', '==', true)
+          .limit(10)
+          .get();
+        const tokens = [];
+        const seen = new Set();
+        for (const doc of adminSnap.docs) {
+          for (const t of collectTokensFromDocData(doc.data() || {})) {
+            if (!seen.has(t)) { seen.add(t); tokens.push(t); }
+          }
+        }
+        if (tokens.length > 0) {
+          await sendPushToTokens({
+            tokens,
+            title: String(title || '').trim(),
+            body: String(message || '').trim(),
+            data: {
+              type: (data && data.type) ? String(data.type) : 'admin_notification',
+              ...(data && typeof data === 'object' ? Object.fromEntries(
+                Object.entries(data).filter(([k]) => k !== 'type').map(([k, v]) => [String(k), String(v ?? '')])
+              ) : {}),
+            },
+          });
+        }
+      } catch (e) {
+        console.warn('writeAdminNotification push error (ignored):', e.message || e);
+      }
+    }
   }
 
   function collectTokensFromDocData(docData) {
@@ -1055,7 +1105,9 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       const notifType = (data && data.type) ? String(data.type) : '';
       const ORDER_REQUEST_SET = new Set([
         'Order Request', 'order_request', 'rfq_broadcast', 'rfq_assignment',
+        'rfq_amended', 'rfq_assigned', 'rfq_updated',
         'future_booking', 'booking_request', 'new_booking',
+        'wallet_topup', 'wallet_credit',
       ]);
       const cId = ORDER_REQUEST_SET.has(notifType)
         ? 'order_request_channel'
@@ -1123,15 +1175,30 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         data: payloadData,
       });
 
-      // Optional FCM push for client users (artisans are pushed via provider doc helper).
-      if (sendPush && isEnvTruthy('ENABLE_FCM_PUSH') && utype === 'user') {
-        const tokens = await getUserTokens(uid);
+      // Optional FCM push for client users and artisans.
+      if (sendPush && isEnvTruthy('ENABLE_FCM_PUSH') && (utype === 'user' || utype === 'artisan')) {
+        const tokens = utype === 'user' ? await getUserTokens(uid) : [];
+        // For artisans, also try serviceProvider collection tokens.
+        if (utype === 'artisan') {
+          try {
+            const spSnap = await firestore.collection('serviceProvider').doc(uid).get();
+            if (spSnap.exists) {
+              for (const t of collectTokensFromDocData(spSnap.data() || {})) {
+                if (!tokens.includes(t)) tokens.push(t);
+              }
+            }
+          } catch (_) { /* ignore */ }
+          // Also try user doc tokens for artisans (they may also have a users doc)
+          for (const t of await getUserTokens(uid)) {
+            if (!tokens.includes(t)) tokens.push(t);
+          }
+        }
         const push = await sendPushToTokens({
           tokens,
           title: String(title || '').trim(),
           body: String(message || '').trim(),
           data: {
-            type: 'square15',
+            type: notifType || 'square15',
             notification_id: ref.id,
             user_type: utype,
             booking_id: payloadData.booking_id || payloadData.bookingId || '',
@@ -1916,8 +1983,19 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       message: smMessage,
       timestamp: now,
       read: false,
+      isRead: false,
       created_at: now,
     });
+
+    // Update unread count on the tasksManagement doc for badge display
+    try {
+      await firestore.collection('tasksManagement').doc(smTmId).set({
+        unread_artisan: admin.firestore.FieldValue.increment(1),
+        last_message: smMessage.substring(0, 100),
+        last_message_at: now,
+        last_message_by: 'client',
+      }, { merge: true });
+    } catch (_) { /* best-effort */ }
 
     try {
       const providerDoc = await getServiceProviderDocByAnyId(smArtisanId);
@@ -1965,8 +2043,19 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       message: scMessage,
       timestamp: now,
       read: false,
+      isRead: false,
       created_at: now,
     });
+
+    // Update unread count on the tasksManagement doc for badge display
+    try {
+      await firestore.collection('tasksManagement').doc(scTmId).set({
+        unread_client: admin.firestore.FieldValue.increment(1),
+        last_message: scMessage.substring(0, 100),
+        last_message_at: now,
+        last_message_by: 'artisan',
+      }, { merge: true });
+    } catch (_) { /* best-effort */ }
 
     try {
       await writePersonalNotification({
@@ -4803,7 +4892,9 @@ app.post('/api/notifications/send', verifyFirebaseAuth, assistantLimiter, async 
     const notifType = (data && data.type) ? String(data.type) : (type || '');
     const ORDER_REQUEST_TYPES = new Set([
       'Order Request', 'order_request', 'rfq_broadcast', 'rfq_assignment',
+      'rfq_amended', 'rfq_assigned', 'rfq_updated',
       'future_booking', 'booking_request', 'new_booking',
+      'wallet_topup', 'wallet_credit',
     ]);
     const channelId = ORDER_REQUEST_TYPES.has(notifType)
       ? 'order_request_channel'
