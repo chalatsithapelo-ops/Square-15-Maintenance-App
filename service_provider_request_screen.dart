@@ -498,8 +498,8 @@ class _ServiceProviderRequestScreenState
                                           style: GoogleFonts.lato(
                                               fontWeight: FontWeight.bold)),
                                       Text(
-                                          data.cost == ""
-                                              ? ""
+                                          (data.cost == null || data.cost == "" || data.cost == "TBD" || data.cost == "0" || data.cost == "0.00")
+                                              ? "Awaiting Quote"
                                               : "R${data.cost}",
                                           style: GoogleFonts.lato(
                                               fontWeight: FontWeight.bold)),
@@ -700,7 +700,7 @@ class _ServiceProviderRequestScreenState
                                                             const Color(
                                                                 0xFFc5a520),
                                                       ),
-                                                      onPressed: () {
+                                                      onPressed: () async {
                                                         final uid =
                                                             (data.userId ?? '')
                                                                 .toString()
@@ -710,6 +710,42 @@ class _ServiceProviderRequestScreenState
                                                               'Missing client id');
                                                           return;
                                                         }
+
+                                                        // Update status to "progress" (in-progress)
+                                                        try {
+                                                          final docId = (data.id ?? '').toString().trim();
+                                                          if (docId.isNotEmpty) {
+                                                            await FirebaseService.tasksManagementRef.doc(docId).update({
+                                                              'status': 'progress',
+                                                              'updated_at': DateTime.now().toString(),
+                                                            });
+                                                          }
+                                                          // Also update future booking if linked
+                                                          final fbId = (data.futureBookingId ?? '').toString().trim();
+                                                          if (fbId.isNotEmpty) {
+                                                            await FutureBookingService.futureBookingsRef.doc(fbId).update({
+                                                              'status': 'in_progress',
+                                                              'updated_at': DateTime.now().toString(),
+                                                            });
+                                                          }
+                                                        } catch (e) {
+                                                          debugPrint('Go to Site status update error: $e');
+                                                        }
+
+                                                        // Notify the client
+                                                        FutureBookingService.sendNotificationToUser(
+                                                          userId: uid,
+                                                          title: 'Artisan On The Way',
+                                                          message: 'Your artisan is on the way to your site. Track their location in real-time.',
+                                                          type: 'artisan_going_to_site',
+                                                          data: {
+                                                            'type': 'artisan_going_to_site',
+                                                            'booking_id': (data.futureBookingId ?? data.id ?? '').toString(),
+                                                          },
+                                                        ).catchError((e) {
+                                                          debugPrint('Go to Site notification error: $e');
+                                                        });
+
                                                         navigateToPage(
                                                           context: context,
                                                           pageName:

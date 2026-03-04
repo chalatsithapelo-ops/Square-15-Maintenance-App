@@ -23,7 +23,10 @@ import 'package:maintenanceapp/screens/home/booking/client_calendar_screen.dart'
 import 'package:maintenanceapp/screens/home/booking/payment_method_sheet.dart';
 import 'package:maintenanceapp/screens/service_provider_panel/Serviceprovider/artisan_appointments_screen.dart';
 import 'package:maintenanceapp/screens/service_provider_panel/service_provider_request_screen.dart';
+import 'package:maintenanceapp/screens/home/profile/transaction_history_screen.dart';
 import 'package:maintenanceapp/screens/service_provider_panel/wallet_page.dart';
+import 'package:maintenanceapp/screens/service_provider_panel/Serviceprovider/notification_screen.dart';
+import 'package:maintenanceapp/screens/home/profile/profilepage.dart';
 import 'package:maintenanceapp/services/booking_monitor_service.dart';
 import 'package:maintenanceapp/services/future_booking_service.dart';
 import 'package:maintenanceapp/services/service_area_checker.dart';
@@ -650,8 +653,12 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
         final artisanId = (d['artisan_id'] ?? d['service_provider_id'] ?? '').toString().trim();
         final scheduledDate = (d['scheduled_date'] ?? '').toString().trim();
         final scheduledTime = (d['scheduled_time'] ?? '').toString().trim();
-        final price = (d['price'] ?? d['total_price'] ?? '').toString().trim();
+        final price = (d['price'] ?? d['total_price'] ?? d['rfq_total'] ?? d['cost'] ?? '').toString().trim();
         final description = (d['problem_description'] ?? d['description'] ?? '').toString().trim();
+        final orderNo = (d['order_no'] ?? '').toString().trim();
+        final rfqNo = (d['rfq_no'] ?? '').toString().trim();
+        final rfqStatus = (d['rfq_status'] ?? '').toString().trim();
+        final isRfq = (d['is_rfq'] == true || rfqStatus.isNotEmpty || rfqNo.isNotEmpty);
 
         bookings.add({
           'booking_id': doc.id,
@@ -662,6 +669,10 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
           'scheduled_date': scheduledDate,
           'scheduled_time': scheduledTime,
           'price': price,
+          'order_no': orderNo,
+          'rfq_no': rfqNo,
+          'rfq_status': rfqStatus,
+          'is_rfq': isRfq,
           'description': description.length > 100
               ? '${description.substring(0, 100)}...'
               : description,
@@ -745,6 +756,29 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
           screenInfo['screen_data'] = {
             'user_name': ctrl.userName.value.isNotEmpty ? ctrl.userName.value : (ctrl.userData?.name ?? ''),
             'active_bookings_count': _cachedActiveBookings.length,
+          };
+        }
+      }
+
+      // When on bookings/future bookings screen, include booking summaries
+      if (route.contains('future') || route.contains('booking') || route.contains('Booking')) {
+        if (_cachedActiveBookings.isNotEmpty) {
+          final bookingSummaries = <Map<String, dynamic>>[];
+          for (final b in _cachedActiveBookings.take(10)) {
+            bookingSummaries.add({
+              'booking_id': b['booking_id'] ?? '',
+              'order_no': b['order_no'] ?? '',
+              'rfq_no': b['rfq_no'] ?? '',
+              'category': b['category'] ?? '',
+              'status': b['status'] ?? '',
+              'rfq_status': b['rfq_status'] ?? '',
+              'price': b['price'] ?? '',
+              'is_rfq': b['is_rfq'] ?? false,
+            });
+          }
+          screenInfo['screen_data'] = {
+            'bookings_count': _cachedActiveBookings.length,
+            'bookings': bookingSummaries,
           };
         }
       }
@@ -1884,7 +1918,7 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
     // Additional app functionalities
     if (action == 'open_notifications') {
       if (_shouldDebounceUiAction(action)) return;
-      Get.toNamed('/notifications');
+      Get.to(() => const NotificationPageView(type: 'user'));
       Get.snackbar(_assistantName, 'Opening notifications',
           backgroundColor: Colors.green, colorText: Colors.white);
       _sendAppContextToAgent(reason: 'navigated_to_notifications');
@@ -1893,7 +1927,7 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
 
     if (action == 'open_profile') {
       if (_shouldDebounceUiAction(action)) return;
-      Get.toNamed('/profile');
+      Get.to(() => const ProfilePage());
       Get.snackbar(_assistantName, 'Opening your profile',
           backgroundColor: Colors.green, colorText: Colors.white);
       _sendAppContextToAgent(reason: 'navigated_to_profile');
@@ -1902,7 +1936,8 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
 
     if (action == 'open_settings') {
       if (_shouldDebounceUiAction(action)) return;
-      Get.toNamed('/settings');
+      // Settings is part of profile page
+      Get.to(() => const ProfilePage());
       Get.snackbar(_assistantName, 'Opening settings',
           backgroundColor: Colors.green, colorText: Colors.white);
       _sendAppContextToAgent(reason: 'navigated_to_settings');
@@ -1911,7 +1946,8 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
 
     if (action == 'open_chat_support' || action == 'open_support') {
       if (_shouldDebounceUiAction(action)) return;
-      Get.toNamed('/support');
+      // Support is accessible from profile
+      Get.to(() => const ProfilePage());
       Get.snackbar(_assistantName, 'Opening customer support',
           backgroundColor: Colors.green, colorText: Colors.white);
       _sendAppContextToAgent(reason: 'navigated_to_support');
@@ -1920,9 +1956,15 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
 
     if (action == 'open_user_wallet' || action == 'open_wallet') {
       if (_shouldDebounceUiAction(action)) return;
-      Get.toNamed('/wallet');
+      final role = widget.role.toLowerCase().trim();
       Get.snackbar(_assistantName, 'Opening your wallet',
           backgroundColor: Colors.green, colorText: Colors.white);
+      await Future.delayed(const Duration(milliseconds: 300));
+      if (role == 'artisan') {
+        await _openArtisanWallet();
+      } else {
+        Get.to(() => const TransactionHistoryScreen());
+      }
       _sendAppContextToAgent(reason: 'navigated_to_wallet');
       return;
     }
@@ -1938,8 +1980,42 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
 
     if (action == 'open_map' || action == 'show_location') {
       // Map screen is not implemented — ignore silently.
-      // The agent instructions have been updated to not use this action.
       print('[voice] open_map action ignored — no map route registered');
+      return;
+    }
+
+    // Pay for a booking — opens the payment method sheet
+    if (action == 'pay_for_booking' || action == 'initiate_payment') {
+      if (_shouldDebounceUiAction(action)) return;
+      final bookingId = (payload['booking_id'] ?? payload['bookingId'] ?? '').toString().trim();
+      if (bookingId.isEmpty) {
+        Get.snackbar(_assistantName, 'Please specify a booking to pay for.',
+            backgroundColor: Colors.orange, colorText: Colors.white);
+        return;
+      }
+      try {
+        final bookingDoc = await FirebaseFirestore.instance
+            .collection('futureBookings')
+            .doc(bookingId)
+            .get();
+        if (bookingDoc.exists) {
+          final bookingData = bookingDoc.data() ?? {};
+          final opened = await _maybeOpenPaymentForConfirmedBooking(
+            bookingId: bookingId,
+            bookingData: bookingData,
+          );
+          if (!opened) {
+            Get.snackbar(_assistantName, 'This booking does not require payment right now.',
+                backgroundColor: Colors.orange, colorText: Colors.white);
+          }
+        } else {
+          Get.snackbar(_assistantName, 'Booking not found.',
+              backgroundColor: Colors.red, colorText: Colors.white);
+        }
+      } catch (e) {
+        Get.snackbar(_assistantName, 'Could not open payment: $e',
+            backgroundColor: Colors.red, colorText: Colors.white);
+      }
       return;
     }
 
@@ -4040,15 +4116,16 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
 
           int score = 0;
           // Exact match.
-          if (name == hLower) score = 100;
-          // Contains match.
-          else if (name.contains(hLower) || hLower.contains(name)) score = 80;
+          if (name == hLower) {
+            score = 100;
+          } else if (name.contains(hLower) || hLower.contains(name)) score = 80;
           else {
             // Token overlap.
             for (final ht in hTokens) {
               for (final nt in nameTokens) {
-                if (ht == nt) score += 15;
-                else if (ht.contains(nt) || nt.contains(ht)) score += 8;
+                if (ht == nt) {
+                  score += 15;
+                } else if (ht.contains(nt) || nt.contains(ht)) score += 8;
               }
             }
           }

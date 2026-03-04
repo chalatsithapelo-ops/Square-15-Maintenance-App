@@ -1020,8 +1020,8 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       sendPush: false,
     });
 
-    // Also send FCM push to admin devices
-    if (isEnvTruthy('ENABLE_FCM_PUSH')) {
+    // Also send FCM push to admin devices (enabled by default).
+    {
       try {
         const adminSnap = await firestore.collection('users')
           .where('isAdmin', '==', true)
@@ -1108,6 +1108,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         'rfq_amended', 'rfq_assigned', 'rfq_updated',
         'future_booking', 'booking_request', 'new_booking',
         'wallet_topup', 'wallet_credit',
+        'chat_message', 'case_reply',
       ]);
       const cId = ORDER_REQUEST_SET.has(notifType)
         ? 'order_request_channel'
@@ -1175,8 +1176,8 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         data: payloadData,
       });
 
-      // Optional FCM push for client users and artisans.
-      if (sendPush && isEnvTruthy('ENABLE_FCM_PUSH') && (utype === 'user' || utype === 'artisan')) {
+      // FCM push for client users and artisans (enabled by default when Firebase is configured).
+      if (sendPush && (utype === 'user' || utype === 'artisan')) {
         const tokens = utype === 'user' ? await getUserTokens(uid) : [];
         // For artisans, also try serviceProvider collection tokens.
         if (utype === 'artisan') {
@@ -1253,8 +1254,8 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       service_provider_user_id: String(pd.user_id || '').trim() || null,
     };
 
-    // Optional: single FCM push using tokens from provider doc + primary user doc.
-    if (isEnvTruthy('ENABLE_FCM_PUSH')) {
+    // FCM push using tokens from provider doc + primary user doc (enabled by default).
+    {
       const tokens = [];
       const seen = new Set();
       for (const t of collectTokensFromDocData(pd)) {
@@ -1276,9 +1277,10 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         title: String(title || '').trim(),
         body: String(message || '').trim(),
         data: {
-          type: 'square15',
+          type: (data && data.type) ? String(data.type) : 'square15',
           user_type: 'artisan',
           booking_id: payloadData.booking_id || payloadData.bookingId || '',
+          tasks_management_id: payloadData.tasks_management_id || '',
           provider_doc_id: providerDocId || '',
           provider_uid: primaryUid || '',
         },
@@ -4895,6 +4897,7 @@ app.post('/api/notifications/send', verifyFirebaseAuth, assistantLimiter, async 
       'rfq_amended', 'rfq_assigned', 'rfq_updated',
       'future_booking', 'booking_request', 'new_booking',
       'wallet_topup', 'wallet_credit',
+      'chat_message', 'case_reply',
     ]);
     const channelId = ORDER_REQUEST_TYPES.has(notifType)
       ? 'order_request_channel'

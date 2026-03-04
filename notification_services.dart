@@ -275,6 +275,8 @@ class NotificationService {
     'new_booking',
     'wallet_topup',
     'wallet_credit',
+    'chat_message',
+    'case_reply',
   };
 
   static void displayNotification(context,

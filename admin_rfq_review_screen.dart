@@ -165,7 +165,27 @@ class _AdminRFQReviewScreenState extends State<AdminRFQReviewScreen> {
           if (liveData != null) ...liveData,
         };
 
-        final rfqTotal = ((data['rfq_total'] ?? 0.0) as num).toDouble();
+        // Try multiple fields for total: rfq_total, then ai_quote.total, then total
+        // Handle both num and String types robustly
+        double rfqTotal = 0.0;
+        for (final key in ['rfq_total', 'admin_quote_total', 'total', 'cost', 'quote_amount']) {
+          final v = data[key];
+          if (v == null) continue;
+          if (v is num && v > 0) { rfqTotal = v.toDouble(); break; }
+          final parsed = double.tryParse(v.toString().replaceAll(RegExp(r'[^0-9.]'), ''));
+          if (parsed != null && parsed > 0) { rfqTotal = parsed; break; }
+        }
+        if (rfqTotal <= 0) {
+          final aq = data['ai_quote'];
+          if (aq is Map) {
+            final aqV = aq['total'] ?? aq['estimatedCost'];
+            if (aqV is num && aqV > 0) rfqTotal = aqV.toDouble();
+            else if (aqV != null) {
+              final p = double.tryParse(aqV.toString().replaceAll(RegExp(r'[^0-9.]'), ''));
+              if (p != null && p > 0) rfqTotal = p;
+            }
+          }
+        }
         final rfqStatus = (data['rfq_status'] ?? '').toString();
         final categoryName = (data['category_name'] ?? '').toString();
         final problemDesc = (data['problem_description'] ?? '').toString();
@@ -431,22 +451,49 @@ class _AdminRFQReviewScreenState extends State<AdminRFQReviewScreen> {
 
             const Divider(height: 24),
 
-            // Material Breakdown
-            Text('Materials',
-                style: GoogleFonts.roboto(fontWeight: FontWeight.bold)),
-            const SizedBox(height: 8),
-            _profitLine('Base Cost',
-                'R${materials?['base_cost']?.toStringAsFixed(2) ?? "0"}'),
-            _profitLine('Multiplier',
-                '${materials?['multiplier']?.toStringAsFixed(2) ?? "0"}x'),
-            _profitLine('Markup Total',
-                'R${materials?['markup_total']?.toStringAsFixed(2) ?? "0"}',
-                bold: true),
-            _profitLine('Company Profit (10%)',
-                'R${materials?['company_profit']?.toStringAsFixed(2) ?? "0"}',
-                color: Colors.green[700]!),
-            _profitLine('Artisan Profit (40%)',
-                'R${materials?['artisan_profit']?.toStringAsFixed(2) ?? "0"}'),
+            // Material Breakdown — hide when labour-only
+            if (materials?['labour_only'] == true) ...[
+              Text('Materials',
+                  style: GoogleFonts.roboto(fontWeight: FontWeight.bold)),
+              const SizedBox(height: 8),
+              Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: Colors.orange.shade50,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Row(
+                  children: [
+                    Icon(Icons.info_outline, size: 16, color: Colors.orange.shade700),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text('Labour Only — Client buys materials',
+                        style: GoogleFonts.roboto(
+                          fontSize: 13, color: Colors.orange.shade800,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ] else ...[
+              Text('Materials',
+                  style: GoogleFonts.roboto(fontWeight: FontWeight.bold)),
+              const SizedBox(height: 8),
+              _profitLine('Base Cost',
+                  'R${materials?['base_cost']?.toStringAsFixed(2) ?? "0"}'),
+              _profitLine('Multiplier',
+                  '${materials?['multiplier']?.toStringAsFixed(2) ?? "0"}x'),
+              _profitLine('Markup Total',
+                  'R${materials?['markup_total']?.toStringAsFixed(2) ?? "0"}',
+                  bold: true),
+              _profitLine('Company Profit (10%)',
+                  'R${materials?['company_profit']?.toStringAsFixed(2) ?? "0"}',
+                  color: Colors.green[700]!),
+              _profitLine('Artisan Profit (40%)',
+                  'R${materials?['artisan_profit']?.toStringAsFixed(2) ?? "0"}'),
+            ],
 
             const Divider(height: 24),
 
@@ -550,15 +597,75 @@ class _AdminRFQReviewScreenState extends State<AdminRFQReviewScreen> {
     final qty = ((material['qty'] ?? 1.0) as num).toDouble();
     final unit = (material['unit'] ?? '').toString();
     final unitPrice = ((material['unit_price'] ?? 0.0) as num).toDouble();
+    final resolvedName = (material['resolved_name'] ?? '').toString().trim();
+    final matchedBy = (material['matched_by'] ?? '').toString().trim();
+    final isClientSelected = matchedBy == 'builders_user_selected';
+    final imageUrl = (material['builders_image_url'] ?? '').toString().trim();
 
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 6),
       child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Icon(Icons.build_circle_outlined,
-              size: 14, color: _square15Gold),
+          // Show product image if available, else icon
+          if (imageUrl.isNotEmpty)
+            ClipRRect(
+              borderRadius: BorderRadius.circular(6),
+              child: Image.network(
+                imageUrl,
+                width: 44,
+                height: 44,
+                fit: BoxFit.cover,
+                errorBuilder: (_, __, ___) => const Icon(
+                    Icons.build_circle_outlined,
+                    size: 14,
+                    color: _square15Gold),
+              ),
+            )
+          else
+            const Padding(
+              padding: EdgeInsets.only(top: 2),
+              child: Icon(Icons.build_circle_outlined,
+                  size: 14, color: _square15Gold),
+            ),
           const SizedBox(width: 8),
-          Expanded(child: Text(name, style: GoogleFonts.roboto(fontSize: 13))),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(name, style: GoogleFonts.roboto(fontSize: 13)),
+                if (resolvedName.isNotEmpty && resolvedName != name) ...[
+                  const SizedBox(height: 2),
+                  Row(
+                    children: [
+                      if (isClientSelected)
+                        Padding(
+                          padding: const EdgeInsets.only(right: 4),
+                          child: Icon(Icons.check_circle,
+                              size: 12, color: Colors.green.shade600),
+                        ),
+                      Expanded(
+                        child: Text(
+                          isClientSelected
+                              ? 'Client chose: $resolvedName'
+                              : 'Matched: $resolvedName',
+                          style: GoogleFonts.roboto(
+                            fontSize: 11,
+                            color: isClientSelected
+                                ? Colors.green.shade700
+                                : Colors.grey.shade600,
+                            fontWeight: isClientSelected
+                                ? FontWeight.w600
+                                : FontWeight.normal,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ],
+            ),
+          ),
           Text(
             '${qty.toStringAsFixed(qty % 1 == 0 ? 0 : 1)} $unit',
             style: GoogleFonts.roboto(fontSize: 12, color: Colors.grey[600]),
@@ -757,6 +864,29 @@ class _AdminRFQReviewScreenState extends State<AdminRFQReviewScreen> {
     );
   }
 
+  /// Resolves the best available cost/total from booking data.
+  /// Returns a numeric string (e.g. "1495.00") or empty string.
+  String _resolveCost(Map<String, dynamic> data) {
+    for (final key in ['rfq_total', 'admin_quote_total', 'cost', 'quote_amount', 'total']) {
+      final v = data[key];
+      if (v == null) continue;
+      if (v is num && v > 0) return v.toStringAsFixed(2);
+      final s = v.toString().replaceAll(RegExp(r'[^0-9.]'), '');
+      final parsed = double.tryParse(s);
+      if (parsed != null && parsed > 0) return parsed.toStringAsFixed(2);
+    }
+    // Try ai_quote.total
+    final aq = data['ai_quote'];
+    if (aq is Map) {
+      final t = aq['total'] ?? aq['estimatedCost'];
+      if (t is num && t > 0) return t.toDouble().toStringAsFixed(2);
+      final s = (t ?? '').toString().replaceAll(RegExp(r'[^0-9.]'), '');
+      final parsed = double.tryParse(s);
+      if (parsed != null && parsed > 0) return parsed.toStringAsFixed(2);
+    }
+    return '';
+  }
+
   Widget _profitRow(String label, double value, {bool bold = false}) {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 2),
@@ -795,6 +925,17 @@ class _AdminRFQReviewScreenState extends State<AdminRFQReviewScreen> {
     );
 
     final baseAi = (aiQuote ?? <String, dynamic>{});
+
+    // ── Check materials responsibility: is this a labour-only job? ──
+    final matResp = (widget.bookingData['materials_responsibility'] ??
+            baseAi['materials_responsibility'] ??
+            baseAi['materialsResponsibility'] ??
+            '')
+        .toString()
+        .trim()
+        .toLowerCase();
+    final isLabourOnly = matResp != 'artisan'; // 'client' or empty = labour only
+
     final priced = (baseAi['materialsPriced_reference'] as List?)
             ?.whereType<Map>()
             .map((m) => m.map((k, v) => MapEntry(k.toString(), v)))
@@ -868,7 +1009,9 @@ class _AdminRFQReviewScreenState extends State<AdminRFQReviewScreen> {
 
           final materialsTotal = computeMaterialsTotal();
           final laborTotal = computeLaborTotal();
-          final total = materialsTotal + laborTotal;
+          // Labour-only: exclude materials from the client total
+          final effectiveMaterialsTotal = isLabourOnly ? 0.0 : materialsTotal;
+          final total = effectiveMaterialsTotal + laborTotal;
 
           // ── Live profitability preview ──
           final lH = toDouble(laborHoursController.text);
@@ -877,11 +1020,11 @@ class _AdminRFQReviewScreenState extends State<AdminRFQReviewScreen> {
           final companyLaborProfit = (lH * lR) - (lH * outsourcedRate);
           final materialMultiplier = 1.5;
           // Base cost is what admin sees as material total; markup is what client pays
-          final materialBaseCost = materialsTotal / materialMultiplier;
-          final materialProfit = materialsTotal - materialBaseCost;
+          final materialBaseCost = isLabourOnly ? 0.0 : (materialsTotal / materialMultiplier);
+          final materialProfit = isLabourOnly ? 0.0 : (materialsTotal - materialBaseCost);
           final companyMaterialProfit = materialProfit * 0.10;
           final artisanMaterialProfit = materialProfit * 0.40;
-          final subtotalForContingency = laborTotal + materialsTotal;
+          final subtotalForContingency = laborTotal + effectiveMaterialsTotal;
           final contingency = subtotalForContingency * 0.15;
           final companyTotalProfit = companyLaborProfit + companyMaterialProfit + contingency;
           final artisanTotalProfit = artisanMaterialProfit;
@@ -1002,6 +1145,29 @@ class _AdminRFQReviewScreenState extends State<AdminRFQReviewScreen> {
                     ),
                     const SizedBox(height: 16),
                     Text('Materials', style: GoogleFonts.roboto(fontWeight: FontWeight.w600)),
+                    if (isLabourOnly) ...[
+                      const SizedBox(height: 4),
+                      Container(
+                        padding: const EdgeInsets.all(6),
+                        decoration: BoxDecoration(
+                          color: Colors.orange.shade50,
+                          borderRadius: BorderRadius.circular(6),
+                          border: Border.all(color: Colors.orange.shade300),
+                        ),
+                        child: Row(
+                          children: [
+                            Icon(Icons.info_outline, size: 14, color: Colors.orange.shade700),
+                            const SizedBox(width: 6),
+                            Expanded(
+                              child: Text(
+                                'Labour Only — Client buys materials (listed for reference only, not included in total)',
+                                style: GoogleFonts.roboto(fontSize: 11, color: Colors.orange.shade800, fontWeight: FontWeight.w600),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
                     const SizedBox(height: 8),
                     if (itemControllers.isEmpty)
                       Text('No materials yet.', style: GoogleFonts.roboto(color: Colors.grey[700])),
@@ -1046,7 +1212,7 @@ class _AdminRFQReviewScreenState extends State<AdminRFQReviewScreen> {
                           Text('Summary', style: GoogleFonts.roboto(fontWeight: FontWeight.w600)),
                           const SizedBox(height: 6),
                           Text('Labour: R${laborTotal.toStringAsFixed(2)}', style: GoogleFonts.roboto(fontSize: 12)),
-                          Text('Materials: R${materialsTotal.toStringAsFixed(2)}', style: GoogleFonts.roboto(fontSize: 12)),
+                          Text('Materials: R${materialsTotal.toStringAsFixed(2)}${isLabourOnly ? " (ref only — not in total)" : ""}', style: GoogleFonts.roboto(fontSize: 12, color: isLabourOnly ? Colors.grey : null)),
                           const SizedBox(height: 6),
                           Text('Total: R${total.toStringAsFixed(2)}', style: GoogleFonts.roboto(fontWeight: FontWeight.bold)),
                         ],
@@ -1203,6 +1369,20 @@ class _AdminRFQReviewScreenState extends State<AdminRFQReviewScreen> {
 
     setState(() => isLoading = true);
     try {
+      // Ensure all identity fields are present so the client's booking query
+      // finds this document regardless of which field variant it uses.
+      final clientId = (widget.bookingData['user_id'] ??
+              widget.bookingData['client_id'] ??
+              '')
+          .toString()
+          .trim();
+      final clientIdCamel = (widget.bookingData['userId'] ?? clientId)
+          .toString()
+          .trim();
+      final clientUid = (widget.bookingData['uid'] ?? clientId)
+          .toString()
+          .trim();
+
       await _writeRfqPatch({
         // Client needs to explicitly respond before assignment.
         'rfq_status': 'pending_client_response',
@@ -1219,13 +1399,15 @@ class _AdminRFQReviewScreenState extends State<AdminRFQReviewScreen> {
         'profit_analysis_admin': profitAnalysisAdmin,
         'profit_analysis_artisan': profitAnalysisArtisan,
         'updated_at': DateTime.now().toString(),
+        // Ensure identity + RFQ flags are present for client query compatibility
+        if (clientId.isNotEmpty) 'user_id': clientId,
+        if (clientIdCamel.isNotEmpty) 'userId': clientIdCamel,
+        if (clientUid.isNotEmpty) 'uid': clientUid,
+        if (clientId.isNotEmpty) 'client_id': clientId,
+        'is_rfq': 'yes',
+        'order_type': 'rfq',
       });
 
-      final clientId = (widget.bookingData['user_id'] ??
-              widget.bookingData['client_id'] ??
-              '')
-          .toString()
-          .trim();
       if (clientId.isNotEmpty) {
         await AdminNotificationService.sendNotificationToUser(
           userId: clientId,
@@ -1292,7 +1474,17 @@ class _AdminRFQReviewScreenState extends State<AdminRFQReviewScreen> {
   //  `tasksManagement` by `service_provider_id`.
   // ──────────────────────────────────────────────────────────────────────
   Future<void> _createTasksManagementBridge({required String artisanId}) async {
-    final data = widget.bookingData;
+    // Read fresh data from Firestore to avoid stale cost/total values
+    Map<String, dynamic> data;
+    try {
+      final freshDoc = await _rfqPrimary.doc(widget.bookingId).get();
+      data = <String, dynamic>{
+        ...widget.bookingData,
+        if (freshDoc.exists && freshDoc.data() != null) ...freshDoc.data()!,
+      };
+    } catch (_) {
+      data = widget.bookingData;
+    }
 
     // Check if a bridge record already exists for this artisan + booking
     final existing = await FirebaseFirestore.instance
@@ -1321,7 +1513,7 @@ class _AdminRFQReviewScreenState extends State<AdminRFQReviewScreen> {
       'status': 'pending',
       'accept': '',
       'artisan_confirmed': 'pending',
-      'cost': data['cost'] ?? data['quote_amount'] ?? '',
+      'cost': _resolveCost(data),
       'description': data['description'] ?? data['address'] ?? '',
       'task_id': data['task_id'] ?? data['category_id'] ?? '',
       'task_name': data['task_name'] ?? data['category'] ?? '',
@@ -1367,20 +1559,49 @@ class _AdminRFQReviewScreenState extends State<AdminRFQReviewScreen> {
         );
       }
 
-      // ── Notify ALL active artisans AND create bridge records ──
+      // ── Notify category-matched active artisans AND create bridge records ──
+      final rfqCategory = (widget.bookingData['category_name'] ?? '').toString().toLowerCase().trim();
+      debugPrint('[broadcast] RFQ category: "$rfqCategory"');
+
       final artisansSnap = await FirebaseFirestore.instance
           .collection('serviceProvider')
           .where('active', isEqualTo: 'y')
           .get();
 
-      // Also try artisans with active == 'yes' or 'Y' or '1'
+      // Also try artisans with active == 'yes'
       final artisansSnap2 = await FirebaseFirestore.instance
           .collection('serviceProvider')
           .where('active', isEqualTo: 'yes')
           .get();
       final allArtisanDocs = <String, QueryDocumentSnapshot>{};
-      for (final d in artisansSnap.docs) allArtisanDocs[d.id] = d;
-      for (final d in artisansSnap2.docs) allArtisanDocs[d.id] = d;
+      for (final d in artisansSnap.docs) {
+        allArtisanDocs[d.id] = d;
+      }
+      for (final d in artisansSnap2.docs) {
+        allArtisanDocs[d.id] = d;
+      }
+
+      // Filter to only artisans whose mainCategory or category array matches the RFQ category
+      if (rfqCategory.isNotEmpty) {
+        allArtisanDocs.removeWhere((id, doc) {
+          final data = doc.data() as Map<String, dynamic>? ?? {};
+          final artisanMainCat = (data['mainCategory'] ?? '').toString().toLowerCase().trim();
+          // Also check the category array (artisan may have multiple approved categories)
+          final catArray = (data['category'] is List) ? (data['category'] as List) : [];
+          final subCatArray = (data['subCategory'] is List) ? (data['subCategory'] as List) : [];
+          final allCats = <String>[
+            artisanMainCat,
+            ...catArray.map((c) => c.toString().toLowerCase().trim()),
+            ...subCatArray.map((c) => c.toString().toLowerCase().trim()),
+          ];
+          final match = allCats.any((c) => c == rfqCategory);
+          if (!match) {
+            debugPrint('[broadcast] Skipping artisan $id (categories: $allCats != "$rfqCategory")');
+          }
+          return !match;
+        });
+        debugPrint('[broadcast] ${allArtisanDocs.length} artisans match category "$rfqCategory"');
+      }
 
       int notified = 0;
       for (final artisanDoc in allArtisanDocs.values) {
@@ -1476,29 +1697,55 @@ class _AdminRFQReviewScreenState extends State<AdminRFQReviewScreen> {
   }
 
   Future<void> _selectAndAssignArtisan() async {
-    // Fetch available artisans
+    // Fetch available artisans filtered by RFQ category
     setState(() => isLoading = true);
     try {
+      final rfqCategory = (widget.bookingData['category_name'] ?? '').toString().toLowerCase().trim();
+      debugPrint('[assign] RFQ category: "$rfqCategory"');
+
       final artisansSnapshot = await FirebaseFirestore.instance
           .collection('serviceProvider')
           .where('active', isEqualTo: 'y')
           .get();
 
+      // Also include artisans with active == 'yes'
+      final artisansSnapshot2 = await FirebaseFirestore.instance
+          .collection('serviceProvider')
+          .where('active', isEqualTo: 'yes')
+          .get();
+
+      final allDocs = <String, QueryDocumentSnapshot>{};
+      for (final d in artisansSnapshot.docs) {
+        allDocs[d.id] = d;
+      }
+      for (final d in artisansSnapshot2.docs) {
+        allDocs[d.id] = d;
+      }
+
+      // Filter to category-matching artisans
+      final matchedDocs = allDocs.values.where((doc) {
+        if (rfqCategory.isEmpty) return true;
+        final data = doc.data() as Map<String, dynamic>? ?? {};
+        final artisanCategory = (data['mainCategory'] ?? '').toString().toLowerCase().trim();
+        return artisanCategory == rfqCategory;
+      }).toList();
+
       setState(() => isLoading = false);
 
-      if (artisansSnapshot.docs.isEmpty) {
-        Get.snackbar('No Artisans', 'No active artisans found',
+      if (matchedDocs.isEmpty) {
+        Get.snackbar('No Artisans', 'No active artisans found for category "$rfqCategory"',
             backgroundColor: Colors.orange, colorText: Colors.white);
         return;
       }
 
-      final artisans = artisansSnapshot.docs.map((doc) {
-        final data = doc.data();
+      final artisans = matchedDocs.map((doc) {
+        final data = doc.data() as Map<String, dynamic>? ?? {};
         return {
           'id': doc.id,
           'name': data['name'] ?? 'Unknown',
           'email': data['email'] ?? '',
           'phone': data['contact'] ?? data['phone'] ?? '',
+          'category': data['mainCategory'] ?? '',
         };
       }).toList();
 
@@ -1524,7 +1771,7 @@ class _AdminRFQReviewScreenState extends State<AdminRFQReviewScreen> {
                     ),
                   ),
                   title: Text(artisan['name'] as String),
-                  subtitle: Text('${artisan['phone']}\n${artisan['email']}'),
+                  subtitle: Text('${artisan['category']}\n${artisan['phone']}\n${artisan['email']}'),
                   isThreeLine: true,
                   onTap: () => Navigator.pop(ctx, artisan),
                 );
