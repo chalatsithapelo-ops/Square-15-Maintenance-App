@@ -1919,6 +1919,16 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       created_at: now,
     });
 
+    // Update unread count on the tasksManagement doc for badge display
+    try {
+      await firestore.collection('tasksManagement').doc(smTmId).set({
+        unread_artisan: admin.firestore.FieldValue.increment(1),
+        last_message: smMessage.substring(0, 100),
+        last_message_at: now,
+        last_message_by: 'client',
+      }, { merge: true });
+    } catch (_) { /* best-effort */ }
+
     try {
       const providerDoc = await getServiceProviderDocByAnyId(smArtisanId);
       await writePersonalNotificationForProviderDoc(
@@ -1967,6 +1977,16 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       read: false,
       created_at: now,
     });
+
+    // Update unread count on the tasksManagement doc for badge display
+    try {
+      await firestore.collection('tasksManagement').doc(scTmId).set({
+        unread_client: admin.firestore.FieldValue.increment(1),
+        last_message: scMessage.substring(0, 100),
+        last_message_at: now,
+        last_message_by: 'artisan',
+      }, { merge: true });
+    } catch (_) { /* best-effort */ }
 
     try {
       await writePersonalNotification({

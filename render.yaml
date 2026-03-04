@@ -36,6 +36,9 @@ services:
       # Admin bootstrap key for setting admin custom claims
       - key: ADMIN_BOOTSTRAP_KEY
         sync: false
+      # Enable FCM push notifications for clients & artisans
+      - key: ENABLE_FCM_PUSH
+        value: "true"
 
   # 2) Always-on agent worker (receives dispatch jobs and speaks)
   - type: worker
