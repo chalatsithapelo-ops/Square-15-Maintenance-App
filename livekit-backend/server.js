@@ -610,6 +610,57 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     return trimmed.length <= safeLen ? trimmed.toUpperCase() : trimmed.slice(0, safeLen).toUpperCase();
   }
 
+  // Format a Date as DD/MM/YYYY.
+  function _todayDateStr(d) {
+    d = d || new Date();
+    const dd = String(d.getDate()).padStart(2, '0');
+    const mm = String(d.getMonth() + 1).padStart(2, '0');
+    const yyyy = d.getFullYear();
+    return `${dd}/${mm}/${yyyy}`;
+  }
+
+  // Allocate a sequential daily counter for a given prefix (RFQ or ORD).
+  async function _nextDailySeq(prefix) {
+    const dateKey = _todayDateStr().replace(/\//g, '-'); // e.g. "06-03-2026"
+    const counterRef = firestore.collection('metadata').doc('counters');
+    let seq = 1;
+    try {
+      await firestore.runTransaction(async (tx) => {
+        const snap = await tx.get(counterRef);
+        let current = 0;
+        if (snap.exists) {
+          const data = snap.data() || {};
+          const daily = data.dailyCounters || {};
+          const prefixMap = daily[prefix] || {};
+          if (prefixMap[dateKey] != null) {
+            const raw = prefixMap[dateKey];
+            current = typeof raw === 'number' ? raw : (parseInt(raw, 10) || 0);
+          }
+        }
+        seq = current + 1;
+        tx.set(counterRef, {
+          dailyCounters: { [prefix]: { [dateKey]: seq } }
+        }, { merge: true });
+      });
+    } catch (_) {
+      seq = Date.now() % 1000 + 1;
+    }
+    return seq;
+  }
+
+  // Generate date-based RFQ number: RFQ-DD/MM/YYYY-NN
+  async function generateDateBasedRfqNo() {
+    const seq = await _nextDailySeq('RFQ');
+    return `RFQ-${_todayDateStr()}-${String(seq).padStart(2, '0')}`;
+  }
+
+  // Generate date-based Order number: ORD-DD/MM/YYYY-NN
+  async function generateDateBasedOrderNo() {
+    const seq = await _nextDailySeq('ORD');
+    return `ORD-${_todayDateStr()}-${String(seq).padStart(2, '0')}`;
+  }
+
+  // Legacy sync functions (kept as fallbacks)
   function generateOrderNo(id) {
     const s = shortId(id);
     return s ? `ORD-${s}` : '';
@@ -1376,7 +1427,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       }
     }
 
-    const resolvedOrderNo = hasNumericOrderNo ? bookingOrderNoRaw : orderSeq != null ? String(orderSeq) : generateOrderNo(bookingIdLocal);
+    const resolvedOrderNo = hasNumericOrderNo ? bookingOrderNoRaw : orderSeq != null ? String(orderSeq) : await generateDateBasedOrderNo();
 
     // Resolve costs best-effort.
     const resolvedTaskCosts = {};
@@ -1801,7 +1852,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       has_photos: workImages.length > 0 ? 'yes' : 'no',
 
       order_no: '',
-      rfq_no: isRFQFlag ? generateRfqNo(bookingIdLocal) : '',
+      rfq_no: isRFQFlag ? await generateDateBasedRfqNo() : '',
 
       client_name: clientName,
       client_phone: clientPhone,
@@ -2653,7 +2704,8 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         rfq_status: String(b.rfq_status || '').trim(),
         order_type: String(b.is_rfq || '').toLowerCase() === 'yes' ? 'rfq' : 'order',
         rfq_no: String(b.rfq_no || '').trim(),
-        order_number: String(b.order_number || '').trim(),
+        order_no: String(b.order_no || '').trim(),
+        order_number: String(b.order_no || b.order_number || '').trim(),
         category_name: String(b.category_name || '').trim(),
         problem_description: String(b.problem_description || '').trim(),
         scheduled_date: String(b.scheduled_date || '').trim(),
@@ -2846,7 +2898,8 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         service_provider_id: artisanId,
         artisan: artisanInfo,
         tasks_management_id: String(data.tasks_management_id || '').trim(),
-        order_number: String(data.order_number || '').trim(),
+        order_no: String(data.order_no || '').trim(),
+        order_number: String(data.order_no || data.order_number || '').trim(),
         rfq_no: String(data.rfq_no || '').trim(),
         rfq_status: String(data.rfq_status || '').trim(),
         order_type: String(data.is_rfq || '').toLowerCase() === 'yes' ? 'rfq' : 'order',
@@ -3568,9 +3621,7 @@ app.get('/health', (req, res) => {
 
 // ── Public pricing test endpoint (dev only) ──
 app.get('/api/test-pricing', async (req, res) => {
-  if (process.env.NODE_ENV === 'production') {
-    return res.status(404).json({ error: 'Not found' });
-  }
+  // Public pricing endpoint — used by voice agent for service/pricing lookups.
   try {
     const firestore = (() => { initFirebaseIfPossible(); if (firebaseInitError) return null; return admin.firestore(); })();
     if (!firestore) return res.status(500).json({ error: 'firebase_not_configured' });

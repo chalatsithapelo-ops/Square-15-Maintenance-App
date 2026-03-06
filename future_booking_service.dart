@@ -1,9 +1,7 @@
-import 'dart:convert';
 import 'dart:math';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/foundation.dart';
-import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:maintenanceapp/model/future_booking_model.dart';
 import 'package:maintenanceapp/services/backend_fcm_service.dart';
@@ -207,17 +205,74 @@ class FutureBookingService {
         : trimmed.substring(0, safeLen).toUpperCase();
   }
 
-  /// Stable order number derived from bookingId.
-  ///
-  /// This remains consistent even if the underlying tasksManagement id changes
-  /// due to reassignment.
+  /// Format today's date as DD/MM/YYYY.
+  static String _todayDateString() {
+    final now = DateTime.now();
+    final dd = now.day.toString().padLeft(2, '0');
+    final mm = now.month.toString().padLeft(2, '0');
+    final yyyy = now.year.toString();
+    return '$dd/$mm/$yyyy';
+  }
+
+  /// Allocate a sequential daily number for a given prefix (RFQ or ORD).
+  /// Uses Firestore transaction on `metadata/counters` → `dailyCounters.<prefix>.<dateKey>`.
+  static Future<int> _nextDailySeq(String prefix) async {
+    final dateKey = _todayDateString().replaceAll('/', '-'); // e.g. "06-03-2026"
+    final counterRef = FirebaseFirestore.instance.collection('metadata').doc('counters');
+    int seq = 1;
+    try {
+      await FirebaseFirestore.instance.runTransaction((tx) async {
+        final snap = await tx.get(counterRef);
+        int current = 0;
+        if (snap.exists) {
+          final data = snap.data();
+          final daily = data?['dailyCounters'] as Map<String, dynamic>?;
+          final prefixMap = daily?[prefix] as Map<String, dynamic>?;
+          if (prefixMap != null && prefixMap[dateKey] != null) {
+            final raw = prefixMap[dateKey];
+            current = raw is int ? raw : (int.tryParse(raw.toString()) ?? 0);
+          }
+        }
+        seq = current + 1;
+        tx.set(
+          counterRef,
+          {
+            'dailyCounters': {
+              prefix: {dateKey: seq},
+            },
+          },
+          SetOptions(merge: true),
+        );
+      });
+    } catch (_) {
+      // Fallback: use timestamp-based unique number
+      seq = DateTime.now().millisecondsSinceEpoch % 1000 + 1;
+    }
+    return seq;
+  }
+
+  /// Generate a date-based RFQ number like RFQ-06/03/2026-01.
+  static Future<String> generateDateBasedRfqNo() async {
+    final seq = await _nextDailySeq('RFQ');
+    final seqStr = seq.toString().padLeft(2, '0');
+    return 'RFQ-${_todayDateString()}-$seqStr';
+  }
+
+  /// Generate a date-based Order number like ORD-06/03/2026-01.
+  static Future<String> generateDateBasedOrderNo() async {
+    final seq = await _nextDailySeq('ORD');
+    final seqStr = seq.toString().padLeft(2, '0');
+    return 'ORD-${_todayDateString()}-$seqStr';
+  }
+
+  /// Legacy sync order number (fallback only).
   static String generateOrderNo(String bookingId) {
     final short = _shortId(bookingId);
     if (short.isEmpty) return '';
     return 'ORD-$short';
   }
 
-  /// Stable RFQ number derived from bookingId.
+  /// Legacy sync RFQ number (fallback only).
   static String generateRfqNo(String bookingId) {
     final short = _shortId(bookingId);
     if (short.isEmpty) return '';
@@ -973,7 +1028,7 @@ class FutureBookingService {
           ? bookingOrderNo.trim()
           : (orderSeq != null
               ? orderSeq.toString()
-              : generateOrderNo(bookingId));
+              : await generateDateBasedOrderNo());
 
       // Prefer the best-known address string for display/logs.
       // For current location flows, callers may pass a reverse-geocoded address.
@@ -1539,11 +1594,10 @@ class FutureBookingService {
     }
 
     // Stable traceability identifiers
-    // - order_no must match tasksManagement.order_no (numeric) for non-RFQ orders.
-    //   We set it after tasksManagement is created (or leave empty if unassigned).
-    // - rfq_no is used for RFQ-only flows before conversion.
+    // - order_no uses date-based format: ORD-DD/MM/YYYY-NN
+    // - rfq_no uses date-based format: RFQ-DD/MM/YYYY-NN
     bookingMap['order_no'] = '';
-    bookingMap['rfq_no'] = isRFQ ? generateRfqNo(bookingId) : '';
+    bookingMap['rfq_no'] = isRFQ ? await generateDateBasedRfqNo() : '';
     final scheduledAt =
         _tryParseScheduledDateTime(scheduledDate, scheduledTime);
     if (scheduledAt != null) {

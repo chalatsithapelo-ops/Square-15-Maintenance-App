@@ -493,10 +493,11 @@ async def entrypoint(ctx: JobContext):
             "- If they want to follow up, use reply_to_case with the case_id.\n"
             "\n"
             "BOOKING MANAGEMENT (CRITICAL — USE DEDICATED TOOLS, NOT ui_navigate):\n"
-            "- When user asks to cancel, reschedule, check status, or do anything with a booking:\n"
-            "  1. If they give a partial order number or RFQ number (like 'RFQ 509' or 'order 0519'), call list_my_bookings() first to find the matching booking by its full ID.\n"
-            "  2. If they don't give a booking ID, call list_my_bookings() first to find it.\n"
-            "  3. You CAN see bookings on the user's screen — use get_current_screen() or analyze_screen() to identify visible bookings with their order/RFQ numbers.\n"
+            "- RFQ numbers use the format RFQ-DD/MM/YYYY-NN (e.g. RFQ-06/03/2026-01). Order numbers use ORD-DD/MM/YYYY-NN.\n"
+            "- When user asks about a booking or RFQ:\n"
+            "  1. ALWAYS call list_my_bookings() first to get the actual list of bookings with their correct IDs, RFQ numbers and order numbers.\n"
+            "  2. Match what the user says to the returned results. Never say you don't see a booking without calling list_my_bookings() first.\n"
+            "  3. If the user reads out an RFQ number or order number, match it against rfq_no and order_no fields from list_my_bookings() results.\n"
             "  4. Then CALL the specific BACKEND tool — these EXECUTE the action:\n"
             "- Cancel: cancel_booking(booking_id, reason) — actually cancels the booking on the server\n"
             "- Reschedule: reschedule_booking(booking_id, scheduled_date, scheduled_time) — actually reschedules on the server\n"
@@ -746,11 +747,28 @@ async def entrypoint(ctx: JobContext):
         """Get booking status from backend API."""
         nonlocal backend_client, app_context_bookings
         logger.info(f"📋 get_booking_status called: booking_id={booking_id}, backend_client={'SET' if backend_client else 'NONE'}, app_bookings={len(app_context_bookings)}")
+
+        # If user gave an RFQ number or order number, try to find the booking_id first
+        clean_id = booking_id.strip()
+        if app_context_bookings and (clean_id.upper().startswith('RFQ') or clean_id.upper().startswith('ORD')):
+            for b in app_context_bookings:
+                rfq = (b.get('rfq_no') or '').strip()
+                ono = (b.get('order_no') or '').strip()
+                if rfq and clean_id.upper() in rfq.upper():
+                    clean_id = b.get('booking_id', clean_id)
+                    logger.info(f"📋 Resolved RFQ {booking_id} → booking {clean_id}")
+                    break
+                if ono and clean_id.upper() in ono.upper():
+                    clean_id = b.get('booking_id', clean_id)
+                    logger.info(f"📋 Resolved order {booking_id} → booking {clean_id}")
+                    break
+
         if not backend_client:
             # Fallback: check app context bookings if available
             if app_context_bookings:
                 for b in app_context_bookings:
-                    if b.get('booking_id') == booking_id:
+                    bid = b.get('booking_id', '')
+                    if bid == clean_id or bid == booking_id:
                         status = b.get('status', 'unknown')
                         category = b.get('category', 'service')
                         artisan_name = b.get('artisan_name', '')
@@ -775,7 +793,7 @@ async def entrypoint(ctx: JobContext):
                 return _CONNECTION_RETRY_MSG
 
         try:
-            result = await backend_client.get_booking_status(booking_id)
+            result = await backend_client.get_booking_status(clean_id)
             if not result.get('ok') and not result.get('success'):
                 error = result.get('error', 'unknown_error')
                 if error == 'booking_not_found':
@@ -910,7 +928,7 @@ async def entrypoint(ctx: JobContext):
                 time = booking.get('scheduled_time', '')
                 price = booking.get('total_price', '')
                 rfq_no = booking.get('rfq_no', '')
-                order_no = booking.get('order_number', '')
+                order_no = booking.get('order_no', '') or booking.get('order_number', '')
                 order_type = booking.get('order_type', '')
                 rfq_status = booking.get('rfq_status', '')
                 response += f"{i}. {category} booking {booking_id}: {booking_status}"
