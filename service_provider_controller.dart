@@ -36,7 +36,8 @@ class ServiceProviderController extends GetxController {
   var withDrawAmount = "".obs;
 
   /// Whether background job-request announcements are enabled.
-  var announcementsEnabled = false.obs;
+  /// Defaults to true so artisans hear new-job sounds out of the box.
+  var announcementsEnabled = true.obs;
 
   /// IDs already seen so only NEW requests generate a notification.
   final Set<String> _knownRequestIds = {};
@@ -439,13 +440,13 @@ class ServiceProviderController extends GetxController {
       } else {
         final prefs = await SharedPreferences.getInstance();
         announcementsEnabled.value =
-            prefs.getBool('announcements_enabled') ?? false;
+            prefs.getBool('announcements_enabled') ?? true;
       }
     } catch (_) {
       try {
         final prefs = await SharedPreferences.getInstance();
         announcementsEnabled.value =
-            prefs.getBool('announcements_enabled') ?? false;
+            prefs.getBool('announcements_enabled') ?? true;
       } catch (_) {}
     }
 
@@ -539,6 +540,7 @@ class ServiceProviderController extends GetxController {
       importance: Importance.max,
       priority: Priority.max,
       playSound: true,
+      sound: RawResourceAndroidNotificationSound('sound'),
       enableVibration: true,
       enableLights: true,
       fullScreenIntent: true,
