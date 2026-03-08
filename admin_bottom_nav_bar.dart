@@ -105,6 +105,18 @@ class _BottomBarState extends State<BottomBar> {
             onSelected: (value) async {
               final messenger = ScaffoldMessenger.of(context);
               switch (value) {
+                case 'categories':
+                  appController.currentIndex.value = 4;
+                  return;
+                case 'pricing_guide':
+                  appController.currentIndex.value = 6;
+                  return;
+                case 'help_center':
+                  appController.currentIndex.value = 7;
+                  return;
+                case 'analytics':
+                  appController.currentIndex.value = 8;
+                  return;
                 case 'support_cases':
                   Get.to(
                     () => const SupportCasesScreen(),
@@ -165,6 +177,35 @@ class _BottomBarState extends State<BottomBar> {
               }
             },
             itemBuilder: (context) => [
+              const PopupMenuItem(value: 'categories', child: Row(
+                children: [
+                  Icon(Icons.category, size: 20),
+                  SizedBox(width: 8),
+                  Text('Categories'),
+                ],
+              )),
+              const PopupMenuItem(value: 'pricing_guide', child: Row(
+                children: [
+                  Icon(Icons.price_change, size: 20),
+                  SizedBox(width: 8),
+                  Text('Pricing Guide'),
+                ],
+              )),
+              const PopupMenuItem(value: 'help_center', child: Row(
+                children: [
+                  Icon(Icons.help, size: 20),
+                  SizedBox(width: 8),
+                  Text('Help Center'),
+                ],
+              )),
+              const PopupMenuItem(value: 'analytics', child: Row(
+                children: [
+                  Icon(Icons.analytics, size: 20),
+                  SizedBox(width: 8),
+                  Text('Analytics'),
+                ],
+              )),
+              const PopupMenuDivider(),
               const PopupMenuItem(value: 'support_cases', child: Row(
                 children: [
                   Icon(Icons.support_agent, size: 20),
@@ -230,12 +271,9 @@ class _BottomBarState extends State<BottomBar> {
         color: Colors.white,
         shape: const CircularNotchedRectangle(),
         notchMargin: 10,
-        child: Obx(() => SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
-              padding: const EdgeInsets.only(right: 72),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
+        child: Obx(() => Row(
+              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+              children: [
                 // Users
                 CustomIcon(
                   icon: Icons.people,
@@ -288,19 +326,6 @@ class _BottomBarState extends State<BottomBar> {
                     appController.currentIndex.value = 3;
                   },
                 ),
-                // Categories
-                CustomIcon(
-                  icon: Icons.category,
-                  backgroundColor: appController.currentIndex.value == 4
-                      ? Colors.green.shade900
-                      : Colors.grey,
-                  iconColor: appController.currentIndex.value == 4
-                      ? Colors.white
-                      : Colors.black,
-                  onTap: () {
-                    appController.currentIndex.value = 4;
-                  },
-                ),
                 // Operations Hub
                 CustomIcon(
                   icon: Icons.dashboard,
@@ -312,32 +337,6 @@ class _BottomBarState extends State<BottomBar> {
                       : Colors.black,
                   onTap: () {
                     appController.currentIndex.value = 5;
-                  },
-                ),
-                // Pricing Guide
-                CustomIcon(
-                  icon: Icons.price_change,
-                  backgroundColor: appController.currentIndex.value == 6
-                      ? Colors.green.shade900
-                      : Colors.grey,
-                  iconColor: appController.currentIndex.value == 6
-                      ? Colors.white
-                      : Colors.black,
-                  onTap: () {
-                    appController.currentIndex.value = 6;
-                  },
-                ),
-                // Analytics
-                CustomIcon(
-                  icon: Icons.analytics,
-                  backgroundColor: appController.currentIndex.value == 8
-                      ? Colors.green.shade900
-                      : Colors.grey,
-                  iconColor: appController.currentIndex.value == 8
-                      ? Colors.white
-                      : Colors.black,
-                  onTap: () {
-                    appController.currentIndex.value = 8;
                   },
                 ),
                 // RFQ with badge
@@ -419,59 +418,9 @@ class _BottomBarState extends State<BottomBar> {
                     ),
                   ],
                 ),
-                // Help Center with badge
-                Stack(
-                  clipBehavior: Clip.none,
-                  children: [
-                    CustomIcon(
-                      icon: Icons.help,
-                      backgroundColor: appController.currentIndex.value == 7
-                          ? Colors.green.shade900
-                          : Colors.grey,
-                      iconColor: appController.currentIndex.value == 7
-                          ? Colors.white
-                          : Colors.black,
-                      onTap: () {
-                        appController.currentIndex.value = 7;
-                      },
-                    ),
-                    StreamBuilder<bool>(
-                      stream: FirebaseFirestore.instance
-                          .collection('help_center')
-                          .snapshots()
-                          .map((snapshot) {
-                        for (var doc in snapshot.docs) {
-                          final data = doc.data();
-                          if ((data['unread'] ?? 0) > 0) {
-                            return true;
-                          }
-                        }
-                        return false;
-                      }),
-                      builder: (context, snapshot) {
-                        final hasUnread = snapshot.data ?? false;
-                        if (hasUnread) {
-                          return Positioned(
-                            right: -2,
-                            top: -4,
-                            child: Container(
-                              width: 10,
-                              height: 10,
-                              decoration: const BoxDecoration(
-                                color: Colors.red,
-                                shape: BoxShape.circle,
-                              ),
-                            ),
-                          );
-                        } else {
-                          return const SizedBox();
-                        }
-                      },
-                    ),
-                  ],
-                ),
+                // Spacer for FAB area
+                const SizedBox(width: 56),
               ],
-            ),
             )),
       ),
     );
