@@ -230,10 +230,11 @@ class _BottomBarState extends State<BottomBar> {
         color: Colors.white,
         shape: const CircularNotchedRectangle(),
         notchMargin: 10,
-        child: Obx(() => Padding(
-              padding: const EdgeInsets.only(right: 60),
+        child: Obx(() => SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              padding: const EdgeInsets.only(right: 72),
               child: Row(
-                mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                mainAxisSize: MainAxisSize.min,
                 children: [
                 // Users
                 CustomIcon(

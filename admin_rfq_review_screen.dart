@@ -28,6 +28,87 @@ class _AdminRFQReviewScreenState extends State<AdminRFQReviewScreen> {
   Map<String, dynamic>? aiQuote;
   bool isLoading = false;
 
+  /// Resolve the parent (main) category for a booking.
+  /// The booking's `category_name` is often a subcategory (e.g. "bathroom")
+  /// while artisans register under the parent category (e.g. "plumbing").
+  /// This method looks up the Firestore categories tree to find the parent.
+  Future<String> _resolveParentCategory(String rfqCategory) async {
+    if (rfqCategory.isEmpty) return rfqCategory;
+
+    // 1. Check if rfqCategory already IS a parent category.
+    final parentSnap = await FirebaseFirestore.instance
+        .collection('category')
+        .where('parent_id', isEqualTo: '')
+        .get();
+
+    for (final doc in parentSnap.docs) {
+      final name = (doc.data()['name'] ?? '').toString().toLowerCase().trim();
+      if (name == rfqCategory) return rfqCategory; // already a parent
+    }
+
+    // 2. rfqCategory is likely a subcategory — find which parent it belongs to.
+    final subSnap = await FirebaseFirestore.instance
+        .collection('category')
+        .where('parent_id', isNotEqualTo: '')
+        .get();
+
+    for (final doc in subSnap.docs) {
+      final name = (doc.data()['name'] ?? '').toString().toLowerCase().trim();
+      if (name == rfqCategory) {
+        final parentId = (doc.data()['parent_id'] ?? '').toString().trim();
+        if (parentId.isEmpty) continue;
+        // Lookup the parent doc
+        for (final pDoc in parentSnap.docs) {
+          final pId = (pDoc.data()['id'] ?? pDoc.id).toString().trim();
+          if (pId == parentId) {
+            final parentName = (pDoc.data()['name'] ?? '').toString().toLowerCase().trim();
+            debugPrint('[category] Resolved subcategory "$rfqCategory" → parent "$parentName"');
+            return parentName;
+          }
+        }
+      }
+    }
+
+    // 3. Also check if booking data has a serviceCategory or mainCategory hint.
+    final sc = (widget.bookingData['serviceCategory'] ??
+            widget.bookingData['service_category'] ??
+            widget.bookingData['mainCategory'] ??
+            '')
+        .toString()
+        .toLowerCase()
+        .trim();
+    if (sc.isNotEmpty && sc != rfqCategory) {
+      debugPrint('[category] Using serviceCategory from booking: "$sc"');
+      return sc;
+    }
+
+    return rfqCategory;
+  }
+
+  /// Check if an artisan matches the given category (parent or sub).
+  bool _artisanMatchesCategory(Map<String, dynamic> artisanData, String rfqCategory, String parentCategory) {
+    if (rfqCategory.isEmpty && parentCategory.isEmpty) return true;
+
+    final artisanMainCat = (artisanData['mainCategory'] ?? '').toString().toLowerCase().trim();
+    final catArray = (artisanData['category'] is List) ? (artisanData['category'] as List) : [];
+    final subCatArray = (artisanData['subCategory'] is List) ? (artisanData['subCategory'] as List) : [];
+
+    final allCats = <String>[
+      artisanMainCat,
+      ...catArray.map((c) => c.toString().toLowerCase().trim()),
+      ...subCatArray.map((c) => c.toString().toLowerCase().trim()),
+    ];
+
+    // Match against both the original subcategory name AND the resolved parent
+    if (allCats.any((c) => c == parentCategory)) return true;
+    if (allCats.any((c) => c == rfqCategory)) return true;
+    // Partial match: artisan mainCategory contains or is contained by parent
+    if (parentCategory.isNotEmpty && artisanMainCat.isNotEmpty) {
+      if (artisanMainCat.contains(parentCategory) || parentCategory.contains(artisanMainCat)) return true;
+    }
+    return false;
+  }
+
   CollectionReference<Map<String, dynamic>> get _rfqPrimary =>
       FirebaseFirestore.instance.collection('futureBookings');
   CollectionReference<Map<String, dynamic>> get _rfqLegacy =>
@@ -1561,7 +1642,9 @@ class _AdminRFQReviewScreenState extends State<AdminRFQReviewScreen> {
 
       // ── Notify category-matched active artisans AND create bridge records ──
       final rfqCategory = (widget.bookingData['category_name'] ?? '').toString().toLowerCase().trim();
-      debugPrint('[broadcast] RFQ category: "$rfqCategory"');
+      // Resolve parent category (e.g. "bathroom" → "plumbing")
+      final parentCategory = await _resolveParentCategory(rfqCategory);
+      debugPrint('[broadcast] RFQ category: "$rfqCategory" → parent: "$parentCategory"');
 
       final artisansSnap = await FirebaseFirestore.instance
           .collection('serviceProvider')
@@ -1581,26 +1664,17 @@ class _AdminRFQReviewScreenState extends State<AdminRFQReviewScreen> {
         allArtisanDocs[d.id] = d;
       }
 
-      // Filter to only artisans whose mainCategory or category array matches the RFQ category
-      if (rfqCategory.isNotEmpty) {
+      // Filter to only artisans whose category matches (check parent + sub)
+      if (rfqCategory.isNotEmpty || parentCategory.isNotEmpty) {
         allArtisanDocs.removeWhere((id, doc) {
           final data = doc.data() as Map<String, dynamic>? ?? {};
-          final artisanMainCat = (data['mainCategory'] ?? '').toString().toLowerCase().trim();
-          // Also check the category array (artisan may have multiple approved categories)
-          final catArray = (data['category'] is List) ? (data['category'] as List) : [];
-          final subCatArray = (data['subCategory'] is List) ? (data['subCategory'] as List) : [];
-          final allCats = <String>[
-            artisanMainCat,
-            ...catArray.map((c) => c.toString().toLowerCase().trim()),
-            ...subCatArray.map((c) => c.toString().toLowerCase().trim()),
-          ];
-          final match = allCats.any((c) => c == rfqCategory);
+          final match = _artisanMatchesCategory(data, rfqCategory, parentCategory);
           if (!match) {
-            debugPrint('[broadcast] Skipping artisan $id (categories: $allCats != "$rfqCategory")');
+            debugPrint('[broadcast] Skipping artisan $id (no match for "$parentCategory" / "$rfqCategory")');
           }
           return !match;
         });
-        debugPrint('[broadcast] ${allArtisanDocs.length} artisans match category "$rfqCategory"');
+        debugPrint('[broadcast] ${allArtisanDocs.length} artisans match category "$parentCategory"');
       }
 
       int notified = 0;
@@ -1701,7 +1775,9 @@ class _AdminRFQReviewScreenState extends State<AdminRFQReviewScreen> {
     setState(() => isLoading = true);
     try {
       final rfqCategory = (widget.bookingData['category_name'] ?? '').toString().toLowerCase().trim();
-      debugPrint('[assign] RFQ category: "$rfqCategory"');
+      // Resolve parent category (e.g. "bathroom" → "plumbing")
+      final parentCategory = await _resolveParentCategory(rfqCategory);
+      debugPrint('[assign] RFQ category: "$rfqCategory" → parent: "$parentCategory"');
 
       final artisansSnapshot = await FirebaseFirestore.instance
           .collection('serviceProvider')
@@ -1722,18 +1798,17 @@ class _AdminRFQReviewScreenState extends State<AdminRFQReviewScreen> {
         allDocs[d.id] = d;
       }
 
-      // Filter to category-matching artisans
+      // Filter to category-matching artisans (check parent AND subcategory)
       final matchedDocs = allDocs.values.where((doc) {
-        if (rfqCategory.isEmpty) return true;
+        if (rfqCategory.isEmpty && parentCategory.isEmpty) return true;
         final data = doc.data() as Map<String, dynamic>? ?? {};
-        final artisanCategory = (data['mainCategory'] ?? '').toString().toLowerCase().trim();
-        return artisanCategory == rfqCategory;
+        return _artisanMatchesCategory(data, rfqCategory, parentCategory);
       }).toList();
 
       setState(() => isLoading = false);
 
       if (matchedDocs.isEmpty) {
-        Get.snackbar('No Artisans', 'No active artisans found for category "$rfqCategory"',
+        Get.snackbar('No Artisans', 'No active artisans found for category "$parentCategory"',
             backgroundColor: Colors.orange, colorText: Colors.white);
         return;
       }
