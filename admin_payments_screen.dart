@@ -99,7 +99,7 @@ class PaymentsScreen extends StatelessWidget {
               OrdersSectionWidget(
                 headingText: "Orders in Progress",
                 queryField: 'status',
-                queryValue: const ['progress', 'in_progress', 'accepted', 'pending', 'pending_assignment', 'confirmed', 'pending_payment'],
+                queryValue: const ['progress', 'in_progress', 'accepted', 'pending_assignment', 'confirmed', 'pending_payment'],
                 useWhereIn: true,
                 viewColor: Colors.cyan.shade100,
                 viewBorderColor: Colors.cyan.shade900,
