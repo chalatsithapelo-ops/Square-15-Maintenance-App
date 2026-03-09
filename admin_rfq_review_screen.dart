@@ -70,18 +70,27 @@ class _AdminRFQReviewScreenState extends State<AdminRFQReviewScreen> {
     }
 
     // 3. Also check if booking data has a serviceCategory or mainCategory hint.
-    final sc = (widget.bookingData['serviceCategory'] ??
-            widget.bookingData['service_category'] ??
-            widget.bookingData['mainCategory'] ??
-            '')
-        .toString()
-        .toLowerCase()
-        .trim();
-    if (sc.isNotEmpty && sc != rfqCategory) {
-      debugPrint('[category] Using serviceCategory from booking: "$sc"');
-      return sc;
+    final fallbackKeys = [
+      'serviceCategory', 'service_category', 'mainCategory',
+      'main_category', 'category', 'sub_category_name',
+      'trade', 'service_type', 'type',
+    ];
+    for (final key in fallbackKeys) {
+      final val = (widget.bookingData[key] ?? '').toString().toLowerCase().trim();
+      if (val.isNotEmpty && val != rfqCategory) {
+        // Check if this value IS a known parent category
+        for (final pDoc in parentSnap.docs) {
+          final pName = (pDoc.data()['name'] ?? '').toString().toLowerCase().trim();
+          if (pName == val) {
+            debugPrint('[category] Resolved via booking field "$key" → "$val"');
+            return val;
+          }
+        }
+      }
     }
 
+    // 4. Last resort: return rfqCategory unchanged.
+    debugPrint('[category] Could not resolve parent for "$rfqCategory" — returning as-is');
     return rfqCategory;
   }
 
@@ -1665,6 +1674,7 @@ class _AdminRFQReviewScreenState extends State<AdminRFQReviewScreen> {
       }
 
       // Filter to only artisans whose category matches (check parent + sub)
+      final totalBefore = allArtisanDocs.length;
       if (rfqCategory.isNotEmpty || parentCategory.isNotEmpty) {
         allArtisanDocs.removeWhere((id, doc) {
           final data = doc.data() as Map<String, dynamic>? ?? {};
@@ -1675,6 +1685,17 @@ class _AdminRFQReviewScreenState extends State<AdminRFQReviewScreen> {
           return !match;
         });
         debugPrint('[broadcast] ${allArtisanDocs.length} artisans match category "$parentCategory"');
+
+        // If no artisans match the category, broadcast to ALL active artisans
+        if (allArtisanDocs.isEmpty) {
+          debugPrint('[broadcast] No category match — falling back to all $totalBefore active artisans');
+          for (final d in artisansSnap.docs) {
+            allArtisanDocs[d.id] = d;
+          }
+          for (final d in artisansSnap2.docs) {
+            allArtisanDocs[d.id] = d;
+          }
+        }
       }
 
       int notified = 0;
@@ -1799,16 +1820,25 @@ class _AdminRFQReviewScreenState extends State<AdminRFQReviewScreen> {
       }
 
       // Filter to category-matching artisans (check parent AND subcategory)
-      final matchedDocs = allDocs.values.where((doc) {
+      var matchedDocs = allDocs.values.where((doc) {
         if (rfqCategory.isEmpty && parentCategory.isEmpty) return true;
         final data = doc.data() as Map<String, dynamic>? ?? {};
         return _artisanMatchesCategory(data, rfqCategory, parentCategory);
       }).toList();
 
+      // If no artisans match the category, fall back to ALL active artisans
+      // so the admin can always manually assign.
+      String headerNote = '';
+      if (matchedDocs.isEmpty && allDocs.isNotEmpty) {
+        debugPrint('[assign] No artisans match "$parentCategory"/"$rfqCategory" — showing all ${allDocs.length} active artisans');
+        matchedDocs = allDocs.values.toList();
+        headerNote = 'No artisans matched "$rfqCategory". Showing all active artisans:';
+      }
+
       setState(() => isLoading = false);
 
       if (matchedDocs.isEmpty) {
-        Get.snackbar('No Artisans', 'No active artisans found for category "$parentCategory"',
+        Get.snackbar('No Artisans', 'No active artisans registered in the system.',
             backgroundColor: Colors.orange, colorText: Colors.white);
         return;
       }
@@ -1832,7 +1862,19 @@ class _AdminRFQReviewScreenState extends State<AdminRFQReviewScreen> {
               style: GoogleFonts.roboto(fontWeight: FontWeight.bold)),
           content: SizedBox(
             width: double.maxFinite,
-            child: ListView.builder(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (headerNote.isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 8),
+                    child: Text(headerNote,
+                        style: GoogleFonts.roboto(
+                            fontSize: 12, color: Colors.orange.shade800)),
+                  ),
+                Flexible(
+                  child: ListView.builder(
               shrinkWrap: true,
               itemCount: artisans.length,
               itemBuilder: (context, index) {
@@ -1851,6 +1893,9 @@ class _AdminRFQReviewScreenState extends State<AdminRFQReviewScreen> {
                   onTap: () => Navigator.pop(ctx, artisan),
                 );
               },
+            ),
+                ),
+              ],
             ),
           ),
           actions: [
