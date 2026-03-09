@@ -87,17 +87,45 @@ class ServiceProviderController extends GetxController {
     if (_isRinging) return;
     _isRinging = true;
     debugPrint("Play Music.......");
+    _doPlayMusic();
+  }
 
-    // Prefer remote-configured ringtone, but always fall back to bundled asset
-    // so release builds still ring even if Firebase Storage is blocked.
+  Future<void> _doPlayMusic() async {
+    // Prefer remote-configured ringtone, fall back to bundled asset.
     final url = downloadFileOfMusic.value.trim();
+
+    // 1) Try remote URL
     if (url.isNotEmpty) {
-      audioPlayer.play(UrlSource(url)).catchError((_) {
-        return audioPlayer.play(AssetSource('assets/sounds/sound.mp3'));
-      });
-      return;
+      try {
+        await audioPlayer.play(UrlSource(url));
+        debugPrint('[playMusic] UrlSource playing OK');
+        return;
+      } catch (e) {
+        debugPrint('[playMusic] UrlSource failed: $e — trying asset');
+      }
     }
-    audioPlayer.play(AssetSource('assets/sounds/sound.mp3'));
+
+    // 2) Try the bundled asset (full Flutter asset key)
+    try {
+      await audioPlayer.play(AssetSource('assets/sounds/sound.mp3'));
+      debugPrint('[playMusic] AssetSource (assets/sounds/) playing OK');
+      return;
+    } catch (e) {
+      debugPrint('[playMusic] AssetSource assets/sounds/ failed: $e');
+    }
+
+    // 3) Try without the assets/ prefix (some audioplayers versions need this)
+    try {
+      await audioPlayer.play(AssetSource('sounds/sound.mp3'));
+      debugPrint('[playMusic] AssetSource (sounds/) playing OK');
+      return;
+    } catch (e) {
+      debugPrint('[playMusic] AssetSource sounds/ failed: $e');
+    }
+
+    // 4) Last resort: try BytesSource from the raw resource
+    debugPrint('[playMusic] All audio play attempts failed — resetting _isRinging');
+    _isRinging = false;
   }
 
   void stopMusic() {
@@ -520,6 +548,9 @@ class ServiceProviderController extends GetxController {
                 ? 'You have a new request at $address. Open the app to respond.'
                 : 'You have a new maintenance request. Open the app to accept or decline.',
           );
+
+          // Also play the alarm tone for new requests
+          playMusic();
         }
       },
     );
