@@ -1670,11 +1670,10 @@ class FutureBookingService {
           : _extractAiQuoteTotal(resolvedAiQuote);
       final bool clientBuysMaterials =
           materialsResponsibility.trim().toLowerCase() == 'client';
-      final bool underAutoAssignThreshold = rfqAmount > 0 && rfqAmount < 30000;
 
-      print('[RFQ_AUTO] clientBuysMaterials=$clientBuysMaterials amount=$rfqAmount underThreshold=$underAutoAssignThreshold');
+      print('[RFQ_AUTO] clientBuysMaterials=$clientBuysMaterials amount=$rfqAmount');
 
-      if (clientBuysMaterials && underAutoAssignThreshold) {
+      if (clientBuysMaterials) {
         // Auto-assign: find up to 3 relevant artisans and publish the RFQ
         final String resolvedLat = serviceOnCurrentLocation ? userLat : otherLat;
         final String resolvedLng = serviceOnCurrentLocation ? userLng : otherLng;
@@ -1700,7 +1699,7 @@ class FutureBookingService {
             'rfq_status': 'rfq_published_to_artisans',
             'rfq_assigned_artisan_ids': assignedArtisanIds,
             'rfq_auto_assigned': true,
-            'rfq_auto_assign_reason': 'client_buys_materials_under_30k',
+            'rfq_auto_assign_reason': 'client_buys_materials',
             'rfq_artisan_rejection_count': 0,
             'rfq_artisan_rejections': [],
             'status': 'rfq_assigned',
@@ -3211,6 +3210,11 @@ class FutureBookingService {
     String? type,
     Map<String, dynamic>? data,
   }) async {
+    final effectiveTitle = (title?.trim().isNotEmpty ?? false)
+        ? title!.trim()
+        : 'Booking Reminder';
+    final effectiveType = (type ?? 'future_booking_reminder').toString();
+
     try {
       DocumentSnapshot userDoc = await userRef.doc(userId).get();
       if (!userDoc.exists) return;
@@ -3222,7 +3226,7 @@ class FutureBookingService {
 
       if (fcmToken.isNotEmpty) {
         final payload = <String, dynamic>{
-          'type': (type ?? 'future_booking_reminder').toString(),
+          'type': effectiveType,
         };
         if (data != null) {
           payload.addAll(data);
@@ -3230,15 +3234,33 @@ class FutureBookingService {
 
         await sendFCMNotification(
           token: fcmToken,
-          title: (title?.trim().isNotEmpty ?? false)
-              ? title!.trim()
-              : 'Booking Reminder',
+          title: effectiveTitle,
           body: message,
           data: payload,
         );
       }
     } catch (e) {
       debugPrint('Error sending notification to user: $e');
+    }
+
+    // Persist notification to Firestore so the in-app Notifications screen
+    // can display it (the screen queries the 'notifications' collection).
+    try {
+      await FirebaseFirestore.instance.collection('notifications').add({
+        'user_id': userId,
+        'user_type': 'user',
+        'title': effectiveTitle,
+        'message': message,
+        'body': message,
+        'type': effectiveType,
+        'read': false,
+        'view': false,
+        'created_at': DateTime.now().toString(),
+        if (data != null && data.containsKey('booking_id'))
+          'booking_id': data['booking_id'],
+      });
+    } catch (e) {
+      debugPrint('Error persisting notification doc: $e');
     }
   }
 

@@ -1594,12 +1594,18 @@ class _AdminRFQReviewScreenState extends State<AdminRFQReviewScreen> {
     final docRef =
         FirebaseFirestore.instance.collection('tasksManagement').doc();
 
+    // Use rfq_no as fallback when order_no is empty (RFQ bookings store
+    // the identifier in rfq_no, not order_no).
+    final rawOrderNo = (data['order_no'] ?? '').toString().trim();
+    final rfqNo = (data['rfq_no'] ?? '').toString().trim();
+    final effectiveOrderNo = rawOrderNo.isNotEmpty ? rawOrderNo : rfqNo;
+
     final bridgeData = <String, dynamic>{
       'service_provider_id': artisanId,
       'user_id': data['user_id'] ?? '',
       'source': 'future_booking',
       'future_booking_id': widget.bookingId,
-      'order_no': data['order_no'] ?? '',
+      'order_no': effectiveOrderNo,
       'status': 'pending',
       'accept': '',
       'artisan_confirmed': 'pending',
@@ -1624,6 +1630,18 @@ class _AdminRFQReviewScreenState extends State<AdminRFQReviewScreen> {
     await docRef.set(bridgeData);
     debugPrint(
         '[bridge] Created tasksManagement ${docRef.id} for artisan=$artisanId booking=${widget.bookingId}');
+
+    // Write bridge doc ID back to futureBookings so the client can link to it.
+    try {
+      await _writeRfqPatch({
+        'tasks_management_id': docRef.id,
+        // Also backfill order_no on the booking if it was empty.
+        if (rawOrderNo.isEmpty && effectiveOrderNo.isNotEmpty)
+          'order_no': effectiveOrderNo,
+      });
+    } catch (e) {
+      debugPrint('[bridge] Failed to write tasks_management_id back: $e');
+    }
   }
 
   Future<void> _broadcastToArtisans() async {

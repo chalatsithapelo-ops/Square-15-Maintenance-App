@@ -348,6 +348,8 @@ class ServiceProviderController extends GetxController {
             'artisan_confirmed': 'yes',
             // Once the artisan accepts, the next step is client payment.
             'status': 'pending_payment',
+            'tasks_management_id': id,
+            'service_provider_id': from,
             'updated_at': DateTime.now().toString(),
           });
 
