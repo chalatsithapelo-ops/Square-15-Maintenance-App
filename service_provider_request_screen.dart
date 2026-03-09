@@ -28,15 +28,29 @@ class ServiceProviderRequestScreen extends StatefulWidget {
 
 class _ServiceProviderRequestScreenState
     extends State<ServiceProviderRequestScreen> {
-  late TextEditingController notesController;
+  /// Per-order notes controllers keyed by tasksManagement doc id.
+  /// This prevents notes typed for one order from appearing in all orders.
+  final Map<String, TextEditingController> _notesControllers = {};
   final ServiceProviderController serviceProviderController = Get.find();
   String userName = "";
   int _requestTab = 0; // 0 = New Requests, 1 = Closed Requests
 
+  TextEditingController _notesFor(String orderId) {
+    return _notesControllers.putIfAbsent(orderId, () => TextEditingController());
+  }
+
   @override
   void initState() {
     super.initState();
-    notesController = TextEditingController();
+  }
+
+  @override
+  void dispose() {
+    for (final c in _notesControllers.values) {
+      c.dispose();
+    }
+    _notesControllers.clear();
+    super.dispose();
   }
 
   @override
@@ -1037,7 +1051,7 @@ class _ServiceProviderRequestScreenState
                                                           color: Colors.white,
                                                           child: TextField(
                                                             controller:
-                                                                notesController,
+                                                                _notesFor(data.id ?? 'unknown_$index'),
                                                             cursorColor:
                                                                 Colors.black,
                                                             style: GoogleFonts
@@ -1121,7 +1135,7 @@ class _ServiceProviderRequestScreenState
                                                     .currentRequest
                                                     .value = index.toString();
                                                 if (artisanImagesNorm == '0') {
-                                                  if (notesController.text ==
+                                                  if (_notesFor(data.id ?? 'unknown_$index').text ==
                                                       "") {
                                                     EasyLoading.showError(
                                                         'Add Notes First');
@@ -1175,7 +1189,7 @@ class _ServiceProviderRequestScreenState
                                                     .currentRequest
                                                     .value = index.toString();
                                                 if (artisanImagesNorm == '1') {
-                                                  if (notesController.text ==
+                                                  if (_notesFor(data.id ?? 'unknown_$index').text ==
                                                       "") {
                                                     EasyLoading.showError(
                                                         'Add Notes First');
@@ -1285,8 +1299,9 @@ class _ServiceProviderRequestScreenState
                                               final taskId = (data.id ?? '')
                                                   .toString()
                                                   .trim();
+                                              final notesCtrl = _notesFor(data.id ?? 'unknown_$index');
                                               final notes =
-                                                  notesController.text.trim();
+                                                  notesCtrl.text.trim();
 
                                               if (to.isEmpty ||
                                                   taskId.isEmpty) {
@@ -1322,7 +1337,7 @@ class _ServiceProviderRequestScreenState
                                                   taskId: taskId,
                                                   notes: notes,
                                                 );
-                                                notesController.clear();
+                                                notesCtrl.clear();
                                                 serviceProviderController
                                                     .showNotedField
                                                     .value = false;
