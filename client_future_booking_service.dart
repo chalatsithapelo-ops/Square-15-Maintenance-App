@@ -3210,11 +3210,6 @@ class FutureBookingService {
     String? type,
     Map<String, dynamic>? data,
   }) async {
-    final effectiveTitle = (title?.trim().isNotEmpty ?? false)
-        ? title!.trim()
-        : 'Booking Reminder';
-    final effectiveType = (type ?? 'future_booking_reminder').toString();
-
     try {
       DocumentSnapshot userDoc = await userRef.doc(userId).get();
       if (!userDoc.exists) return;
@@ -3226,7 +3221,7 @@ class FutureBookingService {
 
       if (fcmToken.isNotEmpty) {
         final payload = <String, dynamic>{
-          'type': effectiveType,
+          'type': (type ?? 'future_booking_reminder').toString(),
         };
         if (data != null) {
           payload.addAll(data);
@@ -3234,33 +3229,15 @@ class FutureBookingService {
 
         await sendFCMNotification(
           token: fcmToken,
-          title: effectiveTitle,
+          title: (title?.trim().isNotEmpty ?? false)
+              ? title!.trim()
+              : 'Booking Reminder',
           body: message,
           data: payload,
         );
       }
     } catch (e) {
       debugPrint('Error sending notification to user: $e');
-    }
-
-    // Persist notification to Firestore so the in-app Notifications screen
-    // can display it (the screen queries the 'notifications' collection).
-    try {
-      await FirebaseFirestore.instance.collection('notifications').add({
-        'user_id': userId,
-        'user_type': 'user',
-        'title': effectiveTitle,
-        'message': message,
-        'body': message,
-        'type': effectiveType,
-        'read': false,
-        'view': false,
-        'created_at': DateTime.now().toString(),
-        if (data != null && data.containsKey('booking_id'))
-          'booking_id': data['booking_id'],
-      });
-    } catch (e) {
-      debugPrint('Error persisting notification doc: $e');
     }
   }
 

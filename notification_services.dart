@@ -267,9 +267,16 @@ class NotificationService {
     'order_request',
     'rfq_broadcast',
     'rfq_assignment',
+    'rfq_amended',
+    'rfq_assigned',
+    'rfq_updated',
     'future_booking',
     'booking_request',
     'new_booking',
+    'wallet_topup',
+    'wallet_credit',
+    'chat_message',
+    'case_reply',
   };
 
   static void displayNotification(context,

@@ -4,14 +4,22 @@ import 'package:flutter/material.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 
 /// Notification types that should use the loud order-request sound.
+/// MUST stay in sync with NotificationService._orderRequestTypes.
 const _orderRequestTypes = {
   'Order Request',
   'order_request',
   'rfq_broadcast',
   'rfq_assignment',
+  'rfq_amended',
+  'rfq_assigned',
+  'rfq_updated',
   'future_booking',
   'booking_request',
   'new_booking',
+  'wallet_topup',
+  'wallet_credit',
+  'chat_message',
+  'case_reply',
 };
 
 Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {

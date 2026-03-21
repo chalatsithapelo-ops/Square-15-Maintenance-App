@@ -568,13 +568,30 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
   const bookingId = normalizeBookingId(payload);
   const now = nowIso();
 
-  const bookingRef = bookingId ? firestore.collection('futureBookings').doc(bookingId) : null;
+  let bookingRef = bookingId ? firestore.collection('futureBookings').doc(bookingId) : null;
 
   async function loadBooking() {
     if (!bookingRef) return null;
     const snap = await bookingRef.get();
-    if (!snap.exists) return null;
-    return snap.data() || {};
+    if (snap.exists) return snap.data() || {};
+
+    // Fallback: try to find booking by order_no or rfq_no (user may provide short ID like "0519B50E")
+    if (bookingId) {
+      const candidates = [bookingId, `ORD-${bookingId}`, `RFQ-${bookingId}`, bookingId.toUpperCase()];
+      for (const candidate of candidates) {
+        for (const field of ['order_no', 'rfq_no']) {
+          try {
+            const q = await firestore.collection('futureBookings')
+              .where(field, '==', candidate).limit(1).get();
+            if (!q.empty) {
+              bookingRef = q.docs[0].ref;
+              return q.docs[0].data() || {};
+            }
+          } catch (_) { /* ignore */ }
+        }
+      }
+    }
+    return null;
   }
 
   // Helpers mirrored from app-side logic.
@@ -593,6 +610,57 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     return trimmed.length <= safeLen ? trimmed.toUpperCase() : trimmed.slice(0, safeLen).toUpperCase();
   }
 
+  // Format a Date as DD/MM/YYYY.
+  function _todayDateStr(d) {
+    d = d || new Date();
+    const dd = String(d.getDate()).padStart(2, '0');
+    const mm = String(d.getMonth() + 1).padStart(2, '0');
+    const yyyy = d.getFullYear();
+    return `${dd}/${mm}/${yyyy}`;
+  }
+
+  // Allocate a sequential daily counter for a given prefix (RFQ or ORD).
+  async function _nextDailySeq(prefix) {
+    const dateKey = _todayDateStr().replace(/\//g, '-'); // e.g. "06-03-2026"
+    const counterRef = firestore.collection('metadata').doc('counters');
+    let seq = 1;
+    try {
+      await firestore.runTransaction(async (tx) => {
+        const snap = await tx.get(counterRef);
+        let current = 0;
+        if (snap.exists) {
+          const data = snap.data() || {};
+          const daily = data.dailyCounters || {};
+          const prefixMap = daily[prefix] || {};
+          if (prefixMap[dateKey] != null) {
+            const raw = prefixMap[dateKey];
+            current = typeof raw === 'number' ? raw : (parseInt(raw, 10) || 0);
+          }
+        }
+        seq = current + 1;
+        tx.set(counterRef, {
+          dailyCounters: { [prefix]: { [dateKey]: seq } }
+        }, { merge: true });
+      });
+    } catch (_) {
+      seq = Date.now() % 1000 + 1;
+    }
+    return seq;
+  }
+
+  // Generate date-based RFQ number: RFQ-DD/MM/YYYY-NN
+  async function generateDateBasedRfqNo() {
+    const seq = await _nextDailySeq('RFQ');
+    return `RFQ-${_todayDateStr()}-${String(seq).padStart(2, '0')}`;
+  }
+
+  // Generate date-based Order number: ORD-DD/MM/YYYY-NN
+  async function generateDateBasedOrderNo() {
+    const seq = await _nextDailySeq('ORD');
+    return `ORD-${_todayDateStr()}-${String(seq).padStart(2, '0')}`;
+  }
+
+  // Legacy sync functions (kept as fallbacks)
   function generateOrderNo(id) {
     const s = shortId(id);
     return s ? `ORD-${s}` : '';
@@ -993,7 +1061,8 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
   }
 
   async function writeAdminNotification({ title, message, data }) {
-    return await _writeNotificationImpl({
+    // Write notification doc for admin UI
+    await _writeNotificationImpl({
       userId: 'admin',
       userType: 'admin',
       title,
@@ -1001,6 +1070,38 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       data,
       sendPush: false,
     });
+
+    // Also send FCM push to admin devices (enabled by default).
+    {
+      try {
+        const adminSnap = await firestore.collection('users')
+          .where('isAdmin', '==', true)
+          .limit(10)
+          .get();
+        const tokens = [];
+        const seen = new Set();
+        for (const doc of adminSnap.docs) {
+          for (const t of collectTokensFromDocData(doc.data() || {})) {
+            if (!seen.has(t)) { seen.add(t); tokens.push(t); }
+          }
+        }
+        if (tokens.length > 0) {
+          await sendPushToTokens({
+            tokens,
+            title: String(title || '').trim(),
+            body: String(message || '').trim(),
+            data: {
+              type: (data && data.type) ? String(data.type) : 'admin_notification',
+              ...(data && typeof data === 'object' ? Object.fromEntries(
+                Object.entries(data).filter(([k]) => k !== 'type').map(([k, v]) => [String(k), String(v ?? '')])
+              ) : {}),
+            },
+          });
+        }
+      } catch (e) {
+        console.warn('writeAdminNotification push error (ignored):', e.message || e);
+      }
+    }
   }
 
   function collectTokensFromDocData(docData) {
@@ -1055,7 +1156,10 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       const notifType = (data && data.type) ? String(data.type) : '';
       const ORDER_REQUEST_SET = new Set([
         'Order Request', 'order_request', 'rfq_broadcast', 'rfq_assignment',
+        'rfq_amended', 'rfq_assigned', 'rfq_updated',
         'future_booking', 'booking_request', 'new_booking',
+        'wallet_topup', 'wallet_credit',
+        'chat_message', 'case_reply',
       ]);
       const cId = ORDER_REQUEST_SET.has(notifType)
         ? 'order_request_channel'
@@ -1123,15 +1227,30 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         data: payloadData,
       });
 
-      // Optional FCM push for client users (artisans are pushed via provider doc helper).
-      if (sendPush && isEnvTruthy('ENABLE_FCM_PUSH') && utype === 'user') {
-        const tokens = await getUserTokens(uid);
+      // FCM push for client users and artisans (enabled by default when Firebase is configured).
+      if (sendPush && (utype === 'user' || utype === 'artisan')) {
+        const tokens = utype === 'user' ? await getUserTokens(uid) : [];
+        // For artisans, also try serviceProvider collection tokens.
+        if (utype === 'artisan') {
+          try {
+            const spSnap = await firestore.collection('serviceProvider').doc(uid).get();
+            if (spSnap.exists) {
+              for (const t of collectTokensFromDocData(spSnap.data() || {})) {
+                if (!tokens.includes(t)) tokens.push(t);
+              }
+            }
+          } catch (_) { /* ignore */ }
+          // Also try user doc tokens for artisans (they may also have a users doc)
+          for (const t of await getUserTokens(uid)) {
+            if (!tokens.includes(t)) tokens.push(t);
+          }
+        }
         const push = await sendPushToTokens({
           tokens,
           title: String(title || '').trim(),
           body: String(message || '').trim(),
           data: {
-            type: 'square15',
+            type: notifType || 'square15',
             notification_id: ref.id,
             user_type: utype,
             booking_id: payloadData.booking_id || payloadData.bookingId || '',
@@ -1186,8 +1305,8 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       service_provider_user_id: String(pd.user_id || '').trim() || null,
     };
 
-    // Optional: single FCM push using tokens from provider doc + primary user doc.
-    if (isEnvTruthy('ENABLE_FCM_PUSH')) {
+    // FCM push using tokens from provider doc + primary user doc (enabled by default).
+    {
       const tokens = [];
       const seen = new Set();
       for (const t of collectTokensFromDocData(pd)) {
@@ -1209,9 +1328,10 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         title: String(title || '').trim(),
         body: String(message || '').trim(),
         data: {
-          type: 'square15',
+          type: (data && data.type) ? String(data.type) : 'square15',
           user_type: 'artisan',
           booking_id: payloadData.booking_id || payloadData.bookingId || '',
+          tasks_management_id: payloadData.tasks_management_id || '',
           provider_doc_id: providerDocId || '',
           provider_uid: primaryUid || '',
         },
@@ -1307,7 +1427,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       }
     }
 
-    const resolvedOrderNo = hasNumericOrderNo ? bookingOrderNoRaw : orderSeq != null ? String(orderSeq) : generateOrderNo(bookingIdLocal);
+    const resolvedOrderNo = hasNumericOrderNo ? bookingOrderNoRaw : orderSeq != null ? String(orderSeq) : await generateDateBasedOrderNo();
 
     // Resolve costs best-effort.
     const resolvedTaskCosts = {};
@@ -1732,7 +1852,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       has_photos: workImages.length > 0 ? 'yes' : 'no',
 
       order_no: '',
-      rfq_no: isRFQFlag ? generateRfqNo(bookingIdLocal) : '',
+      rfq_no: isRFQFlag ? await generateDateBasedRfqNo() : '',
 
       client_name: clientName,
       client_phone: clientPhone,
@@ -1916,8 +2036,19 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       message: smMessage,
       timestamp: now,
       read: false,
+      isRead: false,
       created_at: now,
     });
+
+    // Update unread count on the tasksManagement doc for badge display
+    try {
+      await firestore.collection('tasksManagement').doc(smTmId).set({
+        unread_artisan: admin.firestore.FieldValue.increment(1),
+        last_message: smMessage.substring(0, 100),
+        last_message_at: now,
+        last_message_by: 'client',
+      }, { merge: true });
+    } catch (_) { /* best-effort */ }
 
     try {
       const providerDoc = await getServiceProviderDocByAnyId(smArtisanId);
@@ -1965,8 +2096,19 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       message: scMessage,
       timestamp: now,
       read: false,
+      isRead: false,
       created_at: now,
     });
+
+    // Update unread count on the tasksManagement doc for badge display
+    try {
+      await firestore.collection('tasksManagement').doc(scTmId).set({
+        unread_client: admin.firestore.FieldValue.increment(1),
+        last_message: scMessage.substring(0, 100),
+        last_message_at: now,
+        last_message_by: 'artisan',
+      }, { merge: true });
+    } catch (_) { /* best-effort */ }
 
     try {
       await writePersonalNotification({
@@ -2562,7 +2704,8 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         rfq_status: String(b.rfq_status || '').trim(),
         order_type: String(b.is_rfq || '').toLowerCase() === 'yes' ? 'rfq' : 'order',
         rfq_no: String(b.rfq_no || '').trim(),
-        order_number: String(b.order_number || '').trim(),
+        order_no: String(b.order_no || '').trim(),
+        order_number: String(b.order_no || b.order_number || '').trim(),
         category_name: String(b.category_name || '').trim(),
         problem_description: String(b.problem_description || '').trim(),
         scheduled_date: String(b.scheduled_date || '').trim(),
@@ -2755,7 +2898,8 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         service_provider_id: artisanId,
         artisan: artisanInfo,
         tasks_management_id: String(data.tasks_management_id || '').trim(),
-        order_number: String(data.order_number || '').trim(),
+        order_no: String(data.order_no || '').trim(),
+        order_number: String(data.order_no || data.order_number || '').trim(),
         rfq_no: String(data.rfq_no || '').trim(),
         rfq_status: String(data.rfq_status || '').trim(),
         order_type: String(data.is_rfq || '').toLowerCase() === 'yes' ? 'rfq' : 'order',
@@ -3477,9 +3621,7 @@ app.get('/health', (req, res) => {
 
 // ── Public pricing test endpoint (dev only) ──
 app.get('/api/test-pricing', async (req, res) => {
-  if (process.env.NODE_ENV === 'production') {
-    return res.status(404).json({ error: 'Not found' });
-  }
+  // Public pricing endpoint — used by voice agent for service/pricing lookups.
   try {
     const firestore = (() => { initFirebaseIfPossible(); if (firebaseInitError) return null; return admin.firestore(); })();
     if (!firestore) return res.status(500).json({ error: 'firebase_not_configured' });
@@ -4803,7 +4945,10 @@ app.post('/api/notifications/send', verifyFirebaseAuth, assistantLimiter, async 
     const notifType = (data && data.type) ? String(data.type) : (type || '');
     const ORDER_REQUEST_TYPES = new Set([
       'Order Request', 'order_request', 'rfq_broadcast', 'rfq_assignment',
+      'rfq_amended', 'rfq_assigned', 'rfq_updated',
       'future_booking', 'booking_request', 'new_booking',
+      'wallet_topup', 'wallet_credit',
+      'chat_message', 'case_reply',
     ]);
     const channelId = ORDER_REQUEST_TYPES.has(notifType)
       ? 'order_request_channel'

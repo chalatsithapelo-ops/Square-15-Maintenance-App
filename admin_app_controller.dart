@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
 import 'package:admain_maintence_app/model/push_notification_model.dart';
 import 'package:admain_maintence_app/model/request_model.dart';
@@ -134,6 +133,9 @@ class AppController extends GetxController {
       'updated_at': now,
     });
 
+    // Resolve user name for traceability
+    final userName = (userData['name'] ?? userData['displayName'] ?? userData['full_name'] ?? '').toString().trim();
+
     final txId = const Uuid().v4();
     batch.set(transactionLogRef.doc(txId), {
       'id': txId,
@@ -148,7 +150,10 @@ class AppController extends GetxController {
       'profit': '0.00',
       'schema_version': 2,
       'user_id': targetUserId,
+      'user_name': userName,
       'request_id': effectiveRequestId,
+      'balance_after': newBalance.toStringAsFixed(2),
+      'previous_balance': currentBalance.toStringAsFixed(2),
     });
 
     await batch.commit();
@@ -164,12 +169,12 @@ class AppController extends GetxController {
           imageUrl: '',
           time: now,
           title: notifTitle,
-          type: 'Wallet Top-up',
+          type: 'wallet_topup',
           view: false,
         );
         final notifMessage = <String, Object>{
           'notification': {'title': notifTitle, 'body': notifBody},
-          'data': {'image': '', 'type': 'Wallet Top-up'},
+          'data': {'image': '', 'type': 'wallet_topup'},
           'to': userToken,
         };
         await pushCustomNotification(notificationModel: notifModel, message: notifMessage);
@@ -444,12 +449,13 @@ class AppController extends GetxController {
 
   Future<void> changeStatusOfCategory({required String categoryId, required String status}) async {
     try{
-      // debugPrint(status.toString());
+      // Cycle: publish → coming_soon → draft → publish
       var updateStatus = "";
       if(status == "publish"){
+        updateStatus = "coming_soon";
+      } else if (status == "coming_soon") {
         updateStatus = "draft";
-      }
-      else{
+      } else {
         updateStatus = "publish";
       }
       categoriesRef.doc(categoryId).update({"status": updateStatus});

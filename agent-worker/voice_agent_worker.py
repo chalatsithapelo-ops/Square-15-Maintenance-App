@@ -436,6 +436,20 @@ async def entrypoint(ctx: JobContext):
 
         base = (
             f"You are Lizzy, the Square 15 Voice AI Assistant, speaking to a {role.upper()} user.\n\n"
+            "PERSONALITY & CONVERSATION (VERY IMPORTANT):\n"
+            "- Be warm, friendly, and approachable. You have a South African personality.\n"
+            "- You MUST engage in small talk and casual conversation! You are a friendly assistant, NOT a robot.\n"
+            "- When the user greets you or makes casual conversation (e.g. 'how are you?', 'what's up?', 'hi Lizzy'), "
+            "respond naturally and warmly FIRST, then offer to help. For example:\n"
+            "  User: 'How are you?' → 'I'm doing great, thanks for asking! How about you? What can I help you with today?'\n"
+            "  User: 'Hi Lizzy' → 'Hey there! Great to hear from you. How can I help you today?'\n"
+            "  User: 'What's up?' → 'Not much, just here waiting to help you out! What do you need?'\n"
+            "  User: 'Good morning' → 'Good morning! Hope you're having a lovely day. What can I do for you?'\n"
+            "- You CAN chat about greetings, weather, jokes, how the user is doing, sports, or general questions.\n"
+            "- NEVER respond to a greeting with only 'I am here to assist you'. That sounds robotic. Be human and warm.\n"
+            "- Keep casual responses short (1-2 sentences). Be fun but professional.\n"
+            "- Always be ready to help with app tasks when asked.\n"
+            "\n"
             "RULES:\n"
             "- Greet once, then just help. Never repeat your introduction.\n"
             "- When user asks to DO something, CALL the right tool immediately. Do NOT describe what you would do — just do it.\n"
@@ -479,15 +493,19 @@ async def entrypoint(ctx: JobContext):
             "- If they want to follow up, use reply_to_case with the case_id.\n"
             "\n"
             "BOOKING MANAGEMENT (CRITICAL — USE DEDICATED TOOLS, NOT ui_navigate):\n"
-            "- When user asks to cancel, reschedule, check status, or do anything with a booking:\n"
-            "  1. If they don't give a booking ID, call list_my_bookings() first to find it.\n"
-            "  2. Then CALL the specific BACKEND tool — these EXECUTE the action:\n"
+            "- RFQ numbers use the format RFQ-DD/MM/YYYY-NN (e.g. RFQ-06/03/2026-01). Order numbers use ORD-DD/MM/YYYY-NN.\n"
+            "- When user asks about a booking or RFQ:\n"
+            "  1. ALWAYS call list_my_bookings() first to get the actual list of bookings with their correct IDs, RFQ numbers and order numbers.\n"
+            "  2. Match what the user says to the returned results. Never say you don't see a booking without calling list_my_bookings() first.\n"
+            "  3. If the user reads out an RFQ number or order number, match it against rfq_no and order_no fields from list_my_bookings() results.\n"
+            "  4. Then CALL the specific BACKEND tool — these EXECUTE the action:\n"
             "- Cancel: cancel_booking(booking_id, reason) — actually cancels the booking on the server\n"
             "- Reschedule: reschedule_booking(booking_id, scheduled_date, scheduled_time) — actually reschedules on the server\n"
             "- Check status: get_booking_status(booking_id)\n"
             "- Call artisan: ui_navigate(action='call_assigned_artisan', booking_id=...)\n"
             "- Send message to artisan: send_message_to_artisan(booking_id, message) — actually sends the message\n"
             "- IMPORTANT: NEVER use ui_navigate for cancel, reschedule, or messaging. Those only open screens. Use the dedicated tools to execute the action.\n"
+            "- NEVER say 'I cannot see' or 'I have a challenge seeing' RFQs or bookings. ALWAYS call list_my_bookings() or get_current_screen() to find them.\n"
             "\n"
             "PRICING ENQUIRIES (CRITICAL — MUST USE TOOL):\n"
             "- When user asks how much a service costs, MUST call lookup_service_pricing. Do NOT answer without calling this tool.\n"
@@ -538,6 +556,7 @@ async def entrypoint(ctx: JobContext):
                 "\nCLIENT ACTIONS:\n"
                 "- Create booking: collect category + problem, then call ui_navigate(action='create_order_booking') with category_name and problem_description. The app handles pricing, RFQ creation, and artisan dispatch automatically.\n"
                 "- Cancel: cancel_booking(booking_id, reason). Reschedule: reschedule_booking(booking_id, date, time).\n"
+                "- Pay for booking: ui_navigate(action='pay_for_booking', booking_id=...) — opens the payment screen so user can pay.\n"
                 "- Call artisan → ui_navigate(action='call_assigned_artisan', booking_id)\n"
                 "- Future bookings → ui_navigate(action='open_future_bookings')\n"
             )
@@ -551,7 +570,7 @@ async def entrypoint(ctx: JobContext):
             "Supported actions: create_order_booking, dispatch_artisan, "
             "open_bookings_tab, open_future_bookings, open_artisan_requests, open_artisan_appointments, "
             "open_artisan_wallet, accept_latest_request, reject_latest_request, respond_to_request, "
-            "call_assigned_artisan, "
+            "call_assigned_artisan, pay_for_booking, "
             "open_notifications, open_profile, open_settings, open_support, open_wallet, "
             "open_calendar, open_help, go_home, go_back, close_window, close_dialog, dismiss. "
             "DO NOT use for cancel_booking, reschedule_booking, send_message_to_artisan, "
@@ -728,11 +747,28 @@ async def entrypoint(ctx: JobContext):
         """Get booking status from backend API."""
         nonlocal backend_client, app_context_bookings
         logger.info(f"📋 get_booking_status called: booking_id={booking_id}, backend_client={'SET' if backend_client else 'NONE'}, app_bookings={len(app_context_bookings)}")
+
+        # If user gave an RFQ number or order number, try to find the booking_id first
+        clean_id = booking_id.strip()
+        if app_context_bookings and (clean_id.upper().startswith('RFQ') or clean_id.upper().startswith('ORD')):
+            for b in app_context_bookings:
+                rfq = (b.get('rfq_no') or '').strip()
+                ono = (b.get('order_no') or '').strip()
+                if rfq and clean_id.upper() in rfq.upper():
+                    clean_id = b.get('booking_id', clean_id)
+                    logger.info(f"📋 Resolved RFQ {booking_id} → booking {clean_id}")
+                    break
+                if ono and clean_id.upper() in ono.upper():
+                    clean_id = b.get('booking_id', clean_id)
+                    logger.info(f"📋 Resolved order {booking_id} → booking {clean_id}")
+                    break
+
         if not backend_client:
             # Fallback: check app context bookings if available
             if app_context_bookings:
                 for b in app_context_bookings:
-                    if b.get('booking_id') == booking_id:
+                    bid = b.get('booking_id', '')
+                    if bid == clean_id or bid == booking_id:
                         status = b.get('status', 'unknown')
                         category = b.get('category', 'service')
                         artisan_name = b.get('artisan_name', '')
@@ -757,7 +793,7 @@ async def entrypoint(ctx: JobContext):
                 return _CONNECTION_RETRY_MSG
 
         try:
-            result = await backend_client.get_booking_status(booking_id)
+            result = await backend_client.get_booking_status(clean_id)
             if not result.get('ok') and not result.get('success'):
                 error = result.get('error', 'unknown_error')
                 if error == 'booking_not_found':
@@ -843,11 +879,20 @@ async def entrypoint(ctx: JobContext):
                     date = b.get('scheduled_date', '')
                     time = b.get('scheduled_time', '')
                     price = b.get('price', '')
+                    rfq_no = b.get('rfq_no', '')
+                    order_no = b.get('order_no', '')
+                    rfq_status = b.get('rfq_status', '')
                     response += f"{i}. {category} booking {bid}: {bstatus}"
                     if artisan:
                         response += f", artisan: {artisan}"
                     if price:
                         response += f", price R{price}"
+                    if rfq_no:
+                        response += f", RFQ #{rfq_no}"
+                    if order_no:
+                        response += f", order #{order_no}"
+                    if rfq_status:
+                        response += f", RFQ status: {rfq_status}"
                     if date and time:
                         response += f", scheduled {date} at {time}"
                     elif date:
@@ -883,7 +928,7 @@ async def entrypoint(ctx: JobContext):
                 time = booking.get('scheduled_time', '')
                 price = booking.get('total_price', '')
                 rfq_no = booking.get('rfq_no', '')
-                order_no = booking.get('order_number', '')
+                order_no = booking.get('order_no', '') or booking.get('order_number', '')
                 order_type = booking.get('order_type', '')
                 rfq_status = booking.get('rfq_status', '')
                 response += f"{i}. {category} booking {booking_id}: {booking_status}"
@@ -1543,8 +1588,9 @@ async def entrypoint(ctx: JobContext):
 
     @llm.function_tool(
         description=(
-            "Cancel a booking. Requires: booking_id and reason for cancellation. "
-            "Use this when user asks to cancel a booking."
+            "Cancel a booking or RFQ. Requires: booking_id (can be a booking ID, order number, or RFQ number). "
+            "The backend will search by order_no and rfq_no if direct ID lookup fails. "
+            "Use this when user asks to cancel a booking or RFQ."
         )
     )
     async def cancel_booking(booking_id: str, reason: str = "") -> str:
@@ -1555,13 +1601,27 @@ async def entrypoint(ctx: JobContext):
                 return _CONNECTION_RETRY_MSG
 
         try:
-            payload = {'booking_id': booking_id, 'reason': reason or 'User requested cancellation'}
+            # Clean the booking_id — remove common prefixes users might say
+            clean_id = booking_id.strip()
+            for prefix in ['RFQ-', 'RFQ ', 'ORD-', 'ORD ', 'rfq-', 'rfq ', 'ord-', 'ord ']:
+                if clean_id.startswith(prefix):
+                    clean_id = clean_id[len(prefix):]
+                    break
+            clean_id = clean_id.strip()
+
+            payload = {'booking_id': clean_id, 'reason': reason or 'User requested cancellation'}
             result = await backend_client.call_backend_action('cancel_booking', payload)
 
             if not result.get('ok') and not result.get('success'):
                 error = result.get('error', 'unknown_error')
                 if error == 'booking_not_found':
-                    return f"I couldn't find booking {booking_id}."
+                    # Try with original ID if cleaned version failed
+                    if clean_id != booking_id.strip():
+                        payload['booking_id'] = booking_id.strip()
+                        result = await backend_client.call_backend_action('cancel_booking', payload)
+                        if result.get('ok') or result.get('success'):
+                            return f"Booking {booking_id} has been cancelled successfully."
+                    return f"I couldn't find booking {booking_id}. Please check the booking ID and try again."
                 return f"I couldn't cancel the booking: {error}"
 
             return f"Booking {booking_id} has been cancelled successfully."
@@ -1927,9 +1987,31 @@ async def entrypoint(ctx: JobContext):
         if screen_desc:
             response += f" {screen_desc}"
         if screen_data:
-            for key, val in screen_data.items():
-                readable_key = key.replace('_', ' ')
-                response += f" {readable_key}: {val}."
+            # Handle bookings list specially — show order/RFQ numbers
+            bookings_list = screen_data.get('bookings', [])
+            if bookings_list:
+                response += f" I can see {len(bookings_list)} booking{'s' if len(bookings_list) > 1 else ''}:"
+                for b in bookings_list[:6]:
+                    cat = b.get('category', 'service')
+                    status = b.get('status', 'unknown')
+                    rfq_no = b.get('rfq_no', '')
+                    order_no = b.get('order_no', '')
+                    price = b.get('price', '')
+                    label = f" • {cat} ({status})"
+                    if rfq_no:
+                        label += f" RFQ #{rfq_no}"
+                    elif order_no:
+                        label += f" order #{order_no}"
+                    if price:
+                        label += f" — {price} rand"
+                    response += label
+                response += "."
+            else:
+                for key, val in screen_data.items():
+                    if key == 'bookings':
+                        continue
+                    readable_key = key.replace('_', ' ')
+                    response += f" {readable_key}: {val}."
         if actions:
             action_names = [a.replace('_', ' ') for a in actions[:8]]  # Top 8 for voice
             response += f" Available actions: {', '.join(action_names)}."
@@ -1977,12 +2059,42 @@ async def entrypoint(ctx: JobContext):
                 parts.append("Would you like to create a new booking, check your wallet, or look at service pricing?")
 
         elif 'booking' in r or 'future' in r:
-            if app_context_bookings:
-                parts.append(f"I can see {len(app_context_bookings)} booking{'s' if len(app_context_bookings) > 1 else ''}.")
-                for b in app_context_bookings[:3]:
+            # Show bookings from screen_data first (includes order numbers)
+            screen_bookings = screen_data.get('bookings', [])
+            if screen_bookings:
+                parts.append(f"I can see {len(screen_bookings)} booking{'s' if len(screen_bookings) > 1 else ''} on your screen.")
+                for b in screen_bookings[:5]:
                     cat = b.get('category', 'service')
                     status = b.get('status', 'unknown')
-                    parts.append(f"• {cat}: {status}")
+                    rfq_no = b.get('rfq_no', '')
+                    order_no = b.get('order_no', '')
+                    rfq_status = b.get('rfq_status', '')
+                    price = b.get('price', '')
+                    is_rfq = b.get('is_rfq', False)
+                    label = f"• {cat}: {status}"
+                    if rfq_no:
+                        label += f", RFQ #{rfq_no}"
+                    elif order_no:
+                        label += f", order #{order_no}"
+                    if rfq_status:
+                        label += f" ({rfq_status})"
+                    if price:
+                        label += f", {price} rand"
+                    parts.append(label)
+                parts.append("Tell me which booking you'd like to manage — I can cancel, reschedule, check status, or contact the artisan.")
+            elif app_context_bookings:
+                parts.append(f"I can see {len(app_context_bookings)} booking{'s' if len(app_context_bookings) > 1 else ''}.")
+                for b in app_context_bookings[:5]:
+                    cat = b.get('category', 'service')
+                    status = b.get('status', 'unknown')
+                    rfq_no = b.get('rfq_no', '')
+                    order_no = b.get('order_no', '')
+                    label = f"• {cat}: {status}"
+                    if rfq_no:
+                        label += f", RFQ #{rfq_no}"
+                    elif order_no:
+                        label += f", order #{order_no}"
+                    parts.append(label)
                 parts.append("Would you like to check a specific booking, reschedule, cancel, or contact the artisan?")
             else:
                 parts.append("I can help you manage your bookings from here. Would you like to check a booking status or create a new one?")
