@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
 const { AccessToken, AgentDispatchClient } = require('livekit-server-sdk');
 const admin = require('firebase-admin');
 const crypto = require('crypto');
@@ -98,6 +99,12 @@ const corsOrigins = corsOriginsRaw
   ? corsOriginsRaw.split(',').map((s) => s.trim()).filter(Boolean)
   : '*';
 const corsOriginOption = corsOrigins === '*' ? true : corsOrigins;
+
+// Security headers
+app.use(helmet({
+  contentSecurityPolicy: false, // API server, no HTML
+  crossOriginEmbedderPolicy: false,
+}));
 
 // Middleware
 app.use(cors({
@@ -304,6 +311,9 @@ async function verifyFirebaseAppCheck(req, res, { required = false } = {}) {
 }
 
 async function resolveRole({ firestore, uid, decodedToken }) {
+  // SECURITY: Only trust Firebase custom claims for admin role.
+  // Firestore fallback is allowed for 'artisan' and 'client' but NOT 'admin'
+  // to prevent privilege escalation via self-editable Firestore documents.
   const fromClaims =
     (decodedToken && (decodedToken.role || decodedToken.user_role || decodedToken.user_type)) ||
     '';
@@ -314,6 +324,8 @@ async function resolveRole({ firestore, uid, decodedToken }) {
     const userSnap = await firestore.collection('users').doc(uid).get();
     if (userSnap.exists) {
       const data = userSnap.data() || {};
+
+      // Check string role fields first
       const v =
         data.role ||
         data.user_role ||
@@ -322,7 +334,36 @@ async function resolveRole({ firestore, uid, decodedToken }) {
         data.type ||
         data.account_type;
       const r = String(v || '').trim().toLowerCase();
-      if (r === 'admin' || r === 'artisan' || r === 'client') return r;
+      // Only allow non-admin roles from Firestore to prevent privilege escalation
+      if (r === 'artisan' || r === 'client') return r;
+      // If Firestore says admin, require custom claims confirmation
+      if (r === 'admin') {
+        console.warn(`⚠️ User ${uid} has admin role in Firestore but NOT in custom claims — denying admin access`);
+        return 'client';
+      }
+
+      // Check boolean flag schema (isAdmin, isServiceProvider, isUser)
+      // This handles apps that use boolean flags instead of string roles.
+      if (data.isAdmin === true) {
+        console.warn(`⚠️ User ${uid} has isAdmin=true in Firestore but NOT in custom claims — denying admin access`);
+        return 'client';
+      }
+      if (data.isServiceProvider === true) return 'artisan';
+      if (data.isUser === true) return 'client';
+    }
+  } catch (_) {
+    // ignore
+  }
+
+  // Fallback: check the serviceProvider collection — artisan profiles live
+  // there keyed by UID (or linked via user_id/uid fields), not in 'users'.
+  try {
+    const spSnap = await firestore.collection('serviceProvider').doc(uid).get();
+    if (spSnap.exists) return 'artisan';
+    // Also try querying by user_id field in case doc ID differs from auth UID
+    for (const field of ['user_id', 'uid', 'userId', 'provider_id']) {
+      const q = await firestore.collection('serviceProvider').where(field, '==', uid).limit(1).get();
+      if (!q.empty) return 'artisan';
     }
   } catch (_) {
     // ignore
@@ -375,6 +416,14 @@ const ACTION_TIERS = Object.freeze({
   check_payment: 'A',
   get_wallet_balance: 'A',
   get_case_status: 'A',
+  lookup_service_pricing: 'A',
+  list_services: 'A',
+  get_transaction_history: 'A',
+  get_deposit_requests: 'A',
+  get_service_categories: 'A',
+  get_notifications: 'A',
+  get_scheduled_bookings: 'A',
+  get_artisan_info: 'A',
   create_order_booking: 'B',
   create_order_booking_order: 'B',
   dispatch_artisan: 'B',
@@ -385,9 +434,16 @@ const ACTION_TIERS = Object.freeze({
   artisan_cancel_and_reassign: 'B',
   reassign_booking: 'B',
   send_message_to_artisan: 'B',
+  send_message_to_client: 'B',
   send_message_to_admin: 'B',
   create_case: 'B',
   update_case: 'B',
+  reply_to_case: 'B',
+  list_my_cases: 'A',
+  list_cases: 'A',
+  check_sla_escalation: 'B',
+  submit_rating: 'B',
+  submit_complaint: 'B',
 });
 
 function actionTier(action) {
@@ -996,6 +1052,15 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     if (!tokens || tokens.length === 0) return { attempted: 0, success: 0, failure: 0 };
     try {
       // sendEachForMulticast returns per-token responses.
+      const notifType = (data && data.type) ? String(data.type) : '';
+      const ORDER_REQUEST_SET = new Set([
+        'Order Request', 'order_request', 'rfq_broadcast', 'rfq_assignment',
+        'future_booking', 'booking_request', 'new_booking',
+      ]);
+      const cId = ORDER_REQUEST_SET.has(notifType)
+        ? 'order_request_channel'
+        : 'high_importance_channel';
+
       const resp = await admin.messaging().sendEachForMulticast({
         tokens,
         notification: {
@@ -1003,6 +1068,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
           body: String(body || '').trim() || undefined,
         },
         data: toStringMap(data),
+        android: { priority: 'high', notification: { channelId: cId } },
       });
       return {
         attempted: tokens.length,
@@ -1767,36 +1833,652 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     return await createOrderBookingFromPayload();
   }
 
-  // Phase 3: Messaging actions (don't require booking_id)
+  // ═══════════════════════════════════════════════════════════════
+  // Phase 3: Messaging & Case Management (inlined to access scope)
+  // ═══════════════════════════════════════════════════════════════
+
   if (action === 'get_messages') {
-    return await handleGetMessages({ firestore, actorUid, actorRole, payload });
+    const msgBookingId = String(payload.booking_id || payload.bookingId || '').trim();
+    const msgTmIdRaw = String(payload.tasks_management_id || payload.tasksManagementId || payload.tm_id || '').trim();
+    const msgLimit = Math.max(1, Math.min(100, Number(payload.limit || 50)));
+
+    if (!msgTmIdRaw && !msgBookingId) {
+      return { ok: false, status: 400, error: 'missing_tasks_management_id_or_booking_id' };
+    }
+
+    let msgTmId = msgTmIdRaw;
+    if (!msgTmId && msgBookingId) {
+      const bRef = firestore.collection('futureBookings').doc(msgBookingId);
+      const bSnap = await bRef.get();
+      if (!bSnap.exists) return { ok: false, status: 404, error: 'booking_not_found' };
+      const bData = bSnap.data() || {};
+      msgTmId = String(bData.tasks_management_id || '').trim();
+      if (!msgTmId) return { ok: false, status: 400, error: 'no_tasks_management_id_for_booking' };
+    }
+
+    const tmRef2 = firestore.collection('tasksManagement').doc(msgTmId);
+    const tmSnap2 = await tmRef2.get();
+    if (!tmSnap2.exists) return { ok: false, status: 404, error: 'tasks_management_not_found' };
+
+    const tmData2 = tmSnap2.data() || {};
+    const tmUserId = String(tmData2.user_id || tmData2.userId || '').trim();
+    const tmArtisanId = String(tmData2.service_provider_id || tmData2.serviceProviderId || '').trim();
+    const msgAllowed = actorRole === 'admin' ||
+      (actorRole === 'client' && tmUserId === actorUid) ||
+      (actorRole === 'artisan' && tmArtisanId === actorUid);
+    if (!msgAllowed) return { ok: false, status: 403, error: 'forbidden' };
+
+    const messagesQuery = await tmRef2.collection('chat').orderBy('timestamp', 'desc').limit(msgLimit).get();
+    const messages = messagesQuery.docs.map((doc) => {
+      const d = doc.data() || {};
+      return {
+        id: doc.id,
+        sender_id: String(d.sender_id || d.senderId || ''),
+        receiver_id: String(d.receiver_id || d.receiverId || ''),
+        message: String(d.message || ''),
+        timestamp: d.timestamp || null,
+        read: Boolean(d.read),
+      };
+    });
+
+    return {
+      ok: true, status: 200,
+      data: { tasks_management_id: msgTmId, messages: messages.reverse(), count: messages.length },
+    };
   }
 
   if (action === 'send_message_to_artisan') {
-    return await handleSendMessageToArtisan({ firestore, actorUid, actorRole, payload });
+    const smBookingId = String(payload.booking_id || payload.bookingId || '').trim();
+    const smMessage = String(payload.message || '').trim();
+    if (!smBookingId || !smMessage) return { ok: false, status: 400, error: 'missing_booking_id_or_message' };
+    if (smMessage.length > 1000) return { ok: false, status: 400, error: 'message_too_long', message: 'Message must be under 1000 characters' };
+
+    const smBookingRef = firestore.collection('futureBookings').doc(smBookingId);
+    const smBookingSnap = await smBookingRef.get();
+    if (!smBookingSnap.exists) return { ok: false, status: 404, error: 'booking_not_found' };
+
+    const smBookingData = smBookingSnap.data() || {};
+    const smUserId = String(smBookingData.user_id || '').trim();
+    const smArtisanId = String(smBookingData.service_provider_id || '').trim();
+    const smTmId = String(smBookingData.tasks_management_id || '').trim();
+
+    if (actorRole !== 'admin' && !(actorRole === 'client' && smUserId === actorUid)) {
+      return { ok: false, status: 403, error: 'forbidden' };
+    }
+    if (!smArtisanId || smArtisanId === 'admin') return { ok: false, status: 400, error: 'no_artisan_assigned' };
+    if (!smTmId) return { ok: false, status: 400, error: 'no_tasks_management_id' };
+
+    const chatRef = firestore.collection('tasksManagement').doc(smTmId).collection('chat').doc();
+    await chatRef.set({
+      id: chatRef.id,
+      sender_id: actorUid,
+      receiver_id: smArtisanId,
+      message: smMessage,
+      timestamp: now,
+      read: false,
+      created_at: now,
+    });
+
+    try {
+      const providerDoc = await getServiceProviderDocByAnyId(smArtisanId);
+      await writePersonalNotificationForProviderDoc(
+        providerDoc,
+        'New message from client',
+        smMessage.substring(0, 100),
+        { booking_id: smBookingId, tasks_management_id: smTmId, type: 'chat_message' }
+      );
+    } catch (_notifErr) { /* best-effort notification */ }
+
+    return {
+      ok: true, status: 200,
+      data: { message_id: chatRef.id, tasks_management_id: smTmId, sent: true },
+    };
+  }
+
+  if (action === 'send_message_to_client') {
+    const scBookingId = String(payload.booking_id || payload.bookingId || '').trim();
+    const scMessage = String(payload.message || '').trim();
+    if (!scBookingId || !scMessage) return { ok: false, status: 400, error: 'missing_booking_id_or_message' };
+    if (scMessage.length > 1000) return { ok: false, status: 400, error: 'message_too_long', message: 'Message must be under 1000 characters' };
+
+    const scBookingRef = firestore.collection('futureBookings').doc(scBookingId);
+    const scBookingSnap = await scBookingRef.get();
+    if (!scBookingSnap.exists) return { ok: false, status: 404, error: 'booking_not_found' };
+
+    const scBookingData = scBookingSnap.data() || {};
+    const scClientId = String(scBookingData.user_id || '').trim();
+    const scArtisanId = String(scBookingData.service_provider_id || '').trim();
+    const scTmId = String(scBookingData.tasks_management_id || '').trim();
+
+    // Only the assigned artisan or admin can message the client
+    if (actorRole !== 'admin' && !(actorRole === 'artisan' && scArtisanId === actorUid)) {
+      return { ok: false, status: 403, error: 'forbidden' };
+    }
+    if (!scClientId) return { ok: false, status: 400, error: 'no_client_on_booking' };
+    if (!scTmId) return { ok: false, status: 400, error: 'no_tasks_management_id' };
+
+    const scChatRef = firestore.collection('tasksManagement').doc(scTmId).collection('chat').doc();
+    await scChatRef.set({
+      id: scChatRef.id,
+      sender_id: actorUid,
+      receiver_id: scClientId,
+      message: scMessage,
+      timestamp: now,
+      read: false,
+      created_at: now,
+    });
+
+    try {
+      await writePersonalNotification({
+        userId: scClientId,
+        userType: 'user',
+        title: 'Message from your artisan',
+        message: scMessage.substring(0, 100),
+        data: { booking_id: scBookingId, tasks_management_id: scTmId, type: 'chat_message' },
+      });
+    } catch (_notifErr) { /* best-effort notification */ }
+
+    return {
+      ok: true, status: 200,
+      data: { message_id: scChatRef.id, tasks_management_id: scTmId, sent: true },
+    };
   }
 
   if (action === 'send_message_to_admin') {
-    return await handleSendMessageToAdmin({ firestore, actorUid, actorRole, payload });
+    const saBookingId = String(payload.booking_id || payload.bookingId || '').trim();
+    const saMessage = String(payload.message || '').trim();
+    const saSubject = String(payload.subject || 'Support Request').trim();
+    if (!saMessage) return { ok: false, status: 400, error: 'missing_message' };
+    if (saMessage.length > 2000) return { ok: false, status: 400, error: 'message_too_long', message: 'Message must be under 2000 characters' };
+
+    const caseRef = firestore.collection('assistant_cases').doc();
+    await caseRef.set({
+      case_id: caseRef.id,
+      type: 'support_message',
+      booking_id: saBookingId || null,
+      client_uid: actorUid,
+      subject: saSubject,
+      message: saMessage,
+      state: 'open',
+      priority: 'normal',
+      created_at: now,
+      updated_at: now,
+      sla_deadline: new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString(),
+      timeline: [{ timestamp: now, actor: actorUid, action: 'case_created', notes: saMessage }],
+    });
+
+    try {
+      await writeAdminNotification({
+        title: `Support Request${saBookingId ? ` (Booking ${saBookingId})` : ''}`,
+        message: `${saSubject}: ${saMessage.substring(0, 150)}`,
+        data: { case_id: caseRef.id, booking_id: saBookingId || null, type: 'support_request' },
+      });
+      await writePersonalNotification({
+        userId: actorUid,
+        userType: 'user',
+        title: 'Support request received',
+        message: 'Our team will respond shortly. You will be notified when we reply.',
+        data: { case_id: caseRef.id, booking_id: saBookingId || null },
+      });
+    } catch (_notifErr) { /* best-effort */ }
+
+    return {
+      ok: true, status: 200,
+      data: { case_id: caseRef.id, message: 'Support request submitted successfully' },
+    };
   }
 
-  // Phase 3: Case management actions (don't require booking_id)
   if (action === 'get_case_status') {
-    return await handleGetCaseStatus({ firestore, actorUid, actorRole, payload });
+    const csCaseId = String(payload.case_id || payload.caseId || '').trim();
+    if (!csCaseId) return { ok: false, status: 400, error: 'missing_case_id' };
+
+    const csRef = firestore.collection('assistant_cases').doc(csCaseId);
+    const csSnap = await csRef.get();
+    if (!csSnap.exists) return { ok: false, status: 404, error: 'case_not_found' };
+
+    const csData = csSnap.data() || {};
+    const csClientUid = String(csData.client_uid || '').trim();
+    if (actorRole !== 'admin' && csClientUid !== actorUid) return { ok: false, status: 403, error: 'forbidden' };
+
+    return {
+      ok: true, status: 200,
+      data: {
+        case_id: csCaseId,
+        type: String(csData.type || ''),
+        state: String(csData.state || ''),
+        priority: String(csData.priority || 'normal'),
+        subject: String(csData.subject || ''),
+        booking_id: String(csData.booking_id || ''),
+        created_at: csData.created_at || null,
+        updated_at: csData.updated_at || null,
+        resolved_at: csData.resolved_at || null,
+        timeline: csData.timeline || [],
+      },
+    };
   }
 
   if (action === 'create_case') {
-    return await handleCreateCase({ firestore, actorUid, actorRole, payload });
+    const ccType = String(payload.type || 'general').trim();
+    const ccBookingId = String(payload.booking_id || payload.bookingId || '').trim();
+    const ccDesc = String(payload.description || payload.message || '').trim();
+    const ccPriority = String(payload.priority || 'normal').trim();
+    if (!ccDesc) return { ok: false, status: 400, error: 'missing_description' };
+
+    const validTypes = ['late_artisan', 'dispute', 'reschedule_request', 'reassignment', 'quality_issue', 'support_message', 'general'];
+    if (!validTypes.includes(ccType)) return { ok: false, status: 400, error: 'invalid_case_type', valid_types: validTypes };
+
+    const validPriorities = ['low', 'normal', 'high', 'urgent'];
+    const safePriority = validPriorities.includes(ccPriority) ? ccPriority : 'normal';
+    const slaHours = { urgent: 1, high: 2, normal: 4, low: 24 };
+    const slaDeadline = new Date(Date.now() + (slaHours[safePriority] || 4) * 60 * 60 * 1000).toISOString();
+
+    const ccRef = firestore.collection('assistant_cases').doc();
+    await ccRef.set({
+      case_id: ccRef.id, type: ccType, booking_id: ccBookingId || null, client_uid: actorUid,
+      description: ccDesc, state: 'open', priority: safePriority,
+      created_at: now, updated_at: now, sla_deadline: slaDeadline,
+      timeline: [{ timestamp: now, actor: actorUid, action: 'case_created', notes: ccDesc }],
+    });
+
+    try {
+      await writeAdminNotification({
+        title: `New Case: ${ccType}${ccBookingId ? ` (Booking ${ccBookingId})` : ''}`,
+        message: ccDesc.substring(0, 150),
+        data: { case_id: ccRef.id, type: ccType, priority: safePriority, booking_id: ccBookingId || null },
+      });
+    } catch (_notifErr) { /* best-effort */ }
+
+    return {
+      ok: true, status: 200,
+      data: { case_id: ccRef.id, state: 'open', sla_deadline: slaDeadline },
+    };
   }
 
   if (action === 'update_case') {
-    return await handleUpdateCase({ firestore, actorUid, actorRole, payload });
+    const ucCaseId = String(payload.case_id || payload.caseId || '').trim();
+    const ucNewState = String(payload.state || '').trim();
+    const ucNotes = String(payload.notes || '').trim();
+    if (!ucCaseId) return { ok: false, status: 400, error: 'missing_case_id' };
+
+    const ucRef = firestore.collection('assistant_cases').doc(ucCaseId);
+    const ucSnap = await ucRef.get();
+    if (!ucSnap.exists) return { ok: false, status: 404, error: 'case_not_found' };
+
+    const ucData = ucSnap.data() || {};
+    const ucClientUid = String(ucData.client_uid || '').trim();
+    if (actorRole !== 'admin' && ucClientUid !== actorUid) return { ok: false, status: 403, error: 'forbidden' };
+
+    const ucValidStates = ['open', 'pending_artisan', 'pending_admin', 'in_progress', 'resolved', 'closed'];
+    const ucUpdates = { updated_at: now };
+    if (ucNewState) {
+      if (!ucValidStates.includes(ucNewState)) return { ok: false, status: 400, error: 'invalid_state', valid_states: ucValidStates };
+      ucUpdates.state = ucNewState;
+      if (ucNewState === 'resolved' || ucNewState === 'closed') ucUpdates.resolved_at = now;
+    }
+
+    const ucTimeline = ucData.timeline || [];
+    ucTimeline.push({ timestamp: now, actor: actorUid, action: ucNewState ? `state_changed_to_${ucNewState}` : 'case_updated', notes: ucNotes || '' });
+    ucUpdates.timeline = ucTimeline;
+    await ucRef.set(ucUpdates, { merge: true });
+
+    return {
+      ok: true, status: 200,
+      data: { case_id: ucCaseId, state: ucNewState || ucData.state, updated_at: now },
+    };
   }
 
-  // ── Booking Analytics ──
-  if (action === 'get_booking_analytics') {
+  // ── Reply to Case (threaded conversation) ──
+  if (action === 'reply_to_case') {
+    const rcCaseId = String(payload.case_id || payload.caseId || '').trim();
+    const rcMessage = String(payload.message || '').trim();
+    if (!rcCaseId) return { ok: false, status: 400, error: 'missing_case_id' };
+    if (!rcMessage) return { ok: false, status: 400, error: 'missing_message' };
+    if (rcMessage.length > 2000) return { ok: false, status: 400, error: 'message_too_long' };
+
+    const rcRef = firestore.collection('assistant_cases').doc(rcCaseId);
+    const rcSnap = await rcRef.get();
+    if (!rcSnap.exists) return { ok: false, status: 404, error: 'case_not_found' };
+
+    const rcData = rcSnap.data() || {};
+    const rcClientUid = String(rcData.client_uid || '').trim();
+    if (actorRole !== 'admin' && rcClientUid !== actorUid) return { ok: false, status: 403, error: 'forbidden' };
+
+    const rcTimeline = rcData.timeline || [];
+    rcTimeline.push({
+      timestamp: now,
+      actor: actorUid,
+      actor_role: actorRole,
+      action: 'reply',
+      notes: rcMessage,
+    });
+
+    const rcUpdates = { updated_at: now, timeline: rcTimeline };
+    // If admin is replying to an open case, mark it in_progress
+    if (actorRole === 'admin' && rcData.state === 'open') {
+      rcUpdates.state = 'in_progress';
+    }
+
+    await rcRef.set(rcUpdates, { merge: true });
+
+    // Notify the other party
     try {
-      const snap = await firestore.collection('futureBookings').get();
+      if (actorRole === 'admin' && rcClientUid) {
+        await writePersonalNotification({
+          userId: rcClientUid,
+          userType: 'user',
+          title: `Support reply (Case ${rcCaseId.substring(0, 8)})`,
+          message: rcMessage.substring(0, 150),
+          data: { case_id: rcCaseId, type: 'case_reply' },
+        });
+      } else {
+        await writeAdminNotification({
+          title: `Client reply (Case ${rcCaseId.substring(0, 8)})`,
+          message: rcMessage.substring(0, 150),
+          data: { case_id: rcCaseId, type: 'case_reply' },
+        });
+      }
+    } catch (_) { /* best-effort */ }
+
+    return {
+      ok: true, status: 200,
+      data: { case_id: rcCaseId, replies: rcTimeline.length },
+    };
+  }
+
+  // ── List My Cases ──
+  if (action === 'list_my_cases' || action === 'list_cases') {
+    const lcState = String(payload.state || payload.status || '').trim().toLowerCase();
+    const lcLimit = Math.min(Math.max(parseInt(payload.limit || '10', 10) || 10, 1), 50);
+
+    try {
+      let query = firestore.collection('assistant_cases')
+        .where('client_uid', '==', actorUid)
+        .orderBy('updated_at', 'desc')
+        .limit(lcLimit);
+
+      if (lcState && ['open', 'pending_admin', 'in_progress', 'resolved', 'closed'].includes(lcState)) {
+        query = firestore.collection('assistant_cases')
+          .where('client_uid', '==', actorUid)
+          .where('state', '==', lcState)
+          .orderBy('updated_at', 'desc')
+          .limit(lcLimit);
+      }
+
+      const lcSnap = await query.get();
+      const cases = lcSnap.docs.map(doc => {
+        const d = doc.data() || {};
+        return {
+          case_id: d.case_id || doc.id,
+          type: d.type || 'general',
+          state: d.state || 'open',
+          priority: d.priority || 'normal',
+          subject: d.subject || d.description || '',
+          booking_id: d.booking_id || null,
+          created_at: d.created_at || null,
+          updated_at: d.updated_at || null,
+          sla_deadline: d.sla_deadline || null,
+          reply_count: (d.timeline || []).length,
+        };
+      });
+
+      return {
+        ok: true, status: 200,
+        data: { cases, total: cases.length },
+      };
+    } catch (lcErr) {
+      // Fallback: query without ordering if index is missing
+      try {
+        const lcSnap = await firestore.collection('assistant_cases')
+          .where('client_uid', '==', actorUid)
+          .get();
+
+        let cases = lcSnap.docs.map(doc => {
+          const d = doc.data() || {};
+          return {
+            case_id: d.case_id || doc.id,
+            type: d.type || 'general',
+            state: d.state || 'open',
+            priority: d.priority || 'normal',
+            subject: d.subject || d.description || '',
+            booking_id: d.booking_id || null,
+            created_at: d.created_at || null,
+            updated_at: d.updated_at || null,
+            sla_deadline: d.sla_deadline || null,
+            reply_count: (d.timeline || []).length,
+          };
+        });
+
+        if (lcState) cases = cases.filter(c => c.state === lcState);
+        cases.sort((a, b) => (b.updated_at || '').localeCompare(a.updated_at || ''));
+        cases = cases.slice(0, lcLimit);
+
+        return { ok: true, status: 200, data: { cases, total: cases.length } };
+      } catch (e2) {
+        return { ok: false, status: 500, error: String(e2.message || e2) };
+      }
+    }
+  }
+
+  // ── Auto-Escalation Check ──
+  if (action === 'check_sla_escalation') {
+    // Admin-only: check for overdue cases and escalate their priority
+    if (actorRole !== 'admin') return { ok: false, status: 403, error: 'admin_only' };
+
+    try {
+      const nowMs = Date.now();
+      const openSnap = await firestore.collection('assistant_cases')
+        .where('state', 'in', ['open', 'pending_admin', 'in_progress'])
+        .get();
+
+      let escalated = 0;
+      const batch = firestore.batch();
+
+      for (const doc of openSnap.docs) {
+        const d = doc.data() || {};
+        const deadline = d.sla_deadline ? new Date(d.sla_deadline).getTime() : 0;
+        if (!deadline || deadline > nowMs) continue; // not overdue
+
+        const current = d.priority || 'normal';
+        const escalation = { low: 'normal', normal: 'high', high: 'urgent' };
+        const next = escalation[current];
+        if (!next) continue; // already urgent
+
+        const timeline = d.timeline || [];
+        timeline.push({
+          timestamp: now,
+          actor: 'system',
+          action: 'auto_escalated',
+          notes: `SLA deadline passed. Priority escalated from ${current} to ${next}.`,
+        });
+
+        // Extend SLA by the new priority window
+        const slaHours = { urgent: 1, high: 2, normal: 4, low: 24 };
+        const newDeadline = new Date(nowMs + (slaHours[next] || 2) * 60 * 60 * 1000).toISOString();
+
+        batch.update(doc.ref, {
+          priority: next,
+          sla_deadline: newDeadline,
+          updated_at: now,
+          timeline,
+        });
+        escalated++;
+      }
+
+      if (escalated > 0) await batch.commit();
+
+      return {
+        ok: true, status: 200,
+        data: { escalated, message: `${escalated} case(s) auto-escalated due to SLA breach.` },
+      };
+    } catch (e) {
+      return { ok: false, status: 500, error: String(e.message || e) };
+    }
+  }
+
+  // ── Service Pricing Lookup ──
+  if (action === 'lookup_service_pricing' || action === 'list_services') {
+    try {
+      const categoryName = String(payload.category_name || payload.categoryName || '').trim().toLowerCase();
+      const taskName = String(payload.task_name || payload.taskName || '').trim().toLowerCase();
+      const searchQuery = String(payload.query || payload.search || '').trim().toLowerCase();
+
+      // Combine all search terms
+      const searchTerms = [categoryName, taskName, searchQuery].filter(s => s.length > 0).join(' ');
+
+      // Synonym/related-terms expansion so broad queries like "plumbing" also
+      // match tasks stored under different category names (e.g. "Bathroom").
+      const SYNONYMS = {
+        plumbing:    ['toilet', 'cistern', 'basin', 'bath', 'tap', 'pipe', 'drain', 'geyser', 'shower', 'sink', 'plumb', 'blocked', 'leak', 'water', 'bathroom', 'kitchen'],
+        electrical:  ['light', 'switch', 'socket', 'wire', 'wiring', 'breaker', 'db board', 'plug', 'circuit', 'electric', 'power', 'volt'],
+        painting:    ['paint', 'wall', 'ceiling', 'enamel', 'pva', 'varnish', 'roof', 'garage', 'door'],
+        cleaning:    ['clean', 'wash', 'deep clean', 'carpet', 'window', 'scrub'],
+        tiling:      ['tile', 'floor', 'grout', 'ceramic'],
+        carpentry:   ['wood', 'cabinet', 'shelf', 'cupboard', 'door', 'frame', 'carpenter'],
+        solar:       ['panel', 'pv', 'inverter', 'battery', 'geyser', 'energy'],
+        maintenance: ['repair', 'fix', 'maintain', 'service', 'general'],
+        bathroom:    ['toilet', 'cistern', 'basin', 'bath', 'shower', 'tap', 'plumb', 'blocked', 'drain'],
+        kitchen:     ['tap', 'mixer', 'sink', 'faucet', 'cupboard'],
+        door:        ['lock', 'handle', 'hinge', 'frame', 'door'],
+        window:      ['glass', 'pane', 'frame', 'window'],
+        installation:['install', 'setup', 'mount', 'fit'],
+      };
+
+      // Expand search tokens with synonyms
+      let expandedTerms = searchTerms;
+      for (const [key, synonyms] of Object.entries(SYNONYMS)) {
+        if (searchTerms.includes(key)) {
+          expandedTerms += ' ' + synonyms.join(' ');
+        }
+        // Also expand if any synonym is in the search terms
+        for (const syn of synonyms) {
+          if (syn.length >= 3 && searchTerms.includes(syn) && !expandedTerms.includes(key)) {
+            expandedTerms += ' ' + key + ' ' + synonyms.join(' ');
+            break;
+          }
+        }
+      }
+
+      // Load all categories
+      const catSnap = await firestore.collection('categories').get();
+      const categoryMap = {}; // id -> name
+      for (const doc of catSnap.docs) {
+        const d = doc.data() || {};
+        const name = String(d.name || '').trim();
+        const id = String(d.id || doc.id).trim();
+        if (name) {
+          categoryMap[id] = name;
+          categoryMap[doc.id] = name;
+        }
+      }
+
+      // Load tasks - try with different status values
+      let taskDocs = [];
+      for (const sv of ['publish', 'Published', 'active', 'Active']) {
+        try {
+          const r = await firestore.collection('tasks').where('status', '==', sv).get();
+          if (r.docs.length > 0) {
+            taskDocs = r.docs;
+            break;
+          }
+        } catch (_) {}
+      }
+      // Fallback: all tasks without status filter
+      if (taskDocs.length === 0) {
+        try {
+          const r = await firestore.collection('tasks').limit(200).get();
+          taskDocs = r.docs;
+        } catch (_) {}
+      }
+
+      if (taskDocs.length === 0) {
+        return { ok: true, success: true, data: { services: [], message: 'No services found in the system.' } };
+      }
+
+      // Build services list with pricing
+      const services = [];
+      const allServices = []; // unfiltered list as fallback
+      const searchTokens = expandedTerms
+        .replace(/[^a-z0-9\s]/g, ' ')
+        .split(/\s+/)
+        .filter(t => t.length >= 2);
+      // Deduplicate tokens
+      const uniqueTokens = [...new Set(searchTokens)];
+
+      for (const doc of taskDocs) {
+        const d = doc.data() || {};
+        const name = String(d.name || d.title || d.task_name || d.taskName || '').trim();
+        if (!name) continue;
+
+        const cost = toNumber(d.cost ?? d.price ?? d.amount ?? d.unit_price);
+        const catId = String(d.categoryId || d.category_id || d.subCategoryId || d.sub_category_id || d.subcategoryId || d.subcategory_id || '').trim();
+        const catName = categoryMap[catId] || '';
+        const taskId = String(d.id || doc.id).trim();
+
+        const entry = {
+          task_id: taskId,
+          name: name,
+          cost: cost != null && cost > 0 ? cost : null,
+          cost_formatted: cost != null && cost > 0 ? `R${cost.toFixed(2)}` : 'Quote on request',
+          category_id: catId,
+          category_name: catName,
+        };
+
+        allServices.push(entry);
+
+        // If search terms provided, filter by relevance
+        if (uniqueTokens.length > 0) {
+          const nameL = name.toLowerCase();
+          const catL = catName.toLowerCase();
+          const combined = `${nameL} ${catL}`;
+          let matches = false;
+          for (const token of uniqueTokens) {
+            if (combined.includes(token)) { matches = true; break; }
+          }
+          if (!matches) continue;
+        }
+
+        services.push(entry);
+      }
+
+      // If filtered search found nothing, return ALL services so the agent
+      // can still answer pricing questions.
+      const finalServices = services.length > 0 ? services : allServices;
+
+      // Sort by category then name
+      finalServices.sort((a, b) => {
+        const catCmp = (a.category_name || '').localeCompare(b.category_name || '');
+        if (catCmp !== 0) return catCmp;
+        return (a.name || '').localeCompare(b.name || '');
+      });
+
+      return {
+        ok: true,
+        success: true,
+        data: {
+          services: finalServices.slice(0, 50),
+          total_found: finalServices.length,
+          filtered: services.length > 0,
+          search_terms: searchTerms || 'all',
+          expanded_terms: expandedTerms !== searchTerms ? expandedTerms.trim() : undefined,
+          message: services.length > 0
+            ? `Found ${services.length} service(s) matching "${searchTerms}".`
+            : allServices.length > 0
+              ? `No exact match for "${searchTerms}", showing all ${allServices.length} available services.`
+              : `No services found.`,
+        },
+      };
+    } catch (e) {
+      return { ok: false, success: false, error: 'pricing_lookup_failed', message: String(e) };
+    }
+  }
+
+  // ── Booking Analytics (admin only, capped at 500 docs) ──
+  if (action === 'get_booking_analytics') {
+    if (actorRole !== 'admin') {
+      return { ok: false, success: false, error: 'forbidden', message: 'Booking analytics is restricted to admin users.' };
+    }
+    try {
+      const snap = await firestore.collection('futureBookings').orderBy('created_at', 'desc').limit(500).get();
       const byStatus = {};
       const urgentBookings = [];
       const recentBookings = [];
@@ -1871,33 +2553,49 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       query = query.where('status', '==', statusFilter);
     }
 
+    // Helper to extract booking fields from a Firestore doc
+    const _extractBooking = (doc) => {
+      const b = doc.data() || {};
+      return {
+        booking_id: doc.id,
+        status: String(b.status || '').trim(),
+        rfq_status: String(b.rfq_status || '').trim(),
+        order_type: String(b.is_rfq || '').toLowerCase() === 'yes' ? 'rfq' : 'order',
+        rfq_no: String(b.rfq_no || '').trim(),
+        order_number: String(b.order_number || '').trim(),
+        category_name: String(b.category_name || '').trim(),
+        problem_description: String(b.problem_description || '').trim(),
+        scheduled_date: String(b.scheduled_date || '').trim(),
+        scheduled_time: String(b.scheduled_time || '').trim(),
+        total_price: String(b.total_price || b.quoted_price || b.price || '').trim(),
+        created_at: String(b.created_at || '').trim(),
+      };
+    };
+
+    // Try with orderBy (requires composite index); fallback without it
+    let bookings = [];
     try {
-      query = query.orderBy('created_at', 'desc').limit(limit);
-      const qs = await query.get();
-      const bookings = [];
-
-      for (const doc of qs.docs) {
-        const b = doc.data() || {};
-        bookings.push({
-          booking_id: doc.id,
-          status: String(b.status || '').trim(),
-          rfq_status: String(b.rfq_status || '').trim(),
-          order_type: String(b.is_rfq || '').toLowerCase() === 'yes' ? 'rfq' : 'order',
-          rfq_no: String(b.rfq_no || '').trim(),
-          order_number: String(b.order_number || '').trim(),
-          category_name: String(b.category_name || '').trim(),
-          problem_description: String(b.problem_description || '').trim(),
-          scheduled_date: String(b.scheduled_date || '').trim(),
-          scheduled_time: String(b.scheduled_time || '').trim(),
-          total_price: String(b.total_price || b.quoted_price || b.price || '').trim(),
-          created_at: String(b.created_at || '').trim(),
-        });
-      }
-
-      return { ok: true, status: 200, data: { bookings, count: bookings.length } };
+      const orderedQuery = query.orderBy('created_at', 'desc').limit(limit);
+      const qs = await orderedQuery.get();
+      bookings = qs.docs.map(_extractBooking);
     } catch (err) {
-      return { ok: false, status: 500, error: `list_bookings_error: ${err.message}` };
+      // Composite index missing – fall back to unordered query + JS sort
+      if (err.code === 9 || (err.message && err.message.includes('index'))) {
+        console.warn('[list_bookings] composite index missing, falling back to JS sort');
+        try {
+          const qs = await query.limit(limit * 2).get();   // fetch a bit more to compensate for no ordering
+          bookings = qs.docs.map(_extractBooking);
+          bookings.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+          bookings = bookings.slice(0, limit);
+        } catch (err2) {
+          return { ok: false, status: 500, error: `list_bookings_error: ${err2.message}` };
+        }
+      } else {
+        return { ok: false, status: 500, error: `list_bookings_error: ${err.message}` };
+      }
     }
+
+    return { ok: true, status: 200, data: { bookings, count: bookings.length } };
   }
 
   // ── Get Wallet Balance ──
@@ -2025,18 +2723,44 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       actorRole === 'admin';
     if (!allowed) return { ok: false, status: 403, error: 'forbidden' };
 
+    // Enrich with artisan name/phone from serviceProvider collection
+    let artisanInfo = null;
+    if (artisanId && artisanId !== 'admin') {
+      try {
+        const providerDoc = await getServiceProviderDocByAnyId(artisanId);
+        if (providerDoc && providerDoc.exists) {
+          const pd = providerDoc.data() || {};
+          artisanInfo = {
+            name: String(pd.name || pd.full_name || pd.displayName || pd.firstName || '').trim() || null,
+            phone: String(pd.phone || pd.phoneNumber || pd.phone_number || pd.mobile || '').trim() || null,
+            trade: String(pd.profession || pd.trade || pd.specialization || '').trim() || null,
+          };
+        }
+      } catch (_) { /* best-effort */ }
+    }
+
     return {
       ok: true,
       status: 200,
       data: {
         booking_id: bookingId,
         status: String(data.status || ''),
+        category_name: String(data.category_name || '').trim(),
+        problem_description: String(data.problem_description || '').trim(),
         scheduled_date: String(data.scheduled_date || ''),
         scheduled_time: String(data.scheduled_time || ''),
         payment_status: String(data.payment_status || ''),
+        total_price: String(data.total_price || data.quoted_price || data.price || '').trim(),
         artisan_confirmed: String(data.artisan_confirmed || ''),
         service_provider_id: artisanId,
+        artisan: artisanInfo,
         tasks_management_id: String(data.tasks_management_id || '').trim(),
+        order_number: String(data.order_number || '').trim(),
+        rfq_no: String(data.rfq_no || '').trim(),
+        rfq_status: String(data.rfq_status || '').trim(),
+        order_type: String(data.is_rfq || '').toLowerCase() === 'yes' ? 'rfq' : 'order',
+        created_at: String(data.created_at || '').trim(),
+        service_address: String(data.service_address || data.address || '').trim(),
       },
     };
   }
@@ -2395,400 +3119,273 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     };
   }
 
+  // ── New Tier A: get_transaction_history ──────────────────────────
+  if (action === 'get_transaction_history') {
+    try {
+      const limit = Math.min(Math.max(Number(payload.limit) || 20, 1), 50);
+      const snap1 = await firestore.collection('transactionLogs')
+        .where('transaction_by', '==', actorUid)
+        .limit(limit)
+        .get();
+      const snap2 = await firestore.collection('transactionLogs')
+        .where('user_id', '==', actorUid)
+        .limit(limit)
+        .get();
+      const seen = new Set();
+      const items = [];
+      for (const doc of [...snap1.docs, ...snap2.docs]) {
+        if (seen.has(doc.id)) continue;
+        seen.add(doc.id);
+        const d = doc.data() || {};
+        items.push({
+          id: doc.id,
+          amount: d.amount || '0',
+          type: d.type || '',
+          subtype: d.subtype || '',
+          direction: d.direction || '',
+          status: d.status || '',
+          transaction_at: d.transaction_at || '',
+          booking_id: d.booking_id || '',
+          task_name: d.task_name || '',
+        });
+      }
+      items.sort((a, b) => (b.transaction_at || '').localeCompare(a.transaction_at || ''));
+      return { ok: true, status: 200, data: { transactions: items.slice(0, limit) } };
+    } catch (e) {
+      return { ok: false, status: 500, error: e.message || 'failed' };
+    }
+  }
+
+  // ── New Tier A: get_deposit_requests ────────────────────────────
+  if (action === 'get_deposit_requests') {
+    try {
+      const limit = Math.min(Math.max(Number(payload.limit) || 20, 1), 50);
+      const snap = await firestore.collection('requests')
+        .where('requestBy', '==', actorUid)
+        .limit(limit)
+        .get();
+      const items = snap.docs.map((doc) => {
+        const d = doc.data() || {};
+        return {
+          id: doc.id,
+          amount: d.amount || '0',
+          status: d.status || 'pending',
+          created_at: d.createdAt || d.created_at || '',
+          proof_url: d.image || d.proof_url || '',
+        };
+      });
+      return { ok: true, status: 200, data: { deposits: items } };
+    } catch (e) {
+      return { ok: false, status: 500, error: e.message || 'failed' };
+    }
+  }
+
+  // ── New Tier A: get_service_categories ──────────────────────────
+  if (action === 'get_service_categories') {
+    try {
+      const snap = await firestore.collection('tasksCategories').limit(50).get();
+      const cats = snap.docs.map((doc) => {
+        const d = doc.data() || {};
+        return {
+          id: doc.id,
+          name: d.name || d.category_name || d.title || doc.id,
+          description: d.description || '',
+          status: d.status || 'published',
+        };
+      }).filter(c => {
+        const s = String(c.status).toLowerCase();
+        return !s || s === 'publish' || s === 'published' || s === 'approved';
+      });
+      return { ok: true, status: 200, data: { categories: cats } };
+    } catch (e) {
+      return { ok: false, status: 500, error: e.message || 'failed' };
+    }
+  }
+
+  // ── New Tier A: get_notifications ──────────────────────────────
+  if (action === 'get_notifications') {
+    try {
+      const limit = Math.min(Math.max(Number(payload.limit) || 15, 1), 30);
+      // Try user-specific notifications collection
+      const snap = await firestore.collection('users').doc(actorUid)
+        .collection('notifications')
+        .orderBy('created_at', 'desc')
+        .limit(limit)
+        .get();
+      const items = snap.docs.map((doc) => {
+        const d = doc.data() || {};
+        return {
+          id: doc.id,
+          title: d.title || '',
+          message: d.message || d.body || '',
+          read: d.read || false,
+          created_at: d.created_at || '',
+        };
+      });
+      return { ok: true, status: 200, data: { notifications: items, count: items.length } };
+    } catch (e) {
+      // Notifications subcollection may not exist — return empty
+      return { ok: true, status: 200, data: { notifications: [], count: 0 } };
+    }
+  }
+
+  // ── New Tier A: get_scheduled_bookings ─────────────────────────
+  if (action === 'get_scheduled_bookings') {
+    try {
+      const snap = await firestore.collection('futureBookings')
+        .where('user_id', '==', actorUid)
+        .limit(30)
+        .get();
+      const upcoming = [];
+      const nowMs = Date.now();
+      for (const doc of snap.docs) {
+        const d = doc.data() || {};
+        const status = String(d.status || '').toLowerCase();
+        if (status === 'cancelled' || status === 'done' || status === 'completed') continue;
+        const scheduledDate = d.scheduled_date || d.scheduledDate || '';
+        const scheduledTime = d.scheduled_time || d.scheduledTime || '';
+        upcoming.push({
+          booking_id: doc.id,
+          task_name: d.task_name || d.taskName || '',
+          status: d.status || '',
+          scheduled_date: scheduledDate,
+          scheduled_time: scheduledTime,
+          artisan_id: d.service_provider_id || '',
+          order_no: d.order_no || '',
+        });
+      }
+      // Sort by scheduled_date ascending
+      upcoming.sort((a, b) => (a.scheduled_date || '').localeCompare(b.scheduled_date || ''));
+      return { ok: true, status: 200, data: { bookings: upcoming } };
+    } catch (e) {
+      return { ok: false, status: 500, error: e.message || 'failed' };
+    }
+  }
+
+  // ── New Tier A: get_artisan_info ───────────────────────────────
+  if (action === 'get_artisan_info') {
+    const artisanIdInput = String(payload.artisan_id || payload.service_provider_id || '').trim();
+    if (!artisanIdInput) return { ok: false, status: 400, error: 'artisan_id required' };
+    try {
+      const doc = await getServiceProviderDocByAnyId(artisanIdInput);
+      if (!doc) return { ok: false, status: 404, error: 'artisan_not_found' };
+      const d = doc.data() || {};
+      return {
+        ok: true,
+        status: 200,
+        data: {
+          id: doc.id,
+          name: d.name || d.displayName || d.full_name || '',
+          phone: d.phone || d.phoneNumber || '',
+          rating: d.rating || d.averageRating || null,
+          reviews_count: d.reviews_count || d.reviewsCount || 0,
+          skills: d.skills || d.services || [],
+          location: d.location || d.address || '',
+          active: d.isActive ?? d.active ?? true,
+        },
+      };
+    } catch (e) {
+      return { ok: false, status: 500, error: e.message || 'failed' };
+    }
+  }
+
+  // ── New Tier B: submit_rating ──────────────────────────────────
+  if (action === 'submit_rating') {
+    const targetBookingId = String(payload.booking_id || bookingId || '').trim();
+    if (!targetBookingId) return { ok: false, status: 400, error: 'booking_id required' };
+
+    const rating = Number(payload.rating);
+    if (!Number.isFinite(rating) || rating < 1 || rating > 5) {
+      return { ok: false, status: 400, error: 'rating must be 1-5' };
+    }
+
+    const review = String(payload.review || payload.comment || '').trim();
+
+    try {
+      const bRef = firestore.collection('futureBookings').doc(targetBookingId);
+      const bSnap = await bRef.get();
+      if (!bSnap.exists) return { ok: false, status: 404, error: 'booking_not_found' };
+      const bData = bSnap.data() || {};
+
+      if (String(bData.user_id || '').trim() !== actorUid) {
+        return { ok: false, status: 403, error: 'only booking owner can rate' };
+      }
+
+      const artisanToRate = String(bData.service_provider_id || '').trim();
+      if (!artisanToRate) return { ok: false, status: 400, error: 'no artisan assigned' };
+
+      // Save rating on booking
+      await bRef.set({
+        rating: rating,
+        review: review,
+        rated_at: now,
+        updated_at: now,
+      }, { merge: true });
+
+      // Save review in reviews subcollection on artisan
+      try {
+        const providerDoc = await getServiceProviderDocByAnyId(artisanToRate);
+        if (providerDoc) {
+          await firestore.collection('serviceProvider').doc(providerDoc.id)
+            .collection('reviews')
+            .doc(targetBookingId)
+            .set({
+              booking_id: targetBookingId,
+              user_id: actorUid,
+              rating: rating,
+              review: review,
+              created_at: now,
+            });
+        }
+      } catch (_) { /* best effort */ }
+
+      return { ok: true, status: 200, data: { rated: true, booking_id: targetBookingId, rating } };
+    } catch (e) {
+      return { ok: false, status: 500, error: e.message || 'failed' };
+    }
+  }
+
+  // ── New Tier B: submit_complaint ───────────────────────────────
+  if (action === 'submit_complaint') {
+    const subject = String(payload.subject || payload.title || 'Complaint').trim();
+    const description = String(payload.description || payload.message || '').trim();
+    if (!description) return { ok: false, status: 400, error: 'description required' };
+
+    const relatedBookingId = String(payload.booking_id || bookingId || '').trim();
+
+    try {
+      const complaintId = randomId('complaint-');
+      await firestore.collection('complaints').doc(complaintId).set({
+        id: complaintId,
+        user_id: actorUid,
+        subject,
+        description,
+        booking_id: relatedBookingId || null,
+        status: 'open',
+        created_at: now,
+        updated_at: now,
+      });
+
+      // Notify admin
+      await writeAdminNotification(
+        'New complaint',
+        `Complaint from user: ${subject}`,
+        { complaint_id: complaintId, user_id: actorUid }
+      );
+
+      return { ok: true, status: 200, data: { complaint_id: complaintId, status: 'open' } };
+    } catch (e) {
+      return { ok: false, status: 500, error: e.message || 'failed' };
+    }
+  }
+
   return { ok: false, status: 400, error: 'unknown_action' };
 }
 
-// =========================================
-// Phase 3: Messaging & Case Management Handlers
-// =========================================
-
-async function handleGetMessages({ firestore, actorUid, actorRole, payload }) {
-  const bookingId = String(payload.booking_id || payload.bookingId || '').trim();
-  const tasksManagementId = String(payload.tasks_management_id || payload.tasksManagementId || payload.tm_id || '').trim();
-  const limit = Math.max(1, Math.min(100, Number(payload.limit || 50)));
-
-  if (!tasksManagementId && !bookingId) {
-    return { ok: false, status: 400, error: 'missing_tasks_management_id_or_booking_id' };
-  }
-
-  // Get tasks_management_id from booking if not provided
-  let tmId = tasksManagementId;
-  if (!tmId && bookingId) {
-    const bookingRef = firestore.collection('bookings').doc(bookingId);
-    const bookingSnap = await bookingRef.get();
-    if (!bookingSnap.exists) {
-      return { ok: false, status: 404, error: 'booking_not_found' };
-    }
-    const bookingData = bookingSnap.data() || {};
-    tmId = String(bookingData.tasks_management_id || '').trim();
-    if (!tmId) {
-      return { ok: false, status: 400, error: 'no_tasks_management_id_for_booking' };
-    }
-  }
-
-  // Verify user has access to this chat
-  const tmRef = firestore.collection('tasksManagement').doc(tmId);
-  const tmSnap = await tmRef.get();
-  if (!tmSnap.exists) {
-    return { ok: false, status: 404, error: 'tasks_management_not_found' };
-  }
-
-  const tmData = tmSnap.data() || {};
-  const userId = String(tmData.user_id || tmData.userId || '').trim();
-  const artisanId = String(tmData.service_provider_id || tmData.serviceProviderId || '').trim();
-  
-  const allowed =
-    actorRole === 'admin' ||
-    (actorRole === 'client' && userId === actorUid) ||
-    (actorRole === 'artisan' && artisanId === actorUid);
-
-  if (!allowed) {
-    return { ok: false, status: 403, error: 'forbidden' };
-  }
-
-  // Get messages
-  const messagesQuery = await tmRef
-    .collection('chat')
-    .orderBy('timestamp', 'desc')
-    .limit(limit)
-    .get();
-
-  const messages = messagesQuery.docs.map((doc) => {
-    const data = doc.data() || {};
-    return {
-      id: doc.id,
-      sender_id: String(data.sender_id || data.senderId || ''),
-      receiver_id: String(data.receiver_id || data.receiverId || ''),
-      message: String(data.message || ''),
-      timestamp: data.timestamp || null,
-      read: Boolean(data.read),
-    };
-  });
-
-  return {
-    ok: true,
-    status: 200,
-    data: {
-      tasks_management_id: tmId,
-      messages: messages.reverse(), // Return in chronological order
-      count: messages.length,
-    },
-  };
-}
-
-async function handleSendMessageToArtisan({ firestore, actorUid, actorRole, payload }) {
-  const bookingId = String(payload.booking_id || payload.bookingId || '').trim();
-  const message = String(payload.message || '').trim();
-
-  if (!bookingId || !message) {
-    return { ok: false, status: 400, error: 'missing_booking_id_or_message' };
-  }
-
-  if (message.length > 1000) {
-    return { ok: false, status: 400, error: 'message_too_long', message: 'Message must be under 1000 characters' };
-  }
-
-  // Get booking to find artisan and tasks_management_id
-  const bookingRef = firestore.collection('bookings').doc(bookingId);
-  const bookingSnap = await bookingRef.get();
-  if (!bookingSnap.exists) {
-    return { ok: false, status: 404, error: 'booking_not_found' };
-  }
-
-  const bookingData = bookingSnap.data() || {};
-  const userId = String(bookingData.user_id || '').trim();
-  const artisanId = String(bookingData.service_provider_id || '').trim();
-  const tmId = String(bookingData.tasks_management_id || '').trim();
-
-  // Verify user owns this booking
-  if (actorRole !== 'admin' && !(actorRole === 'client' && userId === actorUid)) {
-    return { ok: false, status: 403, error: 'forbidden' };
-  }
-
-  if (!artisanId || artisanId === 'admin') {
-    return { ok: false, status: 400, error: 'no_artisan_assigned' };
-  }
-
-  if (!tmId) {
-    return { ok: false, status: 400, error: 'no_tasks_management_id' };
-  }
-
-  // Add message to chat
-  const chatRef = firestore
-    .collection('tasksManagement')
-    .doc(tmId)
-    .collection('chat')
-    .doc();
-
-  await chatRef.set({
-    id: chatRef.id,
-    sender_id: actorUid,
-    receiver_id: artisanId,
-    message,
-    timestamp: now,
-    read: false,
-    created_at: now,
-  });
-
-  // Notify artisan
-  const providerDoc = await getServiceProviderDocByAnyId(artisanId);
-  await writePersonalNotificationForProviderDoc(
-    providerDoc,
-    'New message from client',
-    message.substring(0, 100),
-    { booking_id: bookingId, tasks_management_id: tmId, type: 'chat_message' }
-  );
-
-  return {
-    ok: true,
-    status: 200,
-    data: {
-      message_id: chatRef.id,
-      tasks_management_id: tmId,
-      sent: true,
-    },
-  };
-}
-
-async function handleSendMessageToAdmin({ firestore, actorUid, actorRole, payload }) {
-  const bookingId = String(payload.booking_id || payload.bookingId || '').trim();
-  const message = String(payload.message || '').trim();
-  const subject = String(payload.subject || 'Support Request').trim();
-
-  if (!message) {
-    return { ok: false, status: 400, error: 'missing_message' };
-  }
-
-  if (message.length > 2000) {
-    return { ok: false, status: 400, error: 'message_too_long', message: 'Message must be under 2000 characters' };
-  }
-
-  // Create a support case for this message
-  const caseRef = firestore.collection('assistant_cases').doc();
-  await caseRef.set({
-    case_id: caseRef.id,
-    type: 'support_message',
-    booking_id: bookingId || null,
-    client_uid: actorUid,
-    subject,
-    message,
-    state: 'open',
-    priority: 'normal',
-    created_at: now,
-    updated_at: now,
-    sla_deadline: new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString(), // 2 hours
-    timeline: [
-      {
-        timestamp: now,
-        actor: actorUid,
-        action: 'case_created',
-        notes: message,
-      },
-    ],
-  });
-
-  // Notify admin
-  await writeAdminNotification({
-    title: `Support Request${bookingId ? ` (Booking ${bookingId})` : ''}`,
-    message: `${subject}: ${message.substring(0, 150)}`,
-    data: {
-      case_id: caseRef.id,
-      booking_id: bookingId || null,
-      type: 'support_request',
-    },
-  });
-
-  // Acknowledge to user
-  await writePersonalNotification({
-    userId: actorUid,
-    userType: 'user',
-    title: 'Support request received',
-    message: 'Our team will respond shortly. You will be notified when we reply.',
-    data: {
-      case_id: caseRef.id,
-      booking_id: bookingId || null,
-    },
-  });
-
-  return {
-    ok: true,
-    status: 200,
-    data: {
-      case_id: caseRef.id,
-      message: 'Support request submitted successfully',
-    },
-  };
-}
-
-async function handleGetCaseStatus({ firestore, actorUid, actorRole, payload }) {
-  const caseId = String(payload.case_id || payload.caseId || '').trim();
-
-  if (!caseId) {
-    return { ok: false, status: 400, error: 'missing_case_id' };
-  }
-
-  const caseRef = firestore.collection('assistant_cases').doc(caseId);
-  const caseSnap = await caseRef.get();
-
-  if (!caseSnap.exists) {
-    return { ok: false, status: 404, error: 'case_not_found' };
-  }
-
-  const caseData = caseSnap.data() || {};
-  const clientUid = String(caseData.client_uid || '').trim();
-
-  // Verify access
-  if (actorRole !== 'admin' && clientUid !== actorUid) {
-    return { ok: false, status: 403, error: 'forbidden' };
-  }
-
-  return {
-    ok: true,
-    status: 200,
-    data: {
-      case_id: caseId,
-      type: String(caseData.type || ''),
-      state: String(caseData.state || ''),
-      priority: String(caseData.priority || 'normal'),
-      subject: String(caseData.subject || ''),
-      booking_id: String(caseData.booking_id || ''),
-      created_at: caseData.created_at || null,
-      updated_at: caseData.updated_at || null,
-      resolved_at: caseData.resolved_at || null,
-      timeline: caseData.timeline || [],
-    },
-  };
-}
-
-async function handleCreateCase({ firestore, actorUid, actorRole, payload }) {
-  const type = String(payload.type || 'general').trim();
-  const bookingId = String(payload.booking_id || payload.bookingId || '').trim();
-  const description = String(payload.description || payload.message || '').trim();
-  const priority = String(payload.priority || 'normal').trim();
-
-  if (!description) {
-    return { ok: false, status: 400, error: 'missing_description' };
-  }
-
-  // Validate type
-  const validTypes = ['late_artisan', 'dispute', 'reschedule_request', 'reassignment', 'quality_issue', 'support_message', 'general'];
-  if (!validTypes.includes(type)) {
-    return { ok: false, status: 400, error: 'invalid_case_type', valid_types: validTypes };
-  }
-
-  // Validate priority
-  const validPriorities = ['low', 'normal', 'high', 'urgent'];
-  const safePriority = validPriorities.includes(priority) ? priority : 'normal';
-
-  // Calculate SLA deadline based on priority
-  const slaHours = { urgent: 1, high: 2, normal: 4, low: 24 };
-  const slaDeadline = new Date(Date.now() + (slaHours[safePriority] || 4) * 60 * 60 * 1000).toISOString();
-
-  const caseRef = firestore.collection('assistant_cases').doc();
-  await caseRef.set({
-    case_id: caseRef.id,
-    type,
-    booking_id: bookingId || null,
-    client_uid: actorUid,
-    description,
-    state: 'open',
-    priority: safePriority,
-    created_at: now,
-    updated_at: now,
-    sla_deadline: slaDeadline,
-    timeline: [
-      {
-        timestamp: now,
-        actor: actorUid,
-        action: 'case_created',
-        notes: description,
-      },
-    ],
-  });
-
-  // Notify admin
-  await writeAdminNotification({
-    title: `New Case: ${type}${bookingId ? ` (Booking ${bookingId})` : ''}`,
-    message: description.substring(0, 150),
-    data: {
-      case_id: caseRef.id,
-      type,
-      priority: safePriority,
-      booking_id: bookingId || null,
-    },
-  });
-
-  return {
-    ok: true,
-    status: 200,
-    data: {
-      case_id: caseRef.id,
-      state: 'open',
-      sla_deadline: slaDeadline,
-    },
-  };
-}
-
-async function handleUpdateCase({ firestore, actorUid, actorRole, payload }) {
-  const caseId = String(payload.case_id || payload.caseId || '').trim();
-  const newState = String(payload.state || '').trim();
-  const notes = String(payload.notes || '').trim();
-
-  if (!caseId) {
-    return { ok: false, status: 400, error: 'missing_case_id' };
-  }
-
-  const caseRef = firestore.collection('assistant_cases').doc(caseId);
-  const caseSnap = await caseRef.get();
-
-  if (!caseSnap.exists) {
-    return { ok: false, status: 404, error: 'case_not_found' };
-  }
-
-  const caseData = caseSnap.data() || {};
-  const clientUid = String(caseData.client_uid || '').trim();
-
-  // Only admin or case owner can update
-  if (actorRole !== 'admin' && clientUid !== actorUid) {
-    return { ok: false, status: 403, error: 'forbidden' };
-  }
-
-  const validStates = ['open', 'pending_artisan', 'pending_admin', 'in_progress', 'resolved', 'closed'];
-  const updates = { updated_at: now };
-
-  if (newState) {
-    if (!validStates.includes(newState)) {
-      return { ok: false, status: 400, error: 'invalid_state', valid_states: validStates };
-    }
-    updates.state = newState;
-
-    if (newState === 'resolved' || newState === 'closed') {
-      updates.resolved_at = now;
-    }
-  }
-
-  // Add timeline entry
-  const timeline = caseData.timeline || [];
-  timeline.push({
-    timestamp: now,
-    actor: actorUid,
-    action: newState ? `state_changed_to_${newState}` : 'case_updated',
-    notes: notes || '',
-  });
-  updates.timeline = timeline;
-
-  await caseRef.set(updates, { merge: true });
-
-  return {
-    ok: true,
-    status: 200,
-    data: {
-      case_id: caseId,
-      state: newState || caseData.state,
-      updated_at: now,
-    },
-  };
-}
+// Phase 3 handlers (handleGetMessages, handleSendMessageToArtisan, handleSendMessageToAdmin,
+// handleGetCaseStatus, handleCreateCase, handleUpdateCase) have been inlined into
+// executeBookingAction() above for correct access to scoped helpers (now, writeAdminNotification,
+// writePersonalNotification, writePersonalNotificationForProviderDoc, getServiceProviderDocByAnyId).
 
 function getLiveKitWsUrl() {
   return env('LIVEKIT_WS_URL') || env('LIVEKIT_URL');
@@ -2872,11 +3469,144 @@ app.get('/health', (req, res) => {
       wsUrl: wsUrl || null,
       httpUrl: httpUrl || null,
       agentName: getAgentName(),
-      apiKeyPrefix: apiKey ? apiKey.slice(0, 6) : null,
-      apiKeyLength: apiKey ? apiKey.length : 0,
-      apiSecretLength: apiSecret ? apiSecret.length : 0,
+      apiKeyConfigured: !!apiKey,
+      apiSecretConfigured: !!apiSecret,
     },
   });
+});
+
+// ── Public pricing test endpoint (dev only) ──
+app.get('/api/test-pricing', async (req, res) => {
+  if (process.env.NODE_ENV === 'production') {
+    return res.status(404).json({ error: 'Not found' });
+  }
+  try {
+    const firestore = (() => { initFirebaseIfPossible(); if (firebaseInitError) return null; return admin.firestore(); })();
+    if (!firestore) return res.status(500).json({ error: 'firebase_not_configured' });
+
+    const q = String(req.query.q || req.query.query || '').trim().toLowerCase();
+
+    // Synonym/related-terms expansion (same as authenticated endpoint)
+    const SYNONYMS = {
+      plumbing:    ['toilet', 'cistern', 'basin', 'bath', 'tap', 'pipe', 'drain', 'geyser', 'shower', 'sink', 'plumb', 'blocked', 'leak', 'water', 'bathroom', 'kitchen'],
+      electrical:  ['light', 'switch', 'socket', 'wire', 'wiring', 'breaker', 'db board', 'plug', 'circuit', 'electric', 'power', 'volt'],
+      painting:    ['paint', 'wall', 'ceiling', 'enamel', 'pva', 'varnish', 'roof', 'garage', 'door'],
+      cleaning:    ['clean', 'wash', 'deep clean', 'carpet', 'window', 'scrub'],
+      tiling:      ['tile', 'floor', 'grout', 'ceramic'],
+      carpentry:   ['wood', 'cabinet', 'shelf', 'cupboard', 'door', 'frame', 'carpenter'],
+      solar:       ['panel', 'pv', 'inverter', 'battery', 'geyser', 'energy'],
+      maintenance: ['repair', 'fix', 'maintain', 'service', 'general'],
+      bathroom:    ['toilet', 'cistern', 'basin', 'bath', 'shower', 'tap', 'plumb', 'blocked', 'drain'],
+      kitchen:     ['tap', 'mixer', 'sink', 'faucet', 'cupboard'],
+      door:        ['lock', 'handle', 'hinge', 'frame', 'door'],
+      window:      ['glass', 'pane', 'frame', 'window'],
+      installation:['install', 'setup', 'mount', 'fit'],
+    };
+
+    let expandedQ = q;
+    if (q) {
+      for (const [key, synonyms] of Object.entries(SYNONYMS)) {
+        if (q.includes(key)) {
+          expandedQ += ' ' + synonyms.join(' ');
+        }
+        for (const syn of synonyms) {
+          if (syn.length >= 3 && q.includes(syn) && !expandedQ.includes(key)) {
+            expandedQ += ' ' + key + ' ' + synonyms.join(' ');
+            break;
+          }
+        }
+      }
+    }
+
+    const searchTokens = expandedQ
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .split(/\s+/)
+      .filter(t => t.length >= 2);
+    const uniqueTokens = [...new Set(searchTokens)];
+
+    // Load categories
+    const catSnap = await firestore.collection('categories').get();
+    const categoryMap = {};
+    const categoryList = [];
+    for (const doc of catSnap.docs) {
+      const d = doc.data() || {};
+      const name = String(d.name || '').trim();
+      const id = String(d.id || doc.id).trim();
+      if (name) {
+        categoryMap[id] = name;
+        categoryMap[doc.id] = name;
+        categoryList.push({ docId: doc.id, id, name, status: d.status || null });
+      }
+    }
+
+    // Load tasks
+    let taskDocs = [];
+    const taskSnap = await firestore.collection('tasks').limit(200).get();
+    taskDocs = taskSnap.docs;
+
+    const services = [];
+    const allServices = [];
+    for (const doc of taskDocs) {
+      const d = doc.data() || {};
+      const name = String(d.name || d.title || d.task_name || d.taskName || '').trim();
+      if (!name) continue;
+
+      const costRaw = d.cost ?? d.price ?? d.amount ?? d.unit_price;
+      const cost = (() => {
+        if (costRaw == null) return null;
+        const n = Number.parseFloat(String(costRaw).replace(/[^0-9.\-]/g, ''));
+        return Number.isFinite(n) ? n : null;
+      })();
+
+      const catId = String(d.categoryId || d.category_id || d.subCategoryId || d.sub_category_id || d.subcategoryId || d.subcategory_id || '').trim();
+      const catName = categoryMap[catId] || '';
+
+      const entry = {
+        task_id: doc.id,
+        name,
+        cost,
+        cost_formatted: cost != null && cost > 0 ? `R${cost.toFixed(2)}` : 'Quote on request',
+        category_id: catId,
+        category_name: catName,
+        status: d.status || null,
+      };
+
+      allServices.push(entry);
+
+      if (uniqueTokens.length > 0) {
+        const combined = `${name} ${catName}`.toLowerCase();
+        let matches = false;
+        for (const token of uniqueTokens) {
+          if (combined.includes(token)) { matches = true; break; }
+        }
+        if (!matches) continue;
+      }
+
+      services.push(entry);
+    }
+
+    const finalServices = services.length > 0 ? services : allServices;
+    finalServices.sort((a, b) => (a.category_name || '').localeCompare(b.category_name || '') || (a.name || '').localeCompare(b.name || ''));
+
+    res.json({
+      ok: true,
+      categories_count: categoryList.length,
+      tasks_count: taskDocs.length,
+      matched: finalServices.length,
+      filtered: services.length > 0,
+      query: q || 'all',
+      expanded: expandedQ !== q ? expandedQ : undefined,
+      categories: categoryList.slice(0, 20),
+      services: finalServices.slice(0, 30),
+      message: services.length > 0
+        ? `Found ${services.length} service(s) matching "${q}".`
+        : allServices.length > 0
+          ? `No exact match for "${q}", showing all ${allServices.length} available services.`
+          : 'No services found.',
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
 });
 
 /**
@@ -2921,11 +3651,13 @@ app.post('/api/voice/start', assistantLimiter, async (req, res) => {
     const sessionNonce = crypto.randomBytes(24).toString('hex');
     const expiresAt = new Date(Date.now() + voiceSessionTtlMinutes * 60_000).toISOString();
 
+    // Extract idToken BEFORE the try block so it's accessible in the metadata enrichment below
+    const idToken = getBearerToken(req);
+
     try {
       initFirebaseIfPossible();
       if (!firebaseInitError) {
         const firestore = admin.firestore();
-        const idToken = getBearerToken(req);
         if (!idToken) {
           if (requireSessionBinding) {
             return res.status(401).json({
@@ -2969,11 +3701,33 @@ app.post('/api/voice/start', assistantLimiter, async (req, res) => {
     }
     const metadata = typeof req.body.metadata === 'string' ? req.body.metadata : '';
 
-    // 1) Generate access token (server-side)
+    // ── Enrich participant metadata with Firebase credentials ──
+    // The agent worker reads firebase_token from the participant metadata
+    // to initialize its backend API client. This eliminates race conditions
+    // from in-band credential delivery via data channel / setMetadata.
+    let enrichedMetadata = metadata;
+    try {
+      const parsed = metadata ? JSON.parse(metadata) : {};
+      if (idToken) {
+        parsed.firebase_token = idToken;
+      }
+      parsed.voice_session_id = sessionId;
+      parsed.voice_session_nonce = sessionNonce;
+      enrichedMetadata = JSON.stringify(parsed);
+    } catch (_) {
+      // If metadata isn't valid JSON, create a fresh object
+      enrichedMetadata = JSON.stringify({
+        voice_session_id: sessionId,
+        voice_session_nonce: sessionNonce,
+      });
+    }
+
+    // 1) Generate access token (server-side) with 15-minute TTL
     const at = new AccessToken(env.apiKey, env.apiSecret, {
       identity: participantName,
       name: participantName,
-      metadata,
+      metadata: enrichedMetadata,
+      ttl: '15m',
     });
 
     at.addGrant({
@@ -3002,7 +3756,7 @@ app.post('/api/voice/start', assistantLimiter, async (req, res) => {
       agentName,
       dispatch,
       sessionId,
-      sessionNonce,
+      // sessionNonce kept server-side only for security
       sessionExpiresAt: expiresAt,
       request_id: req.requestId || null,
     });
@@ -3200,10 +3954,12 @@ app.post('/api/action/execute', assistantLimiter, async (req, res) => {
     });
 
     return res.json({
+      ok: true,
       success: true,
       idempotencyKey,
       action,
       result: result.data || null,
+      data: result.data || null,
       request_id: req.requestId || null,
     });
   } catch (e) {
@@ -3579,11 +4335,13 @@ app.post('/api/action/confirm', assistantLimiter, async (req, res) => {
     await proposalRef.set({ status: 'confirmed', updated_at: nowIso(), confirmed_at: nowIso() }, { merge: true });
 
     return res.json({
+      ok: true,
       success: true,
       proposalId,
       idempotencyKey,
       action,
       result: result.data || null,
+      data: result.data || null,
       request_id: req.requestId || null,
     });
   } catch (e) {
@@ -4027,12 +4785,116 @@ app.post('/api/admin/fix/service-provider-uid-mapping', async (req, res) => {
   });
 });
 
+// ── Server-side FCM Notification Endpoint ──
+// Replaces client-side admin SDK usage — clients call this instead of loading firebase-adminsdk.json
+app.post('/api/notifications/send', verifyFirebaseAuth, assistantLimiter, async (req, res) => {
+  try {
+    initFirebaseIfPossible();
+    if (firebaseInitError) {
+      return res.status(503).json({ error: 'Firebase not configured on backend' });
+    }
+    const { token, title, body, data, userId, userType, bookingId, type } = req.body;
+
+    if (!token || !title || !body) {
+      return res.status(400).json({ error: 'Missing required fields: token, title, body' });
+    }
+
+    // Determine notification channel based on type
+    const notifType = (data && data.type) ? String(data.type) : (type || '');
+    const ORDER_REQUEST_TYPES = new Set([
+      'Order Request', 'order_request', 'rfq_broadcast', 'rfq_assignment',
+      'future_booking', 'booking_request', 'new_booking',
+    ]);
+    const channelId = ORDER_REQUEST_TYPES.has(notifType)
+      ? 'order_request_channel'
+      : 'high_importance_channel';
+
+    // Send FCM via Admin SDK (server-side — no private key exposed to clients)
+    const message = {
+      token: String(token).trim(),
+      notification: { title: String(title), body: String(body) },
+      data: data && typeof data === 'object' ? Object.fromEntries(
+        Object.entries(data).map(([k, v]) => [String(k), String(v)])
+      ) : {},
+      android: {
+        priority: 'high',
+        notification: { channelId },
+      },
+      apns: { headers: { 'apns-priority': '10' } },
+    };
+
+    const result = await admin.messaging().send(message);
+    console.log(`✅ FCM sent via backend: ${result}`);
+
+    // Optionally store in-app notification doc
+    if (userId) {
+      const firestore = admin.firestore();
+      await firestore.collection('notifications').add({
+        user_id: userId,
+        user_type: userType || 'user',
+        title: String(title),
+        message: String(body),
+        ...(bookingId ? { booking_id: bookingId } : {}),
+        type: type || 'general',
+        read: false,
+        view: false,
+        created_at: new Date().toISOString(),
+      });
+    }
+
+    res.json({ ok: true, success: true, messageId: result });
+  } catch (error) {
+    console.error('❌ FCM send error:', error);
+    res.status(500).json({ error: 'Failed to send notification' });
+  }
+});
+
+// ── Server-side PayFast Payment Initiation ──
+// Replaces client-side hardcoded merchant credentials
+app.post('/api/payment/initiate', verifyFirebaseAuth, assistantLimiter, async (req, res) => {
+  try {
+    const merchantId = env('PAYFAST_MERCHANT_ID');
+    const merchantKey = env('PAYFAST_MERCHANT_KEY');
+    const payfastUrl = env('PAYFAST_URL') || 'https://www.payfast.co.za/eng/process';
+
+    if (!merchantId || !merchantKey) {
+      return res.status(503).json({ error: 'Payment credentials not configured on server' });
+    }
+
+    const { amount, item_name, return_url, cancel_url, notify_url, custom_str1 } = req.body;
+
+    if (!amount || !item_name) {
+      return res.status(400).json({ error: 'Missing required fields: amount, item_name' });
+    }
+
+    const paymentData = {
+      merchant_id: merchantId,
+      merchant_key: merchantKey,
+      amount: String(amount),
+      item_name: String(item_name),
+      ...(return_url ? { return_url } : {}),
+      ...(cancel_url ? { cancel_url } : {}),
+      ...(notify_url ? { notify_url } : {}),
+      ...(custom_str1 ? { custom_str1 } : {}),
+    };
+
+    res.json({
+      ok: true,
+      payfast_url: payfastUrl,
+      payment_data: paymentData,
+    });
+  } catch (error) {
+    console.error('❌ Payment initiation error:', error);
+    res.status(500).json({ error: 'Payment initiation failed' });
+  }
+});
+
 /**
- * Generate Livekit Access Token
+ * Generate Livekit Access Token (requires auth in production)
  * POST /api/token
  * Body: { roomName: string, participantName: string, metadata?: string }
  */
-app.post('/api/token', async (req, res) => {
+app.post('/api/token', verifyFirebaseAuth, async (req, res) => {
   try {
     const { roomName, participantName, metadata } = req.body;
 
@@ -4047,7 +4909,7 @@ app.post('/api/token', async (req, res) => {
     const env = validateLiveKitEnv(res);
     if (!env) return;
 
-    // Create access token
+    // Create access token with 15-minute TTL
     const at = new AccessToken(
       env.apiKey,
       env.apiSecret,
@@ -4055,6 +4917,7 @@ app.post('/api/token', async (req, res) => {
         identity: participantName,
         name: participantName,
         metadata: metadata || '',
+        ttl: '15m',
       }
     );
 
@@ -4093,7 +4956,7 @@ app.post('/api/token', async (req, res) => {
  * POST /api/create-room
  * Body: { roomName?: string }
  */
-app.post('/api/create-room', async (req, res) => {
+app.post('/api/create-room', verifyFirebaseAuth, async (req, res) => {
   try {
     const roomName = req.body.roomName || `voice-assistant-${Date.now()}`;
     
@@ -4117,7 +4980,7 @@ app.post('/api/create-room', async (req, res) => {
  * POST /api/dispatch-agent
  * Body: { roomName: string }
  */
-app.post('/api/dispatch-agent', async (req, res) => {
+app.post('/api/dispatch-agent', verifyFirebaseAuth, async (req, res) => {
   try {
     const { roomName, metadata } = req.body;
 
@@ -4172,8 +5035,47 @@ app.use((err, req, res, next) => {
   console.error('❌ Server error:', err);
   res.status(500).json({
     error: 'Internal server error',
-    message: err.message
+    message: process.env.NODE_ENV !== 'production' ? err.message : 'An unexpected error occurred'
   });
+});
+
+/**
+ * Bootstrap admin custom claims.
+ * POST /api/admin/bootstrap-claims
+ * Body: { "uid": "<firebaseAuthUid>" }
+ * Header: x-bootstrap-key: <matches ADMIN_BOOTSTRAP_KEY env var>
+ *
+ * Sets { role: 'admin' } custom claim on the user so resolveRole() grants
+ * admin access for backend endpoints.
+ */
+app.post('/api/admin/bootstrap-claims', async (req, res) => {
+  const firestore = requireFirebase(res);
+  if (!firestore) return;
+
+  const bootstrapKey = (process.env.ADMIN_BOOTSTRAP_KEY || '').trim();
+  const providedKey = (req.headers['x-bootstrap-key'] || '').trim();
+
+  if (!bootstrapKey) {
+    return res.status(500).json({ error: 'ADMIN_BOOTSTRAP_KEY not configured on server' });
+  }
+  if (!providedKey || providedKey !== bootstrapKey) {
+    return res.status(403).json({ error: 'Invalid bootstrap key' });
+  }
+
+  const uid = String(req.body?.uid || '').trim();
+  if (!uid) {
+    return res.status(400).json({ error: 'Missing uid in request body' });
+  }
+
+  try {
+    const admin = require('firebase-admin');
+    await admin.auth().setCustomUserClaims(uid, { role: 'admin' });
+    console.log(`✅ Admin custom claims set for UID: ${uid}`);
+    return res.json({ success: true, uid, message: 'Admin claims set. User must re-login for claims to take effect.' });
+  } catch (e) {
+    console.error('❌ Failed to set admin claims:', e);
+    return res.status(500).json({ error: 'Failed to set claims', message: e.message });
+  }
 });
 
 // 404 handler

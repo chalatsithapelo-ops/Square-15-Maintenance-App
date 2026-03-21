@@ -2098,6 +2098,23 @@ class _WorkCompletePanelState extends State<_WorkCompletePanel> {
         });
       }
 
+      // 4) Notify artisan that client marked order as complete
+      try {
+        final ratingText = _userRating > 0
+            ? ' Rating: ${_userRating.toStringAsFixed(1)}/5.'
+            : '';
+        await FutureBookingService.sendNotificationToArtisan(
+          artisanId: widget.serviceProviderId,
+          bookingId: futureBookingId.isNotEmpty
+              ? futureBookingId
+              : widget.tasksManagementId,
+          message:
+              'Client has marked the order as complete.$ratingText Thank you for your service!',
+        );
+      } catch (_) {
+        // Best-effort
+      }
+
       if (!mounted) return;
       Get.snackbar(
         'Success',

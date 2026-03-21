@@ -5,19 +5,20 @@ import 'dart:math';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_database/firebase_database.dart';
 import 'package:firebase_storage/firebase_storage.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_easyloading/flutter_easyloading.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:get/get.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
-import 'package:googleapis_auth/auth_io.dart';
 import 'package:image_cropper/image_cropper.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:maintenanceapp/model/artisan_task_model.dart';
 import 'package:maintenanceapp/model/category_model.dart';
 import 'package:maintenanceapp/model/job_images_model.dart';
 import 'package:maintenanceapp/model/job_model.dart';
+import 'package:maintenanceapp/services/backend_fcm_service.dart';
 import 'package:maintenanceapp/model/notification_model.dart';
 import 'package:maintenanceapp/model/request_model.dart';
 import 'package:maintenanceapp/model/task_management_model.dart';
@@ -444,11 +445,11 @@ class AppController extends GetxController {
     userId.value = id.toString();
     userType.value = type.toString();
 
-    debugPrint("$userEmail");
-    debugPrint("$userPassword");
-    debugPrint("$isLogin");
-    debugPrint("$userType");
-    debugPrint("$userId");
+    debugPrint("email=$userEmail");
+    // Password deliberately not logged
+    debugPrint("isLogin=$isLogin");
+    debugPrint("userType=$userType");
+    debugPrint("userId=$userId");
   }
 
   ///using Firebase FireStore
@@ -542,7 +543,7 @@ class AppController extends GetxController {
     debugPrint("Saved Preferences");
     final SharedPreferences pref = await SharedPreferences.getInstance();
     pref.setString('email', email);
-    pref.setString('password', password);
+    // Password no longer stored locally for security
     pref.setBool('isLogin', isLogin);
     pref.setString('id', id);
     pref.setString('type', type);
@@ -552,7 +553,8 @@ class AppController extends GetxController {
     debugPrint("Remove Preferences");
     final SharedPreferences pref = await SharedPreferences.getInstance();
     pref.setString('email', "");
-    pref.setString('password', "");
+    // password key cleared for migration; no longer stored
+    pref.remove('password');
     pref.setBool('isLogin', false);
     pref.setString('id', "");
     pref.setString('type', "");
@@ -1325,6 +1327,23 @@ class AppController extends GetxController {
         } catch (_) {
           // Best-effort; do not block the UI if this update fails.
         }
+      } else {
+        // Regular (non-future-booking) payment — notify the artisan.
+        try {
+          final artisanId =
+              (tmData['service_provider_id'] ?? '').toString().trim();
+          if (artisanId.isNotEmpty) {
+            await FutureBookingService.sendNotificationToArtisan(
+              artisanId: artisanId,
+              bookingId: taskManagementId,
+              message:
+                  'The client has completed payment. '
+                  'You can now proceed with the job.',
+            );
+          }
+        } catch (_) {
+          // Best-effort.
+        }
       }
 
       if (!isPaymentUsingPayFast.value) {
@@ -1735,7 +1754,7 @@ class AppController extends GetxController {
     }
   }
 
-  /// 🔹 Helper: Send FCM v1 notification using OAuth2 token
+  /// 🔹 Helper: Send FCM v1 notification via secure backend endpoint
   Future<void> sendFCMv1Notification({
     required String title,
     required String body,
@@ -1744,50 +1763,17 @@ class AppController extends GetxController {
     String? imageUrl,
   }) async {
     try {
-      // Load service account JSON
-      final serviceAccount = json
-          .decode(await rootBundle.loadString('assets/firebase-adminsdk.json'));
-
-      final credentials = ServiceAccountCredentials.fromJson(serviceAccount);
-      final scopes = ['https://www.googleapis.com/auth/firebase.messaging'];
-
-      // Obtain authenticated HTTP client
-      final client = await clientViaServiceAccount(credentials, scopes);
-      final projectId = serviceAccount['project_id'];
-
-      final url = Uri.parse(
-          'https://fcm.googleapis.com/v1/projects/$projectId/messages:send');
-
-      // 🔹 Build FCM message payload
-      final payload = {
-        "message": {
-          "token": token,
-          "notification": {
-            "title": title,
-            "body": body,
-          },
-          "data": {
-            "type": type,
-            if (imageUrl != null) "image": imageUrl,
-          },
-        }
-      };
-
-      final response = await client.post(
-        url,
-        headers: {'Content-Type': 'application/json; charset=UTF-8'},
-        body: jsonEncode(payload),
+      await BackendFcmService.sendNotification(
+        token: token,
+        title: title,
+        body: body,
+        data: {
+          'type': type,
+          if (imageUrl != null) 'image': imageUrl,
+        },
       );
-
-      if (response.statusCode == 200) {
-        debugPrint("📨 FCM sent to $token");
-      } else {
-        debugPrint("⚠️ FCM error (${response.statusCode}): ${response.body}");
-      }
-
-      client.close();
     } catch (e) {
-      debugPrint("❌ _sendFCMv1Notification error: $e");
+      if (kDebugMode) debugPrint("❌ sendFCMv1Notification error: $e");
     }
   }
 

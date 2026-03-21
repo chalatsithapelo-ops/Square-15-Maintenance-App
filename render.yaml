@@ -14,6 +14,8 @@ services:
         value: production
       - key: NODE_VERSION
         value: "20"
+      - key: TRUST_PROXY
+        value: "1"
       # IMPORTANT: Set the following as "Secret" in Render dashboard after first deploy.
       # Render Blueprints don't allow marking secrets directly in yaml.
       - key: LIVEKIT_WS_URL
@@ -24,6 +26,16 @@ services:
         sync: false
       - key: LIVEKIT_AGENT_NAME
         value: square15-voice-assistant
+      # PayFast credentials (set as Secret in Render dashboard)
+      - key: PAYFAST_MERCHANT_ID
+        sync: false
+      - key: PAYFAST_MERCHANT_KEY
+        sync: false
+      - key: PAYFAST_URL
+        value: "https://www.payfast.co.za/eng/process"
+      # Admin bootstrap key for setting admin custom claims
+      - key: ADMIN_BOOTSTRAP_KEY
+        sync: false
 
   # 2) Always-on agent worker (receives dispatch jobs and speaks)
   - type: worker

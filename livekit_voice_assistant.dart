@@ -21,11 +21,12 @@ import 'package:maintenanceapp/screens/home/booking/future_bookings_list_screen.
 import 'package:maintenanceapp/screens/home/booking/ai_photo_upload_screen.dart';
 import 'package:maintenanceapp/screens/home/booking/client_calendar_screen.dart';
 import 'package:maintenanceapp/screens/home/booking/payment_method_sheet.dart';
-import 'package:maintenanceapp/screens/home/booking/voice_service_picker_screen.dart';
 import 'package:maintenanceapp/screens/service_provider_panel/Serviceprovider/artisan_appointments_screen.dart';
 import 'package:maintenanceapp/screens/service_provider_panel/service_provider_request_screen.dart';
 import 'package:maintenanceapp/screens/service_provider_panel/wallet_page.dart';
+import 'package:maintenanceapp/services/booking_monitor_service.dart';
 import 'package:maintenanceapp/services/future_booking_service.dart';
+import 'package:maintenanceapp/services/service_area_checker.dart';
 import 'package:maintenanceapp/services/firestore_services/firebase_services.dart';
 
 /// Professional Livekit Voice AI Assistant Integration
@@ -116,6 +117,7 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
   bool _isDisconnecting = false;
   Timer? _disconnectDebounce;
   Timer? _metadataPoller;
+  Timer? _firebaseTokenRefreshTimer;
 
   // Conversation Transcript
   final List<Map<String, String>> _transcript = [];
@@ -141,6 +143,9 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
   String _lastCreatedBookingId = '';
   String _lastAssignedArtisanId = '';
   String _watchBookingLastProviderId = '';
+
+  // Cached active bookings summary for agent context
+  List<Map<String, dynamic>> _cachedActiveBookings = [];
 
   StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>?
       _bookingStatusSubscription;
@@ -430,6 +435,19 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
       // subsequent setMetadata calls for context/speak.
       await _sendCredentialsToAgent();
 
+      // ── Periodic Firebase token refresh (tokens expire after ~1 hour) ──
+      // Re-send credentials every 45 minutes so long-running sessions
+      // don't lose backend access when the token expires.
+      _firebaseTokenRefreshTimer?.cancel();
+      _firebaseTokenRefreshTimer = Timer.periodic(
+        const Duration(minutes: 45),
+        (_) async {
+          if (!mounted || !_isConnected) return;
+          debugPrint('🔄 Refreshing Firebase token for agent session...');
+          await _sendCredentialsToAgent();
+        },
+      );
+
       // Provide capabilities + in-app context so the agent can reliably
       // navigate and complete tasks via square15_ui actions.
       await _sendAppContextToAgent(reason: 'connected');
@@ -480,6 +498,11 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
       'payload': {
         'text': t,
       },
+      // Keep credentials in every metadata update so the agent always has
+      // access, even if earlier credential deliveries were lost.
+      'firebase_token': _firebaseIdToken.trim(),
+      'voice_session_id': _voiceSessionId,
+      'voice_session_nonce': _voiceSessionNonce,
       'ts': now.toIso8601String(),
       'seq': ++_appMetadataSeq,
     });
@@ -509,11 +532,21 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
     // Give the agent a moment to finish joining + attach metadata listeners.
     Future.delayed(const Duration(milliseconds: 700), () async {
       try {
+        // ── CRITICAL: Re-send credentials now that agent has joined ──
+        // The initial publishData may have been lost if the agent wasn't
+        // listening yet. This guarantees the agent gets our Firebase token.
+        await _sendCredentialsToAgent();
+
         await _sendSpeakToAgent(
           'I am $_assistantName, how can I help you today?',
         );
+
+        // Also re-send app context with active bookings for the agent.
+        await _sendAppContextToAgent(reason: 'agent_joined');
+
         // Retry once in case the first metadata update was missed.
         await Future.delayed(const Duration(seconds: 3));
+        await _sendCredentialsToAgent();
         await _sendSpeakToAgent(
           'I am $_assistantName, how can I help you today?',
         );
@@ -585,6 +618,62 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
     };
   }
 
+  /// Fetch user's recent/active bookings from Firestore so the agent
+  /// knows about them without needing a backend API call.
+  Future<void> _refreshActiveBookingsForContext() async {
+    try {
+      String userId = '';
+      try {
+        if (Get.isRegistered<AppController>()) {
+          userId = Get.find<AppController>().userId.value.toString().trim();
+        }
+      } catch (_) {}
+      if (userId.isEmpty) {
+        final u = FirebaseAuth.instance.currentUser;
+        if (u != null) userId = u.uid;
+      }
+      if (userId.isEmpty) return;
+
+      // Query recent bookings for this user (last 10, any status)
+      final snap = await FutureBookingService.futureBookingsRef
+          .where('user_id', isEqualTo: userId)
+          .orderBy('created_at', descending: true)
+          .limit(10)
+          .get();
+
+      final bookings = <Map<String, dynamic>>[];
+      for (final doc in snap.docs) {
+        final d = doc.data();
+        final status = (d['status'] ?? '').toString().trim();
+        final category = (d['category_name'] ?? d['category'] ?? '').toString().trim();
+        final artisanName = (d['artisan_name'] ?? d['service_provider_name'] ?? '').toString().trim();
+        final artisanId = (d['artisan_id'] ?? d['service_provider_id'] ?? '').toString().trim();
+        final scheduledDate = (d['scheduled_date'] ?? '').toString().trim();
+        final scheduledTime = (d['scheduled_time'] ?? '').toString().trim();
+        final price = (d['price'] ?? d['total_price'] ?? '').toString().trim();
+        final description = (d['problem_description'] ?? d['description'] ?? '').toString().trim();
+
+        bookings.add({
+          'booking_id': doc.id,
+          'status': status,
+          'category': category,
+          'artisan_name': artisanName,
+          'artisan_id': artisanId,
+          'scheduled_date': scheduledDate,
+          'scheduled_time': scheduledTime,
+          'price': price,
+          'description': description.length > 100
+              ? '${description.substring(0, 100)}...'
+              : description,
+        });
+      }
+      _cachedActiveBookings = bookings;
+      debugPrint('[ai_app] refreshed ${bookings.length} active bookings for context');
+    } catch (e) {
+      debugPrint('[ai_app] _refreshActiveBookingsForContext error: $e');
+    }
+  }
+
   Map<String, dynamic> _buildAppContext({required String reason}) {
     final role = widget.role.toLowerCase().trim();
     final route = Get.currentRoute.toString();
@@ -621,9 +710,110 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
       'last_created_booking_id': _lastCreatedBookingId,
       'last_assigned_artisan_id': _lastAssignedArtisanId,
       'pending_requests_count': pendingRequests,
+      'active_bookings': _cachedActiveBookings,
       'capabilities': _buildAgentCapabilities(),
+      'screen_context': _buildCurrentScreenContext(route: route, role: role),
       'ts': DateTime.now().toIso8601String(),
     };
+  }
+
+  /// Build a description of what's currently visible on the screen.
+  /// This allows the voice agent to understand and interpret the current page.
+  Map<String, dynamic> _buildCurrentScreenContext({required String route, required String role}) {
+    final screenInfo = <String, dynamic>{
+      'current_route': route,
+      'screen_name': _routeToScreenName(route),
+      'screen_description': _routeToScreenDescription(route),
+      'available_actions': _routeToAvailableActions(route, role),
+    };
+
+    // Add screen-specific data when available
+    try {
+      if (route.contains('wallet') || route.contains('Wallet')) {
+        if (Get.isRegistered<AppController>()) {
+          final ctrl = Get.find<AppController>();
+          final balance = ctrl.userBalance.value.isNotEmpty ? ctrl.userBalance.value : (ctrl.userData?.balance ?? '0');
+          screenInfo['screen_data'] = {
+            'wallet_balance': balance.toString(),
+          };
+        }
+      }
+
+      if (route.contains('dashboard') || route == '/') {
+        if (Get.isRegistered<AppController>()) {
+          final ctrl = Get.find<AppController>();
+          screenInfo['screen_data'] = {
+            'user_name': ctrl.userName.value.isNotEmpty ? ctrl.userName.value : (ctrl.userData?.name ?? ''),
+            'active_bookings_count': _cachedActiveBookings.length,
+          };
+        }
+      }
+    } catch (_) {}
+
+    return screenInfo;
+  }
+
+  String _routeToScreenName(String route) {
+    final r = route.toLowerCase().trim();
+    if (r.contains('dashboard') || r == '/') return 'Home Dashboard';
+    if (r.contains('wallet')) return 'Wallet';
+    if (r.contains('profile')) return 'Profile';
+    if (r.contains('settings')) return 'Settings';
+    if (r.contains('notifications')) return 'Notifications';
+    if (r.contains('support') || r.contains('chat')) return 'Support Chat';
+    if (r.contains('future_bookings') || r.contains('futureBookings')) return 'Future Bookings';
+    if (r.contains('bookings') || r.contains('booking')) return 'Bookings';
+    if (r.contains('calendar')) return 'Calendar';
+    if (r.contains('requests')) return 'Service Requests';
+    if (r.contains('appointments')) return 'Appointments';
+    if (r.contains('history') || r.contains('transaction')) return 'Transaction History';
+    return 'App Screen';
+  }
+
+  String _routeToScreenDescription(String route) {
+    final r = route.toLowerCase().trim();
+    if (r.contains('dashboard') || r == '/') return 'Main home screen showing service categories, quick actions, and booking summary.';
+    if (r.contains('wallet')) return 'Wallet screen showing current balance, deposit options, and transaction history.';
+    if (r.contains('profile')) return 'User profile with name, email, phone, and account settings.';
+    if (r.contains('settings')) return 'App settings including notifications preferences and account management.';
+    if (r.contains('notifications')) return 'List of all notifications including booking updates, payment confirmations, and system messages.';
+    if (r.contains('support') || r.contains('chat')) return 'Customer support chat for contacting admin and getting help.';
+    if (r.contains('future_bookings') || r.contains('futureBookings')) return 'List of upcoming scheduled bookings with status, artisan, and pricing details.';
+    if (r.contains('bookings') || r.contains('booking')) return 'All bookings including active, completed, and cancelled ones.';
+    if (r.contains('calendar')) return 'Calendar view of scheduled services and upcoming appointments.';
+    if (r.contains('requests')) return 'Incoming service requests waiting for artisan response.';
+    if (r.contains('appointments')) return 'Confirmed appointments and scheduled work.';
+    if (r.contains('history') || r.contains('transaction')) return 'Transaction history showing deposits, payments, and refunds.';
+    return 'Application screen.';
+  }
+
+  List<String> _routeToAvailableActions(String route, String role) {
+    final r = route.toLowerCase().trim();
+    final actions = <String>[];
+
+    // Global actions always available
+    actions.addAll(['go_home', 'go_back', 'open_notifications', 'open_profile', 'open_settings', 'open_wallet']);
+
+    if (r.contains('dashboard') || r == '/') {
+      actions.addAll(['open_future_bookings', 'open_bookings_tab', 'create_order_booking', 'open_support', 'open_calendar']);
+      if (role == 'artisan') {
+        actions.addAll(['open_artisan_requests', 'open_artisan_appointments', 'open_artisan_wallet']);
+      }
+    }
+    if (r.contains('wallet')) {
+      actions.addAll(['get_wallet_balance', 'get_transaction_history', 'get_deposit_requests']);
+    }
+    if (r.contains('booking') || r.contains('future_bookings')) {
+      actions.addAll(['get_booking_status', 'cancel_booking', 'reschedule_booking', 'send_message_to_artisan', 'call_assigned_artisan']);
+    }
+    if (r.contains('requests') && role == 'artisan') {
+      actions.addAll(['accept_latest_request', 'reject_latest_request', 'respond_to_request']);
+    }
+    if (r.contains('appointments') && role == 'artisan') {
+      actions.addAll(['mark_booking_in_progress', 'artisan_cancel_and_reassign']);
+    }
+
+    return actions;
   }
 
   /// Send Firebase credentials to the agent so it can authenticate
@@ -682,10 +872,19 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
     if (!mounted) return;
     if (_room == null || _room!.localParticipant == null) return;
 
+    // Refresh active bookings so the agent has up-to-date info
+    await _refreshActiveBookingsForContext();
+
     final meta = jsonEncode({
       'type': 'square15_app',
       'action': 'context',
       'payload': _buildAppContext(reason: reason),
+      // Include credentials in EVERY metadata update so the agent can always
+      // pick up firebase_token, even if prior credential-only messages were
+      // lost or overwritten.
+      'firebase_token': _firebaseIdToken.trim(),
+      'voice_session_id': _voiceSessionId,
+      'voice_session_nonce': _voiceSessionNonce,
       'ts': DateTime.now().toIso8601String(),
       'seq': ++_appMetadataSeq,
     });
@@ -1629,29 +1828,8 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
     if (action == 'create_order_booking' || action == 'dispatch_artisan') {
       if (_isCreatingOrderBooking) return;
 
-      // Check if photos are required
-      final map = payload is Map
-          ? payload.map((k, v) => MapEntry(k.toString(), v))
-          : <String, dynamic>{};
-      final requirePhotos = _boolValue(
-          map['require_photos'] ?? map['requirePhotos'],
-          defaultValue: true);
-
-      final workImageUrls = _stringListFromDynamic(
-        map['work_image_urls'] ??
-            map['workImageUrls'] ??
-            map['image_urls'] ??
-            map['imageUrls'] ??
-            map['images'],
-      );
-
-      if (requirePhotos && workImageUrls.length < 3) {
-        // Open photo upload first, then dispatch after photos are uploaded
-        await _openPhotoUploadThenDispatch(payload);
-        return;
-      }
-
-      // Direct dispatch without photos (legacy path)
+      // Voice-first flow: skip photo gate entirely.
+      // Photos are optional and can be added post-booking from booking history.
       _isCreatingOrderBooking = true;
       try {
         await _createOrderBookingFromPayload(payload);
@@ -1709,6 +1887,7 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
       Get.toNamed('/notifications');
       Get.snackbar(_assistantName, 'Opening notifications',
           backgroundColor: Colors.green, colorText: Colors.white);
+      _sendAppContextToAgent(reason: 'navigated_to_notifications');
       return;
     }
 
@@ -1717,6 +1896,7 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
       Get.toNamed('/profile');
       Get.snackbar(_assistantName, 'Opening your profile',
           backgroundColor: Colors.green, colorText: Colors.white);
+      _sendAppContextToAgent(reason: 'navigated_to_profile');
       return;
     }
 
@@ -1725,6 +1905,7 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
       Get.toNamed('/settings');
       Get.snackbar(_assistantName, 'Opening settings',
           backgroundColor: Colors.green, colorText: Colors.white);
+      _sendAppContextToAgent(reason: 'navigated_to_settings');
       return;
     }
 
@@ -1733,6 +1914,7 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
       Get.toNamed('/support');
       Get.snackbar(_assistantName, 'Opening customer support',
           backgroundColor: Colors.green, colorText: Colors.white);
+      _sendAppContextToAgent(reason: 'navigated_to_support');
       return;
     }
 
@@ -1741,6 +1923,7 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
       Get.toNamed('/wallet');
       Get.snackbar(_assistantName, 'Opening your wallet',
           backgroundColor: Colors.green, colorText: Colors.white);
+      _sendAppContextToAgent(reason: 'navigated_to_wallet');
       return;
     }
 
@@ -1749,14 +1932,14 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
       Get.to(() => const ClientCalendarScreen());
       Get.snackbar(_assistantName, 'Opening calendar',
           backgroundColor: Colors.green, colorText: Colors.white);
+      _sendAppContextToAgent(reason: 'navigated_to_calendar');
       return;
     }
 
     if (action == 'open_map' || action == 'show_location') {
-      if (_shouldDebounceUiAction(action)) return;
-      Get.toNamed('/map');
-      Get.snackbar(_assistantName, 'Opening map',
-          backgroundColor: Colors.green, colorText: Colors.white);
+      // Map screen is not implemented — ignore silently.
+      // The agent instructions have been updated to not use this action.
+      print('[voice] open_map action ignored — no map route registered');
       return;
     }
 
@@ -1775,6 +1958,7 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
       Get.offAllNamed('/dashboard');
       Get.snackbar(_assistantName, 'Going to home screen',
           backgroundColor: Colors.green, colorText: Colors.white);
+      _sendAppContextToAgent(reason: 'navigated_to_home');
       return;
     }
 
@@ -2526,9 +2710,31 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
     String categoryName,
   ) async {
     try {
-      final catSnap = await FirebaseService.categoryRef
-          .where('status', isEqualTo: 'publish')
-          .get();
+      // Try multiple status values to find published categories.
+      QuerySnapshot<Map<String, dynamic>>? catSnap;
+      for (final sv in ['publish', 'Published', 'active', 'Active']) {
+        try {
+          final r = await FirebaseService.categoryRef
+              .where('status', isEqualTo: sv)
+              .get();
+          if (r.docs.isNotEmpty) {
+            catSnap = r;
+            print('[ai_cat] Found ${r.docs.length} categories with status=$sv');
+            break;
+          }
+        } catch (_) {}
+      }
+      // Last resort: get all categories without status filter.
+      if (catSnap == null || catSnap.docs.isEmpty) {
+        try {
+          catSnap = await FirebaseService.categoryRef.get();
+          print('[ai_cat] Found ${catSnap.docs.length} categories (no status filter)');
+        } catch (_) {}
+      }
+      if (catSnap == null || catSnap.docs.isEmpty) {
+        print('[ai_cat] No categories found in Firestore');
+        return <String>[];
+      }
 
       String normalize(String s) {
         return s
@@ -2549,57 +2755,247 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
         'electric': 'electrical',
         'power': 'electrical',
         'lights': 'electrical',
+        'light': 'electrical',
         'plug': 'electrical',
         'socket': 'electrical',
         'wiring': 'electrical',
+        'wire': 'electrical',
         'breaker': 'electrical',
         'trip': 'electrical',
+        'tripping': 'electrical',
+        'circuit': 'electrical',
+        'outlet': 'electrical',
+        'switch': 'electrical',
+        'fuse': 'electrical',
+        'fusebox': 'electrical',
+        'panel': 'electrical',
+        'generator': 'electrical',
+        'inverter': 'electrical',
+        'electrician': 'electrical',
+        'ceiling fan': 'electrical',
 
         // Plumbing
         'plumber': 'plumbing',
+        'plumbing': 'plumbing',
         'tap': 'plumbing',
+        'taps': 'plumbing',
+        'faucet': 'plumbing',
         'leak': 'plumbing',
         'leaking': 'plumbing',
+        'leaky': 'plumbing',
         'pipe': 'plumbing',
+        'pipes': 'plumbing',
         'toilet': 'plumbing',
         'geyser': 'plumbing',
         'drain': 'plumbing',
+        'drainage': 'plumbing',
         'blocked': 'plumbing',
+        'unblock': 'plumbing',
+        'clogged': 'plumbing',
+        'sewer': 'plumbing',
+        'sewage': 'plumbing',
+        'water heater': 'plumbing',
+        'burst': 'plumbing',
+        'basin': 'plumbing',
+        'sink': 'plumbing',
+        'shower': 'plumbing',
+        'bath': 'plumbing',
+        'bathtub': 'plumbing',
+        'cistern': 'plumbing',
+        'valve': 'plumbing',
+        'stopcock': 'plumbing',
+        'water pressure': 'plumbing',
+        'garbage disposal': 'plumbing',
 
         // Painting
         'paint': 'painting',
         'painting': 'painting',
         'repaint': 'painting',
-        'wall': 'painting',
-        'ceiling': 'painting',
+        'painter': 'painting',
+        'wall paint': 'painting',
+        'ceiling paint': 'painting',
+        'stain': 'painting',
+        'staining': 'painting',
+        'wallpaper': 'painting',
+        'primer': 'painting',
+        'varnish': 'painting',
+        'coating': 'painting',
 
         // Cleaning
         'clean': 'cleaning',
         'cleaning': 'cleaning',
         'dirty': 'cleaning',
         'deep clean': 'cleaning',
-        'carpet': 'cleaning',
+        'carpet clean': 'cleaning',
+        'window clean': 'cleaning',
+        'pressure wash': 'cleaning',
+        'powerwash': 'cleaning',
+        'sanitize': 'cleaning',
+        'disinfect': 'cleaning',
+        'maid': 'cleaning',
+        'domestic': 'cleaning',
+        'housekeeping': 'cleaning',
+        'move out clean': 'cleaning',
+        'move in clean': 'cleaning',
+        'post construction clean': 'cleaning',
 
         // Tiling
         'tile': 'tiling',
         'tiling': 'tiling',
         'tiles': 'tiling',
+        'retile': 'tiling',
+        'grout': 'tiling',
+        'grouting': 'tiling',
 
         // Roofing
         'roof': 'roofing',
         'roofing': 'roofing',
+        'gutter': 'roofing',
+        'gutters': 'roofing',
+        'shingle': 'roofing',
+        'shingles': 'roofing',
+        'skylight': 'roofing',
+        'roof leak': 'roofing',
+        'waterproofing': 'roofing',
+        'flashing': 'roofing',
 
-        // HVAC (if present)
+        // HVAC / Air Conditioning
         'aircon': 'air conditioning',
         'air con': 'air conditioning',
+        'air conditioner': 'air conditioning',
+        'air conditioning': 'air conditioning',
         'ac': 'air conditioning',
+        'hvac': 'air conditioning',
+        'furnace': 'air conditioning',
+        'heating': 'air conditioning',
+        'ventilation': 'air conditioning',
+        'thermostat': 'air conditioning',
+        'duct': 'air conditioning',
+        'ducting': 'air conditioning',
+        'cooling': 'air conditioning',
+
+        // Carpentry
+        'carpenter': 'carpentry',
+        'carpentry': 'carpentry',
+        'wood': 'carpentry',
+        'wooden': 'carpentry',
+        'door': 'carpentry',
+        'doors': 'carpentry',
+        'cabinet': 'carpentry',
+        'cabinets': 'carpentry',
+        'cupboard': 'carpentry',
+        'cupboards': 'carpentry',
+        'shelf': 'carpentry',
+        'shelves': 'carpentry',
+        'shelving': 'carpentry',
+        'deck': 'carpentry',
+        'decking': 'carpentry',
+        'furniture': 'carpentry',
+        'wardrobe': 'carpentry',
+        'trim': 'carpentry',
+        'skirting': 'carpentry',
+        'staircase': 'carpentry',
+        'stairs': 'carpentry',
+        'window frame': 'carpentry',
+
+        // Flooring
+        'floor': 'flooring',
+        'flooring': 'flooring',
+        'hardwood': 'flooring',
+        'laminate': 'flooring',
+        'vinyl': 'flooring',
+        'carpet': 'flooring',
+        'parquet': 'flooring',
+        'subfloor': 'flooring',
+        'baseboard': 'flooring',
+        'sanding': 'flooring',
+        'refinish': 'flooring',
+
+        // Landscaping
+        'garden': 'landscaping',
+        'gardener': 'landscaping',
+        'gardening': 'landscaping',
+        'landscaping': 'landscaping',
+        'lawn': 'landscaping',
+        'mowing': 'landscaping',
+        'tree': 'landscaping',
+        'trees': 'landscaping',
+        'trimming': 'landscaping',
+        'hedge': 'landscaping',
+        'hedges': 'landscaping',
+        'irrigation': 'landscaping',
+        'sprinkler': 'landscaping',
+        'fence': 'landscaping',
+        'fencing': 'landscaping',
+        'patio': 'landscaping',
+        'paving': 'landscaping',
+        'sod': 'landscaping',
+
+        // Car Detailing
+        'car wash': 'car detailing',
+        'car detailing': 'car detailing',
+        'car detail': 'car detailing',
+        'vehicle': 'car detailing',
+        'car clean': 'car detailing',
+        'car polish': 'car detailing',
+        'car valet': 'car detailing',
+        'valet': 'car detailing',
+        'auto detail': 'car detailing',
+        'car interior': 'car detailing',
+
+        // Solar Energy Solutions
+        'solar': 'solar energy solutions',
+        'solar panel': 'solar energy solutions',
+        'solar panels': 'solar energy solutions',
+        'solar geyser': 'solar energy solutions',
+        'pv solar': 'solar energy solutions',
+        'photovoltaic': 'solar energy solutions',
+        'solar installation': 'solar energy solutions',
+        'solar maintenance': 'solar energy solutions',
+        'solar energy': 'solar energy solutions',
+
+        // General Maintenance
+        'maintenance': 'general maintenance',
+        'general maintenance': 'general maintenance',
+        'handyman': 'general maintenance',
+        'odd job': 'general maintenance',
+        'odd jobs': 'general maintenance',
+        'emergency': 'general maintenance',
+        // Compound phrases for common service requests
+        'blocked toilet': 'plumbing',
+        'blocked drain': 'plumbing',
+        'blocked sink': 'plumbing',
+        'blocked pipe': 'plumbing',
+        'blocked sewer': 'plumbing',
+        'unblock toilet': 'plumbing',
+        'unblock drain': 'plumbing',
+        'clogged toilet': 'plumbing',
+        'clogged drain': 'plumbing',
+        'leaking tap': 'plumbing',
+        'leaking pipe': 'plumbing',
+        'leaking geyser': 'plumbing',
+        'burst pipe': 'plumbing',
+        'burst geyser': 'plumbing',
+        'tripping power': 'electrical',
+        'tripping electricity': 'electrical',
+        'no power': 'electrical',
+        'no electricity': 'electrical',
+        'broken door': 'carpentry',
+        'broken window': 'carpentry',
+        'leaking roof': 'roofing',
       };
 
+      // Sort entries by key length descending so multi-word phrases
+      // (e.g. "blocked toilet") match before single words (e.g. "blocked").
+      final sortedEntries = symptomToCategory.entries.toList()
+        ..sort((a, b) => b.key.length.compareTo(a.key.length));
+
       String inferred = normalizedInput;
-      for (final entry in symptomToCategory.entries) {
+      for (final entry in sortedEntries) {
         if (normalizedInput == entry.key ||
             normalizedInput.contains(entry.key)) {
           inferred = entry.value;
+          print('[ai_cat] symptom "${entry.key}" → category "${entry.value}" from input "$normalizedInput"');
           break;
         }
       }
@@ -2610,10 +3006,19 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
         normalize(inferred),
       };
 
-      if (candidates.contains('electrical')) candidates.addAll({'electrician'});
-      if (candidates.contains('plumbing')) candidates.addAll({'plumber'});
-      if (candidates.contains('painting')) candidates.addAll({'painter'});
-      if (candidates.contains('cleaning')) candidates.addAll({'cleaner'});
+      if (candidates.contains('electrical')) candidates.addAll({'electrician', 'electrics'});
+      if (candidates.contains('plumbing')) candidates.addAll({'plumber', 'plumbers'});
+      if (candidates.contains('painting')) candidates.addAll({'painter', 'painters'});
+      if (candidates.contains('cleaning')) candidates.addAll({'cleaner', 'cleaners'});
+      if (candidates.contains('carpentry')) candidates.addAll({'carpenter', 'carpenters'});
+      if (candidates.contains('roofing')) candidates.addAll({'roofer', 'roofers'});
+      if (candidates.contains('flooring')) candidates.addAll({'floor', 'floors'});
+      if (candidates.contains('landscaping')) candidates.addAll({'landscaper', 'gardener', 'garden'});
+      if (candidates.contains('tiling')) candidates.addAll({'tiler', 'tilers'});
+      if (candidates.contains('air conditioning')) candidates.addAll({'hvac', 'aircon', 'ac'});
+      if (candidates.contains('car detailing')) candidates.addAll({'car wash', 'valet'});
+      if (candidates.contains('solar energy solutions')) candidates.addAll({'solar', 'solar energy'});
+      if (candidates.contains('general maintenance')) candidates.addAll({'maintenance', 'handyman'});
 
       List<String> idsFromDoc(QueryDocumentSnapshot<Map<String, dynamic>> doc) {
         final data = doc.data();
@@ -2675,35 +3080,42 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
 
       QuerySnapshot<Map<String, dynamic>>? snap;
 
+      // Try a query with a specific field, value, and optional status filter.
       Future<QuerySnapshot<Map<String, dynamic>>?> tryQuery(
         String field,
-        String value,
-      ) async {
+        String value, {
+        String? statusValue,
+      }) async {
         try {
-          final r = await FirebaseService.taskRef
-              .where('status', isEqualTo: 'publish')
-              .where(field, isEqualTo: value)
-              .get();
-          print('[ai_task] try field=$field id=$value count=${r.docs.length}');
+          Query<Map<String, dynamic>> q = FirebaseService.taskRef;
+          if (statusValue != null) {
+            q = q.where('status', isEqualTo: statusValue);
+          }
+          q = q.where(field, isEqualTo: value);
+          final r = await q.get();
+          print('[ai_task] try field=$field id=$value status=${statusValue ?? 'any'} count=${r.docs.length}');
           return r;
-        } catch (_) {
+        } catch (e) {
+          print('[ai_task] query error field=$field id=$value: $e');
           return null;
         }
       }
 
-      // Try the most common schema first: tasks.categoryId
-      for (final id in ids) {
-        final r = await tryQuery('categoryId', id);
-        if (r != null && r.docs.isNotEmpty) {
-          snap = r;
-          break;
-        }
-      }
+      // All possible category ID field names in the tasks collection.
+      const categoryFields = [
+        'categoryId',
+        'category_id',
+        'subCategoryId',
+        'sub_category_id',
+        'subcategoryId',
+        'subcategory_id',
+      ];
 
-      // Fallback: some schemas use tasks.category_id
-      if (snap == null || snap.docs.isEmpty) {
+      // Phase 1: Try with status='publish' (the expected value).
+      for (final field in categoryFields) {
+        if (snap != null && snap.docs.isNotEmpty) break;
         for (final id in ids) {
-          final r = await tryQuery('category_id', id);
+          final r = await tryQuery(field, id, statusValue: 'publish');
           if (r != null && r.docs.isNotEmpty) {
             snap = r;
             break;
@@ -2711,7 +3123,45 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
         }
       }
 
-      if (snap == null || snap.docs.isEmpty) return null;
+      // Phase 2: Try other common status values.
+      if (snap == null || snap.docs.isEmpty) {
+        print('[ai_task] No tasks found with status=publish, trying other status values');
+        for (final statusVal in ['Published', 'active', 'Active']) {
+          if (snap != null && snap.docs.isNotEmpty) break;
+          for (final field in categoryFields) {
+            if (snap != null && snap.docs.isNotEmpty) break;
+            for (final id in ids) {
+              final r = await tryQuery(field, id, statusValue: statusVal);
+              if (r != null && r.docs.isNotEmpty) {
+                snap = r;
+                break;
+              }
+            }
+          }
+        }
+      }
+
+      // Phase 3: Try without any status filter as last resort.
+      if (snap == null || snap.docs.isEmpty) {
+        print('[ai_task] No tasks found with any status filter, trying without status');
+        for (final field in categoryFields) {
+          if (snap != null && snap.docs.isNotEmpty) break;
+          for (final id in ids) {
+            final r = await tryQuery(field, id);
+            if (r != null && r.docs.isNotEmpty) {
+              snap = r;
+              break;
+            }
+          }
+        }
+      }
+
+      if (snap == null || snap.docs.isEmpty) {
+        print('[ai_task] No tasks found for any category ID or field combination');
+        return null;
+      }
+
+      print('[ai_task] Found ${snap.docs.length} tasks for category lookup');
 
       Map<String, dynamic> withId(
           QueryDocumentSnapshot<Map<String, dynamic>> doc) {
@@ -2734,6 +3184,8 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
             .map((e) => e.trim())
             .where((e) => e.isNotEmpty)
             .toList();
+        // Only remove truly meaningless words; keep action words like
+        // fix/repair/install as they help match task names.
         const stop = <String>{
           'a',
           'an',
@@ -2747,19 +3199,194 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
           'at',
           'my',
           'our',
+          'i',
+          'me',
+          'we',
           'please',
           'need',
           'help',
           'with',
-          'fix',
-          'repair',
-          'replace',
-          'install',
-          'service',
-          'work',
-          'job',
+          'want',
+          'would',
+          'like',
+          'can',
+          'could',
+          'get',
+          'got',
+          'have',
+          'has',
+          'had',
+          'is',
+          'am',
+          'are',
+          'was',
+          'be',
+          'been',
+          'it',
+          'its',
+          'that',
+          'this',
+          'there',
+          'do',
+          'does',
+          'did',
+          'so',
+          'but',
+          'if',
+          'or',
+          'not',
+          'no',
         };
         return raw.where((t) => !stop.contains(t)).toList();
+      }
+
+      // Synonym groups: any word in a group matches any other in that group.
+      const List<Set<String>> synonymGroups = [
+        // ── Plumbing ──
+        {'unblock', 'unblocking', 'blocked', 'block', 'blockage', 'clogged', 'clog'},
+        {'toilet', 'toilets', 'loo', 'lavatory', 'wc'},
+        {'drain', 'drains', 'drainage', 'draining', 'drainpipe'},
+        {'sewer', 'sewage', 'sewerage', 'sewers'},
+        {'leak', 'leaking', 'leaky', 'leaks', 'leaked'},
+        {'pipe', 'pipes', 'piping', 'pipeline'},
+        {'tap', 'taps', 'faucet', 'faucets'},
+        {'geyser', 'geysers', 'water heater', 'boiler', 'boilers'},
+        {'burst', 'bursting', 'bursted', 'ruptured', 'rupture'},
+        {'valve', 'valves', 'stopcock', 'stopcocks'},
+        {'sink', 'sinks', 'basin', 'basins', 'washbasin'},
+        {'shower', 'showers', 'showerhead'},
+        {'cistern', 'cisterns', 'flush', 'flushing'},
+        {'plumbing', 'plumber', 'plumbers'},
+
+        // ── Electrical ──
+        {'electrical', 'electric', 'electrician', 'electrics', 'electricity'},
+        {'wiring', 'wire', 'wires', 'rewire', 'rewiring'},
+        {'breaker', 'breakers', 'circuit', 'circuits', 'trip', 'tripping', 'tripped'},
+        {'socket', 'sockets', 'outlet', 'outlets', 'plug', 'plugs'},
+        {'switch', 'switches', 'dimmer', 'dimmers'},
+        {'fuse', 'fuses', 'fusebox', 'fuseboard'},
+        {'light', 'lights', 'lighting', 'lamp', 'lamps', 'bulb', 'bulbs'},
+        {'panel', 'panels', 'distribution', 'db'},
+        {'generator', 'generators', 'genset'},
+        {'inverter', 'inverters', 'ups'},
+        {'ceiling fan', 'fan', 'fans', 'extractor'},
+
+        // ── Painting ──
+        {'paint', 'painting', 'repaint', 'repainting', 'painted'},
+        {'primer', 'priming', 'undercoat'},
+        {'varnish', 'varnishing', 'lacquer'},
+        {'stain', 'staining', 'stained', 'woodstain'},
+        {'wallpaper', 'wallpapering', 'wallpapers'},
+        {'coating', 'coatings', 'sealant'},
+        {'wall', 'walls'},
+        {'ceiling', 'ceilings'},
+        {'painter', 'painters'},
+
+        // ── Carpentry ──
+        {'carpenter', 'carpenters', 'carpentry', 'woodwork', 'woodworking'},
+        {'door', 'doors', 'doorframe', 'doorframes'},
+        {'cabinet', 'cabinets', 'cupboard', 'cupboards'},
+        {'shelf', 'shelves', 'shelving'},
+        {'furniture', 'furnishings'},
+        {'deck', 'decking', 'decks'},
+        {'wardrobe', 'wardrobes', 'closet', 'closets'},
+        {'staircase', 'staircases', 'stairs', 'stair', 'banister', 'banisters'},
+        {'skirting', 'baseboard', 'baseboards'},
+        {'trim', 'trimming', 'moulding', 'molding'},
+        {'window frame', 'window frames', 'windowsill'},
+
+        // ── Tiling ──
+        {'tile', 'tiling', 'tiles', 'retile', 'retiling', 'tiled'},
+        {'grout', 'grouting', 'regrouting', 'regrout'},
+        {'mosaic', 'mosaics'},
+
+        // ── Roofing ──
+        {'roof', 'roofing', 'roofs', 'rooftop'},
+        {'gutter', 'gutters', 'guttering', 'downpipe', 'downpipes'},
+        {'shingle', 'shingles'},
+        {'skylight', 'skylights'},
+        {'flashing', 'flashings'},
+        {'waterproof', 'waterproofing', 'damp', 'dampproofing'},
+        {'roofer', 'roofers'},
+
+        // ── HVAC / Air Conditioning ──
+        {'aircon', 'ac', 'hvac', 'air conditioner', 'air conditioning'},
+        {'furnace', 'furnaces', 'heater', 'heaters', 'heating'},
+        {'ventilation', 'ventilate', 'vent', 'vents'},
+        {'thermostat', 'thermostats'},
+        {'duct', 'ducts', 'ducting', 'ductwork'},
+        {'cooling', 'coolant', 'refrigerant'},
+        {'compressor', 'compressors', 'condenser'},
+
+        // ── Flooring ──
+        {'floor', 'floors', 'flooring'},
+        {'hardwood', 'timber', 'wooden'},
+        {'laminate', 'laminates', 'laminated'},
+        {'vinyl', 'vinyls', 'lino', 'linoleum'},
+        {'carpet', 'carpets', 'carpeting', 'rug', 'rugs'},
+        {'parquet', 'parquetry'},
+        {'subfloor', 'subfloors', 'underfloor'},
+        {'sanding', 'sand', 'sanded'},
+        {'refinish', 'refinishing', 'polishing', 'polish'},
+
+        // ── Landscaping ──
+        {'garden', 'gardens', 'gardening', 'gardener', 'gardeners'},
+        {'landscaping', 'landscape', 'landscaper', 'landscapers'},
+        {'lawn', 'lawns', 'grass'},
+        {'mow', 'mowing', 'mowed', 'mower'},
+        {'tree', 'trees', 'shrub', 'shrubs', 'bush', 'bushes'},
+        {'hedge', 'hedges', 'hedging'},
+        {'irrigation', 'irrigate', 'sprinkler', 'sprinklers'},
+        {'fence', 'fences', 'fencing'},
+        {'patio', 'patios', 'paving', 'pavers', 'paved'},
+        {'sod', 'turf', 'turfing'},
+
+        // ── Cleaning ──
+        {'clean', 'cleaning', 'cleaner', 'cleaners'},
+        {'deep clean', 'deep cleaning', 'thorough clean'},
+        {'pressure wash', 'pressure washing', 'powerwash', 'powerwashing'},
+        {'sanitize', 'sanitizing', 'sanitise', 'disinfect', 'disinfecting'},
+        {'housekeeping', 'housekeeper', 'domestic', 'maid'},
+
+        // ── Car Detailing ──
+        {'car wash', 'carwash', 'car cleaning'},
+        {'car detailing', 'car detail', 'auto detailing', 'auto detail'},
+        {'polish', 'polishing', 'buffing', 'buff'},
+        {'valet', 'valeting'},
+        {'wax', 'waxing'},
+
+        // ── Solar Energy Solutions ──
+        {'solar', 'solar panel', 'solar panels', 'photovoltaic', 'pv'},
+        {'solar geyser', 'solar heater', 'solar water heater'},
+        {'battery', 'batteries', 'powerwall', 'energy storage'},
+
+        // ── General Maintenance ──
+        {'maintenance', 'maintain', 'upkeep'},
+        {'handyman', 'handymen', 'odd job', 'odd jobs'},
+
+        // ── Common action synonyms ──
+        {'install', 'installation', 'installing', 'setup', 'set up'},
+        {'repair', 'repairing', 'repairs', 'mend', 'mending'},
+        {'replace', 'replacement', 'replacing', 'swap', 'swapping'},
+        {'fix', 'fixing', 'fixed'},
+        {'remove', 'removal', 'removing', 'demolish', 'demolition'},
+        {'inspect', 'inspection', 'inspecting', 'check', 'checking'},
+        {'upgrade', 'upgrading', 'upgrades'},
+        {'service', 'servicing', 'serviced'},
+        {'assembly', 'assemble', 'assembling'},
+      ];
+
+      /// Check if two tokens are synonyms of each other.
+      bool areSynonyms(String a, String b) {
+        if (a == b) return true;
+        for (final group in synonymGroups) {
+          if (group.contains(a) && group.contains(b)) return true;
+        }
+        // Stem-like: one starts with the other (min 4 chars).
+        if (a.length >= 4 && b.length >= 4) {
+          if (a.startsWith(b) || b.startsWith(a)) return true;
+        }
+        return false;
       }
 
       int scoreTask(String name, String hintLower, List<String> hintTokens) {
@@ -2772,25 +3399,100 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
 
         if (hintTokens.isEmpty) return 0;
         final nameTokens = tokens(n).toSet();
+        // Also include raw tokens from the name (without stop-word removal)
+        // to catch meaningful words like "repair", "install", etc.
+        final nameTokensRaw = n
+            .replaceAll(RegExp(r'[^a-z0-9\s]'), ' ')
+            .split(RegExp(r'\s+'))
+            .map((e) => e.trim())
+            .where((e) => e.isNotEmpty)
+            .toSet();
+        final allNameTokens = {...nameTokens, ...nameTokensRaw};
+
         int overlap = 0;
+        int synonymHits = 0;
         for (final t in hintTokens) {
-          if (nameTokens.contains(t)) overlap++;
+          if (allNameTokens.contains(t)) {
+            overlap++;
+          } else {
+            // Check synonym/stem match against all name tokens.
+            for (final nt in allNameTokens) {
+              if (areSynonyms(t, nt)) {
+                synonymHits++;
+                break;
+              }
+            }
+          }
         }
 
-        // Strong intent words for plumbing unblocks.
+        // Also check hint words against raw name tokens for substring matches.
+        int substringHits = 0;
+        for (final t in hintTokens) {
+          if (t.length < 4) continue;
+          for (final nt in allNameTokens) {
+            if (nt.length < 4) continue;
+            if (nt.contains(t) || t.contains(nt)) {
+              substringHits++;
+              break;
+            }
+          }
+        }
+
+        // Strong intent words for common service types across ALL categories.
         final strong = <String>{
-          'unblock',
-          'blocked',
-          'toilet',
-          'drain',
-          'sewer'
+          // Plumbing
+          'unblock', 'unblocking', 'blocked', 'blockage', 'clogged',
+          'toilet', 'drain', 'sewer', 'sewage',
+          'leak', 'leaking', 'burst', 'pipe', 'geyser',
+          'tap', 'faucet', 'cistern', 'valve',
+          // Electrical
+          'wiring', 'rewire', 'circuit', 'breaker', 'tripping',
+          'socket', 'outlet', 'fuse', 'fusebox',
+          'generator', 'inverter', 'panel',
+          // Painting
+          'paint', 'painting', 'repaint', 'wallpaper', 'varnish', 'stain',
+          // Carpentry
+          'door', 'cabinet', 'cupboard', 'shelf', 'shelving',
+          'deck', 'decking', 'wardrobe', 'staircase', 'furniture',
+          // Tiling
+          'tile', 'tiling', 'retile', 'grout', 'grouting',
+          // Roofing
+          'roof', 'roofing', 'gutter', 'shingle', 'skylight',
+          'waterproofing', 'flashing',
+          // HVAC
+          'aircon', 'hvac', 'furnace', 'thermostat', 'duct',
+          'ventilation', 'compressor',
+          // Flooring
+          'floor', 'flooring', 'hardwood', 'laminate', 'vinyl',
+          'carpet', 'parquet', 'sanding', 'refinish',
+          // Landscaping
+          'garden', 'lawn', 'mowing', 'tree', 'hedge',
+          'irrigation', 'fence', 'fencing', 'patio', 'paving',
+          // Cleaning
+          'deep clean', 'pressure wash', 'sanitize',
+          // Car Detailing
+          'car wash', 'car detailing', 'polish', 'valet',
+          // Solar
+          'solar', 'solar panel', 'solar geyser', 'photovoltaic',
+          // General
+          'emergency', 'handyman',
         };
         int strongHits = 0;
         for (final t in hintTokens) {
-          if (strong.contains(t) && nameTokens.contains(t)) strongHits++;
+          if (!strong.contains(t)) continue;
+          if (allNameTokens.contains(t)) {
+            strongHits++;
+          } else {
+            for (final nt in allNameTokens) {
+              if (areSynonyms(t, nt)) {
+                strongHits++;
+                break;
+              }
+            }
+          }
         }
 
-        return overlap * 10 + strongHits * 15;
+        return overlap * 10 + synonymHits * 12 + substringHits * 8 + strongHits * 15;
       }
 
       final hintTokens = tokens(hint);
@@ -2810,6 +3512,8 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
             ) ??
             0.0;
 
+        print('[ai_task_score] name="$name" score=$s cost=$c hint="$hint"');
+
         if (s > bestScore) {
           best = data;
           bestScore = s;
@@ -2824,6 +3528,15 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
         }
       }
 
+      print('[ai_task] Best score=$bestScore name="${best?['name']}" cost=$bestCost');
+
+      // Minimum score threshold: if the best match scored below 10,
+      // the match is too weak to trust — return null so the user can
+      // manually select the correct service via the future booking workflow.
+      if (bestScore >= 0 && bestScore < 10) {
+        print('[ai_task] Best score ($bestScore) below threshold 10 — no confident match');
+        return null;
+      }
       best ??= withId(snap.docs.first);
       return best;
     } catch (e) {
@@ -2887,14 +3600,8 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
         isNowToken(scheduledTime);
     final bool isEmergency = emergencyFromPayload || emergencyFromText;
 
-    final requirePhotosRaw = map['require_photos'] ?? map['requirePhotos'];
-    final bool requirePhotos = requirePhotosRaw == null
-        ? true
-        : (requirePhotosRaw == true ||
-            (requirePhotosRaw ?? '').toString().trim().toLowerCase() ==
-                'true' ||
-            (requirePhotosRaw ?? '').toString().trim() == '1' ||
-            (requirePhotosRaw ?? '').toString().trim().toLowerCase() == 'yes');
+    // Voice-first flow: requirePhotos is always false.
+    // Photos are optional and can be added post-booking.
 
     List<String> extractStringList(dynamic v) {
       if (v == null) return <String>[];
@@ -3059,20 +3766,17 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
       }
     }
 
-    // Photos-first workflow: once the AI has all job info, it should open upload
-    // and require at least 3 photos before dispatch.
-    if (requirePhotos && workImageUrls.length < 3) {
-      await _openPhotoUploadThenDispatch(map);
-      return;
-    }
+    // Voice-first flow: photos are optional.
+    // Users can add photos post-booking from booking history.
+    // The photo gate is completely bypassed.
 
     // Default schedule if AI did not provide.
     final now = DateTime.now();
 
     // Smart time handling: use smart defaults if not specified
     // (Don't reject after photos uploaded - just use sensible defaults)
-    late final String effectiveDate;
-    late final String effectiveTime;
+    late String effectiveDate;
+    late String effectiveTime;
 
     final bool missingSchedule = scheduledDate.isEmpty ||
         scheduledTime.isEmpty ||
@@ -3119,18 +3823,80 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
         return; // Return early - wait for user response
       }
     } else {
-      effectiveDate = scheduledDate;
-      effectiveTime = scheduledTime;
+      // Validate the AI-provided date is not in the past.
+      // AI agents sometimes hallucinate old dates (e.g. October 2023).
+      DateTime? parsedScheduled;
+      try {
+        final dateParts = scheduledDate.split('-');
+        if (dateParts.length == 3) {
+          final y = int.tryParse(dateParts[0]) ?? 0;
+          final m = int.tryParse(dateParts[1]) ?? 0;
+          final d = int.tryParse(dateParts[2]) ?? 0;
+          if (y > 0 && m > 0 && d > 0) {
+            // Parse time too for full comparison.
+            final timeParts = scheduledTime.split(':');
+            final h = int.tryParse(timeParts.isNotEmpty ? timeParts[0] : '0') ?? 0;
+            final min = int.tryParse(timeParts.length > 1 ? timeParts[1] : '0') ?? 0;
+            parsedScheduled = DateTime(y, m, d, h, min);
+          }
+        }
+      } catch (_) {
+        // ignore parse errors
+      }
+
+      if (parsedScheduled != null && parsedScheduled.isBefore(now)) {
+        // Date is in the past — use smart defaults instead.
+        print('[booking_time] AI provided past date ($scheduledDate $scheduledTime), using smart default');
+        if (isEmergency) {
+          final dt = now.add(const Duration(hours: 1));
+          effectiveDate = _formatDate(dt);
+          final hh = dt.hour.toString().padLeft(2, '0');
+          final mm = dt.minute.toString().padLeft(2, '0');
+          effectiveTime = '$hh:$mm:00';
+        } else if (now.hour < 16) {
+          final roundHour = now.hour < 9 ? 9 : (now.hour + 1);
+          effectiveDate = _formatDate(now);
+          effectiveTime = '$roundHour:00:00'.padLeft(8, '0');
+        } else {
+          final tomorrow = now.add(const Duration(days: 1));
+          effectiveDate = _formatDate(tomorrow);
+          effectiveTime = '09:00:00';
+        }
+      } else {
+        effectiveDate = scheduledDate;
+        effectiveTime = scheduledTime;
+      }
     }
 
-    final resolvedHint = taskNameHint.trim().isNotEmpty
-        ? taskNameHint
-        : (description.trim().isNotEmpty ? description : categoryName);
+    // Build a rich hint by combining all available text fields.
+    // Previously we only used ONE field (taskNameHint → description → categoryName),
+    // but the AI agent sometimes sends a generic task_name (e.g. "plumbing") while
+    // the specific words ("blocked toilet") are in categoryName or description.
+    // Combining all sources ensures the scoring algorithm has all keywords available.
+    final hintParts = <String>[
+      taskNameHint.trim(),
+      categoryName.trim(),
+      description.trim(),
+      notes.trim(),
+    ].where((s) => s.isNotEmpty).toSet(); // deduplicate identical values
+    final resolvedHint = hintParts.join(' ');
 
-    final task = await _resolveTaskForCategory(
+    print('[ai_task] resolvedHint="$resolvedHint" parts=${hintParts.length}');
+
+    var task = await _resolveTaskForCategory(
       categoryIds: categoryIds,
       taskNameHint: resolvedHint,
     );
+
+    // Retry with just categoryName if the combined hint didn't match
+    // (sometimes too many words dilute the score).
+    if (task == null && categoryName.trim().isNotEmpty && hintParts.length > 1) {
+      print('[ai_task] Retrying with categoryName only: "$categoryName"');
+      task = await _resolveTaskForCategory(
+        categoryIds: categoryIds,
+        taskNameHint: categoryName,
+      );
+    }
 
     double extractTaskCost(Map<String, dynamic> taskData) {
       return _toAmount(
@@ -3145,38 +3911,64 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
     Future<Map<String, dynamic>?> findFirstPricedTaskInCategories() async {
       QuerySnapshot<Map<String, dynamic>>? snap;
 
-      for (final catId in categoryIds) {
-        try {
-          final r = await FirebaseService.taskRef
-              .where('status', isEqualTo: 'publish')
-              .where('categoryId', isEqualTo: catId)
-              .limit(10)
-              .get();
-          if (r.docs.isNotEmpty) {
-            snap = r;
-            break;
-          }
-        } catch (_) {}
-      }
+      const catFields = [
+        'categoryId',
+        'category_id',
+        'subCategoryId',
+        'sub_category_id',
+        'subcategoryId',
+        'subcategory_id',
+      ];
+      const statusVals = ['publish', 'Published', 'active', 'Active'];
 
-      if (snap == null || snap.docs.isEmpty) {
-        for (final catId in categoryIds) {
-          try {
-            final r = await FirebaseService.taskRef
-                .where('status', isEqualTo: 'publish')
-                .where('category_id', isEqualTo: catId)
-                .limit(10)
-                .get();
-            if (r.docs.isNotEmpty) {
-              snap = r;
-              break;
-            }
-          } catch (_) {}
+      // Try each status+field combination.
+      for (final sv in statusVals) {
+        if (snap != null && snap.docs.isNotEmpty) break;
+        for (final field in catFields) {
+          if (snap != null && snap.docs.isNotEmpty) break;
+          for (final catId in categoryIds) {
+            try {
+              final r = await FirebaseService.taskRef
+                  .where('status', isEqualTo: sv)
+                  .where(field, isEqualTo: catId)
+                  .limit(20)
+                  .get();
+              if (r.docs.isNotEmpty) {
+                snap = r;
+                print('[ai_fallback] Found ${r.docs.length} tasks: status=$sv field=$field catId=$catId');
+                break;
+              }
+            } catch (_) {}
+          }
         }
       }
 
-      if (snap == null || snap.docs.isEmpty) return null;
+      // Last resort: try without status filter.
+      if (snap == null || snap.docs.isEmpty) {
+        for (final field in catFields) {
+          if (snap != null && snap.docs.isNotEmpty) break;
+          for (final catId in categoryIds) {
+            try {
+              final r = await FirebaseService.taskRef
+                  .where(field, isEqualTo: catId)
+                  .limit(20)
+                  .get();
+              if (r.docs.isNotEmpty) {
+                snap = r;
+                print('[ai_fallback] Found ${r.docs.length} tasks (no status filter): field=$field catId=$catId');
+                break;
+              }
+            } catch (_) {}
+          }
+        }
+      }
 
+      if (snap == null || snap.docs.isEmpty) {
+        print('[ai_fallback] No tasks found in any category field combination');
+        return null;
+      }
+
+      // Prefer priced tasks.
       for (final d in snap.docs) {
         final data = d.data();
         data['id'] ??= d.id;
@@ -3187,6 +3979,98 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
       final data = snap.docs.first.data();
       data['id'] ??= snap.docs.first.id;
       return data;
+    }
+
+    // Global name-based search: if category-based task lookup fails entirely,
+    // search ALL published tasks by name similarity to the hint text.
+    // This handles cases where category IDs don't match between collections.
+    Future<Map<String, dynamic>?> searchTasksByNameGlobally(String hint) async {
+      if (hint.trim().isEmpty) return null;
+      try {
+        // Fetch a batch of all published tasks (no category filter).
+        QuerySnapshot<Map<String, dynamic>>? allSnap;
+        for (final sv in ['publish', 'Published', 'active', 'Active']) {
+          try {
+            final r = await FirebaseService.taskRef
+                .where('status', isEqualTo: sv)
+                .limit(100)
+                .get();
+            if (r.docs.isNotEmpty) {
+              allSnap = r;
+              print('[ai_global_search] Found ${r.docs.length} total tasks with status=$sv');
+              break;
+            }
+          } catch (_) {}
+        }
+        // Also try without status filter.
+        if (allSnap == null || allSnap.docs.isEmpty) {
+          try {
+            final r = await FirebaseService.taskRef.limit(100).get();
+            if (r.docs.isNotEmpty) {
+              allSnap = r;
+              print('[ai_global_search] Found ${r.docs.length} total tasks (no status filter)');
+            }
+          } catch (_) {}
+        }
+        if (allSnap == null || allSnap.docs.isEmpty) return null;
+
+        // Score each task against the hint using simple token matching.
+        final hLower = hint.trim().toLowerCase();
+        final hTokens = hLower
+            .replaceAll(RegExp(r'[^a-z0-9\s]'), ' ')
+            .split(RegExp(r'\s+'))
+            .where((t) => t.length >= 3)
+            .toSet();
+
+        Map<String, dynamic>? bestMatch;
+        int bestScore = 0;
+        double bestCost = 0;
+
+        for (final doc in allSnap.docs) {
+          final data = Map<String, dynamic>.from(doc.data());
+          data['id'] ??= doc.id;
+          final name = (data['name'] ?? '').toString().toLowerCase().trim();
+          if (name.isEmpty) continue;
+
+          final nameTokens = name
+              .replaceAll(RegExp(r'[^a-z0-9\s]'), ' ')
+              .split(RegExp(r'\s+'))
+              .where((t) => t.length >= 2)
+              .toSet();
+
+          int score = 0;
+          // Exact match.
+          if (name == hLower) score = 100;
+          // Contains match.
+          else if (name.contains(hLower) || hLower.contains(name)) score = 80;
+          else {
+            // Token overlap.
+            for (final ht in hTokens) {
+              for (final nt in nameTokens) {
+                if (ht == nt) score += 15;
+                else if (ht.contains(nt) || nt.contains(ht)) score += 8;
+              }
+            }
+          }
+
+          final cost = extractTaskCost(data);
+          if (score > bestScore || (score == bestScore && cost > 0 && bestCost <= 0)) {
+            bestMatch = data;
+            bestScore = score;
+            bestCost = cost;
+          }
+        }
+
+        if (bestScore >= 10 && bestMatch != null) {
+          print('[ai_global_search] Best global match: name="${bestMatch['name']}" score=$bestScore cost=$bestCost');
+          return bestMatch;
+        }
+        print('[ai_global_search] No strong global match (bestScore=$bestScore)');
+        return null;
+      } catch (e) {
+        print('[ai_global_search] Error: $e');
+        return null;
+      }
     }
 
     print(
@@ -3224,13 +4108,28 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
           taskCostsById[taskId] = cost;
         }
       } else {
-        // No published task found
-        // IMPORTANT: Do not create RTBD/unknown-price orders.
-        // Let the user pick a priced service from the catalog or explicitly request RFQ.
-        print(
-            '[ai_task] No published task found for categories; require selection');
-        rfqReason = 'no_matching_task';
-        jobIds = <String>[];
+        // No published task found in any category field combination.
+        // Last resort: search ALL tasks globally by name similarity.
+        print('[ai_task] No published task found for categories; trying global name search');
+        final globalMatch = await searchTasksByNameGlobally(resolvedHint);
+        if (globalMatch != null) {
+          final gId = (globalMatch['id'] ?? '').toString().trim();
+          final gName = (globalMatch['name'] ?? categoryName).toString();
+          final gCost = extractTaskCost(globalMatch);
+          print('[ai_task] Global search found: task=$gId name=$gName cost=$gCost');
+          if (gId.isNotEmpty && gCost > 0) {
+            jobIds = <String>[gId];
+            taskNamesById[gId] = gName;
+            taskCostsById[gId] = gCost;
+          } else {
+            rfqReason = 'unpriced_task';
+            jobIds = <String>[];
+          }
+        } else {
+          print('[ai_task] Global search also found nothing; require RFQ');
+          rfqReason = 'no_matching_task';
+          jobIds = <String>[];
+        }
       }
     } else {
       final taskId = (task['id'] ?? '').toString();
@@ -3263,7 +4162,24 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
         }
 
         if (chosenCost <= 0) {
-          print('[ai_task] task has no saved price; require selection');
+          // Category-based fallback also had no price — try global name search.
+          print('[ai_task] task has no saved price; trying global name search');
+          final globalMatch = await searchTasksByNameGlobally(resolvedHint);
+          if (globalMatch != null) {
+            final gId = (globalMatch['id'] ?? '').toString().trim();
+            final gName = (globalMatch['name'] ?? '').toString().trim();
+            final gCost = extractTaskCost(globalMatch);
+            if (gId.isNotEmpty && gCost > 0) {
+              print('[ai_task] Global search found priced task: $gId cost=$gCost');
+              chosenTaskId = gId;
+              chosenTaskName = gName.isNotEmpty ? gName : categoryName;
+              chosenCost = gCost;
+            }
+          }
+        }
+
+        if (chosenCost <= 0) {
+          print('[ai_task] No priced task found anywhere; require RFQ');
           rfqReason = 'unpriced_task';
           jobIds = <String>[];
         } else {
@@ -3281,80 +4197,227 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
     print(
         '[dispatch_flow] Creating booking with jobIds=${jobIds.length} isRFQ=$isRFQRequested photos=${workImageUrls.length}');
 
-    // If we still have no priced task, open the published services list for this category.
+    // Voice-first flow: if no priced task found, auto-create an RFQ
+    // instead of redirecting to a manual booking form.
+    // The user already described the job — we have all the data needed.
     if (jobIds.isEmpty && !isRFQRequested) {
+      isRFQRequested = true;
+      rfqReason = rfqReason.isEmpty ? 'no_matching_task' : rfqReason;
+      print('[voice_rfq] Auto-creating RFQ: reason=$rfqReason category=$categoryName');
+
       setState(() {
         _aiResponse =
-            'Please select a priced service from the catalog to continue, or request a quote.';
+            'I could not find exact pricing for $categoryName. Creating a request for quotes from available artisans...';
       });
       _addToTranscript(
         'AI',
-        'Please select a priced service from the catalog to continue, or request a quote.',
+        'No exact pricing found for $categoryName. Auto-creating RFQ.',
       );
-
-      final picked = await Get.to<VoiceServicePickerResult>(
-        () => VoiceServicePickerScreen(
-          categoryScopeIds: categoryIds,
-          categoryName: categoryName,
-        ),
+      await _sendSpeakToAgent(
+        'I could not find the exact pricing for this service, '
+        'so I am creating a request for quotes. '
+        'Available artisans in your area will send you their prices.',
       );
-
-      if (!mounted) return;
-
-      if (picked == null) {
-        setState(() {
-          _aiResponse = 'No service selected. Booking not created.';
-        });
-        _addToTranscript('AI', 'No service selected. Booking not created.');
-        return;
-      }
-
-      if (picked.isRFQ) {
-        isRFQRequested = true;
-        rfqReason = rfqReason.isNotEmpty ? rfqReason : 'no_priced_service';
-      } else {
-        final id = (picked.taskId ?? '').toString().trim();
-        final name = (picked.taskName ?? '').toString().trim();
-        final cost = picked.cost ?? 0;
-
-        if (id.isEmpty || cost <= 0) {
-          isRFQRequested = true;
-          rfqReason = rfqReason.isNotEmpty ? rfqReason : 'unpriced_task';
-          jobIds = <String>[];
-        } else {
-          jobIds = <String>[id];
-          taskNamesById[id] = name.isNotEmpty ? name : categoryName;
-          taskCostsById[id] = cost;
-        }
-      }
+      // Fall through to the booking creation below with isRFQRequested = true
     }
+
+    // Voice-first flow: trust AI-provided date/time.
+    // No date/time picker dialogs — the AI already extracted or defaulted them.
+    // The smart defaults above already handle missing/past dates.
+    print('[voice_booking] Using date=$effectiveDate time=$effectiveTime (emergency=$isEmergency)');
 
     final locationSummary = serviceOnCurrentLocation
         ? 'at your current location'
         : (address.trim().isNotEmpty ? 'at $address' : 'at the provided location');
-    final modeSummary = isRFQRequested
-        ? 'Request a quote (RFQ)'
-        : 'Create an order booking';
 
-    final okToProceed = await _confirmUiAction(
-      title: 'Create booking?',
-      message:
-          '$modeSummary for $categoryName on $effectiveDate at $effectiveTime, $locationSummary?',
-      confirmText: 'Create booking',
-    );
-    if (!okToProceed) return;
+    // Voice-first flow: no confirmation dialog.
+    // The AI reads a summary aloud and proceeds directly.
+    // The user already confirmed verbally during the conversation.
+    final modeSummary = isRFQRequested
+        ? 'Creating a request for quotes'
+        : 'Creating an order booking';
+
+    print('[voice_booking] $modeSummary for $categoryName on $effectiveDate at $effectiveTime');
+
+    // Build a human-readable summary for the voice readback.
+    final totalCost = taskCostsById.values.fold(0.0, (a, b) => a + b);
+    final taskNamesSummary = taskNamesById.values.isNotEmpty
+        ? taskNamesById.values.join(', ')
+        : categoryName;
+    final costSummary = totalCost > 0
+        ? 'for R${totalCost.toStringAsFixed(0)}'
+        : '';
+    final dateSummary = effectiveDate.isNotEmpty
+        ? 'on $effectiveDate at ${effectiveTime.substring(0, 5)}'
+        : 'as soon as possible';
+
+    final voiceSummary = isRFQRequested
+        ? 'Creating a request for quotes for $taskNamesSummary $dateSummary $locationSummary. '
+          'Available artisans will send you their prices.'
+        : 'Creating your booking for $taskNamesSummary $costSummary $dateSummary $locationSummary. '
+          'I will send the request to the nearest available artisan.';
 
     setState(() {
-      _aiResponse =
-          'Creating your booking and sending your request to the nearest available artisan...';
+      _aiResponse = voiceSummary;
     });
-    _addToTranscript(
-      'AI',
-      'Creating your booking and sending your request to the nearest available artisan...',
-    );
+    _addToTranscript('AI', voiceSummary);
     await _sendSpeakToAgent(
-      'I am creating your booking now, and I will send your request to the nearest available artisan. I will update you as soon as someone accepts.',
+      isRFQRequested
+          ? 'I will create a request for quotes for $taskNamesSummary $dateSummary $locationSummary. Please confirm on the screen.'
+          : 'Your booking for $taskNamesSummary will cost $costSummary, scheduled $dateSummary $locationSummary. Please confirm on the screen.',
     );
+
+    // ── Price Confirmation Dialog ──────────────────────────────────────────
+    // Show a visual dialog so the client sees and confirms the charge.
+    final bool? confirmed = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) {
+        return AlertDialog(
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          title: Row(
+            children: [
+              Icon(Icons.receipt_long, color: Colors.amber.shade700, size: 28),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  isRFQRequested ? 'Confirm Quote Request' : 'Confirm Booking',
+                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 18),
+                ),
+              ),
+            ],
+          ),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _confirmationRow(Icons.build, 'Service', taskNamesSummary),
+                if (!isRFQRequested && totalCost > 0)
+                  _confirmationRow(Icons.payments, 'Price', 'R${totalCost.toStringAsFixed(2)}'),
+                if (isRFQRequested)
+                  _confirmationRow(Icons.request_quote, 'Type', 'Request for Quotes'),
+                _confirmationRow(Icons.calendar_today, 'Date', effectiveDate),
+                _confirmationRow(Icons.access_time, 'Time', effectiveTime.length >= 5 ? effectiveTime.substring(0, 5) : effectiveTime),
+                _confirmationRow(Icons.location_on, 'Location',
+                    serviceOnCurrentLocation ? 'Your current location' : (address.isNotEmpty ? address : 'Provided location')),
+                if (description.trim().isNotEmpty)
+                  _confirmationRow(Icons.description, 'Description', description),
+                if (isEmergency)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 8),
+                    child: Row(
+                      children: [
+                        Icon(Icons.warning_amber_rounded, color: Colors.red.shade700, size: 20),
+                        const SizedBox(width: 6),
+                        Text('EMERGENCY REQUEST', style: TextStyle(color: Colors.red.shade700, fontWeight: FontWeight.bold)),
+                      ],
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(false),
+              child: const Text('Cancel', style: TextStyle(color: Colors.red, fontSize: 16)),
+            ),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFFc5a520),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+              ),
+              onPressed: () => Navigator.of(ctx).pop(true),
+              child: const Text('Confirm & Continue', style: TextStyle(color: Colors.white, fontSize: 16)),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (confirmed != true) {
+      const cancelMsg = 'Booking cancelled. Let me know if you want to try again.';
+      setState(() { _aiResponse = cancelMsg; });
+      _addToTranscript('AI', cancelMsg);
+      await _sendSpeakToAgent(cancelMsg);
+      Get.snackbar(_assistantName, 'Booking cancelled.',
+          backgroundColor: Colors.orange, colorText: Colors.white);
+      return;
+    }
+
+    // ── Photo Upload Step ──────────────────────────────────────────────────
+    // After price confirmation, ask the client to upload photos so the
+    // artisan knows what to expect and what materials/equipment to bring.
+    List<String> finalImageUrls = List<String>.from(workImageUrls);
+    if (finalImageUrls.length < 3) {
+      await _sendSpeakToAgent(
+        'Great! Now please upload at least 3 photos of the issue so the artisan knows what materials and equipment to bring.',
+      );
+
+      List<String>? uploadedUrls;
+      try {
+        uploadedUrls = await Get.to<List<String>>(
+          () => AiPhotoUploadScreen(
+            categoryName: categoryName,
+            problemDescription: description,
+            additionalNotes: notes,
+            serviceOnCurrentLocation: serviceOnCurrentLocation,
+            serviceAddress: address,
+            minPhotos: 3,
+          ),
+          transition: Transition.fadeIn,
+        );
+      } catch (e) {
+        // Fallback: try Navigator.push
+        try {
+          final ctx2 = Get.context ?? context;
+          uploadedUrls = await Navigator.of(ctx2).push<List<String>>(
+            MaterialPageRoute(
+              builder: (_) => AiPhotoUploadScreen(
+                categoryName: categoryName,
+                problemDescription: description,
+                additionalNotes: notes,
+                serviceOnCurrentLocation: serviceOnCurrentLocation,
+                serviceAddress: address,
+                minPhotos: 3,
+              ),
+            ),
+          );
+        } catch (_) {}
+      }
+
+      if (uploadedUrls == null || uploadedUrls.length < 3) {
+        const photoMsg = 'Photo upload cancelled or incomplete. Please upload at least 3 photos so the artisan can prepare properly.';
+        setState(() { _aiResponse = photoMsg; });
+        _addToTranscript('AI', photoMsg);
+        Get.snackbar(_assistantName, 'Please upload at least 3 photos.',
+            backgroundColor: Colors.orange, colorText: Colors.white);
+        await _sendSpeakToAgent(photoMsg);
+        return;
+      }
+
+      finalImageUrls = uploadedUrls;
+      setState(() {
+        _aiResponse = 'Photos uploaded! Sending your request to the nearest artisan...';
+      });
+      _addToTranscript('AI', 'Photos uploaded successfully.');
+      await _sendSpeakToAgent(
+        'Photos uploaded successfully. I am now sending the request to the nearest available artisan.',
+      );
+    }
+
+    // ── Geo-fence check ─────────────────────────────────────────────────
+    final double geoLat = double.tryParse(
+        serviceOnCurrentLocation ? app.userLat.value : (lat.isNotEmpty ? lat : app.userLat.value)) ?? 0;
+    final double geoLng = double.tryParse(
+        serviceOnCurrentLocation ? app.userLng.value : (lng.isNotEmpty ? lng : app.userLng.value)) ?? 0;
+    final geoBlock = await ServiceAreaChecker.checkLocation(lat: geoLat, lng: geoLng);
+    if (geoBlock != null) {
+      setState(() { _aiResponse = geoBlock; });
+      _addToTranscript('AI', geoBlock);
+      await _sendSpeakToAgent(geoBlock);
+      return;
+    }
 
     try {
       final backend = await _tryExecuteAssistantAction(
@@ -3369,7 +4432,7 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
           'provided_address': address,
           'other_lat': lat,
           'other_lng': lng,
-          'work_image_urls': workImageUrls,
+          'work_image_urls': finalImageUrls,
           'problem_description': effectiveDescription,
           'additional_notes': notes,
           'category_id': categoryIds.first,
@@ -3379,7 +4442,8 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
               : materialsResponsibility,
           'is_rfq_requested': isRFQRequested,
           'rfq_reason': rfqReason,
-          'created_by': 'lizzy',
+          'require_photos': false,
+          'created_by': 'voice_ai',
           'is_emergency': isEmergency,
         },
       );
@@ -3406,8 +4470,15 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
 
       await _sendAppContextToAgent(reason: 'booking_created');
 
-      if (!isRFQ && bookingId.trim().isNotEmpty) {
-        _watchBookingUntilConfirmed(bookingId: bookingId);
+      if (bookingId.trim().isNotEmpty) {
+        // Always register with background monitor (covers both RFQ and direct bookings)
+        if (Get.isRegistered<BookingMonitorService>()) {
+          Get.find<BookingMonitorService>().watchBooking(bookingId);
+        }
+        // In-voice-assistant real-time feedback (spoken + payment screen) — only for non-RFQ
+        if (!isRFQ) {
+          _watchBookingUntilConfirmed(bookingId: bookingId);
+        }
       }
 
       final msg = isRFQ
@@ -3696,6 +4767,12 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
   }
 
   void _watchBookingUntilConfirmed({required String bookingId}) {
+    // Register with the persistent background monitor service so the user
+    // gets local notifications even after leaving this screen.
+    if (Get.isRegistered<BookingMonitorService>()) {
+      Get.find<BookingMonitorService>().watchBooking(bookingId);
+    }
+
     _bookingStatusSubscription?.cancel();
     _watchBookingLastProviderId = '';
     String lastSpokenStatus = '';
@@ -4175,6 +5252,9 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
     _metadataPoller?.cancel();
     _metadataPoller = null;
 
+    _firebaseTokenRefreshTimer?.cancel();
+    _firebaseTokenRefreshTimer = null;
+
     _disposeTypedRoomListener();
     await _disposeRoomEventsListener();
     _lastMetadataByParticipant.clear();
@@ -4288,6 +5368,27 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
             ],
           ),
         ),
+      ),
+    );
+  }
+
+  /// Helper row for the price-confirmation dialog.
+  Widget _confirmationRow(IconData icon, String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(icon, size: 20, color: Colors.grey.shade600),
+          const SizedBox(width: 8),
+          SizedBox(
+            width: 80,
+            child: Text('$label:', style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 14)),
+          ),
+          Expanded(
+            child: Text(value, style: const TextStyle(fontSize: 14)),
+          ),
+        ],
       ),
     );
   }

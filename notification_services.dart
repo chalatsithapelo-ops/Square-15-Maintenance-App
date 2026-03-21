@@ -108,6 +108,50 @@ class NotificationService {
     });
   }
 
+  /// Clear FCM token from Firestore on explicit sign-out.
+  ///
+  /// This ensures that once a user signs out they stop receiving push
+  /// notifications.  Users who merely close the app (without signing
+  /// out) keep their token intact and continue receiving pushes.
+  static Future<void> clearFcmTokenOnSignOut() async {
+    String userId = '';
+    try {
+      userId = Get.find<AppController>().userId.value;
+    } catch (_) {
+      userId = '';
+    }
+    if (userId.trim().isEmpty) {
+      userId = (FirebaseAuth.instance.currentUser?.uid ?? '').toString();
+    }
+    userId = userId.trim();
+    if (userId.isEmpty) return;
+
+    final firestore = FirebaseFirestore.instance;
+    final clearData = <String, dynamic>{
+      'deviceToken': '',
+      'fcm_token': '',
+      'is_online': false,
+      'last_seen': FieldValue.serverTimestamp(),
+    };
+
+    Future<void> tryClear(String collection) async {
+      try {
+        final docRef = firestore.collection(collection).doc(userId);
+        final doc = await docRef.get();
+        if (!doc.exists) return;
+        await docRef.update(clearData);
+      } catch (_) {
+        // ignore
+      }
+    }
+
+    await tryClear('users');
+    await tryClear('serviceProvider');
+
+    // Also cancel the local token-refresh listener.
+    _tokenRefreshSub?.cancel();
+    _tokenRefreshSub = null;
+  }
 
 
   static Future<void> requestPermission() async {
@@ -149,25 +193,32 @@ class NotificationService {
   }
 
   static void initializeNotification(BuildContext context) async {
-    //tz.initializeTimeZones();
-
-
-
-
-    // 🔹 Create the same channel mentioned in AndroidManifest.xml
-    const AndroidNotificationChannel channel = AndroidNotificationChannel(
+    // 🔹 General notification channel (default sound)
+    const AndroidNotificationChannel generalChannel = AndroidNotificationChannel(
       'high_importance_channel', // must match manifest
-      'High Importance Notifications', // human-readable name
+      'High Importance Notifications',
       description: 'This channel is used for important notifications.',
       importance: Importance.high,
       playSound: true,
       enableVibration: true,
+      sound: RawResourceAndroidNotificationSound('sound_small'),
     );
 
+    // 🔹 Order request channel (loud custom sound for artisan requests)
+    const AndroidNotificationChannel orderRequestChannel = AndroidNotificationChannel(
+      'order_request_channel',
+      'Order Requests',
+      description: 'Loud notification sound for new order/booking requests.',
+      importance: Importance.max,
+      playSound: true,
+      enableVibration: true,
+      sound: RawResourceAndroidNotificationSound('sound'),
+    );
 
     final FlutterLocalNotificationsPlugin fln = FlutterLocalNotificationsPlugin();
-    await fln.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()
-        ?.createNotificationChannel(channel);
+    final androidPlugin = fln.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
+    await androidPlugin?.createNotificationChannel(generalChannel);
+    await androidPlugin?.createNotificationChannel(orderRequestChannel);
     await FirebaseMessaging.instance.setForegroundNotificationPresentationOptions(
       alert: true,
       badge: true,
@@ -210,35 +261,68 @@ class NotificationService {
         );
   }
 
+  /// Notification types that should use the loud order-request sound.
+  static const _orderRequestTypes = {
+    'Order Request',
+    'order_request',
+    'rfq_broadcast',
+    'rfq_assignment',
+    'future_booking',
+    'booking_request',
+    'new_booking',
+  };
+
   static void displayNotification(context,
       {required RemoteMessage message}) async {
     final id = DateTime.now().millisecondsSinceEpoch ~/ 1000;
-    var androidPlatformChannelSpecifics =
-        const AndroidNotificationDetails(
-            'high_importance_channel', // must match manifest
-            'High Importance Notifications', // human-readable name
-            channelDescription: 'your channel description',
-            // sound: Provider.of<PositionProvider>(context, listen: false)
-            //             .notificationType ==
-            //         "Order Request"
-            //     ? const RawResourceAndroidNotificationSound(
-            //         'assets/sounds/sound')
-            //     : const RawResourceAndroidNotificationSound(
-            //         'assets/sounds/sound_small'),
-            importance: Importance.max,
-            priority: Priority.high);
 
-    var darwinNotificationDetails = const DarwinNotificationDetails();
+    // Determine notification type from data or PositionProvider
+    String notifType = '';
+    try {
+      notifType = (message.data['type'] ?? '').toString();
+    } catch (_) {}
+    if (notifType.isEmpty) {
+      try {
+        notifType = Provider.of<PositionProvider>(context, listen: false)
+            .notificationType ?? '';
+      } catch (_) {}
+    }
+
+    final bool isOrderRequest = _orderRequestTypes.contains(notifType);
+
+    final androidPlatformChannelSpecifics = AndroidNotificationDetails(
+      isOrderRequest ? 'order_request_channel' : 'high_importance_channel',
+      isOrderRequest ? 'Order Requests' : 'High Importance Notifications',
+      channelDescription: isOrderRequest
+          ? 'Loud notification sound for new order/booking requests.'
+          : 'This channel is used for important notifications.',
+      sound: RawResourceAndroidNotificationSound(
+        isOrderRequest ? 'sound' : 'sound_small',
+      ),
+      importance: Importance.max,
+      priority: Priority.high,
+      playSound: true,
+      enableVibration: true,
+    );
+
+    var darwinNotificationDetails = const DarwinNotificationDetails(
+      presentAlert: true,
+      presentBadge: true,
+      presentSound: true,
+    );
     var platformChannelSpecifics = NotificationDetails(
         android: androidPlatformChannelSpecifics,
         iOS: darwinNotificationDetails);
 
+    final title = message.notification?.title ?? message.data['title'] ?? 'Square15';
+    final body = message.notification?.body ?? message.data['body'] ?? '';
+
     await flutterLocalNotificationsPlugin.show(
       id,
-      message.notification!.title,
-      message.notification!.body,
+      title,
+      body,
       platformChannelSpecifics,
-      payload: "",
+      payload: notifType,
     );
   }
 }
