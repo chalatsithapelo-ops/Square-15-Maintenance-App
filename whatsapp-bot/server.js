@@ -152,6 +152,36 @@ async function sendWhatsAppList(to, header, body, buttonText, sections) {
   }).catch(e => console.error('[wa] list send failed:', e.message));
 }
 
+// ─── Download media from WhatsApp Cloud API ───
+
+async function downloadWhatsAppMedia(mediaId) {
+  const token = process.env.WHATSAPP_ACCESS_TOKEN;
+  if (!token || !mediaId) return null;
+  try {
+    // Step 1: Get the media URL
+    const metaRes = await fetch(`${WA_API}/${mediaId}`, {
+      headers: { 'Authorization': `Bearer ${token}` },
+    });
+    if (!metaRes.ok) { console.error('[wa-media] metadata fetch failed:', metaRes.status); return null; }
+    const meta = await metaRes.json();
+    const mediaUrl = meta.url;
+    if (!mediaUrl) return null;
+
+    // Step 2: Download the media binary
+    const dlRes = await fetch(mediaUrl, {
+      headers: { 'Authorization': `Bearer ${token}` },
+    });
+    if (!dlRes.ok) { console.error('[wa-media] download failed:', dlRes.status); return null; }
+    const buffer = Buffer.from(await dlRes.arrayBuffer());
+    const mimeType = meta.mime_type || 'image/jpeg';
+    const base64 = buffer.toString('base64');
+    return { base64, mimeType, dataUrl: `data:${mimeType};base64,${base64}` };
+  } catch (e) {
+    console.error('[wa-media] error:', e.message);
+    return null;
+  }
+}
+
 // ─── Session management (in-memory + Firestore backup) ───
 
 const sessions = new Map();
@@ -1507,7 +1537,7 @@ GUIDELINES:
 - Always collect: category, description, address, customer name BEFORE creating a booking
 - For complex jobs (renovations, full installations), suggest submitting an RFQ instead of a regular booking
 - Use South African Rands (R) for all pricing
-- If a customer sends a photo, acknowledge it and ask them to describe the issue
+- When a customer sends a photo, ANALYSE the image using your vision capabilities. Identify the maintenance issue (e.g. leaking pipe, broken socket, cracked wall), suggest the correct service category, and offer to create a booking or RFQ
 - For emergencies, emphasise urgency and prioritise booking creation
 - When a booking is created, always mention the estimated cost and payment options
 - After job completion, encourage rating
@@ -1517,8 +1547,17 @@ GUIDELINES:
 - Always include the booking ID/order number in responses about specific bookings
 - The customer's phone number is automatically captured from WhatsApp — never ask for it`;
 
-async function handleMessage(session, userMessage) {
-  session.messages.push({ role: 'user', content: userMessage });
+async function handleMessage(session, userMessage, imageDataUrl) {
+  // Build user message content — supports text-only or text+image (vision)
+  if (imageDataUrl) {
+    const content = [
+      { type: 'image_url', image_url: { url: imageDataUrl, detail: 'low' } },
+      { type: 'text', text: userMessage },
+    ];
+    session.messages.push({ role: 'user', content });
+  } else {
+    session.messages.push({ role: 'user', content: userMessage });
+  }
 
   // Keep context window manageable
   if (session.messages.length > 20) {
@@ -1644,9 +1683,25 @@ app.post('/webhook', async (req, res) => {
             }
           }
           break;
-        case 'image':
-          userText = '[Customer sent a photo of a maintenance issue] ' + (msg.image?.caption || 'Please describe what you see in the photo.');
+        case 'image': {
+          const imageMedia = await downloadWhatsAppMedia(msg.image?.id);
+          const caption = msg.image?.caption || '';
+          if (imageMedia) {
+            userText = caption
+              ? `[Customer sent a photo with caption: "${caption}"] Analyse this image of a maintenance/repair issue. Identify the problem, suggest the service category, and offer to create a booking or RFQ.`
+              : '[Customer sent a photo of a maintenance issue] Analyse this image. Identify what repair or maintenance is needed, suggest the service category (plumbing, electrical, painting, etc.), estimate the scope, and offer to create a booking or submit an RFQ.';
+            console.log(`[msg] ${from}: [IMAGE received, ${(imageMedia.base64.length / 1024).toFixed(0)}KB]`);
+            const reply = await handleMessage(session, userText, imageMedia.dataUrl);
+            const chunks = reply.match(/.{1,4000}/gs) || [reply];
+            for (const chunk of chunks) {
+              await sendWhatsAppMessage(from, chunk);
+            }
+            continue; // Skip normal handleMessage below — already handled
+          } else {
+            userText = '[Customer sent a photo but it could not be downloaded] ' + (caption || 'Please describe the maintenance issue you need help with.');
+          }
           break;
+        }
         case 'document':
           userText = '[Customer sent a document: ' + (msg.document?.filename || 'unknown') + ']';
           break;
