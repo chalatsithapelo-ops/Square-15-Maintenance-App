@@ -254,12 +254,12 @@ const waTools = [
     type: 'function',
     function: {
       name: 'lookup_pricing',
-      description: 'Look up estimated pricing for a service category',
+      description: 'MUST be called BEFORE create_booking. Looks up fixed pricing for a service. Returns the exact fixed price if available, or suggests RFQ if not.',
       parameters: {
         type: 'object',
         properties: {
-          category:    { type: 'string' },
-          subcategory: { type: 'string' },
+          category:    { type: 'string', description: 'Service category (e.g. plumbing, electrical, painting)' },
+          subcategory: { type: 'string', description: 'Specific service needed (e.g. toilet unblocking, leak repair, light installation)' },
         },
         required: ['category'],
       },
@@ -456,16 +456,61 @@ async function executeWaTool(name, args, session) {
       const orderNo = `SQ15-${bookingId}`;
       const now = new Date().toISOString();
 
-      // Look up pricing estimate
-      let estimatedCost = '500';
+      // Look up pricing estimate from pricingGuidance service_prices map and tasks collection
+      let estimatedCost = '0';
+      let pricingSource = 'none';
       try {
-        const pSnap = await firestore.collection('pricingGuidance')
-          .where('category', '==', (args.category || '').toLowerCase()).limit(1).get();
-        if (!pSnap.empty) {
-          const p = pSnap.docs[0].data();
-          estimatedCost = (p.average_price || p.min_price || 500).toString();
+        const catSlug = (args.category || '').toLowerCase().replace(/\s+/g, '_');
+        const subQuery = (args.subcategory || args.description || '').toLowerCase();
+
+        // 1) Check pricingGuidance doc's service_prices map
+        const guidanceDoc = await firestore.collection('pricingGuidance').doc(catSlug).get();
+        if (guidanceDoc.exists) {
+          const gd = guidanceDoc.data();
+          const servicePrices = gd.service_prices || gd.servicePrices || {};
+          // Try to match subcategory/description against service_prices keys
+          for (const [svcName, price] of Object.entries(servicePrices)) {
+            const svcLower = svcName.toLowerCase();
+            if (subQuery.includes(svcLower) || svcLower.includes(subQuery) ||
+                subQuery.split(/\s+/).some(w => w.length >= 3 && svcLower.includes(w))) {
+              estimatedCost = (typeof price === 'number' ? price : parseFloat(price)).toString();
+              pricingSource = 'fixed';
+              break;
+            }
+          }
+          // If no service match, use labor_cost_per_hour as rough baseline (not fallback R500)
+          if (pricingSource === 'none') {
+            const laborRate = gd.labor_cost_per_hour || gd.laborCostPerHour;
+            if (laborRate) {
+              estimatedCost = (parseFloat(laborRate) * 2).toString(); // 2-hour minimum estimate
+              pricingSource = 'labor_estimate';
+            }
+          }
         }
-      } catch (_) {}
+
+        // 2) Also check tasks collection for exact service pricing
+        if (pricingSource !== 'fixed' && subQuery) {
+          const taskSnap = await firestore.collection('tasks').limit(200).get();
+          for (const td of taskSnap.docs) {
+            const d = td.data();
+            const name = (d.name || d.title || d.task_name || '').toString().toLowerCase();
+            const cost = parseFloat(d.cost || d.price || d.amount || 0);
+            if (name && cost > 0 && (subQuery.includes(name) || name.includes(subQuery) ||
+                subQuery.split(/\s+/).some(w => w.length >= 3 && name.includes(w)))) {
+              estimatedCost = cost.toString();
+              pricingSource = 'fixed';
+              break;
+            }
+          }
+        }
+      } catch (e) {
+        console.error('[create_booking] Pricing lookup error:', e.message);
+      }
+
+      // If no pricing found at all, don't default to R500 — flag it
+      if (estimatedCost === '0' || pricingSource === 'none') {
+        estimatedCost = '0';
+      }
 
       // Apply promo discount if active
       let finalCost = parseFloat(estimatedCost);
@@ -710,12 +755,96 @@ async function executeWaTool(name, args, session) {
     case 'lookup_pricing': {
       if (!firestore) return { estimate: 'R350 – R1,200 (typical range for most services)' };
       try {
-        const snap = await firestore.collection('pricingGuidance')
-          .where('category', '==', (args.category || '').toLowerCase()).limit(5).get();
-        if (snap.empty) return { estimate: 'R350 – R1,200 (typical range)', note: 'Final pricing depends on job complexity.' };
-        const prices = snap.docs.map(d => d.data());
-        return { pricing: prices, note: 'These are estimated ranges. Exact pricing confirmed after assessment.' };
+        const catSlug = (args.category || '').toLowerCase().replace(/\s+/g, '_');
+        const subQuery = (args.subcategory || '').toLowerCase();
+
+        // 1) Look up from pricingGuidance by doc ID (e.g. 'plumbing')
+        let servicePrices = {};
+        let categoryName = args.category || '';
+        const guidanceDoc = await firestore.collection('pricingGuidance').doc(catSlug).get();
+        if (guidanceDoc.exists) {
+          const gd = guidanceDoc.data();
+          servicePrices = gd.service_prices || gd.servicePrices || {};
+          categoryName = gd.category_name || gd.categoryName || categoryName;
+        }
+
+        // 2) Also search the tasks collection for matching service entries
+        const taskResults = [];
+        try {
+          const taskSnap = await firestore.collection('tasks').limit(200).get();
+          for (const td of taskSnap.docs) {
+            const d = td.data();
+            const name = (d.name || d.title || d.task_name || '').toString();
+            const cost = parseFloat(d.cost || d.price || d.amount || 0);
+            if (name && cost > 0) {
+              taskResults.push({ name, cost, category_id: d.categoryId || d.category_id || '' });
+            }
+          }
+        } catch (_) {}
+
+        // 3) If subcategory provided, try to find an exact or fuzzy match
+        let matchedService = null;
+        let matchedPrice = null;
+
+        if (subQuery) {
+          // Check service_prices map first
+          for (const [svcName, price] of Object.entries(servicePrices)) {
+            if (svcName.toLowerCase().includes(subQuery) || subQuery.includes(svcName.toLowerCase())) {
+              matchedService = svcName;
+              matchedPrice = typeof price === 'number' ? price : parseFloat(price);
+              break;
+            }
+          }
+          // Then check tasks collection
+          if (!matchedService) {
+            for (const t of taskResults) {
+              if (t.name.toLowerCase().includes(subQuery) || subQuery.includes(t.name.toLowerCase())) {
+                matchedService = t.name;
+                matchedPrice = t.cost;
+                break;
+              }
+            }
+          }
+        }
+
+        // Build response
+        const allFixedPrices = Object.entries(servicePrices).map(([name, price]) => ({
+          service: name,
+          fixedPrice: `R${typeof price === 'number' ? price.toFixed(2) : price}`,
+        }));
+
+        // Add task-collection prices not already in servicePrices
+        const existingNames = new Set(Object.keys(servicePrices).map(n => n.toLowerCase()));
+        for (const t of taskResults) {
+          const catId = t.category_id.toLowerCase();
+          if ((catId === catSlug || catId.includes(catSlug) || catSlug.includes(catId)) && !existingNames.has(t.name.toLowerCase())) {
+            allFixedPrices.push({ service: t.name, fixedPrice: `R${t.cost.toFixed(2)}` });
+          }
+        }
+
+        if (matchedService && matchedPrice) {
+          return {
+            matched: true,
+            service: matchedService,
+            fixedPrice: `R${matchedPrice.toFixed(2)}`,
+            category: categoryName,
+            allServicesInCategory: allFixedPrices,
+            note: 'This is a FIXED price. Use this exact amount when creating the booking.',
+          };
+        }
+
+        if (allFixedPrices.length > 0) {
+          return {
+            matched: false,
+            category: categoryName,
+            availableServices: allFixedPrices,
+            note: 'No exact match for the requested service. These are the fixed-price services available. If the customer\'s job doesn\'t match any fixed-price service, suggest submitting an RFQ instead.',
+          };
+        }
+
+        return { matched: false, estimate: 'No fixed pricing found for this category.', note: 'Suggest the customer submit an RFQ for a detailed quote.' };
       } catch (e) {
+        console.error('[lookup_pricing] Error:', e.message);
         return { estimate: 'R350 – R1,200 (typical range)' };
       }
     }
@@ -1364,6 +1493,14 @@ YOUR FULL CAPABILITIES:
 🔗 ACCOUNT:
 - Auto-link WhatsApp number to existing Square 15 app account
 - Inform customers about app features when relevant
+
+CRITICAL PRICING RULES:
+- You MUST call lookup_pricing BEFORE calling create_booking, EVERY TIME, NO EXCEPTIONS.
+- When calling lookup_pricing, pass the specific service as subcategory (e.g. category="plumbing", subcategory="toilet unblocking").
+- If lookup_pricing returns matched=true with a fixedPrice, use that EXACT price — do NOT estimate or use a different amount.
+- If lookup_pricing returns matched=false and no fixedPrice service matches, tell the customer: "This job needs a detailed quote" and use submit_rfq instead of create_booking.
+- NEVER guess or make up a price. Only use prices returned by lookup_pricing.
+- If create_booking returns an estimated cost of R0.00, it means no fixed price was found — inform the customer and suggest an RFQ.
 
 GUIDELINES:
 - Be warm, professional, and concise (WhatsApp messages should be short)
