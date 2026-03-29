@@ -1738,6 +1738,24 @@ app.post('/webhook', async (req, res) => {
 // Health check
 app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot' }));
 
+// ─── Admin → WhatsApp: Send RFQ response back to client ───
+app.post('/api/send-rfq-response', async (req, res) => {
+  try {
+    const { phone, rfqNo, message } = req.body || {};
+    if (!phone || !message) {
+      return res.status(400).json({ error: 'phone and message are required' });
+    }
+    // Normalise to international format (27…)
+    let to = phone.replace(/[^0-9]/g, '');
+    if (to.startsWith('0')) to = '27' + to.slice(1);
+    await sendWhatsAppMessage(to, message);
+    res.json({ success: true, to, rfqNo });
+  } catch (err) {
+    console.error('[send-rfq-response] error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Privacy policy (required for Meta app Live mode)
 app.get('/privacy', (req, res) => {
   res.type('html').send(`<!DOCTYPE html><html><head><title>Privacy Policy – Square 15 Facility Solutions</title></head><body style="font-family:sans-serif;max-width:700px;margin:40px auto;padding:0 20px">

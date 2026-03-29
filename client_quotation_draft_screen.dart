@@ -966,7 +966,7 @@ class _QuotationDraftScreenState extends State<QuotationDraftScreen> {
     );
     double? price =
         await BuildersWebViewPricing.instance.itemsPriceFromProductId(pid);
-    if ((price == null || price <= 0) &&
+    if ((price <= 0) &&
         (picked['url'] ?? '').toString().trim().isNotEmpty) {
       price = await BuildersWebViewPricing.instance.priceFromUrl(
         (picked['url'] ?? '').toString(),
@@ -974,7 +974,7 @@ class _QuotationDraftScreenState extends State<QuotationDraftScreen> {
     }
     if (!mounted) return;
 
-    if (price == null || price <= 0) {
+    if (price <= 0) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Could not fetch a price for that item.')),
       );
