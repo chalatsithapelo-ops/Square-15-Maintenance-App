@@ -17,6 +17,7 @@ import 'package:maintenanceapp/screens/home/booking/booking.dart';
 import 'package:maintenanceapp/screens/home/booking/google_map_view.dart';
 import 'package:maintenanceapp/services/firestore_services/firebase_services.dart';
 import 'package:maintenanceapp/utils/primary_button.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 class ArtisanAppointmentsScreen extends StatelessWidget {
   final List<String> artisanIds;
@@ -446,6 +447,60 @@ class ArtisanAppointmentsScreen extends StatelessWidget {
                           ),
                         ],
                       ),
+                      // Call Client button
+                      if (userId.isNotEmpty)
+                        FutureBuilder<QuerySnapshot>(
+                          future: FirebaseService.userRef
+                              .where('uid', isEqualTo: userId)
+                              .limit(1)
+                              .get(),
+                          builder: (context, userSnap) {
+                            if (!userSnap.hasData || userSnap.data!.docs.isEmpty) {
+                              return const SizedBox.shrink();
+                            }
+                            final userData = userSnap.data!.docs.first.data() as Map<String, dynamic>;
+                            final clientName = (userData['name'] ?? '').toString().trim();
+                            final clientPhone = (userData['phone'] ?? userData['contact'] ?? userData['phoneNumber'] ?? '').toString().trim();
+                            if (clientPhone.isEmpty) return const SizedBox.shrink();
+                            return Padding(
+                              padding: const EdgeInsets.only(bottom: 8),
+                              child: InkWell(
+                                onTap: () async {
+                                  final uri = Uri(scheme: 'tel', path: clientPhone);
+                                  if (await canLaunchUrl(uri)) {
+                                    await launchUrl(uri);
+                                  }
+                                },
+                                borderRadius: BorderRadius.circular(8),
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                                  decoration: BoxDecoration(
+                                    color: Colors.green.shade50,
+                                    borderRadius: BorderRadius.circular(8),
+                                    border: Border.all(color: Colors.green.shade200),
+                                  ),
+                                  child: Row(
+                                    children: [
+                                      Icon(Icons.phone, color: Colors.green.shade700, size: 20),
+                                      const SizedBox(width: 10),
+                                      Expanded(
+                                        child: Text(
+                                          'Call Client${clientName.isNotEmpty ? " ($clientName)" : ""}',
+                                          style: GoogleFonts.roboto(
+                                            fontSize: 13,
+                                            fontWeight: FontWeight.w600,
+                                            color: Colors.green.shade700,
+                                          ),
+                                        ),
+                                      ),
+                                      Icon(Icons.arrow_forward_ios, size: 14, color: Colors.green.shade400),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                            );
+                          },
+                        ),
                       if (providedAddress != null &&
                           providedAddress.isNotEmpty) ...[
                         const SizedBox(height: 10),
