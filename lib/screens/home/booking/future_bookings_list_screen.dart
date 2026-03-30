@@ -19,6 +19,7 @@ import 'package:maintenanceapp/screens/home/rfq/client_rfq_response_screen.dart'
 import 'package:maintenanceapp/services/firestore_services/firebase_services.dart';
 import 'package:maintenanceapp/services/future_booking_service.dart';
 import 'package:maintenanceapp/services/refund_service.dart';
+import 'package:maintenanceapp/services/artisan_penalty_service.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 class FutureBookingsListScreen extends StatefulWidget {
@@ -2337,7 +2338,22 @@ class _WorkCompletePanelState extends State<_WorkCompletePanel> {
         });
       }
 
-      // 4) Notify artisan that client marked order as complete
+      // 4) Auto-flag penalty for bad reviews (rating <= 2)
+      if (_userRating <= 2) {
+        try {
+          await ArtisanPenaltyService.flagBadReview(
+            taskManagementId: widget.tasksManagementId,
+            artisanId: widget.serviceProviderId,
+            clientId: FirebaseAuth.instance.currentUser?.uid ?? '',
+            rating: _userRating,
+            feedback: feedback,
+          );
+        } catch (_) {
+          // Best-effort penalty flagging
+        }
+      }
+
+      // 5) Notify artisan that client marked order as complete
       try {
         final ratingText = _userRating > 0
             ? ' Rating: ${_userRating.toStringAsFixed(1)}/5.'

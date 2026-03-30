@@ -1454,7 +1454,7 @@ class _JobTimerWidgetState extends State<_JobTimerWidget> {
   }
 
   Future<void> _saveDraft() async {
-    await _togglePause(); // Auto-pause on draft save
+    if (!_isPaused) await _togglePause(); // Only pause if not already paused
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(
