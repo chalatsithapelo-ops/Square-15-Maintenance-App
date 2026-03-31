@@ -7,7 +7,7 @@ upload/deploy a minimal set of files to GitHub/Render.
 
 # ── Version tag — bump this on every deploy so we can verify Render runs the
 # latest code.  Check Render logs for the startup banner.
-WORKER_VERSION = "2026-03-22-v6"
+WORKER_VERSION = "2026-02-26-v5"
 
 import os
 import asyncio
@@ -151,6 +151,15 @@ def _format_currency_for_speech(text: str) -> str:
         text
     )
     return result
+
+
+def _fmt_currency(amount) -> str:
+    """Format a numeric amount as 'R1,234.56' for tool return text."""
+    try:
+        val = float(amount)
+        return f"R{val:,.2f}"
+    except (ValueError, TypeError):
+        return f"R{amount}"
 
 
 # Load environment variables (optional locally; Render uses service env vars)
@@ -374,15 +383,11 @@ async def entrypoint(ctx: JobContext):
     logger.info("🤖 Creating voice agent...")
 
     async def _detect_caller_role() -> str:
-        """Best-effort role detection from the non-agent participant identity.
-        
-        Optimised for speed: 4 polls × 150ms = max ~0.6s (was 12 × 250ms = 3s).
-        Most participants are already present by the time we check.
-        """
+        """Best-effort role detection from the non-agent participant identity."""
         try:
-            # Brief initial wait for LiveKit to populate participants.
-            await asyncio.sleep(0.1)
-            for _ in range(4):
+            # Give LiveKit a moment to populate participants.
+            await asyncio.sleep(0.25)
+            for _ in range(12):
                 try:
                     participants = getattr(ctx.room, "remote_participants", None) or {}
                     for _, p in participants.items():
@@ -396,7 +401,7 @@ async def entrypoint(ctx: JobContext):
                             return "client"
                 except Exception:
                     pass
-                await asyncio.sleep(0.15)
+                await asyncio.sleep(0.25)
         except Exception:
             pass
         return "client"
@@ -438,61 +443,170 @@ async def entrypoint(ctx: JobContext):
     def _instructions_for_role(role: str) -> str:
         role = (role or "client").strip().lower()
 
-        # ── Compact system prompt (~40% smaller for faster first-token latency) ──
-        # Tool descriptions are already provided by @llm.function_tool decorators,
-        # so the system prompt only needs behavioral rules.
         base = (
             f"You are Lizzy, the Square 15 Voice AI Assistant, speaking to a {role.upper()} user.\n\n"
-            "PERSONALITY: Be warm, friendly, South African. Engage in small talk — respond to greetings naturally before offering help. "
-            "Keep casual responses to 1-2 sentences. Be fun but professional. Never sound robotic.\n\n"
-            "CORE RULES:\n"
+            "RULES:\n"
             "- Greet once, then just help. Never repeat your introduction.\n"
-            "- When user asks to DO something, CALL the tool immediately. Never describe what you would do.\n"
-            "- NEVER say 'I cannot access' or 'I am unable to'. ALWAYS try calling the relevant tool.\n"
-            "- NEVER narrate tool calls, say JSON, function names, or metadata.\n"
-            "- NEVER claim you opened/loaded pictures, images, maps, or locations.\n"
+            "- When user asks to DO something, CALL the right tool immediately. Do NOT describe what you would do — just do it.\n"
+            "- NEVER say 'I cannot access', 'I am unable to', 'I don't have access to', or 'I need you to be authenticated'. ALWAYS try calling the relevant tool.\n"
+            "- BACKEND tools for data: get_booking_status, list_my_bookings, explain_quote, check_payment, get_wallet_balance, get_messages, get_case_status.\n"
+            "- BACKEND tools for ACTIONS: cancel_booking, reschedule_booking, send_message_to_artisan, send_message_to_client, send_message_to_admin, mark_booking_in_progress, artisan_cancel_and_reassign, submit_rating, submit_complaint. These tools EXECUTE real actions on the backend — use them, NOT ui_navigate.\n"
+            "- lookup_service_pricing for pricing: when user asks 'how much is...', 'what's the price for...', call lookup_service_pricing.\n"
+            "- FINANCE tools (admin-only, read-only): get_finance_overview, get_daily_revenue_report, get_failed_payments_report, get_fraud_alerts_report. Use when admin asks 'What's the revenue today?', 'Any failed payments?', 'Show financial summary', 'Any fraud alerts?'. These are READ-ONLY and safe. NEVER process refunds, payouts, or wallet adjustments via voice — those require the admin app approval workflow.\n"
+            "- ui_navigate ONLY for opening screens/navigation: open_bookings_tab, open_future_bookings, open_wallet, open_profile, open_settings, open_notifications, open_calendar, open_help, open_support, go_home, go_back, close_window, create_order_booking, call_assigned_artisan.\n"
+            "- NEVER use ui_navigate for cancel_booking, reschedule_booking, send_message_to_artisan, send_message_to_client, send_message_to_admin, mark_booking_in_progress, artisan_cancel_and_reassign. Use the dedicated tools instead.\n"
+            "- NEVER narrate tool calls. Never say JSON, function names, or metadata.\n"
+            "- NEVER claim you opened/loaded pictures or images.\n"
+            "- NEVER claim you opened a map or showed a location. There is no map feature.\n"
             "- Speak naturally, 1-3 short sentences. Be concise.\n"
-            "- CURRENCY: Say amounts in words — 'five hundred rand' NOT 'R500'. NEVER say 'R' before a number.\n"
-            "- Dates: YYYY-MM-DD. Times: HH:MM. 'now'/'asap'/'urgent' → scheduled_date='now', scheduled_time='now'.\n\n"
-            "TOOL ROUTING:\n"
-            "- DATA tools (read info): get_booking_status, list_my_bookings, explain_quote, check_payment, get_wallet_balance, get_messages, get_case_status, lookup_service_pricing\n"
-            "- ACTION tools (execute changes): cancel_booking, reschedule_booking, send_message_to_artisan, send_message_to_client, send_message_to_admin, mark_booking_in_progress, artisan_cancel_and_reassign, submit_rating, submit_complaint\n"
-            "- ui_navigate ONLY for screen navigation: open_bookings_tab, open_future_bookings, open_wallet, open_profile, open_settings, open_support, go_home, go_back, create_order_booking, call_assigned_artisan\n"
-            "- NEVER use ui_navigate for cancel, reschedule, messaging, or status changes. Use dedicated tools.\n\n"
-            "BOOKINGS & RFQs:\n"
-            "- ALWAYS call list_my_bookings() first to find booking IDs. Match by category, artisan, date, RFQ-DD/MM/YYYY-NN, or ORD-DD/MM/YYYY-NN.\n"
-            "- Then call the specific tool (get_booking_status, cancel_booking, reschedule_booking, etc.).\n"
-            "- NEVER say you 'can't see' bookings. Always call list_my_bookings first.\n\n"
-            "PRICING: ALWAYS call lookup_service_pricing. NEVER guess prices. If cost is null, say 'This requires a quote from an artisan'.\n\n"
-            "BOOKING CREATION: Use ui_navigate(action='create_order_booking') with category_name + problem_description. Say 'Processing your booking now, please keep the app open.' No map/photo actions exist.\n\n"
-            "MESSAGING: 'Send message' → use send_message_to_artisan/client/admin tools (they SEND via backend). 'Open chat' → ui_navigate(action='open_support').\n\n"
-            "CASES: list_my_cases, reply_to_case, get_case_status. Create case via send_message_to_admin.\n\n"
-            "SCREEN AWARENESS: get_current_screen() for 'where am I?', analyze_screen() for 'explain this', list_app_features() for 'what can you do?'\n\n"
-            "SERVICE AREAS: Square 15 operates in select areas only. If rejected, say 'Sorry, Square 15 is not yet available in your area. We are expanding soon.'\n"
+            "- CURRENCY: When speaking amounts, say the full words. Say 'one million rand' NOT 'R1000000'. "
+            "Say 'five hundred rand' NOT 'R500'. Say 'one thousand five hundred rand and fifty cents' NOT 'R1500.50'. "
+            "NEVER say the letter 'R' before a number. Always use 'rand' after the amount.\n"
+            "- If user says 'now'/'asap'/'urgent', use scheduled_date='now', scheduled_time='now'.\n"
+            "- Date format: YYYY-MM-DD. Time format: HH:MM.\n"
+            "- If user refers to a booking by price, call list_my_bookings first to find it.\n"
+            "\n"
+            "BOOKING LOOKUP (CRITICAL — MUST USE TOOLS):\n"
+            "- When user asks about a booking, 'where is my artisan/plumber?', 'what's the status of my booking?', or similar:\n"
+            "  1. FIRST call list_my_bookings() to get their bookings.\n"
+            "  2. Find the relevant booking from the results (match by category, artisan, date, or pick the most recent active one).\n"
+            "  3. THEN call get_booking_status(booking_id) with the relevant booking ID to get full details.\n"
+            "  4. Tell the user the booking status, artisan name, and any relevant info.\n"
+            "- NEVER say you 'can't access bookings' or 'unable to retrieve'. ALWAYS call list_my_bookings first. Even if there's an error, try the tool.\n"
+            "\n"
+            "MESSAGING & CHAT (IMPORTANT — USE BACKEND TOOLS, NOT ui_navigate):\n"
+            "- 'Open chat' / 'open messages' / 'contact support' → call ui_navigate(action='open_support')\n"
+            "- 'Send message to artisan' / 'tell artisan ...' → call send_message_to_artisan(booking_id, message). Get booking_id from list_my_bookings if needed. This SENDS the message via the backend.\n"
+            "- 'Send message to client' / 'tell client ...' / 'message the client' → call send_message_to_client(booking_id, message). Get booking_id from list_my_bookings if needed. This SENDS the message via the backend.\n"
+            "- 'Contact admin' / 'send message to support' → call send_message_to_admin(message, subject). This SENDS the message via the backend.\n"
+            "- 'Show messages' / 'read messages for booking' → call get_messages(booking_id)\n"
+            "\n"
+            "SUPPORT CASES:\n"
+            "- 'Show my cases' / 'do I have open tickets?' → call list_my_cases(state='open') or list_my_cases() for all\n"
+            "- 'Reply to case' / 'follow up on my ticket' → call reply_to_case(case_id, message)\n"
+            "- 'Check case status' → call get_case_status(case_id)\n"
+            "- When a user has an issue and wants admin help, first create a case with send_message_to_admin(message, subject).\n"
+            "- If they want to follow up, use reply_to_case with the case_id.\n"
+            "\n"
+            "BOOKING MANAGEMENT (CRITICAL — USE DEDICATED TOOLS, NOT ui_navigate):\n"
+            "- When user asks to cancel, reschedule, check status, or do anything with a booking:\n"
+            "  1. If they don't give a booking ID, call list_my_bookings() first to find it.\n"
+            "  2. Then CALL the specific BACKEND tool — these EXECUTE the action:\n"
+            "- Cancel: cancel_booking(booking_id, reason) — actually cancels the booking on the server\n"
+            "- Reschedule: reschedule_booking(booking_id, scheduled_date, scheduled_time) — actually reschedules on the server\n"
+            "- Check status: get_booking_status(booking_id)\n"
+            "- Call artisan: ui_navigate(action='call_assigned_artisan', booking_id=...)\n"
+            "- Send message to artisan: send_message_to_artisan(booking_id, message) — actually sends the message\n"
+            "- IMPORTANT: NEVER use ui_navigate for cancel, reschedule, or messaging. Those only open screens. Use the dedicated tools to execute the action.\n"
+            "\n"
+            "PRICING ENQUIRIES (CRITICAL — MUST USE TOOL):\n"
+            "- When user asks how much a service costs, MUST call lookup_service_pricing. Do NOT answer without calling this tool.\n"
+            "- Pass query with the service name (e.g. query='plumbing', query='unblock toilet', query='painting').\n"
+            "- The tool ALWAYS returns pricing data. Read back the prices from the results.\n"
+            "- If cost is null for a service, say 'This service requires a quote from an artisan'.\n"
+            "- NEVER guess or make up prices. ALWAYS call lookup_service_pricing.\n"
+            "\n"
+            "DIAGNOSIS & QUOTING (IMPORTANT — ASK BEFORE BOOKING):\n"
+            "- When a user describes a maintenance problem, DO NOT immediately create a booking.\n"
+            "- First, ask 2-3 diagnostic follow-up questions to understand scope and severity:\n"
+            "  1. SCOPE: 'Is this affecting a small area or a large area?' / 'How many rooms or fixtures are affected?'\n"
+            "  2. URGENCY: 'How long has this been happening?' / 'Is there active water flow, sparks, or danger right now?'\n"
+            "  3. DETAIL: 'Can you describe what you see — any cracks, leaks, discolouration, or damage?'\n"
+            "- Use the answers to build a RICH problem_description. Combine the user's original description with the diagnostic details.\n"
+            "  Example: If user says 'my toilet is blocked' and answers 'just one toilet, been 2 days, water rises but drains slowly' →\n"
+            "  problem_description = 'Blocked toilet - single unit, issue for 2 days, water rises but drains slowly, no overflow yet'\n"
+            "- For SUB-CATEGORY precision, ask: 'Is this a [option A], [option B], or something else?'\n"
+            "  Examples by category:\n"
+            "    Plumbing → 'Is this a blocked drain, a leaking pipe, a geyser issue, or something else?'\n"
+            "    Electrical → 'Is this a tripping breaker, a faulty outlet, flickering lights, or something else?'\n"
+            "    Painting → 'Is this interior or exterior? Roughly how many square metres?'\n"
+            "    Roofing → 'Is this a leak, missing tiles, gutter damage, or waterproofing needed?'\n"
+            "    Carpentry → 'Is this a door, window frame, cabinet, or structural timber issue?'\n"
+            "- ONLY after gathering these details, proceed to create the booking.\n"
+            "- If the user says 'just book it' or 'skip the questions', proceed immediately with what you have.\n"
+            "\n"
+            "PRICE ESTIMATE FOR UNPRICED SERVICES:\n"
+            "- When no exact pricing is found and an RFQ is needed, FIRST call lookup_service_pricing with a broad query for the category.\n"
+            "- Use the results to give the user a PRICE RANGE: 'Based on similar jobs, this typically costs between X rand and Y rand.'\n"
+            "- Then say: 'I am creating a request for a detailed custom quote. You will receive a breakdown with labour, materials, and estimated costs shortly.'\n"
+            "- NEVER say 'admin will review' without first giving a price indication.\n"
+            "\n"
+            "RFQ QUOTES & FOLLOW-UP:\n"
+            "- After an RFQ booking is created, the app automatically generates a detailed AI quote with labour, materials, and contingency breakdown.\n"
+            "- Tell the user: 'A preliminary quote is being generated now. You can ask me to explain the quote breakdown once it is ready.'\n"
+            "- When the user asks 'how much will it cost?', 'explain the quote', or 'what is the breakdown?' for an RFQ booking:\n"
+            "  1. Call list_my_bookings() to find the RFQ booking.\n"
+            "  2. Call explain_rfq_quote(booking_id) to get the AI-generated breakdown.\n"
+            "  3. Read back: labour cost, materials list, equipment, contingency, and grand total.\n"
+            "- If the quote is not ready yet, say: 'The quote is still being prepared. Check back in a minute.'\n"
+            "\n"
+            "BOOKING CREATION (IMPORTANT):\n"
+            "- To create a new booking, ALWAYS use ui_navigate with action='create_order_booking'.\n"
+            "- Provide: category_name, problem_description (enriched with diagnostic details), and optionally scheduled_date, scheduled_time, service_address.\n"
+            "- Do NOT use create_booking tool. ONLY use ui_navigate(action='create_order_booking').\n"
+            "- After calling ui_navigate, say 'I am processing your booking now, please keep the app open.' Do NOT say an artisan has been dispatched until confirmed.\n"
+            "- NEVER open photo upload, map, or any other screen during booking creation. The app handles everything.\n"
+            "- Do NOT use open_map or show_location actions. They do not exist.\n"
+            "\n"
+            "SCREEN AWARENESS & APP CONTROL (IMPORTANT):\n"
+            "- You can see what screen the user is on and what actions are available.\n"
+            "- When user asks 'what's on my screen?', 'where am I?', 'what can I do here?' → call get_current_screen()\n"
+            "- When user asks 'analyze this', 'explain this page', 'what does this mean?' → call analyze_screen()\n"
+            "- When user asks 'what can you do?', 'what features are available?' → call list_app_features()\n"
+            "- You control the app completely: navigate to any screen, execute any action, check any data.\n"
+            "- Think of yourself as the user's personal app assistant — they talk, you do.\n"
+            "\n"
+            "SERVICE AREA RESTRICTIONS:\n"
+            "- Square 15 currently operates in specific service areas only (phased launch).\n"
+            "- If a booking is rejected because the user's location is outside our service area, explain politely: "
+            "'Sorry, Square 15 is not yet available in your area. We are currently serving select areas and expanding soon.'\n"
+            "- Do NOT promise service in areas we don't cover yet.\n"
+            "- The app automatically checks the user's location against active service areas.\n"
         )
 
         if role == "artisan":
             base += (
-                "\nARTISAN-SPECIFIC:\n"
+                "\nARTISAN ACTIONS:\n"
                 "- Accept job → ui_navigate(action='accept_latest_request')\n"
                 "- Reject job → ui_navigate(action='reject_latest_request')\n"
                 "- Start job → mark_booking_in_progress(booking_id)\n"
-                "- Cancel+reassign → artisan_cancel_and_reassign(booking_id, reason) — MUST confirm with artisan first.\n"
-                "- Screens: open_artisan_requests, open_artisan_appointments, open_artisan_wallet, open_schedule.\n"
+                "- Cancel+reassign → artisan_cancel_and_reassign(booking_id, reason)\n"
+                "  IMPORTANT: Before calling artisan_cancel_and_reassign, you MUST ask the artisan to confirm. "
+                "Say something like 'Are you sure you want to cancel this job and have it reassigned to another artisan?' "
+                "Only proceed if the artisan explicitly says yes.\n"
+                "- Artisan screens: open_artisan_requests, open_artisan_appointments, open_artisan_wallet, open_schedule.\n"
+                "- Do not dispatch artisans while talking to an artisan.\n"
             )
         else:
             base += (
-                "\nCLIENT-SPECIFIC:\n"
-                "- Create booking: ui_navigate(action='create_order_booking') with category_name + problem_description.\n"
+                "\nCLIENT ACTIONS:\n"
+                "- Create booking: First run the DIAGNOSIS flow (ask 2-3 questions about scope, urgency, and sub-category). "
+                "Then call ui_navigate(action='create_order_booking') with category_name and the enriched problem_description. "
+                "The app handles pricing, RFQ creation, AI quoting, and artisan dispatch automatically.\n"
+                "- If the user explicitly says they want a diagnosis and quote WITHOUT booking, use lookup_service_pricing to give them a price range, "
+                "then ask if they want to proceed with a booking.\n"
                 "- Cancel: cancel_booking(booking_id, reason). Reschedule: reschedule_booking(booking_id, date, time).\n"
-                "- Pay: ui_navigate(action='pay_for_booking', booking_id=...)\n"
-                "- Call artisan: ui_navigate(action='call_assigned_artisan', booking_id)\n"
+                "- Call artisan → ui_navigate(action='call_assigned_artisan', booking_id)\n"
+                "- Future bookings → ui_navigate(action='open_future_bookings')\n"
+                "- Check RFQ quote → explain_rfq_quote(booking_id) — reads back the AI-generated cost breakdown\n"
             )
 
         return base
 
     @llm.function_tool(
-        description="Navigate the app UI. Actions: create_order_booking, open_bookings_tab, open_future_bookings, open_wallet, open_profile, open_settings, open_support, open_notifications, open_artisan_requests, open_artisan_appointments, accept_latest_request, reject_latest_request, call_assigned_artisan, pay_for_booking, go_home, go_back. NOT for cancel/reschedule/message — use dedicated tools."
+        description=(
+            "Send a UI navigation command to the Square 15 mobile app. "
+            "Use ONLY for navigation and screen-opening actions. "
+            "Supported actions: create_order_booking, dispatch_artisan, "
+            "open_bookings_tab, open_future_bookings, open_artisan_requests, open_artisan_appointments, "
+            "open_artisan_wallet, accept_latest_request, reject_latest_request, respond_to_request, "
+            "call_assigned_artisan, "
+            "open_notifications, open_profile, open_settings, open_support, open_wallet, "
+            "open_calendar, open_help, go_home, go_back, close_window, close_dialog, dismiss. "
+            "DO NOT use for cancel_booking, reschedule_booking, send_message_to_artisan, "
+            "send_message_to_admin, mark_booking_in_progress, artisan_cancel_and_reassign — "
+            "use the dedicated action tools instead."
+        )
     )
     async def ui_navigate(
         action: str,
@@ -628,63 +742,46 @@ async def entrypoint(ctx: JobContext):
 
     # ── Helper: retry credential scan before giving up ──
     async def _ensure_backend_or_retry() -> bool:
-        """Last-ditch attempt to initialize backend_client if not set.
-
-        Optimised for speed: 4 fast polls (0.2–0.5s) ≈ 1.3s total max,
-        down from the old 5 × (1.0–3.0s) = 10s.  Credentials almost always
-        arrive within the first 0.5s via data channel, so long waits only
-        punish the user.
-        """
+        """Last-ditch attempt to initialize backend_client if not set."""
         nonlocal backend_client
         if backend_client:
             return True
         logger.info("🔄 _ensure_backend_or_retry: backend_client is None, scanning...")
-        for attempt in range(4):
+        # Try multiple scans with increasing waits
+        for attempt in range(5):
             _scan_participants_for_credentials()
             if backend_client:
                 logger.info(f"✅ _ensure_backend_or_retry: got client on attempt {attempt + 1}")
                 return True
-            wait_time = 0.2 + attempt * 0.1  # 0.2, 0.3, 0.4, 0.5
+            wait_time = 1.0 + attempt * 0.5  # 1.0, 1.5, 2.0, 2.5, 3.0
+            logger.info(f"⏳ _ensure_backend_or_retry: attempt {attempt + 1}/5 failed, waiting {wait_time}s...")
             await asyncio.sleep(wait_time)
         _scan_participants_for_credentials()
         if backend_client:
             logger.info("✅ _ensure_backend_or_retry: got client on final scan")
             return True
-        logger.warning("❌ _ensure_backend_or_retry: FAILED after 4 fast attempts — no firebase_token found")
+        logger.warning("❌ _ensure_backend_or_retry: FAILED after 5 attempts — no firebase_token found in any participant metadata")
         return False
 
     _CONNECTION_RETRY_MSG = "I'm still connecting to your account. Please try again in a moment."
 
     # Phase 2: Read-only backend tools
     @llm.function_tool(
-        description="Get booking status, schedule, artisan details, and payment info by booking ID."
+        description=(
+            "Get the current status of a booking by booking ID. "
+            "Returns status, scheduled time, artisan details, and payment info. "
+            "Use this when user asks 'What's my booking status?' or 'Where is my artisan?'"
+        )
     )
     async def get_booking_status(booking_id: str) -> str:
         """Get booking status from backend API."""
         nonlocal backend_client, app_context_bookings
         logger.info(f"📋 get_booking_status called: booking_id={booking_id}, backend_client={'SET' if backend_client else 'NONE'}, app_bookings={len(app_context_bookings)}")
-
-        # If user gave an RFQ number or order number, try to find the booking_id first
-        clean_id = booking_id.strip()
-        if app_context_bookings and (clean_id.upper().startswith('RFQ') or clean_id.upper().startswith('ORD')):
-            for b in app_context_bookings:
-                rfq = (b.get('rfq_no') or '').strip()
-                ono = (b.get('order_no') or '').strip()
-                if rfq and clean_id.upper() in rfq.upper():
-                    clean_id = b.get('booking_id', clean_id)
-                    logger.info(f"📋 Resolved RFQ {booking_id} → booking {clean_id}")
-                    break
-                if ono and clean_id.upper() in ono.upper():
-                    clean_id = b.get('booking_id', clean_id)
-                    logger.info(f"📋 Resolved order {booking_id} → booking {clean_id}")
-                    break
-
         if not backend_client:
             # Fallback: check app context bookings if available
             if app_context_bookings:
                 for b in app_context_bookings:
-                    bid = b.get('booking_id', '')
-                    if bid == clean_id or bid == booking_id:
+                    if b.get('booking_id') == booking_id:
                         status = b.get('status', 'unknown')
                         category = b.get('category', 'service')
                         artisan_name = b.get('artisan_name', '')
@@ -709,7 +806,7 @@ async def entrypoint(ctx: JobContext):
                 return _CONNECTION_RETRY_MSG
 
         try:
-            result = await backend_client.get_booking_status(clean_id)
+            result = await backend_client.get_booking_status(booking_id)
             if not result.get('ok') and not result.get('success'):
                 error = result.get('error', 'unknown_error')
                 if error == 'booking_not_found':
@@ -766,7 +863,12 @@ async def entrypoint(ctx: JobContext):
             return "Sorry, I had trouble checking that booking. Please try again."
 
     @llm.function_tool(
-        description="List user's bookings. Filter by status. Returns IDs, categories, dates, prices, RFQ/order numbers. Call this first to find booking IDs."
+        description=(
+            "List the user's recent bookings. Optionally filter by status (e.g., 'pending_assignment', 'in_progress', 'completed'). "
+            "Returns booking IDs, categories, statuses, dates, prices, order numbers and RFQ numbers. "
+            "Use this when user asks 'Show my bookings', 'What bookings do I have?', "
+            "'Find my R67000 booking', or 'Which booking costs...' — then match by price/amount from the results."
+        )
     )
     async def list_my_bookings(status: str = "", limit: int = 10) -> str:
         """List user's bookings from backend API."""
@@ -790,20 +892,11 @@ async def entrypoint(ctx: JobContext):
                     date = b.get('scheduled_date', '')
                     time = b.get('scheduled_time', '')
                     price = b.get('price', '')
-                    rfq_no = b.get('rfq_no', '')
-                    order_no = b.get('order_no', '')
-                    rfq_status = b.get('rfq_status', '')
                     response += f"{i}. {category} booking {bid}: {bstatus}"
                     if artisan:
                         response += f", artisan: {artisan}"
                     if price:
                         response += f", price R{price}"
-                    if rfq_no:
-                        response += f", RFQ #{rfq_no}"
-                    if order_no:
-                        response += f", order #{order_no}"
-                    if rfq_status:
-                        response += f", RFQ status: {rfq_status}"
                     if date and time:
                         response += f", scheduled {date} at {time}"
                     elif date:
@@ -839,7 +932,7 @@ async def entrypoint(ctx: JobContext):
                 time = booking.get('scheduled_time', '')
                 price = booking.get('total_price', '')
                 rfq_no = booking.get('rfq_no', '')
-                order_no = booking.get('order_no', '') or booking.get('order_number', '')
+                order_no = booking.get('order_number', '')
                 order_type = booking.get('order_type', '')
                 rfq_status = booking.get('rfq_status', '')
                 response += f"{i}. {category} booking {booking_id}: {booking_status}"
@@ -865,7 +958,13 @@ async def entrypoint(ctx: JobContext):
             return "Sorry, I had trouble getting your bookings. Please try again."
 
     @llm.function_tool(
-        description="Get booking analytics: counts by status, urgent bookings, recent activity summary."
+        description=(
+            "Get analytics and summary of all bookings/requests in the system. "
+            "Returns counts by status, identifies urgent bookings, and gives intelligent insights. "
+            "Use this when user asks things like 'How many open requests?', 'What's the system status?', "
+            "'Any urgent bookings?', 'Give me a summary', 'How many pending jobs?', "
+            "'What's the overview?', or 'Analyze the data'."
+        )
     )
     async def get_booking_analytics() -> str:
         """Get analytics summary from backend API."""
@@ -915,7 +1014,12 @@ async def entrypoint(ctx: JobContext):
             return "Sorry, I had trouble getting the analytics. Please try again."
 
     @llm.function_tool(
-        description="Explain RFQ quote details, scope of work, and pricing. Accepts booking_id or RFQ number."
+        description=(
+            "Explain the details of an RFQ quote, scope of work, or booking details. "
+            "Accepts either a booking_id or an RFQ number (e.g., 'RFQ-BE6A011A'). "
+            "Use this when user asks 'Explain my quote', 'What's the scope of work for RFQ-...', "
+            "'What's the quote for my RFQ?', or 'Tell me about RFQ-...'"
+        )
     )
     async def explain_quote(booking_id: str) -> str:
         """Explain RFQ quote from backend API."""
@@ -972,7 +1076,10 @@ async def entrypoint(ctx: JobContext):
             return "Sorry, I had trouble getting that quote. Please try again."
 
     @llm.function_tool(
-        description="Check payment status and transaction history for a booking."
+        description=(
+            "Check the payment status for a booking. "
+            "Use this when user asks 'Did I pay?' or 'What's the payment status?'"
+        )
     )
     async def check_payment(booking_id: str) -> str:
         """Check payment status from backend API."""
@@ -1009,7 +1116,13 @@ async def entrypoint(ctx: JobContext):
             return "Sorry, I had trouble checking payment. Please try again."
 
     @llm.function_tool(
-        description="Look up service pricing by category/task name or general query. ALWAYS call this — never guess prices."
+        description=(
+            "Look up the price of a service. Use this when the user asks "
+            "'how much is...', 'what's the price for...', 'how much do you charge for...', "
+            "'what does ... cost?'. Provide category_name (e.g. 'plumbing', 'electrical') "
+            "and/or task_name (e.g. 'unblock toilet', 'install geyser'). "
+            "You can also pass a general query string."
+        )
     )
     async def lookup_service_pricing(
         category_name: str = "",
@@ -1089,7 +1202,12 @@ async def entrypoint(ctx: JobContext):
 
     # Phase 1: Write operations with propose/confirm
     @llm.function_tool(
-        description="Create a new booking. Requires category_name, problem_description. Optional: scheduled_date, scheduled_time, service_address."
+        description=(
+            "Create a new order booking and dispatch an artisan. "
+            "Requires: category_name, problem_description. "
+            "Optional: scheduled_date, scheduled_time, service_address. "
+            "This uses the propose-confirm workflow for safety."
+        )
     )
     async def create_booking(
         category_name: str,
@@ -1150,7 +1268,11 @@ async def entrypoint(ctx: JobContext):
     # =========================================
 
     @llm.function_tool(
-        description="Send a message to the artisan assigned to a booking. Requires: booking_id, message."
+        description=(
+            "Send a message to the artisan assigned to a booking. "
+            "Use this when the user wants to contact their artisan (ask about ETA, location, confirm details, etc.). "
+            "Requires: booking_id, message."
+        )
     )
     async def send_message_to_artisan(
         booking_id: str,
@@ -1182,7 +1304,11 @@ async def entrypoint(ctx: JobContext):
             return "Sorry, I had trouble sending the message. Please try again."
 
     @llm.function_tool(
-        description="Send a message to the client who made a booking. Requires: booking_id, message."
+        description=(
+            "Send a message to the client who booked. "
+            "Use this when the artisan wants to contact their client (update on arrival, request info, etc.). "
+            "Requires: booking_id, message."
+        )
     )
     async def send_message_to_client(
         booking_id: str,
@@ -1214,7 +1340,11 @@ async def entrypoint(ctx: JobContext):
             return "Sorry, I had trouble sending the message. Please try again."
 
     @llm.function_tool(
-        description="Send a message to admin support. Requires: message. Optional: booking_id, subject."
+        description=(
+            "Send a message to admin support. "
+            "Use this when the user needs help from support (complaints, escalations, complex issues). "
+            "Requires: message. Optional: booking_id, subject."
+        )
     )
     async def send_message_to_admin(
         message: str,
@@ -1250,7 +1380,11 @@ async def entrypoint(ctx: JobContext):
             return "Sorry, I had trouble contacting support. Please try again."
 
     @llm.function_tool(
-        description="Get chat messages for a booking. Requires: booking_id or tasks_management_id."
+        description=(
+            "Get chat messages for a booking. "
+            "Use this when the user asks to see their messages or conversation with the artisan. "
+            "Requires: booking_id or tasks_management_id."
+        )
     )
     async def get_messages(
         booking_id: str = "",
@@ -1306,7 +1440,11 @@ async def entrypoint(ctx: JobContext):
     # =========================================
 
     @llm.function_tool(
-        description="Get support case status by case_id."
+        description=(
+            "Get the status of a support case. "
+            "Use this when the user asks about their support request or case. "
+            "Requires: case_id."
+        )
     )
     async def get_case_status(
         case_id: str
@@ -1350,7 +1488,11 @@ async def entrypoint(ctx: JobContext):
             return "Sorry, I had trouble getting the case status. Please try again."
 
     @llm.function_tool(
-        description="Reply to an existing support case. Requires: case_id, message."
+        description=(
+            "Reply to an existing support case to add a follow-up message. "
+            "Use when the user says 'reply to my case' or 'add a message to case XYZ'. "
+            "Requires: case_id, message."
+        )
     )
     async def reply_to_case(case_id: str, message: str) -> str:
         """Add a reply to an existing support case thread."""
@@ -1374,7 +1516,11 @@ async def entrypoint(ctx: JobContext):
             return "Sorry, I had trouble replying to your case. Please try again."
 
     @llm.function_tool(
-        description="List user's support cases. Optional: state filter (open, in_progress, resolved, closed)."
+        description=(
+            "List the user's support cases. "
+            "Use when user says 'show my cases', 'what are my open tickets?', 'do I have pending support requests?'. "
+            "Optional: state filter ('open', 'in_progress', 'resolved', 'closed')."
+        )
     )
     async def list_my_cases(state: str = "") -> str:
         """List user's support cases, optionally filtered by state."""
@@ -1417,7 +1563,10 @@ async def entrypoint(ctx: JobContext):
     # =========================================
 
     @llm.function_tool(
-        description="Get user's wallet balance."
+        description=(
+            "Get the user's wallet balance. "
+            "Use this when the user asks 'What's my balance?' or 'How much is in my wallet?'"
+        )
     )
     async def get_wallet_balance() -> str:
         """Get user's wallet balance from backend API."""
@@ -1442,7 +1591,10 @@ async def entrypoint(ctx: JobContext):
             return "Sorry, I had trouble checking your wallet balance. Please try again."
 
     @llm.function_tool(
-        description="Cancel a booking or RFQ by booking_id, order number, or RFQ number. Requires: booking_id, reason."
+        description=(
+            "Cancel a booking. Requires: booking_id and reason for cancellation. "
+            "Use this when user asks to cancel a booking."
+        )
     )
     async def cancel_booking(booking_id: str, reason: str = "") -> str:
         """Cancel a booking via backend API."""
@@ -1452,27 +1604,13 @@ async def entrypoint(ctx: JobContext):
                 return _CONNECTION_RETRY_MSG
 
         try:
-            # Clean the booking_id — remove common prefixes users might say
-            clean_id = booking_id.strip()
-            for prefix in ['RFQ-', 'RFQ ', 'ORD-', 'ORD ', 'rfq-', 'rfq ', 'ord-', 'ord ']:
-                if clean_id.startswith(prefix):
-                    clean_id = clean_id[len(prefix):]
-                    break
-            clean_id = clean_id.strip()
-
-            payload = {'booking_id': clean_id, 'reason': reason or 'User requested cancellation'}
+            payload = {'booking_id': booking_id, 'reason': reason or 'User requested cancellation'}
             result = await backend_client.call_backend_action('cancel_booking', payload)
 
             if not result.get('ok') and not result.get('success'):
                 error = result.get('error', 'unknown_error')
                 if error == 'booking_not_found':
-                    # Try with original ID if cleaned version failed
-                    if clean_id != booking_id.strip():
-                        payload['booking_id'] = booking_id.strip()
-                        result = await backend_client.call_backend_action('cancel_booking', payload)
-                        if result.get('ok') or result.get('success'):
-                            return f"Booking {booking_id} has been cancelled successfully."
-                    return f"I couldn't find booking {booking_id}. Please check the booking ID and try again."
+                    return f"I couldn't find booking {booking_id}."
                 return f"I couldn't cancel the booking: {error}"
 
             return f"Booking {booking_id} has been cancelled successfully."
@@ -1481,7 +1619,11 @@ async def entrypoint(ctx: JobContext):
             return "Sorry, I had trouble cancelling the booking. Please try again."
 
     @llm.function_tool(
-        description="Reschedule a booking. Requires: booking_id. Optional: scheduled_date, scheduled_time."
+        description=(
+            "Reschedule a booking to a new date and/or time. "
+            "Requires: booking_id. Optional: scheduled_date, scheduled_time. "
+            "Use this when user wants to change the time of their booking."
+        )
     )
     async def reschedule_booking(booking_id: str, scheduled_date: str = "", scheduled_time: str = "") -> str:
         """Reschedule a booking via backend API."""
@@ -1513,7 +1655,10 @@ async def entrypoint(ctx: JobContext):
             return "Sorry, I had trouble rescheduling. Please try again."
 
     @llm.function_tool(
-        description="Mark a booking as in-progress. Requires: booking_id."
+        description=(
+            "Mark a booking as in-progress. Use this when artisan says they are starting work. "
+            "Requires: booking_id."
+        )
     )
     async def mark_booking_in_progress(booking_id: str) -> str:
         """Mark booking as in-progress via backend API."""
@@ -1536,7 +1681,12 @@ async def entrypoint(ctx: JobContext):
             return "Sorry, I had trouble updating the booking status. Please try again."
 
     @llm.function_tool(
-        description="Cancel artisan and reassign to new one. Requires: booking_id, reason. MUST confirm with artisan first."
+        description=(
+            "Cancel current artisan assignment and request reassignment to a new artisan. "
+            "Use this when artisan needs to hand off a job. Requires: booking_id, reason. "
+            "IMPORTANT: You MUST verbally confirm with the artisan BEFORE calling this tool. "
+            "Ask 'Are you sure you want to cancel and reassign?' and only call if they say yes."
+        )
     )
     async def artisan_cancel_and_reassign(booking_id: str, reason: str = "") -> str:
         """Cancel artisan and reassign via backend API."""
@@ -1561,7 +1711,11 @@ async def entrypoint(ctx: JobContext):
     # ── New tools ─────────────────────────────────────────────────
 
     @llm.function_tool(
-        description="Get user's wallet transaction history. Optional: limit."
+        description=(
+            "Get the user's recent transaction history from their wallet. "
+            "Shows deposits, payments, refunds and other wallet activity. "
+            "Optional: limit (number of records, default 20)."
+        )
     )
     async def get_transaction_history(limit: int = 20) -> str:
         """Fetch recent transaction logs for the user."""
@@ -1593,7 +1747,9 @@ async def entrypoint(ctx: JobContext):
             return "Sorry, I couldn't fetch your transaction history right now."
 
     @llm.function_tool(
-        description="Get user's deposit/top-up requests and their statuses."
+        description=(
+            "Get the user's deposit/top-up requests. Shows pending, approved and rejected deposit requests."
+        )
     )
     async def get_deposit_requests(limit: int = 10) -> str:
         """Fetch deposit requests for the user."""
@@ -1621,7 +1777,9 @@ async def entrypoint(ctx: JobContext):
             return "Sorry, I couldn't fetch your deposit requests right now."
 
     @llm.function_tool(
-        description="List available service categories."
+        description=(
+            "Get available service categories. Lists all services that can be booked through the app."
+        )
     )
     async def get_service_categories() -> str:
         """Fetch available service categories."""
@@ -1644,7 +1802,9 @@ async def entrypoint(ctx: JobContext):
             return "Sorry, I couldn't fetch service categories right now."
 
     @llm.function_tool(
-        description="Get user's recent notifications."
+        description=(
+            "Get the user's recent notifications. Shows alerts about bookings, payments and updates."
+        )
     )
     async def get_notifications(limit: int = 10) -> str:
         """Fetch recent notifications for the user."""
@@ -1671,7 +1831,9 @@ async def entrypoint(ctx: JobContext):
             return "Sorry, I couldn't fetch your notifications right now."
 
     @llm.function_tool(
-        description="Get user's upcoming scheduled bookings."
+        description=(
+            "Get the user's upcoming/scheduled bookings. Shows future bookings that haven't been completed or cancelled."
+        )
     )
     async def get_scheduled_bookings() -> str:
         """Fetch upcoming scheduled bookings."""
@@ -1700,7 +1862,10 @@ async def entrypoint(ctx: JobContext):
             return "Sorry, I couldn't fetch your scheduled bookings right now."
 
     @llm.function_tool(
-        description="Get artisan details by artisan_id."
+        description=(
+            "Get information about an artisan/service provider. "
+            "Requires: artisan_id (the service provider's ID)."
+        )
     )
     async def get_artisan_info(artisan_id: str) -> str:
         """Fetch details about a specific artisan."""
@@ -1724,7 +1889,10 @@ async def entrypoint(ctx: JobContext):
             return "Sorry, I couldn't fetch artisan information right now."
 
     @llm.function_tool(
-        description="Submit a rating (1-5) for a completed booking. Optional: review text."
+        description=(
+            "Submit a rating for a completed booking. "
+            "Requires: booking_id, rating (1-5). Optional: review (text comment)."
+        )
     )
     async def submit_rating(booking_id: str, rating: int, review: str = "") -> str:
         """Rate an artisan after service completion."""
@@ -1743,7 +1911,10 @@ async def entrypoint(ctx: JobContext):
             return "Sorry, I couldn't submit your rating right now."
 
     @llm.function_tool(
-        description="Submit a complaint. Requires: description. Optional: subject, booking_id."
+        description=(
+            "Submit a complaint about a service or experience. "
+            "Requires: description (what went wrong). Optional: subject, booking_id."
+        )
     )
     async def submit_complaint(description: str, subject: str = "Complaint", booking_id: str = "") -> str:
         """File a complaint with the admin team."""
@@ -1770,7 +1941,13 @@ async def entrypoint(ctx: JobContext):
     _current_screen_context: Dict[str, Any] = {}
 
     @llm.function_tool(
-        description="Get current screen name and context from the app."
+        description=(
+            "Get information about what screen the user is currently viewing in the app. "
+            "Returns the screen name, description, available actions, and any visible data. "
+            "Use this when user asks 'What am I looking at?', 'What's on my screen?', "
+            "'Where am I in the app?', 'What can I do here?', or when you need to understand "
+            "the current context before taking an action."
+        )
     )
     async def get_current_screen() -> str:
         """Get the current screen context from the app."""
@@ -1799,31 +1976,9 @@ async def entrypoint(ctx: JobContext):
         if screen_desc:
             response += f" {screen_desc}"
         if screen_data:
-            # Handle bookings list specially — show order/RFQ numbers
-            bookings_list = screen_data.get('bookings', [])
-            if bookings_list:
-                response += f" I can see {len(bookings_list)} booking{'s' if len(bookings_list) > 1 else ''}:"
-                for b in bookings_list[:6]:
-                    cat = b.get('category', 'service')
-                    status = b.get('status', 'unknown')
-                    rfq_no = b.get('rfq_no', '')
-                    order_no = b.get('order_no', '')
-                    price = b.get('price', '')
-                    label = f" • {cat} ({status})"
-                    if rfq_no:
-                        label += f" RFQ #{rfq_no}"
-                    elif order_no:
-                        label += f" order #{order_no}"
-                    if price:
-                        label += f" — {price} rand"
-                    response += label
-                response += "."
-            else:
-                for key, val in screen_data.items():
-                    if key == 'bookings':
-                        continue
-                    readable_key = key.replace('_', ' ')
-                    response += f" {readable_key}: {val}."
+            for key, val in screen_data.items():
+                readable_key = key.replace('_', ' ')
+                response += f" {readable_key}: {val}."
         if actions:
             action_names = [a.replace('_', ' ') for a in actions[:8]]  # Top 8 for voice
             response += f" Available actions: {', '.join(action_names)}."
@@ -1831,7 +1986,13 @@ async def entrypoint(ctx: JobContext):
         return response
 
     @llm.function_tool(
-        description="Analyze and explain what's on the user's current screen."
+        description=(
+            "Analyze and interpret what's displayed on the user's current screen. "
+            "Provides a detailed summary of the visible information and suggests "
+            "what actions the user might want to take. "
+            "Use this when user says 'Analyze this page', 'What does this mean?', "
+            "'Explain what I'm seeing', 'Help me understand this screen'."
+        )
     )
     async def analyze_screen() -> str:
         """Analyze the current screen and provide intelligent insights."""
@@ -1865,42 +2026,12 @@ async def entrypoint(ctx: JobContext):
                 parts.append("Would you like to create a new booking, check your wallet, or look at service pricing?")
 
         elif 'booking' in r or 'future' in r:
-            # Show bookings from screen_data first (includes order numbers)
-            screen_bookings = screen_data.get('bookings', [])
-            if screen_bookings:
-                parts.append(f"I can see {len(screen_bookings)} booking{'s' if len(screen_bookings) > 1 else ''} on your screen.")
-                for b in screen_bookings[:5]:
-                    cat = b.get('category', 'service')
-                    status = b.get('status', 'unknown')
-                    rfq_no = b.get('rfq_no', '')
-                    order_no = b.get('order_no', '')
-                    rfq_status = b.get('rfq_status', '')
-                    price = b.get('price', '')
-                    is_rfq = b.get('is_rfq', False)
-                    label = f"• {cat}: {status}"
-                    if rfq_no:
-                        label += f", RFQ #{rfq_no}"
-                    elif order_no:
-                        label += f", order #{order_no}"
-                    if rfq_status:
-                        label += f" ({rfq_status})"
-                    if price:
-                        label += f", {price} rand"
-                    parts.append(label)
-                parts.append("Tell me which booking you'd like to manage — I can cancel, reschedule, check status, or contact the artisan.")
-            elif app_context_bookings:
+            if app_context_bookings:
                 parts.append(f"I can see {len(app_context_bookings)} booking{'s' if len(app_context_bookings) > 1 else ''}.")
-                for b in app_context_bookings[:5]:
+                for b in app_context_bookings[:3]:
                     cat = b.get('category', 'service')
                     status = b.get('status', 'unknown')
-                    rfq_no = b.get('rfq_no', '')
-                    order_no = b.get('order_no', '')
-                    label = f"• {cat}: {status}"
-                    if rfq_no:
-                        label += f", RFQ #{rfq_no}"
-                    elif order_no:
-                        label += f", order #{order_no}"
-                    parts.append(label)
+                    parts.append(f"• {cat}: {status}")
                 parts.append("Would you like to check a specific booking, reschedule, cancel, or contact the artisan?")
             else:
                 parts.append("I can help you manage your bookings from here. Would you like to check a booking status or create a new one?")
@@ -1925,7 +2056,11 @@ async def entrypoint(ctx: JobContext):
         return " ".join(parts)
 
     @llm.function_tool(
-        description="List all app features and available screens."
+        description=(
+            "Get a complete list of all screens and features available in the Square 15 app. "
+            "Use this when user asks 'What can you do?', 'What features are available?', "
+            "'Show me everything', 'What screens are there?'"
+        )
     )
     async def list_app_features() -> str:
         """List all available screens and features in the app."""
@@ -1966,10 +2101,174 @@ async def entrypoint(ctx: JobContext):
             "Just tell me what you'd like to do and I'll help you."
         )
 
+    # =========================================
+    # Phase 5.1: Finance Read-Only Tools (Admin)
+    # =========================================
+
+    @llm.function_tool(
+        description=(
+            "Get a financial overview/summary for the platform. "
+            "Returns total revenue, expenses, profit, and breakdown by category. "
+            "Accepts optional period: 'today', 'week', 'month' (default: 'month'). "
+            "Use when admin asks 'What's the financial summary?', 'How's revenue?', "
+            "'Show me the money overview', 'What's our profit this month?'"
+        )
+    )
+    async def get_finance_overview(period: str = "month") -> str:
+        """Get platform finance summary (admin-only, read-only)."""
+        nonlocal backend_client
+        if not backend_client:
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
+        try:
+            result = await backend_client.call_backend_action('get_finance_summary', {'period': period})
+            if not result.get('ok') and not result.get('success'):
+                error = result.get('error', 'unknown_error')
+                if error == 'admin_only':
+                    return "Finance data is only available to admin users."
+                return f"Could not get finance summary: {error}"
+            data = result.get('data', result.get('result', {}))
+            total_in = data.get('total_in', 0)
+            total_out = data.get('total_out', 0)
+            net = data.get('net', 0)
+            period_label = data.get('period', period)
+            breakdown = data.get('breakdown', {})
+            response = f"Finance overview for {period_label}: "
+            response += f"Total revenue {_fmt_currency(total_in)}, "
+            response += f"total expenses {_fmt_currency(total_out)}, "
+            response += f"net profit {_fmt_currency(net)}."
+            if breakdown:
+                parts = []
+                for k, v in list(breakdown.items())[:5]:
+                    parts.append(f"{k.replace('_', ' ')}: {_fmt_currency(v)}")
+                response += f" Breakdown: {', '.join(parts)}."
+            return response
+        except Exception as e:
+            logger.error(f"get_finance_overview error: {e}", exc_info=True)
+            return "Sorry, I couldn't fetch the financial overview right now."
+
+    @llm.function_tool(
+        description=(
+            "Get daily revenue report showing income per day. "
+            "Accepts optional days parameter (default 7, max 30). "
+            "Use when admin asks 'What's the daily revenue?', 'Revenue per day?', "
+            "'Show me earnings this week'"
+        )
+    )
+    async def get_daily_revenue_report(days: int = 7) -> str:
+        """Get daily revenue breakdown (admin-only, read-only)."""
+        nonlocal backend_client
+        if not backend_client:
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
+        try:
+            result = await backend_client.call_backend_action('get_daily_revenue', {'days': min(days, 30)})
+            if not result.get('ok') and not result.get('success'):
+                error = result.get('error', 'unknown_error')
+                if error == 'admin_only':
+                    return "Revenue data is only available to admin users."
+                return f"Could not get daily revenue: {error}"
+            data = result.get('data', result.get('result', {}))
+            day_entries = data.get('days', [])
+            total = data.get('total', 0)
+            if not day_entries:
+                return "No revenue data found for the requested period."
+            response = f"Revenue for the last {len(day_entries)} days, total {_fmt_currency(total)}: "
+            summaries = []
+            for d in day_entries[:7]:
+                date_str = d.get('date', 'unknown')
+                amount = d.get('amount', 0)
+                summaries.append(f"{date_str}: {_fmt_currency(amount)}")
+            response += "; ".join(summaries) + "."
+            return response
+        except Exception as e:
+            logger.error(f"get_daily_revenue_report error: {e}", exc_info=True)
+            return "Sorry, I couldn't fetch the daily revenue report right now."
+
+    @llm.function_tool(
+        description=(
+            "Get a list of failed payments. Shows transactions that failed, were declined, or timed out. "
+            "Use when admin asks 'Any failed payments?', 'Show payment failures', "
+            "'Are there any declined transactions?'"
+        )
+    )
+    async def get_failed_payments_report() -> str:
+        """Get failed payments list (admin-only, read-only)."""
+        nonlocal backend_client
+        if not backend_client:
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
+        try:
+            result = await backend_client.call_backend_action('get_failed_payments', {})
+            if not result.get('ok') and not result.get('success'):
+                error = result.get('error', 'unknown_error')
+                if error == 'admin_only':
+                    return "Failed payments data is only available to admin users."
+                return f"Could not get failed payments: {error}"
+            data = result.get('data', result.get('result', {}))
+            failures = data.get('failures', [])
+            count = data.get('count', len(failures))
+            if count == 0:
+                return "Great news — there are no failed payments."
+            response = f"There {'is' if count == 1 else 'are'} {count} failed payment{'s' if count != 1 else ''}. "
+            for f in failures[:5]:
+                amount = f.get('amount', 0)
+                reason = f.get('reason', 'unknown')
+                user = f.get('user_name', 'a user')
+                date = (f.get('created_at', '') or '')[:10]
+                response += f"{_fmt_currency(amount)} from {user} — {reason} ({date}). "
+            return response.strip()
+        except Exception as e:
+            logger.error(f"get_failed_payments_report error: {e}", exc_info=True)
+            return "Sorry, I couldn't fetch the failed payments report right now."
+
+    @llm.function_tool(
+        description=(
+            "Get active fraud alerts and suspicious activity flags. "
+            "Shows flagged transactions, self-dealing attempts, unusual patterns. "
+            "Use when admin asks 'Any fraud alerts?', 'Show suspicious activity', "
+            "'Are there security concerns?', 'Any flags?'"
+        )
+    )
+    async def get_fraud_alerts_report() -> str:
+        """Get fraud alerts (admin-only, read-only)."""
+        nonlocal backend_client
+        if not backend_client:
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
+        try:
+            result = await backend_client.call_backend_action('get_fraud_alerts', {})
+            if not result.get('ok') and not result.get('success'):
+                error = result.get('error', 'unknown_error')
+                if error == 'admin_only':
+                    return "Fraud alerts are only available to admin users."
+                return f"Could not get fraud alerts: {error}"
+            data = result.get('data', result.get('result', {}))
+            alerts = data.get('alerts', [])
+            count = data.get('count', len(alerts))
+            if count == 0:
+                return "No active fraud alerts. The system is clean."
+            response = f"There {'is' if count == 1 else 'are'} {count} active fraud alert{'s' if count != 1 else ''}. "
+            for a in alerts[:5]:
+                severity = a.get('severity', 'medium')
+                rule = a.get('rule', 'unknown')
+                amount = a.get('amount', 0)
+                actor = a.get('actor_email', 'unknown admin')
+                response += f"{severity.upper()} alert: {rule.replace('_', ' ')} "
+                if amount:
+                    response += f"({_fmt_currency(amount)}) "
+                response += f"by {actor}. "
+            if count > 5:
+                response += f"Plus {count - 5} more alerts. Check the admin app for full details."
+            return response.strip()
+        except Exception as e:
+            logger.error(f"get_fraud_alerts_report error: {e}", exc_info=True)
+            return "Sorry, I couldn't fetch the fraud alerts right now."
+
     agent = voice.Agent(
         vad=vad,
         stt=openai.STT(model="whisper-1", language="en"),
-        llm=openai.LLM(model="gpt-4o-mini", temperature=0.3),
+        llm=openai.LLM(model="gpt-4o-mini", temperature=0.4),
         tts=openai.TTS(model="tts-1", voice="alloy"),
         instructions=_instructions_for_role(caller_role),
     )
@@ -2224,7 +2523,13 @@ async def entrypoint(ctx: JobContext):
     await session.start(agent, room=ctx.room)
     logger.info("✅ Agent session started and running!")
 
-    # ── Greeting FIRST (before any scans) for fastest perceived response ──
+    # ── Post-start: re-scan in case metadata arrived during start ──
+    if not backend_client:
+        await asyncio.sleep(0.5)  # Brief wait for late-arriving metadata
+        _scan_participants_for_credentials()
+        if backend_client:
+            logger.info("✅ Backend client initialized from post-start scan")
+
     try:
         session.say(
             "Hi, I am Lizzy, how can I help you today?",
@@ -2233,13 +2538,6 @@ async def entrypoint(ctx: JobContext):
         logger.info("✅ Greeting sent")
     except Exception as e:
         logger.warning(f"⚠️ Could not send greeting: {e}")
-
-    # ── Post-start: re-scan in background (non-blocking) ──
-    if not backend_client:
-        await asyncio.sleep(0.3)
-        _scan_participants_for_credentials()
-        if backend_client:
-            logger.info("✅ Backend client initialized from post-start scan")
 
     # ── Background: periodically retry credential scan until backend_client is set ──
     async def _credential_retry_loop():

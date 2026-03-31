@@ -444,6 +444,25 @@ const ACTION_TIERS = Object.freeze({
   check_sla_escalation: 'B',
   submit_rating: 'B',
   submit_complaint: 'B',
+  // Phase 4: Admin automation tools (Tier B — admin role required)
+  admin_bulk_reassign: 'B',
+  admin_close_stale_cases: 'B',
+  admin_broadcast_notification: 'B',
+  admin_flag_user: 'B',
+  // Phase 5.1: Finance read-only (Tier A)
+  get_finance_summary: 'A',
+  get_daily_revenue: 'A',
+  get_failed_payments: 'A',
+  get_refund_history: 'A',
+  get_payout_status: 'A',
+  get_fraud_alerts: 'A',
+  // Phase 5.2: Money-moving (Tier C — requires approval pipeline)
+  request_refund: 'C',
+  request_wallet_adjustment: 'C',
+  request_payout: 'C',
+  request_fee_override: 'C',
+  approve_finance_request: 'C',
+  reject_finance_request: 'C',
 });
 
 function actionTier(action) {
@@ -1851,7 +1870,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       imageUrls: workImages,
       has_photos: workImages.length > 0 ? 'yes' : 'no',
 
-      order_no: '',
+      order_no: isRFQFlag ? '' : await generateDateBasedOrderNo(),
       rfq_no: isRFQFlag ? await generateDateBasedRfqNo() : '',
 
       client_name: clientName,
@@ -1896,7 +1915,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         providerDoc,
         'New booking assigned',
         `New booking request for ${scheduledDate} at ${scheduledTime} for ${categoryName || 'a service'}.`,
-        { booking_id: bookingIdLocal, tasks_management_id: tasksManagementId || null, order_type: 'order' }
+        { booking_id: bookingIdLocal, tasks_management_id: tasksManagementId || null, order_type: 'order', type: 'new_booking' }
       );
       await writePersonalNotification({
         userId: actorUid,
@@ -3240,7 +3259,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       providerDoc,
       'New booking assigned',
       `New booking assigned for ${scheduledDate || 'the scheduled date'} at ${scheduledTime || 'the scheduled time'}.`,
-      { booking_id: bookingId, tasks_management_id: newTmId || null, is_reassignment: true }
+      { booking_id: bookingId, tasks_management_id: newTmId || null, is_reassignment: true, type: 'new_booking' }
     );
 
     await writePersonalNotification({
@@ -3520,6 +3539,300 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       return { ok: true, status: 200, data: { complaint_id: complaintId, status: 'open' } };
     } catch (e) {
       return { ok: false, status: 500, error: e.message || 'failed' };
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // PHASE 4 — Admin Automation Tools (Tier B, admin-only)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  if (action === 'admin_bulk_reassign') {
+    if (actorRole !== 'admin') return { ok: false, status: 403, error: 'admin_only' };
+    const bookingIds = Array.isArray(payload.booking_ids) ? payload.booking_ids : [];
+    const newArtisanId = String(payload.new_artisan_id || '').trim();
+    const reason = String(payload.reason || 'Admin bulk reassignment').trim();
+    if (!bookingIds.length || !newArtisanId) {
+      return { ok: false, status: 400, error: 'missing_booking_ids_or_new_artisan_id' };
+    }
+    if (bookingIds.length > 20) {
+      return { ok: false, status: 400, error: 'max_20_bookings_per_bulk_reassign' };
+    }
+    const results = [];
+    for (const bid of bookingIds) {
+      const id = String(bid).trim();
+      if (!id) continue;
+      try {
+        const bRef = firestore.collection('futureBookings').doc(id);
+        const bSnap = await bRef.get();
+        if (!bSnap.exists) { results.push({ booking_id: id, ok: false, error: 'not_found' }); continue; }
+        await bRef.update({
+          service_provider_id: newArtisanId,
+          reassigned_at: now,
+          reassigned_by: actorUid,
+          reassignment_reason: reason,
+        });
+        results.push({ booking_id: id, ok: true });
+      } catch (e) {
+        results.push({ booking_id: id, ok: false, error: e.message });
+      }
+    }
+    return { ok: true, status: 200, data: { reassigned: results.filter(r => r.ok).length, total: bookingIds.length, results } };
+  }
+
+  if (action === 'admin_close_stale_cases') {
+    if (actorRole !== 'admin') return { ok: false, status: 403, error: 'admin_only' };
+    const maxAgeHours = Number(payload.max_age_hours) || 48;
+    const cutoff = new Date(Date.now() - maxAgeHours * 3600 * 1000).toISOString();
+    try {
+      const snap = await firestore.collection('assistant_cases')
+        .where('state', 'in', ['open', 'in_progress'])
+        .where('created_at', '<', cutoff)
+        .limit(50)
+        .get();
+      let closed = 0;
+      for (const doc of snap.docs) {
+        await doc.ref.update({
+          state: 'resolved',
+          resolved_at: now,
+          resolved_by: actorUid,
+          resolution_note: `Auto-closed: stale for ${maxAgeHours}+ hours`,
+        });
+        closed++;
+      }
+      return { ok: true, status: 200, data: { closed, checked: snap.size } };
+    } catch (e) {
+      return { ok: false, status: 500, error: e.message };
+    }
+  }
+
+  if (action === 'admin_broadcast_notification') {
+    if (actorRole !== 'admin') return { ok: false, status: 403, error: 'admin_only' };
+    const title = String(payload.title || '').trim();
+    const body = String(payload.body || '').trim();
+    const targetRole = String(payload.target_role || 'all').trim();
+    if (!title || !body) return { ok: false, status: 400, error: 'missing_title_or_body' };
+    if (title.length > 100 || body.length > 500) return { ok: false, status: 400, error: 'title_max_100_body_max_500' };
+    try {
+      const notifId = randomId('broadcast-');
+      await firestore.collection('admin_broadcasts').doc(notifId).set({
+        id: notifId,
+        title, body,
+        target_role: targetRole,
+        sent_by: actorUid,
+        sent_at: now,
+        status: 'pending',
+      });
+      return { ok: true, status: 200, data: { broadcast_id: notifId, target_role: targetRole } };
+    } catch (e) {
+      return { ok: false, status: 500, error: e.message };
+    }
+  }
+
+  if (action === 'admin_flag_user') {
+    if (actorRole !== 'admin') return { ok: false, status: 403, error: 'admin_only' };
+    const targetUid = String(payload.user_id || payload.uid || '').trim();
+    const flagReason = String(payload.reason || '').trim();
+    const flagType = String(payload.flag_type || 'warning').trim();
+    if (!targetUid) return { ok: false, status: 400, error: 'missing_user_id' };
+    if (!flagReason) return { ok: false, status: 400, error: 'missing_reason' };
+    if (!['warning', 'suspend', 'ban'].includes(flagType)) {
+      return { ok: false, status: 400, error: 'flag_type_must_be_warning_suspend_or_ban' };
+    }
+    try {
+      const flagId = randomId('flag-');
+      await firestore.collection('user_flags').doc(flagId).set({
+        id: flagId,
+        user_id: targetUid,
+        flag_type: flagType,
+        reason: flagReason,
+        flagged_by: actorUid,
+        flagged_at: now,
+        status: 'active',
+      });
+      if (flagType === 'suspend' || flagType === 'ban') {
+        await firestore.collection('users').doc(targetUid).update({
+          account_status: flagType === 'ban' ? 'banned' : 'suspended',
+          account_status_reason: flagReason,
+          account_status_updated_at: now,
+          account_status_updated_by: actorUid,
+        });
+      }
+      return { ok: true, status: 200, data: { flag_id: flagId, flag_type: flagType, user_id: targetUid } };
+    } catch (e) {
+      return { ok: false, status: 500, error: e.message };
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // PHASE 5.1 — Finance Read-Only Tools (Tier A)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  if (action === 'get_finance_summary') {
+    if (actorRole !== 'admin') return { ok: false, status: 403, error: 'admin_only' };
+    const period = String(payload.period || 'today').trim().toLowerCase();
+    try {
+      let startDate;
+      const nowDate = new Date();
+      if (period === 'today') {
+        startDate = new Date(nowDate.getFullYear(), nowDate.getMonth(), nowDate.getDate());
+      } else if (period === 'week') {
+        startDate = new Date(Date.now() - 7 * 86400000);
+      } else if (period === 'month') {
+        startDate = new Date(Date.now() - 30 * 86400000);
+      } else {
+        startDate = new Date(Date.now() - 86400000);
+      }
+      const snap = await firestore.collection('transactionLogs')
+        .where('transaction_at', '>=', startDate.toISOString())
+        .orderBy('transaction_at', 'desc')
+        .limit(1000)
+        .get();
+      let totalIn = 0, totalOut = 0, refunds = 0, fees = 0, count = 0;
+      for (const d of snap.docs) {
+        const tx = d.data() || {};
+        const amt = toNumber(tx.amount) || 0;
+        const dir = String(tx.direction || '').trim().toLowerCase();
+        const type = String(tx.transaction_type || tx.type || '').trim().toLowerCase();
+        if (dir === 'in') totalIn += amt;
+        if (dir === 'out') totalOut += amt;
+        if (type.includes('refund')) refunds += amt;
+        if (type.includes('fee') || type.includes('commission')) fees += amt;
+        count++;
+      }
+      return {
+        ok: true, status: 200, data: {
+          period, transaction_count: count,
+          total_in: Number(totalIn.toFixed(2)),
+          total_out: Number(totalOut.toFixed(2)),
+          net: Number((totalIn - totalOut).toFixed(2)),
+          refunds: Number(refunds.toFixed(2)),
+          fees_commissions: Number(fees.toFixed(2)),
+        }
+      };
+    } catch (e) {
+      return { ok: false, status: 500, error: e.message };
+    }
+  }
+
+  if (action === 'get_daily_revenue') {
+    if (actorRole !== 'admin') return { ok: false, status: 403, error: 'admin_only' };
+    const days = Math.min(30, Math.max(1, Number(payload.days) || 7));
+    try {
+      const startDate = new Date(Date.now() - days * 86400000).toISOString();
+      const snap = await firestore.collection('transactionLogs')
+        .where('transaction_at', '>=', startDate)
+        .where('direction', '==', 'in')
+        .orderBy('transaction_at', 'desc')
+        .limit(2000)
+        .get();
+      const byDay = {};
+      for (const d of snap.docs) {
+        const tx = d.data() || {};
+        const dateStr = String(tx.transaction_at || '').slice(0, 10);
+        if (!dateStr) continue;
+        byDay[dateStr] = (byDay[dateStr] || 0) + (toNumber(tx.amount) || 0);
+      }
+      return { ok: true, status: 200, data: { days, revenue_by_day: byDay } };
+    } catch (e) {
+      return { ok: false, status: 500, error: e.message };
+    }
+  }
+
+  if (action === 'get_failed_payments') {
+    if (actorRole !== 'admin') return { ok: false, status: 403, error: 'admin_only' };
+    const limit = Math.min(100, Math.max(1, Number(payload.limit) || 20));
+    try {
+      const snap = await firestore.collection('transactionLogs')
+        .where('status', 'in', ['failed', 'error', 'declined', 'cancelled'])
+        .orderBy('transaction_at', 'desc')
+        .limit(limit)
+        .get();
+      const failures = snap.docs.map(d => {
+        const tx = d.data() || {};
+        return {
+          id: d.id,
+          amount: String(tx.amount || ''),
+          status: String(tx.status || ''),
+          type: String(tx.transaction_type || tx.type || ''),
+          user_id: String(tx.user_id || tx.client_id || ''),
+          booking_id: String(tx.booking_id || ''),
+          error_reason: String(tx.error_reason || tx.failure_reason || ''),
+          transaction_at: String(tx.transaction_at || ''),
+        };
+      });
+      return { ok: true, status: 200, data: { count: failures.length, failures } };
+    } catch (e) {
+      return { ok: false, status: 500, error: e.message };
+    }
+  }
+
+  if (action === 'get_refund_history') {
+    if (actorRole !== 'admin') return { ok: false, status: 403, error: 'admin_only' };
+    const limit = Math.min(100, Math.max(1, Number(payload.limit) || 20));
+    try {
+      const snap = await firestore.collection('finance_requests')
+        .where('type', '==', 'refund')
+        .orderBy('created_at', 'desc')
+        .limit(limit)
+        .get();
+      const refunds = snap.docs.map(d => {
+        const r = d.data() || {};
+        return {
+          id: d.id, amount: String(r.amount || ''),
+          status: String(r.status || ''), reason: String(r.reason || ''),
+          user_id: String(r.target_user_id || ''), booking_id: String(r.booking_id || ''),
+          requested_by: String(r.requested_by || ''), approved_by: String(r.approved_by || ''),
+          created_at: String(r.created_at || ''), resolved_at: String(r.resolved_at || ''),
+        };
+      });
+      return { ok: true, status: 200, data: { count: refunds.length, refunds } };
+    } catch (e) {
+      return { ok: false, status: 500, error: e.message };
+    }
+  }
+
+  if (action === 'get_payout_status') {
+    if (actorRole !== 'admin') return { ok: false, status: 403, error: 'admin_only' };
+    const targetId = String(payload.user_id || payload.artisan_id || payload.partner_id || '').trim();
+    try {
+      let q = firestore.collection('finance_requests').where('type', '==', 'payout').orderBy('created_at', 'desc').limit(20);
+      if (targetId) q = firestore.collection('finance_requests').where('type', '==', 'payout').where('target_user_id', '==', targetId).orderBy('created_at', 'desc').limit(20);
+      const snap = await q.get();
+      const payouts = snap.docs.map(d => {
+        const p = d.data() || {};
+        return {
+          id: d.id, amount: String(p.amount || ''), status: String(p.status || ''),
+          target_user_id: String(p.target_user_id || ''), method: String(p.method || ''),
+          created_at: String(p.created_at || ''), resolved_at: String(p.resolved_at || ''),
+        };
+      });
+      return { ok: true, status: 200, data: { count: payouts.length, payouts } };
+    } catch (e) {
+      return { ok: false, status: 500, error: e.message };
+    }
+  }
+
+  if (action === 'get_fraud_alerts') {
+    if (actorRole !== 'admin') return { ok: false, status: 403, error: 'admin_only' };
+    const limit = Math.min(100, Math.max(1, Number(payload.limit) || 20));
+    try {
+      const snap = await firestore.collection('fraud_alerts')
+        .where('status', '==', 'open')
+        .orderBy('created_at', 'desc')
+        .limit(limit)
+        .get();
+      const alerts = snap.docs.map(d => {
+        const a = d.data() || {};
+        return {
+          id: d.id, alert_type: String(a.alert_type || ''),
+          severity: String(a.severity || ''), description: String(a.description || ''),
+          user_id: String(a.user_id || ''), amount: String(a.amount || ''),
+          created_at: String(a.created_at || ''), status: String(a.status || ''),
+        };
+      });
+      return { ok: true, status: 200, data: { count: alerts.length, alerts } };
+    } catch (e) {
+      return { ok: false, status: 500, error: e.message };
     }
   }
 
@@ -5034,6 +5347,133 @@ app.post('/api/payment/initiate', verifyFirebaseAuth, assistantLimiter, async (r
   }
 });
 
+// ── PayFast ITN (Instant Transaction Notification) Webhook ──
+// Server-side payment verification — PayFast posts here after payment
+app.post('/api/payment/itn', async (req, res) => {
+  try {
+    const data = req.body;
+    console.log('📥 PayFast ITN received:', JSON.stringify(data));
+
+    // 1. Verify signature
+    const merchantKey = env('PAYFAST_MERCHANT_KEY');
+    if (!merchantKey) {
+      console.error('❌ ITN: PAYFAST_MERCHANT_KEY not configured');
+      return res.status(503).send('Server misconfigured');
+    }
+
+    const receivedSignature = data.signature;
+    if (!receivedSignature) {
+      console.error('❌ ITN: No signature in payload');
+      return res.status(400).send('Missing signature');
+    }
+
+    // Build param string for signature verification (exclude signature itself)
+    const paramString = Object.keys(data)
+      .filter(key => key !== 'signature')
+      .sort()
+      .map(key => `${key}=${encodeURIComponent(String(data[key] || '')).replace(/%20/g, '+')}`)
+      .join('&');
+
+    const expectedSignature = crypto
+      .createHash('md5')
+      .update(paramString + `&passphrase=${encodeURIComponent(merchantKey)}`)
+      .digest('hex');
+
+    if (receivedSignature !== expectedSignature) {
+      console.error('❌ ITN: Signature mismatch');
+      return res.status(403).send('Invalid signature');
+    }
+
+    // 2. Extract payment info
+    const paymentStatus = String(data.payment_status || '');
+    const pfPaymentId = String(data.pf_payment_id || '');
+    const amountGross = String(data.amount_gross || '0');
+    const customStr1 = String(data.custom_str1 || ''); // tasksManagement ID
+    const itemName = String(data.item_name || '');
+
+    console.log(`✅ ITN verified: status=${paymentStatus}, pfId=${pfPaymentId}, amount=R${amountGross}, taskId=${customStr1}`);
+
+    // 3. Update Firestore
+    const now = new Date().toISOString();
+
+    if (customStr1) {
+      // Update tasksManagement if we have a task ID
+      const taskRef = db.collection('tasksManagement').doc(customStr1);
+      const taskSnap = await taskRef.get();
+
+      if (taskSnap.exists) {
+        const updateData = {
+          payfast_payment_id: pfPaymentId,
+          payfast_itn_status: paymentStatus,
+          payfast_itn_amount: amountGross,
+          payfast_itn_received_at: now,
+          updated_at: now,
+        };
+
+        if (paymentStatus === 'COMPLETE') {
+          updateData.payment_status = 'paid';
+          updateData.payment_verified = true;
+          updateData.payment_verified_at = now;
+          updateData.payment_verified_via = 'payfast_itn';
+        } else if (paymentStatus === 'CANCELLED') {
+          updateData.payment_status = 'cancelled';
+        } else if (paymentStatus === 'FAILED') {
+          updateData.payment_status = 'failed';
+        }
+
+        await taskRef.update(updateData);
+        console.log(`📝 Updated tasksManagement/${customStr1}: payment_status=${updateData.payment_status || paymentStatus}`);
+      }
+
+      // Create/update transaction log
+      const txRef = db.collection('transactionLogs');
+      const existingTx = await txRef
+        .where('payfast_payment_id', '==', pfPaymentId)
+        .limit(1)
+        .get();
+
+      if (existingTx.empty) {
+        const taskData = taskSnap.exists ? taskSnap.data() : {};
+        const txId = crypto.randomUUID();
+        await txRef.doc(txId).set({
+          id: txId,
+          amount: amountGross,
+          transaction_at: now,
+          status: paymentStatus === 'COMPLETE' ? 'success' : paymentStatus.toLowerCase(),
+          user_id: taskData.user_id || taskData.userId || '',
+          type: 'payfast',
+          subtype: 'payment',
+          direction: 'in',
+          cash_movement: true,
+          schema_version: 2,
+          tasks_management_id: customStr1,
+          payfast_payment_id: pfPaymentId,
+          payfast_itn_status: paymentStatus,
+          verified_via: 'payfast_itn',
+          item_name: itemName,
+        });
+        console.log(`📝 Created transactionLog for ITN: ${txId}`);
+      } else {
+        // Update existing transaction log
+        const existingDoc = existingTx.docs[0];
+        await existingDoc.ref.update({
+          payfast_itn_status: paymentStatus,
+          payfast_itn_received_at: now,
+          status: paymentStatus === 'COMPLETE' ? 'success' : paymentStatus.toLowerCase(),
+          verified_via: 'payfast_itn',
+        });
+        console.log(`📝 Updated existing transactionLog: ${existingDoc.id}`);
+      }
+    }
+
+    // PayFast expects a 200 OK response
+    res.status(200).send('OK');
+  } catch (error) {
+    console.error('❌ PayFast ITN error:', error);
+    res.status(200).send('OK'); // Always return 200 so PayFast doesn't retry indefinitely
+  }
+});
+
 /**
  * Generate Livekit Access Token (requires auth in production)
  * POST /api/token
@@ -5220,6 +5660,556 @@ app.post('/api/admin/bootstrap-claims', async (req, res) => {
   } catch (e) {
     console.error('❌ Failed to set admin claims:', e);
     return res.status(500).json({ error: 'Failed to set claims', message: e.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PHASE 5.2 — Secure Finance Approval Pipeline (Tier C)
+// Money NEVER moves without: auth → fraud check → request doc → admin approval
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── Fraud Detection Engine ──────────────────────────────────────────────────
+async function runFraudChecks({ firestore, type, amount, targetUserId, requestedBy, bookingId }) {
+  const alerts = [];
+  const amountNum = typeof amount === 'number' ? amount : Number.parseFloat(String(amount).replace(/[^0-9.\-]/g, ''));
+
+  // Rule 1: Amount exceeds daily limit per type
+  const DAILY_LIMITS = { refund: 10000, wallet_adjustment: 5000, payout: 50000, fee_override: 2000 };
+  const dailyLimit = DAILY_LIMITS[type] || 5000;
+  if (amountNum > dailyLimit) {
+    alerts.push({ rule: 'amount_exceeds_daily_limit', severity: 'high', detail: `R${amountNum} exceeds R${dailyLimit} limit for ${type}` });
+  }
+
+  // Rule 2: Velocity check — max 5 finance requests per user per hour
+  try {
+    const oneHourAgo = new Date(Date.now() - 3600000).toISOString();
+    const recentSnap = await firestore.collection('finance_requests')
+      .where('requested_by', '==', requestedBy)
+      .where('created_at', '>', oneHourAgo)
+      .limit(10)
+      .get();
+    if (recentSnap.size >= 5) {
+      alerts.push({ rule: 'velocity_exceeded', severity: 'high', detail: `${recentSnap.size} requests in last hour from same admin` });
+    }
+  } catch (_) {}
+
+  // Rule 3: Self-dealing — admin requesting funds to themselves
+  if (targetUserId === requestedBy) {
+    alerts.push({ rule: 'self_dealing', severity: 'critical', detail: 'Admin requesting financial action to own account' });
+  }
+
+  // Rule 4: Duplicate refund — same booking refunded within 24 hours
+  if (type === 'refund' && bookingId) {
+    try {
+      const oneDayAgo = new Date(Date.now() - 86400000).toISOString();
+      const dupSnap = await firestore.collection('finance_requests')
+        .where('type', '==', 'refund')
+        .where('booking_id', '==', bookingId)
+        .where('created_at', '>', oneDayAgo)
+        .limit(1)
+        .get();
+      if (!dupSnap.empty) {
+        alerts.push({ rule: 'duplicate_refund', severity: 'high', detail: `Booking ${bookingId} already has a recent refund request` });
+      }
+    } catch (_) {}
+  }
+
+  // Rule 5: Flagged user target
+  if (targetUserId) {
+    try {
+      const flagSnap = await firestore.collection('user_flags')
+        .where('user_id', '==', targetUserId)
+        .where('status', '==', 'active')
+        .limit(1)
+        .get();
+      if (!flagSnap.empty) {
+        const flag = flagSnap.docs[0].data() || {};
+        alerts.push({ rule: 'flagged_user', severity: 'medium', detail: `Target user is flagged: ${flag.flag_type} - ${flag.reason || ''}` });
+      }
+    } catch (_) {}
+  }
+
+  // Rule 6: Unusual amount (suspiciously round or very large)
+  if (amountNum > 0 && amountNum === Math.round(amountNum) && amountNum >= 1000 && amountNum % 1000 === 0) {
+    alerts.push({ rule: 'round_amount_pattern', severity: 'low', detail: `Suspiciously round amount: R${amountNum}` });
+  }
+
+  const blocked = alerts.some(a => a.severity === 'critical');
+  const requiresReview = alerts.some(a => a.severity === 'high' || a.severity === 'critical');
+
+  return { alerts, blocked, requiresReview, score: alerts.length };
+}
+
+// ── Create Finance Request (admin-only, creates approval doc) ────────────────
+app.post('/api/finance/request', adminLimiter, async (req, res) => {
+  const firestore = requireFirebase(res);
+  if (!firestore) return;
+  const decoded = await verifyFirebaseAuth(req, res);
+  if (!decoded) return;
+  const role = await resolveRole({ firestore, uid: decoded.uid, decodedToken: decoded });
+  if (role !== 'admin') {
+    return res.status(403).json({ error: 'forbidden', message: 'Admin only' });
+  }
+
+  const type = String(req.body.type || '').trim().toLowerCase();
+  const amountRaw = req.body.amount;
+  const targetUserId = String(req.body.target_user_id || '').trim();
+  const bookingIdParam = String(req.body.booking_id || '').trim();
+  const reason = String(req.body.reason || '').trim();
+  const method = String(req.body.method || '').trim();
+  const notes = String(req.body.notes || '').trim();
+
+  // Validation
+  const validTypes = ['refund', 'wallet_adjustment', 'payout', 'fee_override'];
+  if (!validTypes.includes(type)) {
+    return res.status(400).json({ error: 'invalid_type', message: `Type must be one of: ${validTypes.join(', ')}` });
+  }
+  const amount = Number.parseFloat(String(amountRaw).replace(/[^0-9.\-]/g, ''));
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return res.status(400).json({ error: 'invalid_amount', message: 'Amount must be a positive number' });
+  }
+  if (amount > 100000) {
+    return res.status(400).json({ error: 'amount_too_large', message: 'Maximum single request is R100,000' });
+  }
+  if (!targetUserId) {
+    return res.status(400).json({ error: 'missing_target_user_id' });
+  }
+  if (!reason || reason.length < 5) {
+    return res.status(400).json({ error: 'missing_reason', message: 'Reason must be at least 5 characters' });
+  }
+
+  // Verify target user exists
+  try {
+    const userSnap = await firestore.collection('users').doc(targetUserId).get();
+    if (!userSnap.exists) {
+      return res.status(404).json({ error: 'target_user_not_found' });
+    }
+  } catch (_) {}
+
+  // Run fraud detection
+  const fraud = await runFraudChecks({
+    firestore, type, amount, targetUserId,
+    requestedBy: decoded.uid, bookingId: bookingIdParam,
+  });
+
+  // Block critical fraud alerts immediately
+  if (fraud.blocked) {
+    const alertId = randomId('fraud-');
+    await firestore.collection('fraud_alerts').doc(alertId).set({
+      id: alertId, alert_type: 'blocked_request', severity: 'critical',
+      description: `Blocked ${type} request: ${fraud.alerts.map(a => a.detail).join('; ')}`,
+      user_id: decoded.uid, target_user_id: targetUserId,
+      amount: amount.toFixed(2), booking_id: bookingIdParam,
+      alerts: fraud.alerts, created_at: nowIso(), status: 'open',
+    });
+    return res.status(403).json({
+      error: 'fraud_blocked',
+      message: 'This request was blocked by fraud detection and flagged for review',
+      alerts: fraud.alerts.filter(a => a.severity === 'critical'),
+    });
+  }
+
+  // Create the finance request document
+  const requestId = randomId('fin-');
+  const finReq = {
+    id: requestId,
+    type,
+    amount: Number(amount.toFixed(2)),
+    target_user_id: targetUserId,
+    booking_id: bookingIdParam || null,
+    reason,
+    method: method || null,
+    notes: notes || null,
+    requested_by: decoded.uid,
+    status: fraud.requiresReview ? 'flagged_for_review' : 'pending_approval',
+    fraud_score: fraud.score,
+    fraud_alerts: fraud.alerts,
+    requires_secondary_approval: fraud.requiresReview || amount > 5000,
+    approvals: [],
+    rejections: [],
+    created_at: nowIso(),
+    resolved_at: null,
+    executed_at: null,
+  };
+
+  await firestore.collection('finance_requests').doc(requestId).set(finReq);
+
+  // If flagged, also create a fraud alert
+  if (fraud.requiresReview) {
+    const alertId = randomId('fraud-');
+    await firestore.collection('fraud_alerts').doc(alertId).set({
+      id: alertId, alert_type: 'flagged_request', severity: 'high',
+      description: `Flagged ${type} for R${amount.toFixed(2)}: ${fraud.alerts.map(a => a.detail).join('; ')}`,
+      user_id: decoded.uid, target_user_id: targetUserId,
+      amount: amount.toFixed(2), finance_request_id: requestId,
+      alerts: fraud.alerts, created_at: nowIso(), status: 'open',
+    });
+  }
+
+  // Audit trail
+  await writeAudit({
+    firestore,
+    auditId: randomId('audit-'),
+    audit: {
+      action: `finance_request_${type}`,
+      actor_uid: decoded.uid,
+      actor_role: role,
+      status: 'request_created',
+      payload: { request_id: requestId, type, amount, target_user_id: targetUserId, reason },
+      context: { fraud_score: fraud.score, blocked: fraud.blocked },
+      created_at: nowIso(),
+    },
+  });
+
+  return res.json({
+    success: true,
+    request_id: requestId,
+    status: finReq.status,
+    fraud_score: fraud.score,
+    fraud_alerts: fraud.alerts.length > 0 ? fraud.alerts : undefined,
+    message: fraud.requiresReview
+      ? 'Request created but flagged for additional review due to fraud checks'
+      : 'Request created and pending admin approval',
+  });
+});
+
+// ── Approve Finance Request (admin-only, requires different admin than requester) ──
+app.post('/api/finance/approve', adminLimiter, async (req, res) => {
+  const firestore = requireFirebase(res);
+  if (!firestore) return;
+  const decoded = await verifyFirebaseAuth(req, res);
+  if (!decoded) return;
+  const role = await resolveRole({ firestore, uid: decoded.uid, decodedToken: decoded });
+  if (role !== 'admin') {
+    return res.status(403).json({ error: 'forbidden', message: 'Admin only' });
+  }
+
+  const requestId = String(req.body.request_id || '').trim();
+  if (!requestId) return res.status(400).json({ error: 'missing_request_id' });
+
+  const reqSnap = await firestore.collection('finance_requests').doc(requestId).get();
+  if (!reqSnap.exists) return res.status(404).json({ error: 'request_not_found' });
+
+  const finReq = reqSnap.data() || {};
+
+  // Security: Cannot approve own request (separation of duties)
+  if (finReq.requested_by === decoded.uid) {
+    return res.status(403).json({
+      error: 'self_approval_forbidden',
+      message: 'You cannot approve your own finance request. Another admin must approve it.',
+    });
+  }
+
+  // Check status — only pending or flagged can be approved
+  if (!['pending_approval', 'flagged_for_review'].includes(finReq.status)) {
+    return res.status(409).json({
+      error: 'invalid_status',
+      message: `Request is already ${finReq.status}, cannot approve`,
+    });
+  }
+
+  // Check if secondary approval is needed and hasn't been met
+  const approvals = Array.isArray(finReq.approvals) ? finReq.approvals : [];
+  const alreadyApproved = approvals.some(a => a.uid === decoded.uid);
+  if (alreadyApproved) {
+    return res.status(409).json({ error: 'already_approved', message: 'You have already approved this request' });
+  }
+
+  approvals.push({ uid: decoded.uid, approved_at: nowIso() });
+
+  const needsTwo = finReq.requires_secondary_approval || (finReq.amount > 5000);
+  if (needsTwo && approvals.length < 2) {
+    await reqSnap.ref.update({ approvals, status: 'awaiting_second_approval', updated_at: nowIso() });
+    return res.json({
+      success: true, request_id: requestId,
+      status: 'awaiting_second_approval',
+      message: 'First approval recorded. A second admin must also approve this request.',
+      approvals_count: approvals.length,
+    });
+  }
+
+  // ── Execute the financial operation ──────────────────────────────────
+  const now = nowIso();
+  let executionResult = null;
+  const amount = Number(finReq.amount) || 0;
+  const targetUserId = String(finReq.target_user_id || '').trim();
+
+  try {
+    if (finReq.type === 'refund' || finReq.type === 'wallet_adjustment') {
+      // Credit the user's wallet balance
+      const userRef = firestore.collection('users').doc(targetUserId);
+      const userSnap = await userRef.get();
+      if (!userSnap.exists) throw new Error('Target user not found');
+
+      const userData = userSnap.data() || {};
+      const currentBalance = Number.parseFloat(String(userData.balance || '0').replace(/[^0-9.\-]/g, '')) || 0;
+      const direction = finReq.type === 'refund' ? 'credit' : (amount >= 0 ? 'credit' : 'debit');
+      const newBalance = direction === 'credit' ? currentBalance + Math.abs(amount) : currentBalance - Math.abs(amount);
+
+      if (newBalance < 0 && direction === 'debit') {
+        throw new Error(`Insufficient balance: current R${currentBalance.toFixed(2)}, requested debit R${Math.abs(amount).toFixed(2)}`);
+      }
+
+      await userRef.update({ balance: newBalance.toFixed(2) });
+
+      // Write transaction log
+      const txId = randomId('tx-');
+      await firestore.collection('transactionLogs').doc(txId).set({
+        id: txId,
+        transaction_type: finReq.type,
+        amount: amount.toFixed(2),
+        direction: direction === 'credit' ? 'in' : 'out',
+        status: 'success',
+        user_id: targetUserId,
+        booking_id: finReq.booking_id || null,
+        finance_request_id: requestId,
+        previous_balance: currentBalance.toFixed(2),
+        new_balance: newBalance.toFixed(2),
+        reason: finReq.reason,
+        executed_by: decoded.uid,
+        approved_by: approvals.map(a => a.uid),
+        transaction_at: now,
+        created_at: now,
+      });
+
+      executionResult = {
+        type: finReq.type, amount: amount.toFixed(2),
+        previous_balance: currentBalance.toFixed(2),
+        new_balance: newBalance.toFixed(2),
+        transaction_id: txId,
+      };
+    } else if (finReq.type === 'payout') {
+      // Payouts create a pending payout record (actual transfer handled externally)
+      const payoutId = randomId('payout-');
+      await firestore.collection('payout_records').doc(payoutId).set({
+        id: payoutId,
+        target_user_id: targetUserId,
+        amount: amount.toFixed(2),
+        method: finReq.method || 'eft',
+        status: 'pending_transfer',
+        finance_request_id: requestId,
+        reason: finReq.reason,
+        approved_by: approvals.map(a => a.uid),
+        created_at: now,
+      });
+
+      // Deduct from user balance
+      const userRef = firestore.collection('users').doc(targetUserId);
+      const userSnap = await userRef.get();
+      if (userSnap.exists) {
+        const bal = Number.parseFloat(String((userSnap.data() || {}).balance || '0').replace(/[^0-9.\-]/g, '')) || 0;
+        if (bal < amount) {
+          throw new Error(`Insufficient balance for payout: R${bal.toFixed(2)} < R${amount.toFixed(2)}`);
+        }
+        await userRef.update({ balance: (bal - amount).toFixed(2) });
+      }
+
+      const txId = randomId('tx-');
+      await firestore.collection('transactionLogs').doc(txId).set({
+        id: txId, transaction_type: 'payout', amount: amount.toFixed(2),
+        direction: 'out', status: 'pending_transfer', user_id: targetUserId,
+        finance_request_id: requestId, payout_id: payoutId,
+        reason: finReq.reason, executed_by: decoded.uid,
+        approved_by: approvals.map(a => a.uid), transaction_at: now, created_at: now,
+      });
+
+      executionResult = { type: 'payout', payout_id: payoutId, amount: amount.toFixed(2), status: 'pending_transfer' };
+    } else if (finReq.type === 'fee_override') {
+      // Fee overrides update the booking's fee/commission fields
+      const bId = String(finReq.booking_id || '').trim();
+      if (!bId) throw new Error('Fee override requires a booking_id');
+      const bRef = firestore.collection('futureBookings').doc(bId);
+      const bSnap = await bRef.get();
+      if (!bSnap.exists) throw new Error('Booking not found');
+      await bRef.update({
+        fee_override: amount.toFixed(2),
+        fee_override_reason: finReq.reason,
+        fee_override_by: decoded.uid,
+        fee_override_at: now,
+      });
+      executionResult = { type: 'fee_override', booking_id: bId, new_fee: amount.toFixed(2) };
+    }
+
+    // Mark request as executed
+    await reqSnap.ref.update({
+      status: 'executed',
+      approvals,
+      executed_at: now,
+      executed_by: decoded.uid,
+      execution_result: executionResult,
+      updated_at: now,
+    });
+
+    // Audit trail
+    await writeAudit({
+      firestore, auditId: randomId('audit-'),
+      audit: {
+        action: `finance_executed_${finReq.type}`,
+        actor_uid: decoded.uid, actor_role: role,
+        status: 'executed',
+        payload: { request_id: requestId, type: finReq.type, amount, target_user_id: targetUserId },
+        context: { approvals: approvals.length, execution_result: executionResult },
+        created_at: now,
+      },
+    });
+
+    return res.json({
+      success: true, request_id: requestId,
+      status: 'executed', execution_result: executionResult,
+    });
+  } catch (execErr) {
+    await reqSnap.ref.update({
+      status: 'execution_failed',
+      execution_error: execErr.message,
+      updated_at: nowIso(),
+    });
+    return res.status(500).json({
+      error: 'execution_failed',
+      message: execErr.message,
+      request_id: requestId,
+    });
+  }
+});
+
+// ── Reject Finance Request (admin-only) ──────────────────────────────────────
+app.post('/api/finance/reject', adminLimiter, async (req, res) => {
+  const firestore = requireFirebase(res);
+  if (!firestore) return;
+  const decoded = await verifyFirebaseAuth(req, res);
+  if (!decoded) return;
+  const role = await resolveRole({ firestore, uid: decoded.uid, decodedToken: decoded });
+  if (role !== 'admin') {
+    return res.status(403).json({ error: 'forbidden', message: 'Admin only' });
+  }
+
+  const requestId = String(req.body.request_id || '').trim();
+  const rejectReason = String(req.body.reason || '').trim();
+  if (!requestId) return res.status(400).json({ error: 'missing_request_id' });
+  if (!rejectReason) return res.status(400).json({ error: 'missing_reason' });
+
+  const reqSnap = await firestore.collection('finance_requests').doc(requestId).get();
+  if (!reqSnap.exists) return res.status(404).json({ error: 'request_not_found' });
+
+  const finReq = reqSnap.data() || {};
+  if (['executed', 'rejected'].includes(finReq.status)) {
+    return res.status(409).json({ error: 'invalid_status', message: `Request is already ${finReq.status}` });
+  }
+
+  await reqSnap.ref.update({
+    status: 'rejected',
+    rejected_by: decoded.uid,
+    rejection_reason: rejectReason,
+    resolved_at: nowIso(),
+    updated_at: nowIso(),
+  });
+
+  await writeAudit({
+    firestore, auditId: randomId('audit-'),
+    audit: {
+      action: `finance_rejected_${finReq.type}`,
+      actor_uid: decoded.uid, actor_role: role,
+      status: 'rejected',
+      payload: { request_id: requestId, type: finReq.type, amount: finReq.amount, rejection_reason: rejectReason },
+      created_at: nowIso(),
+    },
+  });
+
+  return res.json({ success: true, request_id: requestId, status: 'rejected' });
+});
+
+// ── List Finance Requests (admin-only) ───────────────────────────────────────
+app.get('/api/finance/requests', adminLimiter, async (req, res) => {
+  const firestore = requireFirebase(res);
+  if (!firestore) return;
+  const decoded = await verifyFirebaseAuth(req, res);
+  if (!decoded) return;
+  const role = await resolveRole({ firestore, uid: decoded.uid, decodedToken: decoded });
+  if (role !== 'admin') {
+    return res.status(403).json({ error: 'forbidden', message: 'Admin only' });
+  }
+
+  const status = String(req.query.status || '').trim();
+  const type = String(req.query.type || '').trim();
+  const limitRaw = Number.parseInt(String(req.query.limit || '50'), 10);
+  const limit = Math.max(1, Math.min(200, limitRaw));
+
+  let q = firestore.collection('finance_requests').orderBy('created_at', 'desc').limit(limit);
+  if (status) q = firestore.collection('finance_requests').where('status', '==', status).orderBy('created_at', 'desc').limit(limit);
+
+  try {
+    const snap = await q.get();
+    const items = snap.docs.map(d => {
+      const r = d.data() || {};
+      return {
+        id: d.id, type: r.type, amount: r.amount, status: r.status,
+        target_user_id: r.target_user_id, booking_id: r.booking_id,
+        reason: r.reason, requested_by: r.requested_by, method: r.method,
+        fraud_score: r.fraud_score, fraud_alerts: r.fraud_alerts,
+        requires_secondary_approval: r.requires_secondary_approval,
+        approvals: r.approvals, created_at: r.created_at,
+        executed_at: r.executed_at, resolved_at: r.resolved_at,
+      };
+    });
+    return res.json({ success: true, count: items.length, items });
+  } catch (e) {
+    return res.status(500).json({ error: 'internal_error', message: e.message });
+  }
+});
+
+// ── Fraud Alerts Dashboard (admin-only) ──────────────────────────────────────
+app.get('/api/finance/fraud-alerts', adminLimiter, async (req, res) => {
+  const firestore = requireFirebase(res);
+  if (!firestore) return;
+  const decoded = await verifyFirebaseAuth(req, res);
+  if (!decoded) return;
+  const role = await resolveRole({ firestore, uid: decoded.uid, decodedToken: decoded });
+  if (role !== 'admin') {
+    return res.status(403).json({ error: 'forbidden', message: 'Admin only' });
+  }
+
+  const status = String(req.query.status || 'open').trim();
+  const limitRaw = Number.parseInt(String(req.query.limit || '50'), 10);
+  const limit = Math.max(1, Math.min(200, limitRaw));
+
+  try {
+    const snap = await firestore.collection('fraud_alerts')
+      .where('status', '==', status)
+      .orderBy('created_at', 'desc')
+      .limit(limit)
+      .get();
+    const items = snap.docs.map(d => d.data() || {});
+    return res.json({ success: true, count: items.length, items });
+  } catch (e) {
+    return res.status(500).json({ error: 'internal_error', message: e.message });
+  }
+});
+
+// ── Dismiss Fraud Alert (admin-only) ─────────────────────────────────────────
+app.post('/api/finance/fraud-alerts/dismiss', adminLimiter, async (req, res) => {
+  const firestore = requireFirebase(res);
+  if (!firestore) return;
+  const decoded = await verifyFirebaseAuth(req, res);
+  if (!decoded) return;
+  const role = await resolveRole({ firestore, uid: decoded.uid, decodedToken: decoded });
+  if (role !== 'admin') {
+    return res.status(403).json({ error: 'forbidden', message: 'Admin only' });
+  }
+
+  const alertId = String(req.body.alert_id || '').trim();
+  const dismissReason = String(req.body.reason || '').trim();
+  if (!alertId) return res.status(400).json({ error: 'missing_alert_id' });
+  if (!dismissReason) return res.status(400).json({ error: 'missing_reason' });
+
+  try {
+    await firestore.collection('fraud_alerts').doc(alertId).update({
+      status: 'dismissed',
+      dismissed_by: decoded.uid,
+      dismiss_reason: dismissReason,
+      dismissed_at: nowIso(),
+    });
+    return res.json({ success: true, alert_id: alertId, status: 'dismissed' });
+  } catch (e) {
+    return res.status(500).json({ error: 'internal_error', message: e.message });
   }
 });
 
