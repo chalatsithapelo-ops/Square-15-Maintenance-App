@@ -18,6 +18,322 @@ function getOpenAI() {
   return _openai;
 }
 
+// ─── Builders.co.za Real-Time Pricing (ported from Cloud Functions) ───
+
+let _buildersBffCache = { fetchedAt: 0, ttlMs: 12 * 60 * 60 * 1000, value: null };
+
+function _asString(v) { return v == null ? '' : String(v); }
+
+function normalizeBuildersQuery(name) {
+  let q = _asString(name);
+  q = q.replace(/\b(size\s+tbd|tbd|-\s*size\s+tbd)\b/gi, ' ');
+  q = q.replace(/\([^)]*\)/g, ' ');
+  q = q.replace(/\s+/g, ' ').trim();
+  return q;
+}
+
+function buildersHeaders({ referer } = {}) {
+  const h = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-ZA,en;q=0.9',
+    'Cache-Control': 'no-cache',
+    Pragma: 'no-cache',
+  };
+  if (referer) h.Referer = referer;
+  h.Origin = 'https://www.builders.co.za';
+  return h;
+}
+
+function buildersCorrelationId() {
+  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 14)}`;
+}
+
+async function fetchWithTimeout(url, { method = 'GET', headers, body, timeoutMs = 15000 } = {}) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { method, headers, body, signal: controller.signal });
+  } finally {
+    clearTimeout(id);
+  }
+}
+
+function extractLiters(s) {
+  const lowerS = _asString(s).toLowerCase();
+  const m = lowerS.match(/\b(\d{2,4})\s*(?:l|lt|litre|liter|litres|liters)\b/);
+  if (!m) return null;
+  const v = parseInt(m[1], 10);
+  if (!Number.isFinite(v) || v < 40 || v > 600) return null;
+  return v;
+}
+
+function buildersTokens(s) {
+  const cleaned = _asString(s).toLowerCase().replace(/[()[\],]/g, ' ').replace(/[^a-z0-9\s./-]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!cleaned) return [];
+  return cleaned.split(' ').map(t => t.trim()).filter(t => t.length > 2);
+}
+
+function parseZarPrice(raw) {
+  const s = _asString(raw);
+  if (!s) return null;
+  const cleaned = s.replace(/[^0-9,.]/g, '');
+  if (!cleaned) return null;
+  const normalized = cleaned.replace(/,/g, '');
+  const v = parseFloat(normalized);
+  return Number.isFinite(v) ? v : null;
+}
+
+function extractRetailPriceFromProductHtml(html) {
+  const meta = html.match(/(product:price:amount|og:price:amount|twitter:data1)"\s+content="([0-9.,]+)"/i);
+  if (meta && meta[2]) { const p = parseZarPrice(meta[2]); if (p && p > 0) return p; }
+  const jsonLd = html.match(/"price"\s*:\s*"?([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?)"?/i);
+  if (jsonLd && jsonLd[1]) { const p = parseZarPrice(jsonLd[1]); if (p && p > 0) return p; }
+  const visible = html.match(/R\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?)/);
+  if (visible && visible[1]) { const p = parseZarPrice(visible[1]); if (p && p > 0) return p; }
+  return null;
+}
+
+function buildersBffHeaders({ operationName, operationHash } = {}) {
+  return {
+    ...buildersHeaders({ referer: 'https://www.builders.co.za/' }),
+    Accept: 'application/json, text/plain, */*',
+    'Content-Type': 'application/json',
+    WM_TENANT_ID: '32',
+    request_origin: 'web',
+    'wm_qos.correlation_id': buildersCorrelationId(),
+    'x-apollo-operation-name': operationName || 'search',
+    'x-apollo-operation-hash': operationHash || '',
+  };
+}
+
+function extractPriceFromBffItem(item) {
+  const candidate = item?.price ?? item?.prices ?? item?.priceData ?? item?.pricing;
+  const fromAny = (v) => {
+    if (v == null) return null;
+    if (typeof v === 'number') return v;
+    if (typeof v === 'string') return parseZarPrice(v);
+    if (typeof v === 'object') {
+      const formatted = v.formattedValue ?? v.formatted ?? v.display;
+      const p1 = parseZarPrice(formatted);
+      if (p1 && p1 > 0) return p1;
+      if (typeof v.value === 'number') return v.value;
+      const p2 = parseZarPrice(v.value); if (p2 && p2 > 0) return p2;
+      if (typeof v.current === 'number') return v.current;
+      const p3 = parseZarPrice(v.current); if (p3 && p3 > 0) return p3;
+      if (typeof v.retail === 'number') return v.retail;
+      const p4 = parseZarPrice(v.retail); if (p4 && p4 > 0) return p4;
+      return null;
+    }
+    return null;
+  };
+  let p = fromAny(candidate);
+  if (p && p > 0) return p;
+  if (candidate && typeof candidate === 'object') {
+    p = fromAny(candidate.retail) ?? fromAny(candidate.current) ?? fromAny(candidate.selling);
+    if (p && p > 0) return p;
+  }
+  for (const k of ['formattedPrice', 'priceFormatted', 'sellingPrice', 'retailPrice', 'priceInclVat', 'price_incl_vat']) {
+    p = parseZarPrice(item?.[k]); if (p && p > 0) return p;
+  }
+  return null;
+}
+
+async function getBuildersBffConfig() {
+  const now = Date.now();
+  if (now - _buildersBffCache.fetchedAt <= _buildersBffCache.ttlMs) return _buildersBffCache.value;
+  try {
+    const extractScriptSrcs = (htmlText) => {
+      const out = [];
+      const re = /\bsrc="([^"]+\.js[^"]*)"/gi;
+      for (const m of htmlText.matchAll(re)) {
+        const s = _asString(m[1]);
+        if (!s || /googletagmanager|google-analytics|gtm\.js/i.test(s)) continue;
+        out.push(s);
+      }
+      return [...new Set(out)];
+    };
+    const toAbs = (u) => { if (!u) return null; return u.startsWith('http') ? u : `https://www.builders.co.za${u.startsWith('/') ? '' : '/'}${u}`; };
+    const bootstrapUrls = [
+      'https://www.builders.co.za/',
+      'https://www.builders.co.za/Plumbing-Bathroom-and-Kitchen/Geysers-and-Water-Heaters/Geysers/Kwikot-DSG-200-5-400KPA-Superline-Dual-Geyser-200-L/p/000000000000659070',
+    ];
+    let html = null;
+    for (const u of bootstrapUrls) {
+      const htmlResp = await fetchWithTimeout(u, { headers: buildersHeaders({ referer: 'https://www.builders.co.za/' }), timeoutMs: 20000 });
+      if (!htmlResp.ok || _asString(htmlResp.url).includes('/blocked?')) continue;
+      const text = await htmlResp.text();
+      if (text) { html = text; break; }
+    }
+    if (!html) { _buildersBffCache = { ..._buildersBffCache, fetchedAt: now, value: null }; return null; }
+    const scriptSrcs = extractScriptSrcs(html).map(toAbs).filter(Boolean);
+    if (!scriptSrcs.length) { _buildersBffCache = { ..._buildersBffCache, fetchedAt: now, value: null }; return null; }
+    const preferred = [...scriptSrcs].sort((a, b) => {
+      const score = (u) => { const s = _asString(u); if (/\/main\.[a-z0-9]{8,40}\.js/i.test(s)) return 0; if (/runtimechunk~main\.[a-z0-9]{8,40}\.js/i.test(s)) return 2; if (/\.js$/i.test(s)) return 5; return 9; };
+      return score(a) - score(b);
+    });
+    let hash = null, site = null;
+    for (const jsUrl of preferred.slice(0, 12)) {
+      const jsResp = await fetchWithTimeout(jsUrl, { headers: buildersHeaders({ referer: 'https://www.builders.co.za/' }), timeoutMs: 25000 });
+      if (!jsResp.ok) continue;
+      const js = await jsResp.text();
+      if (!js) continue;
+      const hashMatch = js.match(/SearchHash\s*=\s*"([a-f0-9]{32,80})"/i) || js.match(/\/wmapi\/bff\/graphql\/search\/([a-f0-9]{32,80})/i);
+      hash = hashMatch ? hashMatch[1] : null;
+      const siteMatch = js.match(/BFF_SITE_VALUE\s*=\s*"([A-Z0-9]{3,10})"/);
+      site = siteMatch ? siteMatch[1] : null;
+      if (hash) break;
+    }
+    if (!hash) { _buildersBffCache = { ..._buildersBffCache, fetchedAt: now, value: null }; return null; }
+    const cfg = { searchKey: 'search', searchHash: hash, site: site || 'BWH1' };
+    _buildersBffCache = { ..._buildersBffCache, fetchedAt: now, value: cfg };
+    return cfg;
+  } catch (e) {
+    console.error('[builders] BFF config fetch failed:', e.message);
+    _buildersBffCache = { ..._buildersBffCache, fetchedAt: now, value: null };
+    return null;
+  }
+}
+
+async function hydrateCandidateFromProductPage(candidate, { referer } = {}) {
+  try {
+    const resp = await fetchWithTimeout(candidate.url, { headers: buildersHeaders({ referer }), timeoutMs: 20000 });
+    if (!resp.ok) return null;
+    const html = await resp.text();
+    const price = extractRetailPriceFromProductHtml(html);
+    if (!price || price <= 0) return null;
+    const og = html.match(/property="og:title"\s+content="([^"]{3,200})"/i);
+    const title = og && og[1] ? og[1] : candidate.title;
+    return { ...candidate, title, priceZar: price };
+  } catch { return null; }
+}
+
+async function lookupBuildersPriceOne(rawName) {
+  const q = normalizeBuildersQuery(rawName);
+  if (!q) return null;
+  const targetLiters = extractLiters(q);
+  const wantsKwikot = q.toLowerCase().includes('kwikot');
+  const cfg = await getBuildersBffConfig();
+  if (!cfg) return null;
+  const uri = `https://www.builders.co.za/wmapi/bff/graphql/${cfg.searchKey}/${cfg.searchHash}`;
+  const variables = { keyword: q, offset: 0, pageSize: 20, dynamicPriceRange: true, site: cfg.site };
+  let decoded;
+  try {
+    const resp = await fetchWithTimeout(uri, {
+      method: 'POST',
+      headers: buildersBffHeaders({ operationName: cfg.searchKey, operationHash: cfg.searchHash }),
+      body: JSON.stringify({ variables }),
+      timeoutMs: 12000,
+    });
+    if (!resp.ok) {
+      if (resp.status === 412) return { title: '', url: '', priceZar: 0, source: 'builders_blocked', blocked: true };
+      return null;
+    }
+    decoded = await resp.json();
+  } catch { return null; }
+  if (decoded?.redirectUrl && _asString(decoded.redirectUrl).includes('/blocked')) {
+    return { title: '', url: '', priceZar: 0, source: 'builders_blocked', blocked: true };
+  }
+  const items = decoded?.data?.search?.data?.results?.items;
+  if (!Array.isArray(items) || items.length === 0) return null;
+  const qt = new Set(buildersTokens(q));
+  const referer = `https://www.builders.co.za/search?text=${encodeURIComponent(q)}`;
+  const scored = [];
+  for (const it of items) {
+    if (!it || typeof it !== 'object') continue;
+    const title = _asString(it.name || it.title || it.productName);
+    if (!title) continue;
+    const liters = extractLiters(title);
+    if (targetLiters != null && liters != null && liters !== targetLiters) continue;
+    let urlPath = _asString(it.url || it.productUrl || it.seoUrl || it.link);
+    if (!urlPath) { const code = _asString(it.code || it.id || it.productCode); if (code) urlPath = `/p/${code}`; }
+    if (!urlPath) continue;
+    const url = urlPath.startsWith('http') ? urlPath : `https://www.builders.co.za${urlPath.startsWith('/') ? '' : '/'}${urlPath}`;
+    const tt = new Set(buildersTokens(title));
+    let score = 0;
+    for (const t of qt) if (tt.has(t)) score += 1;
+    if (targetLiters != null) { if (liters === targetLiters) score += 6; if (liters == null) score -= 2; }
+    const hasKwikot = title.toLowerCase().includes('kwikot');
+    if (hasKwikot) score += 2;
+    if (wantsKwikot && !hasKwikot) score -= 3;
+    const price = extractPriceFromBffItem(it);
+    const hasPrice = price != null && price > 0;
+    if (hasPrice) score += 2;
+    scored.push({ score, candidate: { title, url, priceZar: hasPrice ? price : 0, source: hasPrice ? 'builders_bff' : 'builders_bff_no_price' } });
+  }
+  if (!scored.length) return null;
+  scored.sort((a, b) => (b.score || 0) - (a.score || 0));
+  for (const row of scored.slice(0, 4)) {
+    const c = row.candidate;
+    if (c.priceZar && c.priceZar > 0) return c;
+    const hydrated = await hydrateCandidateFromProductPage(c, { referer });
+    if (!hydrated) continue;
+    if (targetLiters != null) { const hl = extractLiters(hydrated.title); if (hl != null && hl !== targetLiters) continue; }
+    return { ...hydrated, source: 'builders_bff_hydrated' };
+  }
+  return null;
+}
+
+async function buildersPriceLookupBatch(materialNames, concurrency = 4) {
+  const results = new Array(materialNames.length);
+  let i = 0;
+  const workers = new Array(Math.min(concurrency, materialNames.length)).fill(0).map(async () => {
+    while (true) {
+      const idx = i++;
+      if (idx >= materialNames.length) return;
+      try { results[idx] = await lookupBuildersPriceOne(materialNames[idx]); } catch { results[idx] = null; }
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+async function lookupMaterialsCatalog(firestore, name) {
+  if (!firestore || !name) return null;
+  try {
+    const normalized = name.toLowerCase().replace(/\s+/g, '_');
+    // Try by doc ID
+    let doc = await firestore.collection('materialsCatalog').doc(normalized).get();
+    if (doc.exists) { const d = doc.data(); const p = parseFloat(d.unit_price || d.price_incl_vat || d.price || 0); if (p > 0) return { price: p, source: 'catalog_doc_id' }; }
+    // Try by name_lower field
+    let snap = await firestore.collection('materialsCatalog').where('name_lower', '==', normalized).limit(1).get();
+    if (!snap.empty) { const d = snap.docs[0].data(); const p = parseFloat(d.unit_price || d.price_incl_vat || d.price || 0); if (p > 0) return { price: p, source: 'catalog_name_lower' }; }
+    // Try by aliases
+    snap = await firestore.collection('materialsCatalog').where('aliases', 'array-contains', name.toLowerCase()).limit(1).get();
+    if (!snap.empty) { const d = snap.docs[0].data(); const p = parseFloat(d.unit_price || d.price_incl_vat || d.price || 0); if (p > 0) return { price: p, source: 'catalog_alias' }; }
+  } catch (e) { console.error('[catalog] lookup error:', e.message); }
+  return null;
+}
+
+async function getLearningFactor(firestore, categoryId, categoryName) {
+  if (!firestore) return 1.0;
+  try {
+    const catSlug = (categoryId || categoryName || '').toLowerCase().replace(/\s+/g, '_');
+    if (!catSlug) return 1.0;
+    const snap = await firestore.collection('aiQuoteCorrections')
+      .where('category_id', '==', catSlug)
+      .orderBy('created_at', 'desc')
+      .limit(20)
+      .get();
+    if (snap.empty) return 1.0;
+    let total = 0, count = 0;
+    snap.docs.forEach(doc => {
+      const d = doc.data();
+      const aiTotal = parseFloat(d.ai_total);
+      const adminTotal = parseFloat(d.admin_total);
+      if (aiTotal > 0 && adminTotal > 0) { total += adminTotal / aiTotal; count++; }
+    });
+    if (count === 0) return 1.0;
+    const avg = total / count;
+    return Math.max(0.6, Math.min(1.6, avg)); // Clamped [0.6, 1.6]
+  } catch (e) {
+    console.error('[learning-factor] error:', e.message);
+    return 1.0;
+  }
+}
+
+// ─── End Builders Pricing ───
+
 function sanitizeEnvValue(value) {
   if (typeof value !== 'string') return value;
   let v = value.trim();
@@ -3015,7 +3331,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     return { ok: true, status: 200, data: result };
   }
 
-  // ── Generate AI RFQ Quote ──
+  // ── Generate AI RFQ Quote (with Builders.co.za real-time pricing) ──
   if (action === 'generate_rfq_quote') {
     const data = await loadBooking();
     if (!data) return { ok: false, status: 404, error: 'booking_not_found' };
@@ -3039,6 +3355,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     if (!oai) return { ok: false, status: 500, error: 'ai_unavailable' };
 
     const category = String(data.category_name || '').trim();
+    const categoryId = String(data.category_id || '').trim();
     const description = String(data.problem_description || data.description || '').trim();
     const materialsResp = String(data.materials_responsibility || 'artisan').trim();
 
@@ -3057,13 +3374,14 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     } catch (_) {}
 
     try {
+      // Step 1: Generate BOM with GPT (same as before, but instruct to use Builders-stocked items)
       const completion = await oai.chat.completions.create({
         model: 'gpt-4o-mini',
         temperature: 0.3,
-        max_tokens: 1000,
+        max_tokens: 1500,
         response_format: { type: 'json_object' },
         messages: [
-          { role: 'system', content: 'You are a South African maintenance quotation expert. Return only valid JSON.' },
+          { role: 'system', content: 'You are a South African maintenance quotation expert. CRITICAL: Every material in materialsBOM MUST be a real product available on builders.co.za (Builders Warehouse). Do NOT include specialty items or proprietary accessories that Builders does not stock. Return only valid JSON.' },
           {
             role: 'user',
             content: `Generate a detailed maintenance quote:\nCategory: ${category}\nDescription: ${description}\nMaterials: ${materialsResp}\n${pricingCtx ? `Pricing: ${pricingCtx}` : ''}\n\nReturn JSON: {"laborHours":<num>,"laborCostPerHour":${laborRate},"complexity":<1-5>,"equipmentCost":<num>,"scopeOfWork":"<text>","estimatedDuration":"<text>","materialsBOM":[{"name":"<text>","qty":<num>,"unit":"<text>","estimated_price":<num>}]}`,
@@ -3074,25 +3392,77 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       const draft = JSON.parse(completion.choices[0]?.message?.content || '{}');
       const laborHours = parseFloat(draft.laborHours) || 4;
       const lrUsed = parseFloat(draft.laborCostPerHour) || laborRate;
-      const laborCost = laborHours * lrUsed;
 
+      // Step 2: Look up real Builders.co.za prices for each BOM item
+      const rawBom = draft.materialsBOM || [];
+      const materialNames = rawBom.map(m => m.name || '');
+      console.log(`[generate_rfq_quote] Looking up ${materialNames.length} items on Builders.co.za...`);
+
+      let buildersResults = [];
+      try {
+        buildersResults = await buildersPriceLookupBatch(materialNames, 4);
+        console.log(`[generate_rfq_quote] Builders lookup complete: ${buildersResults.filter(r => r && r.priceZar > 0).length}/${materialNames.length} priced`);
+      } catch (e) {
+        console.error('[generate_rfq_quote] Builders batch lookup error:', e.message);
+      }
+
+      // Step 3: Build BOM with real prices (Builders > Catalog > AI estimate fallback)
       const materialsMultiplier = 1.5;
       let matSubtotal = 0;
-      const bom = (draft.materialsBOM || []).map(m => {
-        const q = parseFloat(m.qty) || 1;
-        const up = parseFloat(m.estimated_price) || 0;
-        const lb = q * up;
-        matSubtotal += lb;
-        return { name: m.name, qty: q, unit: m.unit || 'each', unit_price: up, line_base: lb };
-      });
+      const bom = [];
+      for (let i = 0; i < rawBom.length; i++) {
+        const m = rawBom[i];
+        const qty = parseFloat(m.qty) || 1;
+        const aiEstimate = parseFloat(m.estimated_price) || 0;
+        const br = buildersResults[i];
 
+        let unitPrice = aiEstimate;
+        let matchedBy = 'ai_estimate';
+        let buildersTitle = null;
+        let buildersUrl = null;
+
+        // Priority 1: Builders.co.za real price
+        if (br && !br.blocked && br.priceZar > 0) {
+          unitPrice = br.priceZar;
+          matchedBy = br.source || 'builders_bff';
+          buildersTitle = br.title || null;
+          buildersUrl = br.url || null;
+        }
+        // Priority 2: Firestore materialsCatalog fallback
+        else {
+          const catalogResult = await lookupMaterialsCatalog(firestore, m.name);
+          if (catalogResult && catalogResult.price > 0) {
+            unitPrice = catalogResult.price;
+            matchedBy = catalogResult.source;
+          }
+          // Priority 3: AI estimate (already set as default)
+        }
+
+        const lineBase = qty * unitPrice;
+        matSubtotal += lineBase;
+
+        const bomItem = { name: m.name, qty, unit: m.unit || 'each', unit_price: unitPrice, line_base: lineBase, matched_by: matchedBy };
+        if (buildersTitle) bomItem.builders_title = buildersTitle;
+        if (buildersUrl) bomItem.builders_url = buildersUrl;
+        bom.push(bomItem);
+      }
+
+      // Step 4: Apply learning factor from historical admin corrections
+      const learningFactor = await getLearningFactor(firestore, categoryId, category);
+      console.log(`[generate_rfq_quote] Learning factor for ${category}: ${learningFactor.toFixed(3)}`);
+
+      const laborCost = laborHours * lrUsed * learningFactor;
       const artisanBuys = materialsResp === 'artisan';
-      const matWithMarkup = matSubtotal * materialsMultiplier;
+      const matWithMarkup = matSubtotal * materialsMultiplier * learningFactor;
       const matForTotals = artisanBuys ? matWithMarkup : 0;
-      const eqCost = parseFloat(draft.equipmentCost) || 0;
+      const eqCost = (parseFloat(draft.equipmentCost) || 0) * learningFactor;
       const subtotal = laborCost + matForTotals + eqCost;
       const contingency = subtotal * 0.15;
       const grandTotal = subtotal + contingency;
+
+      const buildersCount = bom.filter(b => b.matched_by && b.matched_by.startsWith('builders')).length;
+      const catalogCount = bom.filter(b => b.matched_by && b.matched_by.startsWith('catalog')).length;
+      const aiCount = bom.filter(b => b.matched_by === 'ai_estimate').length;
 
       const r2 = (v) => Math.round(v * 100) / 100;
       const aiQuote = {
@@ -3105,14 +3475,16 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         contingency: r2(contingency), grand_total: r2(grandTotal),
         scope_of_work: draft.scopeOfWork || description,
         estimated_duration: draft.estimatedDuration || 'TBD',
+        learning_factor: r2(learningFactor),
+        pricing_sources: { builders: buildersCount, catalog: catalogCount, ai_estimate: aiCount },
         breakdown: [
-          { description: `Labour (${laborHours}hrs @ R${lrUsed}/hr)`, cost: laborCost.toFixed(2) },
-          ...(artisanBuys && bom.length > 0 ? [{ description: 'Materials & Supplies', cost: matWithMarkup.toFixed(2) }] : []),
+          { description: `Labour (${laborHours}hrs @ R${lrUsed}/hr${learningFactor !== 1 ? ` × ${learningFactor.toFixed(2)} adj` : ''})`, cost: laborCost.toFixed(2) },
+          ...(artisanBuys && bom.length > 0 ? [{ description: `Materials & Supplies (${buildersCount} Builders-priced, ${catalogCount} catalog, ${aiCount} estimated)`, cost: matWithMarkup.toFixed(2) }] : []),
           ...(eqCost > 0 ? [{ description: 'Equipment & Tools', cost: eqCost.toFixed(2) }] : []),
           { description: 'Contingency (15%)', cost: contingency.toFixed(2) },
         ],
-        disclaimer: 'AI-generated estimate. Final costs may vary based on actual site conditions.',
-        generated_at: now, source: 'backend_ai',
+        disclaimer: 'Quote uses real-time Builders.co.za pricing where available. Final costs may vary based on actual site conditions.',
+        generated_at: now, source: 'backend_ai_builders',
       };
 
       // Save to Firestore
@@ -3126,6 +3498,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         updated_at: now,
       });
 
+      console.log(`[generate_rfq_quote] Quote saved: R${grandTotal.toFixed(2)} (${buildersCount}/${bom.length} Builders-priced, LF=${learningFactor.toFixed(2)})`);
       return { ok: true, status: 200, data: { ai_quote: aiQuote, grand_total: grandTotal, rfq_no: String(data.rfq_no || '').trim() } };
     } catch (e) {
       console.error('[generate_rfq_quote] AI error:', e.message);

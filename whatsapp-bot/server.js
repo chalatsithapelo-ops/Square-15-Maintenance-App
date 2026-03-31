@@ -491,13 +491,277 @@ const waTools = [
   },
 ];
 
-// ─── AI Quote Generation for RFQ ───
+// ─── Builders.co.za Real-Time Pricing (same logic as Cloud Functions & client app) ───
+
+let _waBuildersCache = { fetchedAt: 0, ttlMs: 12 * 60 * 60 * 1000, value: null };
+
+function _str(v) { return v == null ? '' : String(v); }
+
+function normalizeBuildersQuery(name) {
+  let q = _str(name);
+  q = q.replace(/\b(size\s+tbd|tbd|-\s*size\s+tbd)\b/gi, ' ');
+  q = q.replace(/\([^)]*\)/g, ' ');
+  q = q.replace(/\s+/g, ' ').trim();
+  return q;
+}
+
+function buildersHeaders({ referer } = {}) {
+  const h = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-ZA,en;q=0.9',
+    'Cache-Control': 'no-cache',
+    Pragma: 'no-cache',
+  };
+  if (referer) h.Referer = referer;
+  h.Origin = 'https://www.builders.co.za';
+  return h;
+}
+
+function buildersCorrelationId() {
+  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 14)}`;
+}
+
+async function buildersFetch(url, { method = 'GET', headers, body, timeoutMs = 15000 } = {}) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+  try { return await fetch(url, { method, headers, body, signal: controller.signal }); }
+  finally { clearTimeout(id); }
+}
+
+function extractLiters(s) {
+  const m = _str(s).toLowerCase().match(/\b(\d{2,4})\s*(?:l|lt|litre|liter|litres|liters)\b/);
+  if (!m) return null;
+  const v = parseInt(m[1], 10);
+  return Number.isFinite(v) && v >= 40 && v <= 600 ? v : null;
+}
+
+function buildersTokens(s) {
+  const cleaned = _str(s).toLowerCase().replace(/[()[\],]/g, ' ').replace(/[^a-z0-9\s./-]/g, ' ').replace(/\s+/g, ' ').trim();
+  return cleaned ? cleaned.split(' ').map(t => t.trim()).filter(t => t.length > 2) : [];
+}
+
+function parseZarPrice(raw) {
+  const cleaned = _str(raw).replace(/[^0-9,.]/g, '');
+  if (!cleaned) return null;
+  const v = parseFloat(cleaned.replace(/,/g, ''));
+  return Number.isFinite(v) ? v : null;
+}
+
+function extractRetailPriceFromHtml(html) {
+  const meta = html.match(/(product:price:amount|og:price:amount|twitter:data1)"\s+content="([0-9.,]+)"/i);
+  if (meta && meta[2]) { const p = parseZarPrice(meta[2]); if (p > 0) return p; }
+  const jsonLd = html.match(/"price"\s*:\s*"?([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?)"?/i);
+  if (jsonLd && jsonLd[1]) { const p = parseZarPrice(jsonLd[1]); if (p > 0) return p; }
+  const visible = html.match(/R\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?)/);
+  if (visible && visible[1]) { const p = parseZarPrice(visible[1]); if (p > 0) return p; }
+  return null;
+}
+
+function buildersBffHeaders({ operationName, operationHash } = {}) {
+  return {
+    ...buildersHeaders({ referer: 'https://www.builders.co.za/' }),
+    Accept: 'application/json, text/plain, */*',
+    'Content-Type': 'application/json',
+    WM_TENANT_ID: '32',
+    request_origin: 'web',
+    'wm_qos.correlation_id': buildersCorrelationId(),
+    'x-apollo-operation-name': operationName || 'search',
+    'x-apollo-operation-hash': operationHash || '',
+  };
+}
+
+function extractPriceFromBffItem(item) {
+  const candidate = item?.price ?? item?.prices ?? item?.priceData ?? item?.pricing;
+  const fromAny = (v) => {
+    if (v == null) return null;
+    if (typeof v === 'number') return v;
+    if (typeof v === 'string') return parseZarPrice(v);
+    if (typeof v === 'object') {
+      for (const k of ['formattedValue', 'formatted', 'display']) { const p = parseZarPrice(v[k]); if (p > 0) return p; }
+      for (const k of ['value', 'current', 'retail']) { if (typeof v[k] === 'number') return v[k]; const p = parseZarPrice(v[k]); if (p > 0) return p; }
+      return null;
+    }
+    return null;
+  };
+  let p = fromAny(candidate);
+  if (p > 0) return p;
+  if (candidate && typeof candidate === 'object') {
+    p = fromAny(candidate.retail) ?? fromAny(candidate.current) ?? fromAny(candidate.selling);
+    if (p > 0) return p;
+  }
+  for (const k of ['formattedPrice', 'sellingPrice', 'retailPrice', 'priceInclVat', 'price_incl_vat']) {
+    p = parseZarPrice(item?.[k]); if (p > 0) return p;
+  }
+  return null;
+}
+
+async function getBuildersBffConfig() {
+  const now = Date.now();
+  if (now - _waBuildersCache.fetchedAt <= _waBuildersCache.ttlMs) return _waBuildersCache.value;
+  try {
+    const extractScripts = (html) => {
+      const out = [];
+      for (const m of html.matchAll(/\bsrc="([^"]+\.js[^"]*)"/gi)) {
+        const s = _str(m[1]);
+        if (s && !/googletagmanager|google-analytics|gtm\.js/i.test(s)) out.push(s);
+      }
+      return [...new Set(out)];
+    };
+    const toAbs = (u) => u ? (u.startsWith('http') ? u : `https://www.builders.co.za${u.startsWith('/') ? '' : '/'}${u}`) : null;
+    const bootstrapUrls = [
+      'https://www.builders.co.za/',
+      'https://www.builders.co.za/Plumbing-Bathroom-and-Kitchen/Geysers-and-Water-Heaters/Geysers/Kwikot-DSG-200-5-400KPA-Superline-Dual-Geyser-200-L/p/000000000000659070',
+    ];
+    let html = null;
+    for (const u of bootstrapUrls) {
+      const r = await buildersFetch(u, { headers: buildersHeaders({ referer: 'https://www.builders.co.za/' }), timeoutMs: 20000 });
+      if (!r.ok || _str(r.url).includes('/blocked?')) continue;
+      const t = await r.text(); if (t) { html = t; break; }
+    }
+    if (!html) { _waBuildersCache = { ..._waBuildersCache, fetchedAt: now, value: null }; return null; }
+    const scripts = extractScripts(html).map(toAbs).filter(Boolean);
+    if (!scripts.length) { _waBuildersCache = { ..._waBuildersCache, fetchedAt: now, value: null }; return null; }
+    const preferred = [...scripts].sort((a, b) => {
+      const sc = (u) => /\/main\.[a-z0-9]{8,40}\.js/i.test(u) ? 0 : /runtimechunk~main/i.test(u) ? 2 : /\.js$/i.test(u) ? 5 : 9;
+      return sc(a) - sc(b);
+    });
+    let hash = null, site = null;
+    for (const jsUrl of preferred.slice(0, 12)) {
+      const r = await buildersFetch(jsUrl, { headers: buildersHeaders({ referer: 'https://www.builders.co.za/' }), timeoutMs: 25000 });
+      if (!r.ok) continue;
+      const js = await r.text(); if (!js) continue;
+      const hm = js.match(/SearchHash\s*=\s*"([a-f0-9]{32,80})"/i) || js.match(/\/wmapi\/bff\/graphql\/search\/([a-f0-9]{32,80})/i);
+      hash = hm ? hm[1] : null;
+      const sm = js.match(/BFF_SITE_VALUE\s*=\s*"([A-Z0-9]{3,10})"/);
+      site = sm ? sm[1] : null;
+      if (hash) break;
+    }
+    if (!hash) { _waBuildersCache = { ..._waBuildersCache, fetchedAt: now, value: null }; return null; }
+    const cfg = { searchKey: 'search', searchHash: hash, site: site || 'BWH1' };
+    _waBuildersCache = { ..._waBuildersCache, fetchedAt: now, value: cfg };
+    return cfg;
+  } catch (e) {
+    console.error('[wa-builders] BFF config failed:', e.message);
+    _waBuildersCache = { ..._waBuildersCache, fetchedAt: now, value: null };
+    return null;
+  }
+}
+
+async function hydrateProductPage(candidate, { referer } = {}) {
+  try {
+    const r = await buildersFetch(candidate.url, { headers: buildersHeaders({ referer }), timeoutMs: 20000 });
+    if (!r.ok) return null;
+    const html = await r.text();
+    const price = extractRetailPriceFromHtml(html);
+    if (!price || price <= 0) return null;
+    const og = html.match(/property="og:title"\s+content="([^"]{3,200})"/i);
+    return { ...candidate, title: og?.[1] || candidate.title, priceZar: price };
+  } catch { return null; }
+}
+
+async function lookupBuildersPriceOne(rawName) {
+  const q = normalizeBuildersQuery(rawName);
+  if (!q) return null;
+  const targetL = extractLiters(q);
+  const wantsKwikot = q.toLowerCase().includes('kwikot');
+  const cfg = await getBuildersBffConfig();
+  if (!cfg) return null;
+  const uri = `https://www.builders.co.za/wmapi/bff/graphql/${cfg.searchKey}/${cfg.searchHash}`;
+  let decoded;
+  try {
+    const r = await buildersFetch(uri, {
+      method: 'POST',
+      headers: buildersBffHeaders({ operationName: cfg.searchKey, operationHash: cfg.searchHash }),
+      body: JSON.stringify({ variables: { keyword: q, offset: 0, pageSize: 20, dynamicPriceRange: true, site: cfg.site } }),
+      timeoutMs: 12000,
+    });
+    if (!r.ok) { if (r.status === 412) return { blocked: true }; return null; }
+    decoded = await r.json();
+  } catch { return null; }
+  if (decoded?.redirectUrl && _str(decoded.redirectUrl).includes('/blocked')) return { blocked: true };
+  const items = decoded?.data?.search?.data?.results?.items;
+  if (!Array.isArray(items) || !items.length) return null;
+  const qt = new Set(buildersTokens(q));
+  const referer = `https://www.builders.co.za/search?text=${encodeURIComponent(q)}`;
+  const scored = [];
+  for (const it of items) {
+    if (!it) continue;
+    const title = _str(it.name || it.title || it.productName); if (!title) continue;
+    const liters = extractLiters(title);
+    if (targetL != null && liters != null && liters !== targetL) continue;
+    let urlPath = _str(it.url || it.productUrl || it.seoUrl || it.link);
+    if (!urlPath) { const code = _str(it.code || it.id || it.productCode); if (code) urlPath = `/p/${code}`; }
+    if (!urlPath) continue;
+    const url = urlPath.startsWith('http') ? urlPath : `https://www.builders.co.za${urlPath.startsWith('/') ? '' : '/'}${urlPath}`;
+    const tt = new Set(buildersTokens(title));
+    let score = 0;
+    for (const t of qt) if (tt.has(t)) score++;
+    if (targetL != null) { if (liters === targetL) score += 6; if (liters == null) score -= 2; }
+    if (title.toLowerCase().includes('kwikot')) score += 2;
+    if (wantsKwikot && !title.toLowerCase().includes('kwikot')) score -= 3;
+    const price = extractPriceFromBffItem(it);
+    if (price > 0) score += 2;
+    scored.push({ score, candidate: { title, url, priceZar: price > 0 ? price : 0, source: price > 0 ? 'builders_bff' : 'builders_bff_no_price' } });
+  }
+  if (!scored.length) return null;
+  scored.sort((a, b) => b.score - a.score);
+  for (const row of scored.slice(0, 4)) {
+    const c = row.candidate;
+    if (c.priceZar > 0) return c;
+    const h = await hydrateProductPage(c, { referer });
+    if (!h) continue;
+    if (targetL != null) { const hl = extractLiters(h.title); if (hl != null && hl !== targetL) continue; }
+    return { ...h, source: 'builders_bff_hydrated' };
+  }
+  return null;
+}
+
+async function buildersBatchLookup(names, concurrency = 4) {
+  const results = new Array(names.length);
+  let i = 0;
+  const workers = new Array(Math.min(concurrency, names.length)).fill(0).map(async () => {
+    while (true) { const idx = i++; if (idx >= names.length) return; try { results[idx] = await lookupBuildersPriceOne(names[idx]); } catch { results[idx] = null; } }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+async function lookupCatalog(firestore, name) {
+  if (!firestore || !name) return null;
+  try {
+    const normalized = name.toLowerCase().replace(/\s+/g, '_');
+    let doc = await firestore.collection('materialsCatalog').doc(normalized).get();
+    if (doc.exists) { const d = doc.data(); const p = parseFloat(d.unit_price || d.price_incl_vat || d.price || 0); if (p > 0) return { price: p, source: 'catalog_doc_id' }; }
+    let snap = await firestore.collection('materialsCatalog').where('name_lower', '==', normalized).limit(1).get();
+    if (!snap.empty) { const d = snap.docs[0].data(); const p = parseFloat(d.unit_price || d.price_incl_vat || d.price || 0); if (p > 0) return { price: p, source: 'catalog_name_lower' }; }
+    snap = await firestore.collection('materialsCatalog').where('aliases', 'array-contains', name.toLowerCase()).limit(1).get();
+    if (!snap.empty) { const d = snap.docs[0].data(); const p = parseFloat(d.unit_price || d.price_incl_vat || d.price || 0); if (p > 0) return { price: p, source: 'catalog_alias' }; }
+  } catch (e) { console.error('[wa-catalog] lookup error:', e.message); }
+  return null;
+}
+
+async function getLearningFactor(firestore, category) {
+  if (!firestore) return 1.0;
+  try {
+    const catSlug = (category || '').toLowerCase().replace(/\s+/g, '_');
+    if (!catSlug) return 1.0;
+    const snap = await firestore.collection('aiQuoteCorrections').where('category_id', '==', catSlug).orderBy('created_at', 'desc').limit(20).get();
+    if (snap.empty) return 1.0;
+    let total = 0, count = 0;
+    snap.docs.forEach(doc => { const d = doc.data(); const ai = parseFloat(d.ai_total); const admin = parseFloat(d.admin_total); if (ai > 0 && admin > 0) { total += admin / ai; count++; } });
+    if (count === 0) return 1.0;
+    return Math.max(0.6, Math.min(1.6, total / count));
+  } catch (e) { console.error('[wa-learning] error:', e.message); return 1.0; }
+}
+
+// ─── AI Quote Generation for RFQ (with Builders.co.za real-time pricing) ───
 
 async function generateAIQuote(category, description, materialsResponsibility, additionalContext) {
   const firestore = db();
 
   // 1. Look up pricing guidance from Firestore
-  let laborRate = 150; // default ZAR/hr
+  let laborRate = 150;
   let pricingContext = '';
   try {
     if (firestore) {
@@ -514,7 +778,7 @@ async function generateAIQuote(category, description, materialsResponsibility, a
     console.error('[ai-quote] pricing lookup error:', e.message);
   }
 
-  // 2. Ask OpenAI to generate structured quote
+  // 2. Ask OpenAI to generate structured quote (Builders-only materials rule)
   const quotePrompt = `You are a professional maintenance quotation system for South Africa.
 Generate a detailed quote for the following job:
 
@@ -537,22 +801,18 @@ Return a JSON object with EXACTLY this structure:
   ]
 }
 
-IMPORTANT:
-- Use realistic South African pricing (ZAR)
-- Include ALL materials needed (consumables, fittings, etc.)
-- Labor rate is R${laborRate}/hr
-- Be thorough with the BOM
-- Equipment cost covers tool hire/wear
-- Return ONLY the JSON object`;
+CRITICAL: Every material in materialsBOM MUST be a real product available on builders.co.za (Builders Warehouse).
+Do NOT include specialty items or proprietary accessories that Builders does not stock.
+Use realistic South African pricing (ZAR). Include ALL materials needed. Return ONLY the JSON object.`;
 
   try {
     const completion = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       temperature: 0.3,
-      max_tokens: 1000,
+      max_tokens: 1500,
       response_format: { type: 'json_object' },
       messages: [
-        { role: 'system', content: 'You are a South African maintenance quotation expert. Return only valid JSON.' },
+        { role: 'system', content: 'You are a South African maintenance quotation expert. Only include materials available on builders.co.za. Return only valid JSON.' },
         { role: 'user', content: quotePrompt },
       ],
     });
@@ -560,58 +820,100 @@ IMPORTANT:
     const raw = completion.choices[0]?.message?.content || '{}';
     const draft = JSON.parse(raw);
 
-    // 3. Calculate final totals (same formula as the client app)
     const laborHours = parseFloat(draft.laborHours) || 4;
     const laborCostPerHour = parseFloat(draft.laborCostPerHour) || laborRate;
-    const laborCost = laborHours * laborCostPerHour;
 
-    const materialsMultiplier = 1.5; // Standard markup
+    // 3. Look up REAL Builders.co.za prices for each BOM item
+    const rawBom = draft.materialsBOM || [];
+    const materialNames = rawBom.map(m => m.name || '');
+    console.log(`[wa-quote] Looking up ${materialNames.length} items on Builders.co.za...`);
+
+    let buildersResults = [];
+    try {
+      buildersResults = await buildersBatchLookup(materialNames, 4);
+      console.log(`[wa-quote] Builders: ${buildersResults.filter(r => r && r.priceZar > 0).length}/${materialNames.length} priced`);
+    } catch (e) {
+      console.error('[wa-quote] Builders batch error:', e.message);
+    }
+
+    // 4. Build BOM with real prices (Builders > Catalog > AI estimate fallback)
+    const materialsMultiplier = 1.5;
     let materialsSubtotal = 0;
-    const materialsBOM = (draft.materialsBOM || []).map(m => {
+    const materialsBOM = [];
+    for (let i = 0; i < rawBom.length; i++) {
+      const m = rawBom[i];
       const qty = parseFloat(m.qty) || 1;
-      const unitPrice = parseFloat(m.estimated_price) || 0;
+      const aiEstimate = parseFloat(m.estimated_price) || 0;
+      const br = buildersResults[i];
+
+      let unitPrice = aiEstimate;
+      let matchedBy = 'ai_estimate';
+      let buildersUrl = null;
+
+      if (br && !br.blocked && br.priceZar > 0) {
+        unitPrice = br.priceZar;
+        matchedBy = br.source || 'builders_bff';
+        buildersUrl = br.url || null;
+      } else if (firestore) {
+        const cat = await lookupCatalog(firestore, m.name);
+        if (cat && cat.price > 0) { unitPrice = cat.price; matchedBy = cat.source; }
+      }
+
       const lineBase = qty * unitPrice;
       materialsSubtotal += lineBase;
-      return { name: m.name, qty, unit: m.unit || 'each', unit_price: unitPrice, line_base: lineBase };
-    });
+      const bomItem = { name: m.name, qty, unit: m.unit || 'each', unit_price: unitPrice, line_base: lineBase, matched_by: matchedBy };
+      if (buildersUrl) bomItem.builders_url = buildersUrl;
+      materialsBOM.push(bomItem);
+    }
 
+    // 5. Apply learning factor from historical admin corrections
+    const learningFactor = await getLearningFactor(firestore, category);
+    console.log(`[wa-quote] Learning factor for ${category}: ${learningFactor.toFixed(3)}`);
+
+    const laborCost = laborHours * laborCostPerHour * learningFactor;
     const artisanBuysMaterials = (materialsResponsibility || 'artisan') === 'artisan';
-    const materialsWithMarkup = materialsSubtotal * materialsMultiplier;
+    const materialsWithMarkup = materialsSubtotal * materialsMultiplier * learningFactor;
     const materialCostForTotals = artisanBuysMaterials ? materialsWithMarkup : 0;
-
-    const equipmentCost = parseFloat(draft.equipmentCost) || 0;
+    const equipmentCost = (parseFloat(draft.equipmentCost) || 0) * learningFactor;
 
     const subtotal = laborCost + materialCostForTotals + equipmentCost;
     const contingency = subtotal * 0.15;
     const grandTotal = subtotal + contingency;
 
+    const buildersCount = materialsBOM.filter(b => b.matched_by && b.matched_by.startsWith('builders')).length;
+    const catalogCount = materialsBOM.filter(b => b.matched_by && b.matched_by.startsWith('catalog')).length;
+    const aiCount = materialsBOM.filter(b => b.matched_by === 'ai_estimate').length;
+
+    const r2 = (v) => Math.round(v * 100) / 100;
     return {
       laborHours,
       laborCostPerHour,
-      laborCost: Math.round(laborCost * 100) / 100,
+      laborCost: r2(laborCost),
       complexity: draft.complexity || 3,
       materialsBOM,
       materialsMultiplier,
-      materials_subtotal: Math.round(materialsSubtotal * 100) / 100,
-      materials_with_markup: Math.round(materialsWithMarkup * 100) / 100,
+      materials_subtotal: r2(materialsSubtotal),
+      materials_with_markup: r2(materialsWithMarkup),
       materials_responsibility: materialsResponsibility || 'artisan',
-      equipmentCost: Math.round(equipmentCost * 100) / 100,
-      subtotal: Math.round(subtotal * 100) / 100,
-      contingency: Math.round(contingency * 100) / 100,
-      grand_total: Math.round(grandTotal * 100) / 100,
+      equipmentCost: r2(equipmentCost),
+      subtotal: r2(subtotal),
+      contingency: r2(contingency),
+      grand_total: r2(grandTotal),
       scope_of_work: draft.scopeOfWork || description,
       estimated_duration: draft.estimatedDuration || 'To be determined',
+      learning_factor: r2(learningFactor),
+      pricing_sources: { builders: buildersCount, catalog: catalogCount, ai_estimate: aiCount },
       breakdown: [
-        { description: `Labour (${laborHours}hrs @ R${laborCostPerHour}/hr)`, cost: laborCost.toFixed(2) },
+        { description: `Labour (${laborHours}hrs @ R${laborCostPerHour}/hr${learningFactor !== 1 ? ` × ${learningFactor.toFixed(2)} adj` : ''})`, cost: laborCost.toFixed(2) },
         ...(artisanBuysMaterials && materialsBOM.length > 0
-          ? [{ description: 'Materials & Supplies', cost: materialsWithMarkup.toFixed(2) }]
+          ? [{ description: `Materials (${buildersCount} Builders-priced, ${catalogCount} catalog, ${aiCount} estimated)`, cost: materialsWithMarkup.toFixed(2) }]
           : []),
         ...(equipmentCost > 0 ? [{ description: 'Equipment & Tools', cost: equipmentCost.toFixed(2) }] : []),
         { description: 'Contingency (15%)', cost: contingency.toFixed(2) },
       ],
-      disclaimer: 'This is an AI-generated estimate. Final costs may vary based on actual site conditions.',
+      disclaimer: 'Quote uses real-time Builders.co.za pricing where available. Final costs may vary based on site conditions.',
       generated_at: new Date().toISOString(),
-      source: 'whatsapp_ai',
+      source: 'whatsapp_ai_builders',
     };
   } catch (e) {
     console.error('[ai-quote] generation error:', e.message);
@@ -632,6 +934,10 @@ function formatQuoteForWhatsApp(quote, rfqNo) {
 
   if (quote.materials_responsibility === 'artisan' && quote.materialsBOM.length > 0) {
     lines.push(`\u2022 Materials (${quote.materialsBOM.length} items): R${quote.materials_subtotal.toFixed(2)} \u00D7 ${quote.materialsMultiplier} markup = *R${quote.materials_with_markup.toFixed(2)}*`);
+    if (quote.pricing_sources) {
+      const ps = quote.pricing_sources;
+      lines.push(`  \u{1F3E2} ${ps.builders} Builders-priced | ${ps.catalog} catalog | ${ps.ai_estimate} estimated`);
+    }
   } else if (quote.materialsBOM.length > 0) {
     lines.push(`\u2022 Materials (client provides): ${quote.materialsBOM.length} items listed`);
   }
@@ -648,10 +954,13 @@ function formatQuoteForWhatsApp(quote, rfqNo) {
 
   if (quote.materialsBOM.length > 0 && quote.materials_responsibility === 'artisan') {
     lines.push('');
-    lines.push(`\u{1F4E6} *Materials List:*`);
+    lines.push(`\u{1F4E6} *Materials List (from Builders.co.za):*`);
     quote.materialsBOM.forEach((m, i) => {
-      lines.push(`${i + 1}. ${m.name} \u2014 ${m.qty} ${m.unit} @ R${m.unit_price.toFixed(2)} = R${m.line_base.toFixed(2)}`);
+      const src = m.matched_by && m.matched_by.startsWith('builders') ? '\u2705' : m.matched_by && m.matched_by.startsWith('catalog') ? '\u{1F4D7}' : '\u{1F4CA}';
+      lines.push(`${i + 1}. ${src} ${m.name} \u2014 ${m.qty} ${m.unit} @ R${m.unit_price.toFixed(2)} = R${m.line_base.toFixed(2)}`);
     });
+    lines.push('');
+    lines.push('\u2705 = Builders.co.za price | \u{1F4D7} = Catalog | \u{1F4CA} = Estimated');
   }
 
   lines.push('');
