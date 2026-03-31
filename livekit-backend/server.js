@@ -215,7 +215,7 @@ async function hydrateCandidateFromProductPage(candidate, { referer } = {}) {
     const og = html.match(/property="og:title"\s+content="([^"]{3,200})"/i);
     const title = og && og[1] ? og[1] : candidate.title;
     return { ...candidate, title, priceZar: price };
-  } catch { return null; }
+  } catch (e) { console.warn('\u26a0\ufe0f buildersProductPage fetch:', e.message); return null; }
 }
 
 async function lookupBuildersPriceOne(rawName) {
@@ -240,7 +240,7 @@ async function lookupBuildersPriceOne(rawName) {
       return null;
     }
     decoded = await resp.json();
-  } catch { return null; }
+  } catch (e) { console.warn('\u26a0\ufe0f buildersProductPrice JSON parse:', e.message); return null; }
   if (decoded?.redirectUrl && _asString(decoded.redirectUrl).includes('/blocked')) {
     return { title: '', url: '', priceZar: 0, source: 'builders_blocked', blocked: true };
   }
@@ -291,7 +291,7 @@ async function buildersPriceLookupBatch(materialNames, concurrency = 4) {
     while (true) {
       const idx = i++;
       if (idx >= materialNames.length) return;
-      try { results[idx] = await lookupBuildersPriceOne(materialNames[idx]); } catch { results[idx] = null; }
+      try { results[idx] = await lookupBuildersPriceOne(materialNames[idx]); } catch (e) { console.warn('\u26a0\ufe0f buildersPriceLookupBatch worker:', e.message); results[idx] = null; }
     }
   });
   await Promise.all(workers);
@@ -922,7 +922,7 @@ async function enforceAssistantSessionBinding({ firestore, req, actorUid, action
       { last_used_at: nowIso(), last_action: action, last_request_id: req.requestId || null },
       { merge: true }
     );
-  } catch (_) {
+  } catch (e) { console.warn('\u26a0\ufe0f voice session metadata write:', e.message);
     // Best-effort only
   }
 
@@ -956,7 +956,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
               bookingRef = q.docs[0].ref;
               return q.docs[0].data() || {};
             }
-          } catch (_) { /* ignore */ }
+          } catch (e) { console.warn('\u26a0\ufe0f booking lookup by alt field:', e.message); }
         }
       }
     }
@@ -1187,7 +1187,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     try {
       const doc = await firestore.collection('serviceProvider').doc(key).get();
       if (doc.exists) return doc;
-    } catch (_) {
+    } catch (e) { console.warn('\u26a0\ufe0f getServiceProviderDoc direct fetch:', e.message);
       // ignore and try query fallbacks
     }
 
@@ -1196,7 +1196,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         const snap = await firestore.collection('serviceProvider').where(field, '==', key).limit(1).get();
         if (snap.empty) return null;
         return snap.docs[0];
-      } catch (_) {
+      } catch (e) { console.warn('\u26a0\ufe0f getServiceProviderDoc field query:', e.message);
         return null;
       }
     }
@@ -1247,14 +1247,14 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     let snap = null;
     try {
       snap = await firestore.collection('userTasks').where('task_id', '==', t).get();
-    } catch (_) {
+    } catch (e) { console.warn('\u26a0\ufe0f candidateArtisans task_id query:', e.message);
       snap = null;
     }
 
     if (!snap || snap.empty) {
       try {
         snap = await firestore.collection('userTasks').where('taskId', '==', t).get();
-      } catch (_) {
+      } catch (e) { console.warn('\u26a0\ufe0f candidateArtisans taskId query:', e.message);
         snap = null;
       }
     }
@@ -1263,7 +1263,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       try {
         const catSnap = await firestore.collection('userTasks').where('category_id', '==', t).get();
         if (!catSnap.empty) snap = catSnap;
-      } catch (_) {
+      } catch (e) { console.warn('\u26a0\ufe0f candidateArtisans category_id query:', e.message);
         // ignore
       }
     }
@@ -1272,7 +1272,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       try {
         const catSnap2 = await firestore.collection('userTasks').where('categoryId', '==', t).get();
         if (!catSnap2.empty) snap = catSnap2;
-      } catch (_) {
+      } catch (e) { console.warn('\u26a0\ufe0f candidateArtisans categoryId query:', e.message);
         // ignore
       }
     }
@@ -1298,7 +1298,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     let bookingsSnap;
     try {
       bookingsSnap = await firestore.collection('futureBookings').where('service_provider_id', '==', artisanId).get();
-    } catch (_) {
+    } catch (e) { console.warn('\u26a0\ufe0f checkArtisanAvailability:', e.message);
       return true;
     }
     if (!bookingsSnap || bookingsSnap.empty) return true;
@@ -1371,7 +1371,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       try {
         snap = await firestore.collection('serviceProvider').where('status', '==', 'publish').limit(200).get();
         if (snap.empty) snap = await firestore.collection('serviceProvider').limit(200).get();
-      } catch (_) {
+      } catch (e) { console.warn('\u26a0\ufe0f findAvailableArtisan fallback query:', e.message);
         snap = await firestore.collection('serviceProvider').limit(200).get();
       }
 
@@ -1422,7 +1422,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       const data = doc.data() || {};
       const amount = toNumber(data.cost ?? data.price ?? data.amount ?? data.unit_price);
       return amount && amount > 0 ? amount : null;
-    } catch (_) {
+    } catch (e) { console.warn('\u26a0\ufe0f resolveTaskCost:', e.message);
       return null;
     }
   }
@@ -1550,7 +1550,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         success: resp.successCount || 0,
         failure: resp.failureCount || 0,
       };
-    } catch (_) {
+    } catch (e) { console.warn('\u26a0\ufe0f sendPushToTokens:', e.message);
       return { attempted: tokens.length, success: 0, failure: tokens.length };
     }
   }
@@ -1562,7 +1562,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       const snap = await firestore.collection('users').doc(id).get();
       if (!snap.exists) return [];
       return collectTokensFromDocData(snap.data() || {});
-    } catch (_) {
+    } catch (e) { console.warn('\u26a0\ufe0f getUserTokens:', e.message);
       return [];
     }
   }
@@ -1610,7 +1610,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
                 if (!tokens.includes(t)) tokens.push(t);
               }
             }
-          } catch (_) { /* ignore */ }
+          } catch (e) { console.warn('\u26a0\ufe0f FCM token collection:', e.message); }
           // Also try user doc tokens for artisans (they may also have a users doc)
           for (const t of await getUserTokens(uid)) {
             if (!tokens.includes(t)) tokens.push(t);
@@ -1640,7 +1640,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
           { merge: true }
         );
       }
-    } catch (_) {
+    } catch (e) { console.warn('\u26a0\ufe0f writeNotification impl:', e.message);
       // ignore
     }
   }
@@ -1764,7 +1764,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
           userLatLocal = String((ud.lat ?? userLatLocal) || '0');
           userLngLocal = String((ud.lng ?? userLngLocal) || '0');
         }
-      } catch (_) {
+      } catch (e) { console.warn('\u26a0\ufe0f user location lookup:', e.message);
         // ignore
       }
     }
@@ -2025,7 +2025,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         const snap = await firestore.collection('users').doc(id).get();
         if (!snap.exists) return null;
         return snap.data() || {};
-      } catch (_) {
+      } catch (e) { console.warn('\u26a0\ufe0f resolveClientDoc:', e.message);
         return null;
       }
     }
@@ -2038,7 +2038,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         if (!doc.exists) return '';
         const data = doc.data() || {};
         return String(data.name || data.task_name || '').trim();
-      } catch (_) {
+      } catch (e) { console.warn('\u26a0\ufe0f resolveTaskName:', e.message);
         return '';
       }
     }
@@ -2420,7 +2420,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         last_message_at: now,
         last_message_by: 'client',
       }, { merge: true });
-    } catch (_) { /* best-effort */ }
+    } catch (e) { console.warn('\u26a0\ufe0f chat unread count update:', e.message); }
 
     try {
       const providerDoc = await getServiceProviderDocByAnyId(smArtisanId);
@@ -2480,7 +2480,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         last_message_at: now,
         last_message_by: 'artisan',
       }, { merge: true });
-    } catch (_) { /* best-effort */ }
+    } catch (e) { console.warn('\u26a0\ufe0f chat unread count update (artisan):', e.message); }
 
     try {
       await writePersonalNotification({
@@ -2691,7 +2691,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
           data: { case_id: rcCaseId, type: 'case_reply' },
         });
       }
-    } catch (_) { /* best-effort */ }
+    } catch (e) { console.warn('\u26a0\ufe0f case reply notification:', e.message); }
 
     return {
       ok: true, status: 200,
@@ -2894,14 +2894,14 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
             taskDocs = r.docs;
             break;
           }
-        } catch (_) {}
+        } catch (e) { console.warn('\u26a0\ufe0f task status query:', e.message); }
       }
       // Fallback: all tasks without status filter
       if (taskDocs.length === 0) {
         try {
           const r = await firestore.collection('tasks').limit(200).get();
           taskDocs = r.docs;
-        } catch (_) {}
+        } catch (e) { console.warn('\u26a0\ufe0f task fallback query:', e.message); }
       }
 
       if (taskDocs.length === 0) {
@@ -3251,7 +3251,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
             trade: String(pd.profession || pd.trade || pd.specialization || '').trim() || null,
           };
         }
-      } catch (_) { /* best-effort */ }
+      } catch (e) { console.warn('\u26a0\ufe0f artisan info lookup:', e.message); }
     }
 
     return {
@@ -3320,7 +3320,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
             }
             return { ok: true, status: 200, data: result };
           }
-        } catch (_) {}
+        } catch (e) { console.warn('\u26a0\ufe0f RFQ data lookup:', e.message); }
       }
       return { ok: false, status: 404, error: 'booking_not_found' };
     }
@@ -3397,7 +3397,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         const sp = gd.service_prices || gd.servicePrices || {};
         pricingCtx = `Labor rate: R${laborRate}/hr. Service prices: ${JSON.stringify(sp)}`;
       }
-    } catch (_) {}
+    } catch (e) { console.warn('\u26a0\ufe0f pricing guidance fetch:', e.message); }
 
     try {
       // Step 1: Generate BOM with GPT (same as before, but instruct to use Builders-stocked items)
@@ -3718,7 +3718,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
           clientLat = String(ud.lat ?? '0');
           clientLng = String(ud.lng ?? '0');
         }
-      } catch (_) {
+      } catch (e) { console.warn('\u26a0\ufe0f user geo lookup for reassign:', e.message);
         // ignore
       }
     } else {
@@ -4070,7 +4070,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
               created_at: now,
             });
         }
-      } catch (_) { /* best effort */ }
+      } catch (e) { console.warn('\u26a0\ufe0f review write best-effort:', e.message); }
 
       return { ok: true, status: 200, data: { rated: true, booking_id: targetBookingId, rating } };
     } catch (e) {
@@ -4453,7 +4453,7 @@ function getSdkVersion() {
   try {
     // eslint-disable-next-line global-require
     return require('livekit-server-sdk/package.json').version;
-  } catch {
+  } catch (e) { console.warn('\u26a0\ufe0f SDK version require:', e.message);
     // Some package managers / export maps may prevent requiring package.json.
     // Fall back to the version range declared in this service's package.json.
     try {
@@ -4464,7 +4464,7 @@ function getSdkVersion() {
         (pkg.devDependencies && pkg.devDependencies['livekit-server-sdk']) ||
         'unknown'
       );
-    } catch {
+    } catch (e) { console.warn('\u26a0\ufe0f SDK version fallback require:', e.message);
       return 'unknown';
     }
   }
@@ -4721,7 +4721,7 @@ app.post('/api/voice/start', assistantLimiter, async (req, res) => {
           });
         }
       }
-    } catch (_) {
+    } catch (e) { console.warn('\u26a0\ufe0f app-check verification:', e.message);
       // Best-effort only
     }
     const metadata = typeof req.body.metadata === 'string' ? req.body.metadata : '';
@@ -4739,7 +4739,7 @@ app.post('/api/voice/start', assistantLimiter, async (req, res) => {
       parsed.voice_session_id = sessionId;
       parsed.voice_session_nonce = sessionNonce;
       enrichedMetadata = JSON.stringify(parsed);
-    } catch (_) {
+    } catch (e) { console.warn('\u26a0\ufe0f metadata JSON parse:', e.message);
       // If metadata isn't valid JSON, create a fresh object
       enrichedMetadata = JSON.stringify({
         voice_session_id: sessionId,
@@ -5194,7 +5194,7 @@ app.post('/api/action/confirm', assistantLimiter, async (req, res) => {
           request_id: req.requestId || null,
         });
       }
-    } catch (_) {
+    } catch (e) { console.warn('\u26a0\ufe0f idempotency check:', e.message);
       // fall through
     }
   }
@@ -5494,7 +5494,7 @@ app.get('/api/admin/jobs/by-request/:requestId', adminLimiter, async (req, res) 
       .get();
     const items = snap.docs.map((d) => ({ id: d.id, ...(d.data() || {}) }));
     return res.json({ success: true, requestId, items });
-  } catch (_) {
+  } catch (e) { console.warn('\u26a0\ufe0f action jobs query:', e.message);
     return res.json({ success: true, requestId, items: [] });
   }
 });
@@ -5596,7 +5596,7 @@ app.get('/api/admin/debug/reassignment-recipients', async (req, res) => {
     try {
       const direct = await firestore.collection('serviceProvider').doc(providerKey).get();
       if (direct.exists) providerDoc = direct;
-    } catch (_) {
+    } catch (e) { console.warn('\u26a0\ufe0f provider doc direct fetch:', e.message);
       providerDoc = null;
     }
     if (!providerDoc) {
@@ -5608,7 +5608,7 @@ app.get('/api/admin/debug/reassignment-recipients', async (req, res) => {
             providerDoc = qs.docs[0];
             break;
           }
-        } catch (_) {
+        } catch (e) { console.warn('\u26a0\ufe0f provider doc field query:', e.message);
           // ignore
         }
       }
@@ -5698,14 +5698,14 @@ app.post('/api/admin/fix/service-provider-uid-mapping', async (req, res) => {
     try {
       const direct = await firestore.collection('serviceProvider').doc(k).get();
       if (direct.exists) return direct;
-    } catch (_) {
+    } catch (e) { console.warn('\u26a0\ufe0f resolveProviderDoc direct fetch:', e.message);
       // ignore
     }
     for (const f of ['user_id', 'uid', 'userId', 'provider_id']) {
       try {
         const qs = await firestore.collection('serviceProvider').where(f, '==', k).limit(1).get();
         if (!qs.empty) return qs.docs[0];
-      } catch (_) {
+      } catch (e) { console.warn('\u26a0\ufe0f resolveProviderDoc field query:', e.message);
         // ignore
       }
     }
@@ -5778,7 +5778,7 @@ app.post('/api/admin/fix/service-provider-uid-mapping', async (req, res) => {
         prev,
       },
     });
-  } catch (_) {
+  } catch (e) { console.warn('\u26a0\ufe0f admin action audit write:', e.message);
     // best-effort
   }
 
@@ -5794,7 +5794,7 @@ app.post('/api/admin/fix/service-provider-uid-mapping', async (req, res) => {
       const r = String(v || '').trim().toLowerCase();
       userRoleHint = r || null;
     }
-  } catch (_) {
+  } catch (e) { console.warn('\u26a0\ufe0f user role hint lookup:', e.message);
     // ignore
   }
 
@@ -6262,7 +6262,7 @@ async function runFraudChecks({ firestore, type, amount, targetUserId, requested
     if (recentSnap.size >= 5) {
       alerts.push({ rule: 'velocity_exceeded', severity: 'high', detail: `${recentSnap.size} requests in last hour from same admin` });
     }
-  } catch (_) {}
+  } catch (e) { console.warn('\u26a0\ufe0f fraud velocity check:', e.message); }
 
   // Rule 3: Self-dealing — admin requesting funds to themselves
   if (targetUserId === requestedBy) {
@@ -6282,7 +6282,7 @@ async function runFraudChecks({ firestore, type, amount, targetUserId, requested
       if (!dupSnap.empty) {
         alerts.push({ rule: 'duplicate_refund', severity: 'high', detail: `Booking ${bookingId} already has a recent refund request` });
       }
-    } catch (_) {}
+    } catch (e) { console.warn('\u26a0\ufe0f fraud duplicate refund check:', e.message); }
   }
 
   // Rule 5: Flagged user target
@@ -6297,7 +6297,7 @@ async function runFraudChecks({ firestore, type, amount, targetUserId, requested
         const flag = flagSnap.docs[0].data() || {};
         alerts.push({ rule: 'flagged_user', severity: 'medium', detail: `Target user is flagged: ${flag.flag_type} - ${flag.reason || ''}` });
       }
-    } catch (_) {}
+    } catch (e) { console.warn('\u26a0\ufe0f fraud flagged user check:', e.message); }
   }
 
   // Rule 6: Unusual amount (suspiciously round or very large)
@@ -6355,7 +6355,7 @@ app.post('/api/finance/request', adminLimiter, async (req, res) => {
     if (!userSnap.exists) {
       return res.status(404).json({ error: 'target_user_not_found' });
     }
-  } catch (_) {}
+  } catch (e) { console.warn('\u26a0\ufe0f target user exists check:', e.message); }
 
   // Run fraud detection
   const fraud = await runFraudChecks({
