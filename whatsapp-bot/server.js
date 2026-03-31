@@ -191,9 +191,34 @@ async function downloadWhatsAppMedia(mediaId) {
     const buffer = Buffer.from(await dlRes.arrayBuffer());
     const mimeType = meta.mime_type || 'image/jpeg';
     const base64 = buffer.toString('base64');
-    return { base64, mimeType, dataUrl: `data:${mimeType};base64,${base64}` };
+    return { base64, mimeType, dataUrl: `data:${mimeType};base64,${base64}`, buffer };
   } catch (e) {
     console.error('[wa-media] error:', e.message);
+    return null;
+  }
+}
+
+// ─── Transcribe audio via Whisper ───
+
+async function transcribeAudio(mediaId) {
+  try {
+    const media = await downloadWhatsAppMedia(mediaId);
+    if (!media || !media.buffer) return null;
+
+    // Whisper accepts common audio formats — WhatsApp voice notes are ogg/opus
+    const ext = (media.mimeType || '').includes('ogg') ? 'ogg'
+      : (media.mimeType || '').includes('mp4') ? 'mp4'
+      : (media.mimeType || '').includes('mpeg') ? 'mp3' : 'ogg';
+
+    const file = new File([media.buffer], `voice.${ext}`, { type: media.mimeType || 'audio/ogg' });
+    const transcription = await openai.audio.transcriptions.create({
+      model: 'whisper-1',
+      file,
+      language: 'en',
+    });
+    return transcription.text || null;
+  } catch (e) {
+    console.warn('[whisper] Transcription failed:', e.message);
     return null;
   }
 }
@@ -1179,7 +1204,7 @@ async function executeWaTool(name, args, session) {
           await firestore.collection('promo_codes').doc(session.promoId).update({
             used_count: admin.firestore.FieldValue.increment(1),
           });
-        } catch (_) {}
+        } catch (e) { console.warn('[wa-tool] promo usage tracking failed:', e.message); }
         // Clear promo from session after use
         session.promoCode = null;
         session.promoDiscount = 0;
@@ -1214,7 +1239,7 @@ async function executeWaTool(name, args, session) {
               });
             }
           }
-        } catch (_) {}
+        } catch (e) { console.warn('[wa-tool] partner commission tracking failed:', e.message); }
       }
 
       // Send notification to admin
@@ -1228,7 +1253,7 @@ async function executeWaTool(name, args, session) {
           read: false,
           created_at: admin.firestore.FieldValue.serverTimestamp(),
         });
-      } catch (_) {}
+      } catch (e) { console.warn('[wa-tool] booking notification failed:', e.message); }
 
       return {
         success: true,
@@ -1356,7 +1381,7 @@ async function executeWaTool(name, args, session) {
               taskResults.push({ name, cost, category_id: d.categoryId || d.category_id || '' });
             }
           }
-        } catch (_) {}
+        } catch (e) { console.warn('[wa-tool] tasks lookup failed:', e.message); }
 
         // 3) If subcategory provided, try to find an exact or fuzzy match
         let matchedService = null;
@@ -1764,6 +1789,7 @@ async function executeWaTool(name, args, session) {
         status: 'cancelled',
         cancelled_at: now,
         cancelled_by: 'client_whatsapp',
+        cancel_reason: args.reason || 'Cancelled via WhatsApp',
         cancellation_reason: args.reason || 'Cancelled via WhatsApp',
       });
 
@@ -1775,10 +1801,11 @@ async function executeWaTool(name, args, session) {
             status: 'cancelled',
             cancelled_at: now,
             cancelled_by: 'client_whatsapp',
+            cancel_reason: args.reason || 'Cancelled via WhatsApp',
             cancellation_reason: args.reason || 'Cancelled via WhatsApp',
           });
         }
-      } catch (_) {}
+      } catch (e) { console.warn('[wa-tool] futureBookings cancel sync failed:', e.message); }
 
       // Initiate refund if paid
       let refundMsg = '';
@@ -1818,7 +1845,8 @@ async function executeWaTool(name, args, session) {
                 created_at: admin.firestore.FieldValue.serverTimestamp(),
               });
               refundMsg = ` R${cost.toFixed(2)} has been refunded to your wallet.`;
-            } catch (_) {
+            } catch (e) {
+              console.warn('[wa-tool] wallet refund failed:', e.message);
               refundMsg = ' Your refund request has been submitted. Admin will process it shortly.';
             }
           } else {
@@ -1876,8 +1904,8 @@ async function executeWaTool(name, args, session) {
       };
 
       // Update both collections
-      try { await firestore.collection('futureBookings').doc(bid).update(update); } catch (_) {}
-      try { await firestore.collection('tasksManagement').doc(bid).update(update); } catch (_) {}
+      try { await firestore.collection('futureBookings').doc(bid).update(update); } catch (e) { console.warn('[wa-tool] reschedule futureBookings failed:', e.message); }
+      try { await firestore.collection('tasksManagement').doc(bid).update(update); } catch (e) { console.warn('[wa-tool] reschedule tasksManagement failed:', e.message); }
 
       return {
         success: true,
@@ -1947,7 +1975,7 @@ async function executeWaTool(name, args, session) {
             rating: Math.round(avgRating * 10) / 10,
             job_count: admin.firestore.FieldValue.increment(1),
           });
-        } catch (_) {}
+        } catch (e) { console.warn('[wa-tool] artisan rating update failed:', e.message); }
       }
 
       const stars = '⭐'.repeat(rating);
@@ -2500,9 +2528,17 @@ app.post('/webhook', async (req, res) => {
         case 'document':
           userText = '[Customer sent a document: ' + (msg.document?.filename || 'unknown') + ']';
           break;
-        case 'audio':
-          userText = '[Customer sent a voice note — please ask them to type their question instead]';
+        case 'audio': {
+          // Transcribe voice note via Whisper
+          const audioTranscript = await transcribeAudio(msg.audio?.id);
+          if (audioTranscript && audioTranscript.trim()) {
+            userText = audioTranscript.trim();
+            console.log(`[msg] ${from}: [VOICE NOTE transcribed: "${userText.substring(0, 80)}"]`);
+          } else {
+            userText = '[Customer sent a voice note but it could not be transcribed] Please ask them to type their question instead, or try sending the voice note again.';
+          }
           break;
+        }
         case 'location':
           userText = `[Customer shared location: ${msg.location.latitude}, ${msg.location.longitude}]`;
           if (msg.location.address) userText += ` Address: ${msg.location.address}`;

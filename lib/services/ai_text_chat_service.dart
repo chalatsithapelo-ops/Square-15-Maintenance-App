@@ -277,7 +277,7 @@ class AITextChatService {
             'source': 'future',
           });
         }
-      } catch (_) {}
+      } catch (e) { debugPrint('[AITextChat] futureBookings fetch failed: $e'); }
 
       return {'bookings': bookings, 'count': bookings.length};
     } catch (e) {
@@ -446,7 +446,7 @@ class AITextChatService {
             break;
           }
         }
-      } catch (_) {}
+      } catch (e) { debugPrint('[AITextChat] pricing lookup failed: $e'); }
 
       final now = FieldValue.serverTimestamp();
       final bookingId = FirebaseFirestore.instance.collection('futureBookings').doc().id;
@@ -491,7 +491,7 @@ class AITextChatService {
           'read': false,
           'timestamp': now,
         });
-      } catch (_) {}
+      } catch (e) { debugPrint('[AITextChat] booking notification failed: $e'); }
 
       return {
         'success': true,
@@ -563,7 +563,7 @@ class AITextChatService {
           'read': false,
           'timestamp': now,
         });
-      } catch (_) {}
+      } catch (e) { debugPrint('[AITextChat] RFQ notification failed: $e'); }
 
       return {
         'success': true,
@@ -628,6 +628,9 @@ class AITextChatService {
       if (status == 'completed' || status == 'closed' || status == 'cancelled') {
         return {'error': 'Cannot cancel a booking that is already $status.'};
       }
+      if (status == 'progress' || status == 'in_progress') {
+        return {'error': 'This booking is currently in progress. Please contact support@square15.co.za to cancel an active job.'};
+      }
 
       final cancelReason = reason ?? 'Cancelled via AI chat';
       final now = FieldValue.serverTimestamp();
@@ -636,6 +639,8 @@ class AITextChatService {
       await FirebaseFirestore.instance.collection(collection).doc(bookingId).update({
         'status': 'cancelled',
         'cancel_reason': cancelReason,
+        'cancellation_reason': cancelReason,
+        'cancelled_by': 'client_ai_chat',
         'cancelled_at': now,
       });
       // Also update in other collection
@@ -646,10 +651,12 @@ class AITextChatService {
           await FirebaseFirestore.instance.collection(otherCol).doc(bookingId).update({
             'status': 'cancelled',
             'cancel_reason': cancelReason,
+            'cancellation_reason': cancelReason,
+            'cancelled_by': 'client_ai_chat',
             'cancelled_at': now,
           });
         }
-      } catch (_) {}
+      } catch (e) { debugPrint('[AITextChat] cancel sync to $otherCol failed: $e'); }
 
       // Auto-refund wallet payment
       if (data['payment_status'] == 'paid' && data['payment_method'] == 'wallet') {
@@ -667,8 +674,19 @@ class AITextChatService {
               'booking_id': bookingId,
               'timestamp': now,
             });
+            // Also write to transactionLogs for cross-platform consistency
+            await FirebaseFirestore.instance.collection('transactionLogs').add({
+              'user_id': uid,
+              'type': 'refund',
+              'subtype': 'wallet_refund',
+              'amount': cost,
+              'booking_id': bookingId,
+              'source': 'ai_text_chat',
+              'status': 'success',
+              'created_at': now,
+            });
           }
-        } catch (_) {}
+        } catch (e) { debugPrint('[AITextChat] wallet refund failed: $e'); }
       }
 
       // Notify admin
@@ -682,7 +700,7 @@ class AITextChatService {
           'read': false,
           'timestamp': now,
         });
-      } catch (_) {}
+      } catch (e) { debugPrint('[AITextChat] cancel notification failed: $e'); }
 
       return {'success': true, 'message': 'Booking $bookingId has been cancelled.'};
     } catch (e) {
@@ -819,7 +837,7 @@ class AITextChatService {
             'review_count': allReviews.docs.length,
           });
         }
-      } catch (_) {}
+      } catch (e) { debugPrint('[AITextChat] artisan rating update failed: $e'); }
 
       return {'success': true, 'message': 'Thank you! Your $ratingVal-star rating has been submitted.'};
     } catch (e) {
@@ -855,7 +873,7 @@ class AITextChatService {
           'read': false,
           'timestamp': FieldValue.serverTimestamp(),
         });
-      } catch (_) {}
+      } catch (e) { debugPrint('[AITextChat] complaint notification failed: $e'); }
 
       return {'success': true, 'case_id': caseId, 'message': 'Your complaint has been submitted (ref: $caseId). Our team will review it.'};
     } catch (e) {
@@ -1039,7 +1057,7 @@ class AITextChatService {
           'read': false,
           'timestamp': FieldValue.serverTimestamp(),
         });
-      } catch (_) {}
+      } catch (e) { debugPrint('[AITextChat] refund notification failed: $e'); }
 
       return {'success': true, 'refund_id': refundId, 'message': 'Refund request submitted. Admin will review shortly.'};
     } catch (e) {
@@ -1065,7 +1083,7 @@ class AITextChatService {
         'assistant_message': assistantMsg.content,
         'timestamp': FieldValue.serverTimestamp(),
       });
-    } catch (_) {}
+    } catch (e) { debugPrint('[AITextChat] message store failed: $e'); }
   }
 
   void endSession() {
