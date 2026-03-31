@@ -1096,7 +1096,7 @@ async function executeWaTool(name, args, session) {
         problem_description: args.description || '',
         address: args.address || '',
         materials_responsibility: args.materialsResponsibility || 'artisan',
-        status: 'pending',
+        status: 'rfq_pending',
         payment_status: 'unpaid',
         cost: '',
         source: 'whatsapp',
@@ -1551,7 +1551,7 @@ async function handleMessage(session, userMessage, imageDataUrl) {
   // Build user message content — supports text-only or text+image (vision)
   if (imageDataUrl) {
     const content = [
-      { type: 'image_url', image_url: { url: imageDataUrl, detail: 'low' } },
+      { type: 'image_url', image_url: { url: imageDataUrl, detail: 'auto' } },
       { type: 'text', text: userMessage },
     ];
     session.messages.push({ role: 'user', content });
