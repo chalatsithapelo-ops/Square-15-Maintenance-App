@@ -6800,6 +6800,14 @@ module.exports = app;
 
 // Start server only when executed directly (node server.js)
 if (require.main === module) {
+  process.on('unhandledRejection', (reason, promise) => {
+    console.error('\u274c Unhandled Rejection:', reason);
+  });
+  process.on('uncaughtException', (error) => {
+    console.error('\u274c Uncaught Exception:', error);
+    process.exit(1);
+  });
+
   app.listen(PORT, () => {
     console.log('🚀 Square 15 Livekit Backend');
     console.log(`📡 Server running on port ${PORT}`);

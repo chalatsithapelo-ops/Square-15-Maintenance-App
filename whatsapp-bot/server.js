@@ -101,30 +101,36 @@ async function sendWhatsAppMessage(to, text) {
 async function sendWhatsAppInteractive(to, header, body, buttons) {
   const phoneId = process.env.WHATSAPP_PHONE_NUMBER_ID;
   const token   = process.env.WHATSAPP_ACCESS_TOKEN;
+  if (!phoneId || !token) { console.error('[wa-interactive] Missing credentials'); return; }
 
-  await fetch(`${WA_API}/${phoneId}/messages`, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      messaging_product: 'whatsapp',
-      to,
-      type: 'interactive',
-      interactive: {
-        type: 'button',
-        header: { type: 'text', text: header },
-        body: { text: body },
-        action: {
-          buttons: buttons.map((b, i) => ({
-            type: 'reply',
-            reply: { id: b.id || `btn_${i}`, title: b.title.substring(0, 20) },
-          })),
-        },
+  try {
+    const res = await fetch(`${WA_API}/${phoneId}/messages`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json',
       },
-    }),
-  });
+      body: JSON.stringify({
+        messaging_product: 'whatsapp',
+        to,
+        type: 'interactive',
+        interactive: {
+          type: 'button',
+          header: { type: 'text', text: header },
+          body: { text: body },
+          action: {
+            buttons: buttons.map((b, i) => ({
+              type: 'reply',
+              reply: { id: b.id || `btn_${i}`, title: b.title.substring(0, 20) },
+            })),
+          },
+        },
+      }),
+    });
+    if (!res.ok) console.error('[wa-interactive] send failed:', res.status, await res.text().catch(() => ''));
+  } catch (e) {
+    console.error('[wa-interactive] network error:', e.message);
+  }
 }
 
 async function sendWhatsAppList(to, header, body, buttonText, sections) {
@@ -231,8 +237,10 @@ async function findUserByPhone(phone) {
   if (phone.startsWith('0')) variants.push('27' + phone.slice(1), '+27' + phone.slice(1));
 
   for (const v of variants) {
-    const snap = await firestore.collection('users').where('contact', '==', v).limit(1).get();
-    if (!snap.empty) return { id: snap.docs[0].id, ...snap.docs[0].data() };
+    for (const field of ['contact', 'phone', 'mobile', 'phoneNumber', 'phone_number']) {
+      const snap = await firestore.collection('users').where(field, '==', v).limit(1).get();
+      if (!snap.empty) return { id: snap.docs[0].id, ...snap.docs[0].data() };
+    }
   }
   return null;
 }
