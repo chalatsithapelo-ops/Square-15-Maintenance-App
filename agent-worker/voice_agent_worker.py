@@ -381,6 +381,8 @@ async def entrypoint(ctx: JobContext):
 
     # Backend API configuration
     backend_url = os.getenv("BACKEND_API_URL", "https://square15-livekit-backend.onrender.com")
+    if not os.getenv("BACKEND_API_URL"):
+        logger.warning("⚠️ BACKEND_API_URL not set — using hardcoded fallback. Set this env var in production.")
     logger.info(f"📡 Backend API URL: {backend_url}")
 
     # Initialize backend client (will be updated with token/session after voice start)

@@ -1335,6 +1335,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     excludeArtisanId,
     categoryId,
     categoryName,
+    bookingId,
   }) {
     const clientLat = Number.parseFloat(String(userLat || '0')) || 0.0;
     const clientLng = Number.parseFloat(String(userLng || '0')) || 0.0;
@@ -1792,7 +1793,8 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
           tx.set(counterRef, { taskManagementCounter: { nextOrderNo: next } }, { merge: true });
           orderSeq = next;
         });
-      } catch (_) {
+      } catch (e) {
+        console.warn(`⚠️ Order counter transaction failed: ${e.message}; falling back to date-based order number`);
         orderSeq = null;
       }
     }
@@ -3739,6 +3741,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       excludeArtisanId: artisanId || null,
       categoryId,
       categoryName,
+      bookingId,
     });
 
     if (!newArtisanId) {
