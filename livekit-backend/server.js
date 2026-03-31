@@ -5,7 +5,18 @@ const { AccessToken, AgentDispatchClient } = require('livekit-server-sdk');
 const admin = require('firebase-admin');
 const crypto = require('crypto');
 const fs = require('fs');
+const OpenAI = require('openai');
 require('dotenv').config();
+
+// ─── OpenAI (for AI RFQ quote generation) ───
+let _openai = null;
+function getOpenAI() {
+  if (_openai) return _openai;
+  const key = process.env.OPENAI_API_KEY;
+  if (!key) { console.warn('[openai] No OPENAI_API_KEY set'); return null; }
+  _openai = new OpenAI({ apiKey: key });
+  return _openai;
+}
 
 function sanitizeEnvValue(value) {
   if (typeof value !== 'string') return value;
@@ -3002,6 +3013,165 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     }
 
     return { ok: true, status: 200, data: result };
+  }
+
+  // ── Generate AI RFQ Quote ──
+  if (action === 'generate_rfq_quote') {
+    const data = await loadBooking();
+    if (!data) return { ok: false, status: 404, error: 'booking_not_found' };
+
+    const isRfq = String(data.is_rfq || data.is_rfq_requested || '').toLowerCase() === 'yes';
+    if (!isRfq) return { ok: false, status: 400, error: 'not_an_rfq' };
+
+    // If already quoted, return existing quote
+    if (data.ai_quote && data.ai_quote.grand_total) {
+      return {
+        ok: true, status: 200, data: {
+          already_quoted: true,
+          ai_quote: data.ai_quote,
+          grand_total: data.ai_quote.grand_total,
+          rfq_no: String(data.rfq_no || '').trim(),
+        }
+      };
+    }
+
+    const oai = getOpenAI();
+    if (!oai) return { ok: false, status: 500, error: 'ai_unavailable' };
+
+    const category = String(data.category_name || '').trim();
+    const description = String(data.problem_description || data.description || '').trim();
+    const materialsResp = String(data.materials_responsibility || 'artisan').trim();
+
+    // Look up pricing guidance
+    let laborRate = 150;
+    let pricingCtx = '';
+    try {
+      const catSlug = category.toLowerCase().replace(/\s+/g, '_');
+      const guidanceDoc = await firestore.collection('pricingGuidance').doc(catSlug).get();
+      if (guidanceDoc.exists) {
+        const gd = guidanceDoc.data();
+        laborRate = parseFloat(gd.labor_cost_per_hour || gd.laborCostPerHour || 150);
+        const sp = gd.service_prices || gd.servicePrices || {};
+        pricingCtx = `Labor rate: R${laborRate}/hr. Service prices: ${JSON.stringify(sp)}`;
+      }
+    } catch (_) {}
+
+    try {
+      const completion = await oai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        temperature: 0.3,
+        max_tokens: 1000,
+        response_format: { type: 'json_object' },
+        messages: [
+          { role: 'system', content: 'You are a South African maintenance quotation expert. Return only valid JSON.' },
+          {
+            role: 'user',
+            content: `Generate a detailed maintenance quote:\nCategory: ${category}\nDescription: ${description}\nMaterials: ${materialsResp}\n${pricingCtx ? `Pricing: ${pricingCtx}` : ''}\n\nReturn JSON: {"laborHours":<num>,"laborCostPerHour":${laborRate},"complexity":<1-5>,"equipmentCost":<num>,"scopeOfWork":"<text>","estimatedDuration":"<text>","materialsBOM":[{"name":"<text>","qty":<num>,"unit":"<text>","estimated_price":<num>}]}`,
+          },
+        ],
+      });
+
+      const draft = JSON.parse(completion.choices[0]?.message?.content || '{}');
+      const laborHours = parseFloat(draft.laborHours) || 4;
+      const lrUsed = parseFloat(draft.laborCostPerHour) || laborRate;
+      const laborCost = laborHours * lrUsed;
+
+      const materialsMultiplier = 1.5;
+      let matSubtotal = 0;
+      const bom = (draft.materialsBOM || []).map(m => {
+        const q = parseFloat(m.qty) || 1;
+        const up = parseFloat(m.estimated_price) || 0;
+        const lb = q * up;
+        matSubtotal += lb;
+        return { name: m.name, qty: q, unit: m.unit || 'each', unit_price: up, line_base: lb };
+      });
+
+      const artisanBuys = materialsResp === 'artisan';
+      const matWithMarkup = matSubtotal * materialsMultiplier;
+      const matForTotals = artisanBuys ? matWithMarkup : 0;
+      const eqCost = parseFloat(draft.equipmentCost) || 0;
+      const subtotal = laborCost + matForTotals + eqCost;
+      const contingency = subtotal * 0.15;
+      const grandTotal = subtotal + contingency;
+
+      const r2 = (v) => Math.round(v * 100) / 100;
+      const aiQuote = {
+        laborHours, laborCostPerHour: lrUsed, laborCost: r2(laborCost),
+        complexity: draft.complexity || 3,
+        materialsBOM: bom, materialsMultiplier,
+        materials_subtotal: r2(matSubtotal), materials_with_markup: r2(matWithMarkup),
+        materials_responsibility: materialsResp,
+        equipmentCost: r2(eqCost), subtotal: r2(subtotal),
+        contingency: r2(contingency), grand_total: r2(grandTotal),
+        scope_of_work: draft.scopeOfWork || description,
+        estimated_duration: draft.estimatedDuration || 'TBD',
+        breakdown: [
+          { description: `Labour (${laborHours}hrs @ R${lrUsed}/hr)`, cost: laborCost.toFixed(2) },
+          ...(artisanBuys && bom.length > 0 ? [{ description: 'Materials & Supplies', cost: matWithMarkup.toFixed(2) }] : []),
+          ...(eqCost > 0 ? [{ description: 'Equipment & Tools', cost: eqCost.toFixed(2) }] : []),
+          { description: 'Contingency (15%)', cost: contingency.toFixed(2) },
+        ],
+        disclaimer: 'AI-generated estimate. Final costs may vary based on actual site conditions.',
+        generated_at: now, source: 'backend_ai',
+      };
+
+      // Save to Firestore
+      await bookingRef.update({
+        ai_quote: aiQuote,
+        quoted_price: grandTotal.toString(),
+        quote_details: aiQuote.scope_of_work,
+        rfq_status: 'pending_client_response',
+        total_price: grandTotal.toString(),
+        cost: grandTotal.toString(),
+        updated_at: now,
+      });
+
+      return { ok: true, status: 200, data: { ai_quote: aiQuote, grand_total: grandTotal, rfq_no: String(data.rfq_no || '').trim() } };
+    } catch (e) {
+      console.error('[generate_rfq_quote] AI error:', e.message);
+      return { ok: false, status: 500, error: 'ai_generation_failed', detail: e.message };
+    }
+  }
+
+  // ── Accept RFQ Quote ──
+  if (action === 'accept_rfq_quote') {
+    const data = await loadBooking();
+    if (!data) return { ok: false, status: 404, error: 'booking_not_found' };
+    if (!data.ai_quote && !data.quoted_price) return { ok: false, status: 400, error: 'no_quote_available' };
+
+    await bookingRef.update({
+      rfq_status: 'accepted_converted',
+      status: 'pending_payment',
+      accepted_at: now,
+      accepted_via: payload.source || 'voice',
+      updated_at: now,
+    });
+
+    const price = data.quoted_price || (data.ai_quote ? String(data.ai_quote.grand_total) : '0');
+    return { ok: true, status: 200, data: { accepted: true, price, rfq_no: String(data.rfq_no || '').trim() } };
+  }
+
+  // ── Reject / Negotiate RFQ Quote ──
+  if (action === 'reject_rfq_quote') {
+    const data = await loadBooking();
+    if (!data) return { ok: false, status: 404, error: 'booking_not_found' };
+
+    const reason = String(payload.reason || 'Customer wants negotiation').trim();
+    await bookingRef.update({
+      rfq_status: 'under_negotiation',
+      negotiation_reason: reason,
+      negotiation_at: now,
+      negotiation_via: payload.source || 'voice',
+      updated_at: now,
+    });
+
+    await writeAdminNotification({
+      title: 'RFQ Quote Negotiation',
+      message: `Customer wants to negotiate RFQ ${data.rfq_no || bookingId}. Reason: ${reason}`,
+      data: { type: 'rfq_negotiation', bookingId },
+    });
+
+    return { ok: true, status: 200, data: { negotiation: true, rfq_no: String(data.rfq_no || '').trim() } };
   }
 
   const bookingData = await loadBooking();

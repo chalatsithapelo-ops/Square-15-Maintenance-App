@@ -447,7 +447,220 @@ const waTools = [
       parameters: { type: 'object', properties: {}, required: [] },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'check_rfq_status',
+      description: 'Check the status of an RFQ (Request for Quote). Returns quote details, breakdown, and acceptance status. Can look up by RFQ ID or list all RFQs for the customer.',
+      parameters: {
+        type: 'object',
+        properties: {
+          rfqId: { type: 'string', description: 'The RFQ ID or booking ID (e.g. RFQ-XXXXX). If omitted, lists all RFQs for this customer.' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'accept_rfq_quote',
+      description: 'Accept a quoted RFQ and proceed to payment. Customer confirms the AI-generated or admin-provided quote.',
+      parameters: {
+        type: 'object',
+        properties: {
+          rfqId: { type: 'string', description: 'The RFQ ID to accept' },
+        },
+        required: ['rfqId'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'reject_rfq_quote',
+      description: 'Reject or request changes to an RFQ quote. Puts the RFQ into negotiation with admin.',
+      parameters: {
+        type: 'object',
+        properties: {
+          rfqId: { type: 'string', description: 'The RFQ ID to reject/negotiate' },
+          reason: { type: 'string', description: 'Reason for rejection or what changes are requested' },
+        },
+        required: ['rfqId'],
+      },
+    },
+  },
 ];
+
+// ─── AI Quote Generation for RFQ ───
+
+async function generateAIQuote(category, description, materialsResponsibility, additionalContext) {
+  const firestore = db();
+
+  // 1. Look up pricing guidance from Firestore
+  let laborRate = 150; // default ZAR/hr
+  let pricingContext = '';
+  try {
+    if (firestore) {
+      const catSlug = (category || '').toLowerCase().replace(/\s+/g, '_');
+      const guidanceDoc = await firestore.collection('pricingGuidance').doc(catSlug).get();
+      if (guidanceDoc.exists) {
+        const gd = guidanceDoc.data();
+        laborRate = parseFloat(gd.labor_cost_per_hour || gd.laborCostPerHour || 150);
+        const servicePrices = gd.service_prices || gd.servicePrices || {};
+        pricingContext = `Labor rate for ${category}: R${laborRate}/hr. Known service prices: ${JSON.stringify(servicePrices)}`;
+      }
+    }
+  } catch (e) {
+    console.error('[ai-quote] pricing lookup error:', e.message);
+  }
+
+  // 2. Ask OpenAI to generate structured quote
+  const quotePrompt = `You are a professional maintenance quotation system for South Africa.
+Generate a detailed quote for the following job:
+
+Category: ${category}
+Description: ${description}
+Materials responsibility: ${materialsResponsibility || 'artisan'}
+${additionalContext ? `Additional context from photos/conversation: ${additionalContext}` : ''}
+${pricingContext ? `\nPricing guidance from database: ${pricingContext}` : ''}
+
+Return a JSON object with EXACTLY this structure:
+{
+  "laborHours": <number>,
+  "laborCostPerHour": ${laborRate},
+  "complexity": <1-5>,
+  "equipmentCost": <number in ZAR>,
+  "scopeOfWork": "<detailed scope of work>",
+  "estimatedDuration": "<e.g. 1-2 days>",
+  "materialsBOM": [
+    {"name": "<material name>", "qty": <number>, "unit": "<each/m/m²/L/kg>", "estimated_price": <ZAR per unit>}
+  ]
+}
+
+IMPORTANT:
+- Use realistic South African pricing (ZAR)
+- Include ALL materials needed (consumables, fittings, etc.)
+- Labor rate is R${laborRate}/hr
+- Be thorough with the BOM
+- Equipment cost covers tool hire/wear
+- Return ONLY the JSON object`;
+
+  try {
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      temperature: 0.3,
+      max_tokens: 1000,
+      response_format: { type: 'json_object' },
+      messages: [
+        { role: 'system', content: 'You are a South African maintenance quotation expert. Return only valid JSON.' },
+        { role: 'user', content: quotePrompt },
+      ],
+    });
+
+    const raw = completion.choices[0]?.message?.content || '{}';
+    const draft = JSON.parse(raw);
+
+    // 3. Calculate final totals (same formula as the client app)
+    const laborHours = parseFloat(draft.laborHours) || 4;
+    const laborCostPerHour = parseFloat(draft.laborCostPerHour) || laborRate;
+    const laborCost = laborHours * laborCostPerHour;
+
+    const materialsMultiplier = 1.5; // Standard markup
+    let materialsSubtotal = 0;
+    const materialsBOM = (draft.materialsBOM || []).map(m => {
+      const qty = parseFloat(m.qty) || 1;
+      const unitPrice = parseFloat(m.estimated_price) || 0;
+      const lineBase = qty * unitPrice;
+      materialsSubtotal += lineBase;
+      return { name: m.name, qty, unit: m.unit || 'each', unit_price: unitPrice, line_base: lineBase };
+    });
+
+    const artisanBuysMaterials = (materialsResponsibility || 'artisan') === 'artisan';
+    const materialsWithMarkup = materialsSubtotal * materialsMultiplier;
+    const materialCostForTotals = artisanBuysMaterials ? materialsWithMarkup : 0;
+
+    const equipmentCost = parseFloat(draft.equipmentCost) || 0;
+
+    const subtotal = laborCost + materialCostForTotals + equipmentCost;
+    const contingency = subtotal * 0.15;
+    const grandTotal = subtotal + contingency;
+
+    return {
+      laborHours,
+      laborCostPerHour,
+      laborCost: Math.round(laborCost * 100) / 100,
+      complexity: draft.complexity || 3,
+      materialsBOM,
+      materialsMultiplier,
+      materials_subtotal: Math.round(materialsSubtotal * 100) / 100,
+      materials_with_markup: Math.round(materialsWithMarkup * 100) / 100,
+      materials_responsibility: materialsResponsibility || 'artisan',
+      equipmentCost: Math.round(equipmentCost * 100) / 100,
+      subtotal: Math.round(subtotal * 100) / 100,
+      contingency: Math.round(contingency * 100) / 100,
+      grand_total: Math.round(grandTotal * 100) / 100,
+      scope_of_work: draft.scopeOfWork || description,
+      estimated_duration: draft.estimatedDuration || 'To be determined',
+      breakdown: [
+        { description: `Labour (${laborHours}hrs @ R${laborCostPerHour}/hr)`, cost: laborCost.toFixed(2) },
+        ...(artisanBuysMaterials && materialsBOM.length > 0
+          ? [{ description: 'Materials & Supplies', cost: materialsWithMarkup.toFixed(2) }]
+          : []),
+        ...(equipmentCost > 0 ? [{ description: 'Equipment & Tools', cost: equipmentCost.toFixed(2) }] : []),
+        { description: 'Contingency (15%)', cost: contingency.toFixed(2) },
+      ],
+      disclaimer: 'This is an AI-generated estimate. Final costs may vary based on actual site conditions.',
+      generated_at: new Date().toISOString(),
+      source: 'whatsapp_ai',
+    };
+  } catch (e) {
+    console.error('[ai-quote] generation error:', e.message);
+    return null;
+  }
+}
+
+function formatQuoteForWhatsApp(quote, rfqNo) {
+  const lines = [
+    `\u{1F4CB} *AI Quote \u2014 ${rfqNo}*`,
+    '',
+    `\u{1F4DD} *Scope of Work:*`,
+    quote.scope_of_work,
+    '',
+    `\u{1F4B0} *Cost Breakdown:*`,
+    `\u2022 Labour: ${quote.laborHours}hrs \u00D7 R${quote.laborCostPerHour}/hr = *R${quote.laborCost.toFixed(2)}*`,
+  ];
+
+  if (quote.materials_responsibility === 'artisan' && quote.materialsBOM.length > 0) {
+    lines.push(`\u2022 Materials (${quote.materialsBOM.length} items): R${quote.materials_subtotal.toFixed(2)} \u00D7 ${quote.materialsMultiplier} markup = *R${quote.materials_with_markup.toFixed(2)}*`);
+  } else if (quote.materialsBOM.length > 0) {
+    lines.push(`\u2022 Materials (client provides): ${quote.materialsBOM.length} items listed`);
+  }
+
+  if (quote.equipmentCost > 0) {
+    lines.push(`\u2022 Equipment: *R${quote.equipmentCost.toFixed(2)}*`);
+  }
+
+  lines.push(`\u2022 Contingency (15%): *R${quote.contingency.toFixed(2)}*`);
+  lines.push('');
+  lines.push(`\u{1F3F7}\uFE0F *Estimated Total: R${quote.grand_total.toFixed(2)}*`);
+  lines.push('');
+  lines.push(`\u23F1 Est. Duration: ${quote.estimated_duration}`);
+
+  if (quote.materialsBOM.length > 0 && quote.materials_responsibility === 'artisan') {
+    lines.push('');
+    lines.push(`\u{1F4E6} *Materials List:*`);
+    quote.materialsBOM.forEach((m, i) => {
+      lines.push(`${i + 1}. ${m.name} \u2014 ${m.qty} ${m.unit} @ R${m.unit_price.toFixed(2)} = R${m.line_base.toFixed(2)}`);
+    });
+  }
+
+  lines.push('');
+  lines.push(`\u26A0\uFE0F ${quote.disclaimer}`);
+  lines.push('');
+  lines.push('Reply *ACCEPT* to approve or *NEGOTIATE* to discuss changes.');
+
+  return lines.join('\n');
+}
 
 // ─── Tool execution engine ───
 
@@ -1073,7 +1286,7 @@ async function executeWaTool(name, args, session) {
     }
 
     // ═══════════════════════════════════════════
-    // 10) SUBMIT RFQ
+    // 10) SUBMIT RFQ (with AI Quote Generation)
     // ═══════════════════════════════════════════
     case 'submit_rfq': {
       if (!firestore) return { error: 'Database unavailable' };
@@ -1110,6 +1323,10 @@ async function executeWaTool(name, args, session) {
 
       await firestore.collection('futureBookings').doc(rfqId).set(rfqDoc);
 
+      // Track in session for follow-up
+      session.lastRfqId = rfqId;
+      session.lastRfqNo = rfqNo;
+
       // Notify admin
       await firestore.collection('notifications').add({
         title: 'New WhatsApp RFQ',
@@ -1121,10 +1338,61 @@ async function executeWaTool(name, args, session) {
         created_at: admin.firestore.FieldValue.serverTimestamp(),
       });
 
+      // ── AI Quote Generation ──
+      // Extract any image analysis context from the conversation history
+      let imageContext = '';
+      for (const m of session.messages) {
+        if (typeof m.content === 'string' && m.role === 'assistant' && m.content.length > 50) {
+          // Capture assistant's image analysis summaries
+          if (m.content.toLowerCase().includes('issue') || m.content.toLowerCase().includes('damage') ||
+              m.content.toLowerCase().includes('repair') || m.content.toLowerCase().includes('install')) {
+            imageContext += m.content.substring(0, 300) + ' ';
+          }
+        }
+      }
+
+      try {
+        console.log(`[submit_rfq] Generating AI quote for ${rfqNo}...`);
+        const quote = await generateAIQuote(
+          args.category || '',
+          args.description || '',
+          args.materialsResponsibility || 'artisan',
+          imageContext.trim()
+        );
+
+        if (quote) {
+          // Save quote to the RFQ document
+          await firestore.collection('futureBookings').doc(rfqId).update({
+            ai_quote: quote,
+            quoted_price: quote.grand_total.toString(),
+            quote_details: quote.scope_of_work,
+            rfq_status: 'pending_client_response',
+            total_price: quote.grand_total.toString(),
+            cost: quote.grand_total.toString(),
+          });
+
+          const quoteMsg = formatQuoteForWhatsApp(quote, rfqNo);
+          console.log(`[submit_rfq] AI quote generated: R${quote.grand_total.toFixed(2)} for ${rfqNo}`);
+
+          return {
+            success: true,
+            rfqId,
+            rfqNo,
+            hasQuote: true,
+            grand_total: `R${quote.grand_total.toFixed(2)}`,
+            message: `RFQ ${rfqNo} submitted with AI-generated quote!\n\n${quoteMsg}`,
+          };
+        }
+      } catch (quoteErr) {
+        console.error('[submit_rfq] AI quote generation error:', quoteErr.message);
+      }
+
+      // Fallback if quote generation fails
       return {
         success: true,
         rfqId,
         rfqNo,
+        hasQuote: false,
         message: `RFQ ${rfqNo} submitted! Our team will review your request and provide a detailed quotation. You'll receive the quote here on WhatsApp.`,
       };
     }
@@ -1479,6 +1747,180 @@ async function executeWaTool(name, args, session) {
       };
     }
 
+    // ═══════════════════════════════════════════
+    // 17) CHECK RFQ STATUS
+    // ═══════════════════════════════════════════
+    case 'check_rfq_status': {
+      if (!firestore) return { error: 'Database unavailable' };
+
+      const rfqId = args.rfqId || args.bookingId || session.lastRfqId;
+      if (!rfqId) {
+        // List all RFQs for this phone number
+        try {
+          const snap = await firestore.collection('futureBookings')
+            .where('user_phone', '==', session.phone)
+            .where('is_rfq', '==', 'yes')
+            .limit(5)
+            .get();
+
+          if (snap.empty) {
+            // Also try linked user ID
+            if (session.linkedUserId) {
+              const snap2 = await firestore.collection('futureBookings')
+                .where('user_id', '==', session.linkedUserId)
+                .where('is_rfq', '==', 'yes')
+                .limit(5)
+                .get();
+              if (!snap2.empty) {
+                const rfqs = snap2.docs.map(d => {
+                  const data = d.data();
+                  return {
+                    rfqId: d.id,
+                    rfqNo: data.rfq_no || data.order_no,
+                    category: data.category_name,
+                    status: data.rfq_status || data.status,
+                    quotedPrice: data.quoted_price || data.total_price || 'pending',
+                    createdAt: data.created_at,
+                  };
+                });
+                return { rfqs, message: `Found ${rfqs.length} RFQ(s).` };
+              }
+            }
+            return { message: 'No RFQ requests found for your number.' };
+          }
+
+          const rfqs = snap.docs.map(d => {
+            const data = d.data();
+            return {
+              rfqId: d.id,
+              rfqNo: data.rfq_no || data.order_no,
+              category: data.category_name,
+              status: data.rfq_status || data.status,
+              quotedPrice: data.quoted_price || data.total_price || 'pending',
+              createdAt: data.created_at,
+            };
+          });
+
+          return { rfqs, message: `Found ${rfqs.length} RFQ(s).` };
+        } catch (e) {
+          return { error: 'Could not retrieve RFQs. Please try again.' };
+        }
+      }
+
+      // Specific RFQ lookup
+      const doc = await firestore.collection('futureBookings').doc(rfqId).get();
+      if (!doc.exists) return { error: `RFQ "${rfqId}" not found.` };
+
+      const data = doc.data();
+      const result = {
+        rfqId: doc.id,
+        rfqNo: data.rfq_no || data.order_no,
+        category: data.category_name,
+        description: data.problem_description || data.description,
+        status: data.rfq_status || data.status,
+        quotedPrice: data.quoted_price || data.total_price || '',
+        quoteDetails: data.quote_details || '',
+        createdAt: data.created_at,
+      };
+
+      if (data.ai_quote) {
+        result.hasQuote = true;
+        result.quote = {
+          grandTotal: `R${parseFloat(data.ai_quote.grand_total || 0).toFixed(2)}`,
+          labor: `R${parseFloat(data.ai_quote.laborCost || 0).toFixed(2)}`,
+          materials: `R${parseFloat(data.ai_quote.materials_with_markup || 0).toFixed(2)}`,
+          contingency: `R${parseFloat(data.ai_quote.contingency || 0).toFixed(2)}`,
+          scopeOfWork: data.ai_quote.scope_of_work || '',
+          duration: data.ai_quote.estimated_duration || '',
+          materialsBOM: (data.ai_quote.materialsBOM || []).map(m => `${m.name} (${m.qty} ${m.unit})`),
+        };
+      }
+
+      return result;
+    }
+
+    // ═══════════════════════════════════════════
+    // 18) ACCEPT RFQ QUOTE
+    // ═══════════════════════════════════════════
+    case 'accept_rfq_quote': {
+      if (!firestore) return { error: 'Database unavailable' };
+
+      const rfqId = args.rfqId || args.bookingId || session.lastRfqId;
+      if (!rfqId) return { error: 'Please provide the RFQ ID.' };
+
+      const doc = await firestore.collection('futureBookings').doc(rfqId).get();
+      if (!doc.exists) return { error: `RFQ "${rfqId}" not found.` };
+
+      const data = doc.data();
+      if (!data.quoted_price && !data.ai_quote) {
+        return { error: 'This RFQ does not have a quote yet. Please wait for the quote to be generated.' };
+      }
+
+      await firestore.collection('futureBookings').doc(rfqId).update({
+        rfq_status: 'accepted_converted',
+        status: 'pending_payment',
+        accepted_at: new Date().toISOString(),
+        accepted_via: 'whatsapp',
+      });
+
+      // Notify admin
+      await firestore.collection('notifications').add({
+        title: 'RFQ Quote Accepted',
+        body: `Customer accepted quote for RFQ ${data.rfq_no || rfqId}`,
+        type: 'rfq_accepted',
+        user_type: 'admin',
+        booking_id: rfqId,
+        read: false,
+        created_at: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      const price = data.quoted_price || (data.ai_quote ? data.ai_quote.grand_total : '0');
+      return {
+        success: true,
+        message: `Quote accepted! RFQ ${data.rfq_no || rfqId} (R${parseFloat(price).toFixed(2)}) is ready for payment. Reply "pay" to proceed with card or wallet payment.`,
+        rfqId,
+        price: `R${parseFloat(price).toFixed(2)}`,
+      };
+    }
+
+    // ═══════════════════════════════════════════
+    // 19) REJECT / NEGOTIATE RFQ QUOTE
+    // ═══════════════════════════════════════════
+    case 'reject_rfq_quote': {
+      if (!firestore) return { error: 'Database unavailable' };
+
+      const rfqId = args.rfqId || args.bookingId || session.lastRfqId;
+      if (!rfqId) return { error: 'Please provide the RFQ ID.' };
+
+      const doc = await firestore.collection('futureBookings').doc(rfqId).get();
+      if (!doc.exists) return { error: `RFQ "${rfqId}" not found.` };
+
+      const reason = args.reason || 'Customer wants to negotiate via WhatsApp';
+
+      await firestore.collection('futureBookings').doc(rfqId).update({
+        rfq_status: 'under_negotiation',
+        negotiation_reason: reason,
+        negotiation_at: new Date().toISOString(),
+        negotiation_via: 'whatsapp',
+      });
+
+      // Notify admin
+      await firestore.collection('notifications').add({
+        title: 'RFQ Quote Negotiation',
+        body: `Customer wants to negotiate RFQ ${doc.data().rfq_no || rfqId}. Reason: ${reason}`,
+        type: 'rfq_negotiation',
+        user_type: 'admin',
+        booking_id: rfqId,
+        read: false,
+        created_at: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      return {
+        success: true,
+        message: `We've noted your feedback on RFQ ${doc.data().rfq_no || rfqId}. Our admin team will review and adjust the quote. You'll receive an updated quote here on WhatsApp.`,
+      };
+    }
+
     default:
       return { error: `Unknown tool: ${name}` };
   }
@@ -1504,9 +1946,29 @@ YOUR FULL CAPABILITIES:
 - Request payment link for card payment
 - Apply promo/discount codes before booking
 
-📝 RFQ (Request for Quote):
+📝 RFQ (Request for Quote) — AI-POWERED QUOTING:
 - Submit RFQ for complex/large jobs that need a detailed quote first
-- Suggest RFQ when the job sounds complex (e.g. full bathroom renovation, roof replacement)
+- AI automatically generates a full cost breakdown: labour, materials BOM, equipment, contingency (15%), and grand total
+- Customer receives the quote instantly on WhatsApp with line-by-line materials pricing
+- Customer can ACCEPT the quote (proceeds to payment) or NEGOTIATE (admin reviews and adjusts)
+- Check status of existing RFQs
+- Suggest RFQ when the job sounds complex (e.g. full bathroom renovation, roof replacement, geyser installation)
+
+RFQ FLOW (CRITICAL — Follow this exactly):
+1. Customer describes a complex job or sends photos of the issue
+2. Collect: category, detailed description, address, name, materials responsibility (client or artisan)
+3. Call submit_rfq — this creates the RFQ AND generates an AI quote instantly
+4. The AI quote includes: labour hours × rate, materials BOM with markup (1.5×), equipment, and 15% contingency
+5. Present the full quote breakdown to the customer (it's included in the submit_rfq response)
+6. Ask if they want to ACCEPT or NEGOTIATE the quote
+7. If ACCEPT → call accept_rfq_quote → proceed to payment
+8. If NEGOTIATE → call reject_rfq_quote with their feedback → admin reviews
+9. Customer can check RFQ status anytime with check_rfq_status
+
+PHOTO ANALYSIS FOR RFQ:
+- When a customer sends photos, analyse them with vision to identify the issue
+- Use the photo analysis to build a detailed description for the RFQ
+- The AI quote generator uses the conversation context including your photo analysis
 
 ⭐ RATINGS & REVIEWS:
 - Rate completed jobs (1-5 stars with optional comment)

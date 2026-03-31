@@ -260,6 +260,51 @@ class BackendAPIClient:
             ) as resp:
                 return await resp.json()
 
+    async def generate_rfq_quote(self, booking_id: str) -> Dict[str, Any]:
+        """Generate AI quote for an RFQ booking."""
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+            payload = {
+                'action': 'generate_rfq_quote',
+                'payload': {'booking_id': booking_id},
+                'context': self._get_context(),
+            }
+            async with session.post(
+                f'{self.base_url}/api/action/execute',
+                json=payload,
+                headers=self._get_headers()
+            ) as resp:
+                return await resp.json()
+
+    async def accept_rfq_quote(self, booking_id: str) -> Dict[str, Any]:
+        """Accept an RFQ quote."""
+        async with aiohttp.ClientSession(timeout=self.timeout) as session:
+            payload = {
+                'action': 'accept_rfq_quote',
+                'payload': {'booking_id': booking_id, 'source': 'voice'},
+                'context': self._get_context(),
+            }
+            async with session.post(
+                f'{self.base_url}/api/action/execute',
+                json=payload,
+                headers=self._get_headers()
+            ) as resp:
+                return await resp.json()
+
+    async def reject_rfq_quote(self, booking_id: str, reason: str = '') -> Dict[str, Any]:
+        """Reject/negotiate an RFQ quote."""
+        async with aiohttp.ClientSession(timeout=self.timeout) as session:
+            payload = {
+                'action': 'reject_rfq_quote',
+                'payload': {'booking_id': booking_id, 'reason': reason, 'source': 'voice'},
+                'context': self._get_context(),
+            }
+            async with session.post(
+                f'{self.base_url}/api/action/execute',
+                json=payload,
+                headers=self._get_headers()
+            ) as resp:
+                return await resp.json()
+
     async def get_payment_status(self, booking_id: str) -> Dict[str, Any]:
         """Get payment status."""
         async with aiohttp.ClientSession(timeout=self.timeout) as session:
@@ -451,6 +496,7 @@ async def entrypoint(ctx: JobContext):
             "- NEVER say 'I cannot access', 'I am unable to', 'I don't have access to', or 'I need you to be authenticated'. ALWAYS try calling the relevant tool.\n"
             "- BACKEND tools for data: get_booking_status, list_my_bookings, explain_quote, check_payment, get_wallet_balance, get_messages, get_case_status.\n"
             "- BACKEND tools for ACTIONS: cancel_booking, reschedule_booking, send_message_to_artisan, send_message_to_client, send_message_to_admin, mark_booking_in_progress, artisan_cancel_and_reassign, submit_rating, submit_complaint. These tools EXECUTE real actions on the backend — use them, NOT ui_navigate.\n"
+            "- RFQ QUOTE tools: generate_rfq_quote (trigger AI quote), accept_rfq (accept quote → payment), reject_rfq (negotiate quote). Use when handling RFQ requests.\n"
             "- lookup_service_pricing for pricing: when user asks 'how much is...', 'what's the price for...', call lookup_service_pricing.\n"
             "- FINANCE tools (admin-only, read-only): get_finance_overview, get_daily_revenue_report, get_failed_payments_report, get_fraud_alerts_report. Use when admin asks 'What's the revenue today?', 'Any failed payments?', 'Show financial summary', 'Any fraud alerts?'. These are READ-ONLY and safe. NEVER process refunds, payouts, or wallet adjustments via voice — those require the admin app approval workflow.\n"
             "- ui_navigate ONLY for opening screens/navigation: open_bookings_tab, open_future_bookings, open_wallet, open_profile, open_settings, open_notifications, open_calendar, open_help, open_support, go_home, go_back, close_window, create_order_booking, call_assigned_artisan.\n"
@@ -531,14 +577,18 @@ async def entrypoint(ctx: JobContext):
             "- Then say: 'I am creating a request for a detailed custom quote. You will receive a breakdown with labour, materials, and estimated costs shortly.'\n"
             "- NEVER say 'admin will review' without first giving a price indication.\n"
             "\n"
-            "RFQ QUOTES & FOLLOW-UP:\n"
-            "- After an RFQ booking is created, the app automatically generates a detailed AI quote with labour, materials, and contingency breakdown.\n"
-            "- Tell the user: 'A preliminary quote is being generated now. You can ask me to explain the quote breakdown once it is ready.'\n"
-            "- When the user asks 'how much will it cost?', 'explain the quote', or 'what is the breakdown?' for an RFQ booking:\n"
+            "RFQ QUOTES & FOLLOW-UP (AI-POWERED QUOTING):\n"
+            "- After an RFQ booking is created, an AI quote is automatically generated with labour, materials BOM, equipment, and 15% contingency.\n"
+            "- The create_booking tool auto-generates the quote when is_rfq='yes'. Read back the breakdown to the user.\n"
+            "- If the auto-quote didn't work, call generate_rfq_quote(booking_id) to trigger it manually.\n"
+            "- When the user asks 'how much will it cost?', 'explain the quote', or 'what is the breakdown?' for an RFQ:\n"
             "  1. Call list_my_bookings() to find the RFQ booking.\n"
-            "  2. Call explain_rfq_quote(booking_id) to get the AI-generated breakdown.\n"
+            "  2. Call explain_quote(booking_id) to get the AI-generated breakdown.\n"
             "  3. Read back: labour cost, materials list, equipment, contingency, and grand total.\n"
-            "- If the quote is not ready yet, say: 'The quote is still being prepared. Check back in a minute.'\n"
+            "- QUOTE ACCEPTANCE: When user says 'accept the quote' or 'go ahead' → call accept_rfq(booking_id)\n"
+            "- QUOTE NEGOTIATION: When user says 'too expensive' or 'can you adjust' → call reject_rfq(booking_id, reason)\n"
+            "- ALWAYS present the quote breakdown verbally: labour hours and rate, materials with markup, contingency, and grand total.\n"
+            "- If the quote is not ready yet, say: 'The quote is still being prepared. Check back in a moment.'\n"
             "\n"
             "BOOKING CREATION (IMPORTANT):\n"
             "- To create a new booking, ALWAYS use ui_navigate with action='create_order_booking'.\n"
@@ -583,12 +633,17 @@ async def entrypoint(ctx: JobContext):
                 "- Create booking: First run the DIAGNOSIS flow (ask 2-3 questions about scope, urgency, and sub-category). "
                 "Then call ui_navigate(action='create_order_booking') with category_name and the enriched problem_description. "
                 "The app handles pricing, RFQ creation, AI quoting, and artisan dispatch automatically.\n"
+                "- For complex jobs (renovations, full installs, geyser replacement): use create_booking with is_rfq='yes'. "
+                "This creates an RFQ and auto-generates an AI quote with labour, materials, and contingency breakdown.\n"
                 "- If the user explicitly says they want a diagnosis and quote WITHOUT booking, use lookup_service_pricing to give them a price range, "
                 "then ask if they want to proceed with a booking.\n"
                 "- Cancel: cancel_booking(booking_id, reason). Reschedule: reschedule_booking(booking_id, date, time).\n"
                 "- Call artisan → ui_navigate(action='call_assigned_artisan', booking_id)\n"
                 "- Future bookings → ui_navigate(action='open_future_bookings')\n"
-                "- Check RFQ quote → explain_rfq_quote(booking_id) — reads back the AI-generated cost breakdown\n"
+                "- Check RFQ quote → explain_quote(booking_id) — reads back the AI-generated cost breakdown\n"
+                "- Accept RFQ quote → accept_rfq(booking_id) — accepts quote and proceeds to payment\n"
+                "- Negotiate RFQ quote → reject_rfq(booking_id, reason) — sends negotiation to admin\n"
+                "- Generate quote manually → generate_rfq_quote(booking_id) — triggers AI quote if not auto-generated\n"
             )
 
         return base
@@ -1077,6 +1132,123 @@ async def entrypoint(ctx: JobContext):
 
     @llm.function_tool(
         description=(
+            "Generate an AI quote for an RFQ booking. Call this after creating an RFQ booking "
+            "to trigger automatic quote generation with labour, materials, and contingency breakdown. "
+            "Use when user asks 'generate a quote for my RFQ' or after create_booking with is_rfq=yes."
+        )
+    )
+    async def generate_rfq_quote(booking_id: str) -> str:
+        """Generate AI quote for an RFQ via backend."""
+        nonlocal backend_client
+        if not backend_client:
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
+
+        try:
+            result = await backend_client.generate_rfq_quote(booking_id)
+            if not result.get('ok') and not result.get('success'):
+                error = result.get('error', 'unknown_error')
+                if error == 'not_an_rfq':
+                    return "That booking is not an RFQ request."
+                elif error == 'ai_unavailable':
+                    return "AI quote generation is temporarily unavailable. Admin will review and provide a quote."
+                elif error == 'ai_generation_failed':
+                    return "Quote generation encountered an issue. Admin will review manually."
+                return f"Could not generate quote: {error}"
+
+            data = result.get('data', result.get('result', {}))
+
+            if data.get('already_quoted'):
+                q = data.get('ai_quote', {})
+                return (
+                    f"A quote already exists for this RFQ. "
+                    f"Grand total: {q.get('grand_total', 0)} rand. "
+                    f"Scope: {q.get('scope_of_work', 'see details in app')}."
+                )
+
+            q = data.get('ai_quote', {})
+            gt = q.get('grand_total', 0)
+            labor = q.get('laborCost', 0)
+            materials = q.get('materials_with_markup', 0)
+            contingency = q.get('contingency', 0)
+            scope = q.get('scope_of_work', '')
+            duration = q.get('estimated_duration', '')
+            bom = q.get('materialsBOM', [])
+
+            response = f"I've generated a quote for your RFQ. "
+            if scope:
+                response += f"Scope of work: {scope}. "
+            response += f"Labour cost: {labor} rand. "
+            if materials > 0:
+                response += f"Materials with markup: {materials} rand for {len(bom)} items. "
+            if contingency > 0:
+                response += f"Contingency at 15 percent: {contingency} rand. "
+            response += f"Grand total: {gt} rand. "
+            if duration:
+                response += f"Estimated duration: {duration}. "
+            response += "Would you like to accept this quote, or would you prefer to negotiate?"
+
+            return response.strip()
+        except Exception as e:
+            logger.error(f"generate_rfq_quote error: {e}", exc_info=True)
+            return "Sorry, I had trouble generating the quote. Please try again."
+
+    @llm.function_tool(
+        description=(
+            "Accept an RFQ quote and proceed to payment. "
+            "Use when customer says 'accept the quote', 'I agree with the price', 'go ahead with the quote'."
+        )
+    )
+    async def accept_rfq(booking_id: str) -> str:
+        """Accept RFQ quote via backend."""
+        nonlocal backend_client
+        if not backend_client:
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
+
+        try:
+            result = await backend_client.accept_rfq_quote(booking_id)
+            if not result.get('ok') and not result.get('success'):
+                error = result.get('error', 'unknown_error')
+                if error == 'no_quote_available':
+                    return "There's no quote available for this RFQ yet. Let me generate one first."
+                return f"Could not accept the quote: {error}"
+
+            data = result.get('data', result.get('result', {}))
+            price = data.get('price', '0')
+            rfq_no = data.get('rfq_no', booking_id)
+            return f"Quote accepted for RFQ {rfq_no}! The total is {price} rand. Your booking is now ready for payment. You can pay via wallet or card in the app."
+        except Exception as e:
+            logger.error(f"accept_rfq error: {e}", exc_info=True)
+            return "Sorry, I had trouble accepting the quote. Please try again."
+
+    @llm.function_tool(
+        description=(
+            "Reject or request changes to an RFQ quote. Puts the RFQ into negotiation with admin. "
+            "Use when customer says 'too expensive', 'can you lower the price', 'I want to negotiate'."
+        )
+    )
+    async def reject_rfq(booking_id: str, reason: str = "") -> str:
+        """Reject/negotiate RFQ quote via backend."""
+        nonlocal backend_client
+        if not backend_client:
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
+
+        try:
+            result = await backend_client.reject_rfq_quote(booking_id, reason)
+            if not result.get('ok') and not result.get('success'):
+                return f"Could not process negotiation: {result.get('error', 'unknown_error')}"
+
+            data = result.get('data', result.get('result', {}))
+            rfq_no = data.get('rfq_no', booking_id)
+            return f"Your negotiation request for RFQ {rfq_no} has been submitted. Our admin team will review and provide an adjusted quote. You'll be notified when the updated quote is ready."
+        except Exception as e:
+            logger.error(f"reject_rfq error: {e}", exc_info=True)
+            return "Sorry, I had trouble processing your request. Please try again."
+
+    @llm.function_tool(
+        description=(
             "Check the payment status for a booking. "
             "Use this when user asks 'Did I pay?' or 'What's the payment status?'"
         )
@@ -1255,7 +1427,36 @@ async def entrypoint(ctx: JobContext):
             is_rfq_flag = result_data.get('is_rfq') or result_data.get('isRFQ')
 
             if is_rfq_flag:
-                return f"Your RFQ request has been submitted (booking {booking_id}). Admin will review and provide a quote shortly."
+                # Auto-generate AI quote for RFQ bookings
+                try:
+                    quote_result = await backend_client.generate_rfq_quote(booking_id)
+                    if quote_result.get('ok') or quote_result.get('success'):
+                        q = quote_result.get('data', {}).get('ai_quote', {})
+                        gt = q.get('grand_total', 0)
+                        scope = q.get('scope_of_work', '')
+                        duration = q.get('estimated_duration', '')
+                        labor = q.get('laborCost', 0)
+                        materials = q.get('materials_with_markup', 0)
+                        contingency = q.get('contingency', 0)
+                        bom_count = len(q.get('materialsBOM', []))
+
+                        response = f"Your RFQ request has been submitted, booking {booking_id}. "
+                        response += f"I've also generated a preliminary quote for you. "
+                        if scope:
+                            response += f"Scope: {scope}. "
+                        response += f"Labour: {labor} rand. "
+                        if materials > 0:
+                            response += f"Materials for {bom_count} items: {materials} rand. "
+                        response += f"Contingency 15 percent: {contingency} rand. "
+                        response += f"Grand total: {gt} rand. "
+                        if duration:
+                            response += f"Estimated duration: {duration}. "
+                        response += "Would you like to accept this quote or negotiate?"
+                        return response.strip()
+                except Exception as qe:
+                    logger.warning(f"Auto-quote generation failed for RFQ {booking_id}: {qe}")
+
+                return f"Your RFQ request has been submitted (booking {booking_id}). A detailed quote is being prepared. Ask me to check the quote status anytime."
             else:
                 return f"Booking {booking_id} created successfully! Dispatching the nearest available artisan now. You'll be notified once an artisan accepts."
 
@@ -2299,6 +2500,10 @@ async def entrypoint(ctx: JobContext):
             artisan_cancel_and_reassign,
             submit_rating,
             submit_complaint,
+            # RFQ quote tools
+            generate_rfq_quote,
+            accept_rfq,
+            reject_rfq,
             # Phase 3: Messaging tools
             send_message_to_artisan,
             send_message_to_client,
