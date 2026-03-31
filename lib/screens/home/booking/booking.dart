@@ -1819,7 +1819,7 @@ class _BalancePaymentSheet extends StatelessWidget {
                 ),
                 onPressed: () async {
                   appController.isPaymentUsingPayFast.value = false;
-                  appController.isPaymentUsingPayFlex.value = false;
+                  appController.isPaymentUsingBnpl.value = false;
                   appController.activePaymentMethod.value = 'wallet';
                   EasyLoading.show(status: 'Processing balance payment...');
                   try {
@@ -1873,7 +1873,7 @@ class _BalancePaymentSheet extends StatelessWidget {
                 ),
                 onPressed: () async {
                   appController.isPaymentUsingPayFast.value = true;
-                  appController.isPaymentUsingPayFlex.value = false;
+                  appController.isPaymentUsingBnpl.value = false;
                   appController.activePaymentMethod.value = 'payFast';
                   EasyLoading.show(status: 'Please Wait...!');
                   try {

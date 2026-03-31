@@ -501,7 +501,9 @@ class _FutureBookingsListScreenState extends State<FutureBookingsListScreen> {
       return bDt.compareTo(aDt);
     });
 
-    return ListView.builder(
+    return Container(
+      color: Colors.white,
+      child: ListView.builder(
       physics: const BouncingScrollPhysics(),
       itemCount: docs.length,
       padding: const EdgeInsets.all(10),
@@ -1456,7 +1458,8 @@ class _FutureBookingsListScreenState extends State<FutureBookingsListScreen> {
           ), // Closes Container
         ); // Closes GestureDetector
       },
-    );
+    ),
+    ); // Closes Container
   }
 
   Future<void> _payToConfirmFutureBooking({
@@ -2112,7 +2115,7 @@ class _FutureBookingsListScreenState extends State<FutureBookingsListScreen> {
                   reason: 'cancelled_by_customer',
                 );
 
-                // Handle card payment refunds (PayFast/PayFlex)
+                // Handle card payment refunds (PayFast/BNPL)
                 try {
                   final refundResult = await RefundService.refundFutureBooking(
                     bookingId: booking.id ?? '',

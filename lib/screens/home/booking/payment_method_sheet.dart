@@ -6,8 +6,8 @@ import 'package:google_fonts/google_fonts.dart';
 import 'package:maintenanceapp/controller/app_controller.dart';
 import 'package:maintenanceapp/model/task_management_model.dart';
 import 'package:maintenanceapp/screens/home/payment_method_view.dart';
-import 'package:maintenanceapp/screens/home/payflex_checkout_view.dart';
-import 'package:maintenanceapp/services/payflex_service.dart';
+import 'package:maintenanceapp/screens/home/bnpl_checkout_view.dart';
+import 'package:maintenanceapp/services/bnpl_service.dart';
 import 'package:maintenanceapp/services/deposit_service.dart';
 import 'package:maintenanceapp/services/promo_code_service.dart';
 import 'package:maintenanceapp/utils/primary_button.dart';
@@ -26,8 +26,8 @@ class ModelBottomSheet extends StatefulWidget {
 
 class _ModelBottomSheetState extends State<ModelBottomSheet> {
   final AppController appController = Get.find();
-  bool _payflexAvailable = false;
-  bool _checkingPayflex = true;
+  List<BnplProvider> _availableBnpl = [];
+  bool _checkingBnpl = true;
   bool _isDepositTask = false;
   double _depositAmount = 0;
   double _balanceAmount = 0;
@@ -41,7 +41,7 @@ class _ModelBottomSheetState extends State<ModelBottomSheet> {
   @override
   void initState() {
     super.initState();
-    _checkPayFlexEligibility();
+    _checkBnplEligibility();
     _checkDepositStatus();
   }
 
@@ -106,19 +106,15 @@ class _ModelBottomSheetState extends State<ModelBottomSheet> {
     } catch (_) {}
   }
 
-  Future<void> _checkPayFlexEligibility() async {
+  Future<void> _checkBnplEligibility() async {
     final cost = double.tryParse(widget.record.cost?.toString() ?? '0') ?? 0;
-    if (PayFlexService.isEligible(cost)) {
-      final config = await PayFlexService.getConfig();
-      if (config != null && mounted) {
-        setState(() {
-          _payflexAvailable = true;
-          _checkingPayflex = false;
-        });
-        return;
-      }
+    final providers = await BnplService.getAvailableProviders(cost);
+    if (mounted) {
+      setState(() {
+        _availableBnpl = providers;
+        _checkingBnpl = false;
+      });
     }
-    if (mounted) setState(() => _checkingPayflex = false);
   }
 
   @override
@@ -252,7 +248,7 @@ class _ModelBottomSheetState extends State<ModelBottomSheet> {
                 if (_paymentProcessing) return;
                 setState(() => _paymentProcessing = true);
                 appController.isPaymentUsingPayFast.value = false;
-                appController.isPaymentUsingPayFlex.value = false;
+                appController.isPaymentUsingBnpl.value = false;
                 appController.activePaymentMethod.value = 'wallet';
                 EasyLoading.dismiss();
                 EasyLoading.show(status: 'Please Wait...!');
@@ -327,7 +323,7 @@ class _ModelBottomSheetState extends State<ModelBottomSheet> {
                       duration: const Duration(seconds: 4),
                       snackPosition: SnackPosition.TOP,
                       title: 'Insufficient Wallet Balance',
-                      message: 'Your balance is R${bal?.toStringAsFixed(2) ?? "0.00"} but R${discountedCost.toStringAsFixed(2)} is required. Please top up your wallet or use PayFast/PayFlex instead.',
+                      message: 'Your balance is R${bal?.toStringAsFixed(2) ?? "0.00"} but R${discountedCost.toStringAsFixed(2)} is required. Please top up your wallet or use PayFast or Buy Now Pay Later instead.',
                     ));
                     EasyLoading.dismiss();
                     if (Navigator.of(context).canPop()) {
@@ -347,7 +343,7 @@ class _ModelBottomSheetState extends State<ModelBottomSheet> {
             PrimaryButton(
               onPressed: () async {
                 appController.isPaymentUsingPayFast.value = true;
-                appController.isPaymentUsingPayFlex.value = false;
+                appController.isPaymentUsingBnpl.value = false;
                 appController.activePaymentMethod.value = 'payFast';
                 EasyLoading.show(status: 'Please Wait...!');
                 try {
@@ -387,118 +383,130 @@ class _ModelBottomSheetState extends State<ModelBottomSheet> {
                   : 'Pay Via PayFast (credit or debit card)',
             ),
 
-            // --- PayFlex Buy-Now-Pay-Later ---
-            if (_payflexAvailable) ...[
+            // --- Buy-Now-Pay-Later Options ---
+            if (_availableBnpl.isNotEmpty) ...[
               const SizedBox(height: 20),
-              Container(
-                decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(12),
-                  gradient: LinearGradient(
-                    colors: [Colors.blue.shade50, Colors.blue.shade100],
-                  ),
-                  border: Border.all(color: Colors.blue.shade300),
-                ),
-                child: Material(
-                  color: Colors.transparent,
-                  borderRadius: BorderRadius.circular(12),
-                  child: InkWell(
-                    borderRadius: BorderRadius.circular(12),
-                    onTap: () => _initiatePayFlex(),
-                    child: Padding(
-                      padding: const EdgeInsets.all(16),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Row(
+              Text('Buy Now, Pay Later',
+                  style: GoogleFonts.lato(
+                      fontWeight: FontWeight.w700, fontSize: 14)),
+              const SizedBox(height: 8),
+              ..._availableBnpl.map((provider) {
+                final info = BnplService.providerInfo[provider]!;
+                final perInstalment = fullCost / info.instalments;
+                return Padding(
+                  padding: const EdgeInsets.only(bottom: 10),
+                  child: Container(
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(12),
+                      gradient: LinearGradient(
+                        colors: [Colors.blue.shade50, Colors.blue.shade100],
+                      ),
+                      border: Border.all(color: Colors.blue.shade300),
+                    ),
+                    child: Material(
+                      color: Colors.transparent,
+                      borderRadius: BorderRadius.circular(12),
+                      child: InkWell(
+                        borderRadius: BorderRadius.circular(12),
+                        onTap: () => _initiateBnpl(provider),
+                        child: Padding(
+                          padding: const EdgeInsets.all(16),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
-                              Icon(Icons.credit_score,
-                                  color: Colors.blue.shade700, size: 24),
-                              const SizedBox(width: 10),
-                              Expanded(
-                                child: Text(
-                                  'Pay with PayFlex',
-                                  style: GoogleFonts.lato(
-                                    fontSize: 15,
-                                    fontWeight: FontWeight.w700,
-                                    color: Colors.blue.shade800,
+                              Row(
+                                children: [
+                                  Icon(Icons.credit_score,
+                                      color: Colors.blue.shade700, size: 24),
+                                  const SizedBox(width: 10),
+                                  Expanded(
+                                    child: Text(
+                                      'Pay with ${info.name}',
+                                      style: GoogleFonts.lato(
+                                        fontSize: 15,
+                                        fontWeight: FontWeight.w700,
+                                        color: Colors.blue.shade800,
+                                      ),
+                                    ),
                                   ),
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(
+                                        horizontal: 8, vertical: 3),
+                                    decoration: BoxDecoration(
+                                      color: Colors.green.shade100,
+                                      borderRadius: BorderRadius.circular(12),
+                                    ),
+                                    child: Text('0% Interest',
+                                        style: GoogleFonts.lato(
+                                          fontSize: 10,
+                                          fontWeight: FontWeight.w700,
+                                          color: Colors.green.shade800,
+                                        )),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 10),
+                              Text(
+                                '${info.tagline} of R${perInstalment.toStringAsFixed(2)}',
+                                style: GoogleFonts.lato(
+                                  fontSize: 13,
+                                  color: Colors.blue.shade700,
                                 ),
                               ),
-                              Container(
-                                padding: const EdgeInsets.symmetric(
-                                    horizontal: 8, vertical: 3),
-                                decoration: BoxDecoration(
-                                  color: Colors.green.shade100,
-                                  borderRadius: BorderRadius.circular(12),
-                                ),
-                                child: Text('0% Interest',
-                                    style: GoogleFonts.lato(
-                                      fontSize: 10,
-                                      fontWeight: FontWeight.w700,
-                                      color: Colors.green.shade800,
-                                    )),
+                              const SizedBox(height: 8),
+                              Row(
+                                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                children: List.generate(info.instalments > 4 ? 4 : info.instalments, (i) {
+                                  final labels = info.instalments == 3
+                                      ? ['Today', '2 weeks', '4 weeks']
+                                      : ['Today', '1 month', '2 months', '3 months'];
+                                  return Column(
+                                    children: [
+                                      Container(
+                                        width: 28,
+                                        height: 28,
+                                        decoration: BoxDecoration(
+                                          shape: BoxShape.circle,
+                                          color: i == 0
+                                              ? Colors.blue.shade600
+                                              : Colors.blue.shade200,
+                                        ),
+                                        child: Center(
+                                          child: Text('${i + 1}',
+                                              style: GoogleFonts.lato(
+                                                fontSize: 12,
+                                                fontWeight: FontWeight.bold,
+                                                color: i == 0
+                                                    ? Colors.white
+                                                    : Colors.blue.shade800,
+                                              )),
+                                        ),
+                                      ),
+                                      const SizedBox(height: 4),
+                                      Text(i < labels.length ? labels[i] : '',
+                                          style: GoogleFonts.lato(
+                                            fontSize: 9,
+                                            color: Colors.blue.shade600,
+                                          )),
+                                      Text('R${perInstalment.toStringAsFixed(0)}',
+                                          style: GoogleFonts.lato(
+                                            fontSize: 10,
+                                            fontWeight: FontWeight.w600,
+                                            color: Colors.blue.shade800,
+                                          )),
+                                    ],
+                                  );
+                                }),
                               ),
                             ],
                           ),
-                          const SizedBox(height: 10),
-                          Text(
-                            'Pay in 4 interest-free instalments of R${instalment.toStringAsFixed(2)}',
-                            style: GoogleFonts.lato(
-                              fontSize: 13,
-                              color: Colors.blue.shade700,
-                            ),
-                          ),
-                          const SizedBox(height: 8),
-                          // Instalment timeline
-                          Row(
-                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                            children: List.generate(4, (i) {
-                              final labels = ['Today', '2 weeks', '4 weeks', '6 weeks'];
-                              return Column(
-                                children: [
-                                  Container(
-                                    width: 28,
-                                    height: 28,
-                                    decoration: BoxDecoration(
-                                      shape: BoxShape.circle,
-                                      color: i == 0
-                                          ? Colors.blue.shade600
-                                          : Colors.blue.shade200,
-                                    ),
-                                    child: Center(
-                                      child: Text('${i + 1}',
-                                          style: GoogleFonts.lato(
-                                            fontSize: 12,
-                                            fontWeight: FontWeight.bold,
-                                            color: i == 0
-                                                ? Colors.white
-                                                : Colors.blue.shade800,
-                                          )),
-                                    ),
-                                  ),
-                                  const SizedBox(height: 4),
-                                  Text(labels[i],
-                                      style: GoogleFonts.lato(
-                                        fontSize: 9,
-                                        color: Colors.blue.shade600,
-                                      )),
-                                  Text('R${instalment.toStringAsFixed(0)}',
-                                      style: GoogleFonts.lato(
-                                        fontSize: 10,
-                                        fontWeight: FontWeight.w600,
-                                        color: Colors.blue.shade800,
-                                      )),
-                                ],
-                              );
-                            }),
-                          ),
-                        ],
+                        ),
                       ),
                     ),
                   ),
-                ),
-              ),
-            ] else if (_checkingPayflex) ...[
+                );
+              }),
+            ] else if (_checkingBnpl) ...[
               const SizedBox(height: 20),
               Center(
                 child: SizedBox(
@@ -519,8 +527,9 @@ class _ModelBottomSheetState extends State<ModelBottomSheet> {
     );
   }
 
-  Future<void> _initiatePayFlex() async {
-    EasyLoading.show(status: 'Setting up PayFlex...');
+  Future<void> _initiateBnpl(BnplProvider provider) async {
+    final info = BnplService.providerInfo[provider]!;
+    EasyLoading.show(status: 'Setting up ${info.name}...');
 
     try {
       final cost = widget.record.cost;
@@ -540,7 +549,6 @@ class _ModelBottomSheetState extends State<ModelBottomSheet> {
 
       await appController.getUser(id: appController.userId.value);
 
-      // Parse user name into first/last
       final fullName = appController.userName.value.trim();
       final nameParts = fullName.split(' ');
       final firstName = nameParts.isNotEmpty ? nameParts.first : 'Customer';
@@ -549,7 +557,8 @@ class _ModelBottomSheetState extends State<ModelBottomSheet> {
 
       final orderId = 'SQ15-${const Uuid().v4().substring(0, 8).toUpperCase()}';
 
-      final result = await PayFlexService.createOrder(
+      final result = await BnplService.createOrder(
+        provider: provider,
         amount: amount,
         orderId: orderId,
         consumerEmail: appController.userEmail.value.isNotEmpty
@@ -569,31 +578,30 @@ class _ModelBottomSheetState extends State<ModelBottomSheet> {
           backgroundColor: Colors.red.shade800,
           duration: const Duration(seconds: 4),
           snackPosition: SnackPosition.TOP,
-          title: 'PayFlex Unavailable',
+          title: '${info.name} Unavailable',
           message:
-              'Could not connect to PayFlex. Please try another payment method.',
+              'Could not connect to ${info.name}. Please try another payment method.',
         ));
         return;
       }
 
-      // Set payment method flags
       appController.isPaymentUsingPayFast.value = false;
-      appController.isPaymentUsingPayFlex.value = true;
-      appController.activePaymentMethod.value = 'payFlex';
+      appController.isPaymentUsingBnpl.value = true;
+      appController.activePaymentMethod.value = 'bnpl';
 
-      // Navigate to PayFlex checkout WebView
       Get.to(
-        () => PayFlexCheckoutView(
+        () => BnplCheckoutView(
           checkoutUrl: result.redirectUrl,
-          payflexToken: result.token,
+          bnplToken: result.token,
           orderId: result.orderId,
+          provider: provider,
           taskManagementModel: widget.record,
         ),
         transition: Transition.fadeIn,
       );
     } catch (e) {
       EasyLoading.dismiss();
-      debugPrint('[PayFlex] initiate error: $e');
+      debugPrint('[BNPL] initiate error: $e');
       Get.showSnackbar(GetSnackBar(
         backgroundColor: Colors.red.shade800,
         duration: const Duration(seconds: 3),
