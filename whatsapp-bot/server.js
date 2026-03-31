@@ -13,6 +13,16 @@
 
 'use strict';
 
+// ─── Prompt sanitization (prevent injection via user-supplied text) ───
+function sanitizeForPrompt(text, maxLen = 500) {
+  if (!text || typeof text !== 'string') return '';
+  return text
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '') // strip control chars
+    .replace(/\r\n|\r/g, '\n')                       // normalise line endings
+    .slice(0, maxLen)
+    .trim();
+}
+
 require('dotenv').config();
 const express = require('express');
 const helmet  = require('helmet');
@@ -758,6 +768,12 @@ async function getLearningFactor(firestore, category) {
 // ─── AI Quote Generation for RFQ (with Builders.co.za real-time pricing) ───
 
 async function generateAIQuote(category, description, materialsResponsibility, additionalContext) {
+  // Sanitize user-provided inputs before injecting into AI prompts
+  category = sanitizeForPrompt(category, 100);
+  description = sanitizeForPrompt(description, 1000);
+  materialsResponsibility = sanitizeForPrompt(materialsResponsibility, 50);
+  additionalContext = sanitizeForPrompt(additionalContext, 500);
+
   const firestore = db();
 
   // 1. Look up pricing guidance from Firestore

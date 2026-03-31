@@ -1625,7 +1625,7 @@ async def entrypoint(ctx: JobContext):
             # Format messages for readability
             msg_list = []
             for msg in messages[-5:]:  # Last 5 messages
-                sender = "You" if msg.get('sender_id') == backend_client.firebase_token else "Artisan"
+                sender = "You" if msg.get('sender_id') == app_context_user_id else "Artisan"
                 text = msg.get('message', '')
                 msg_list.append(f"{sender}: {text}")
 

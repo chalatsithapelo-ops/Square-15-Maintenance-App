@@ -8,6 +8,16 @@ const fs = require('fs');
 const OpenAI = require('openai');
 require('dotenv').config();
 
+// ─── Prompt sanitization (prevent injection via user-supplied text) ───
+function sanitizeForPrompt(text, maxLen = 500) {
+  if (!text || typeof text !== 'string') return '';
+  return text
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '') // strip control chars
+    .replace(/\r\n|\r/g, '\n')                       // normalise line endings
+    .slice(0, maxLen)
+    .trim();
+}
+
 // ─── OpenAI (for AI RFQ quote generation) ───
 let _openai = null;
 function getOpenAI() {
@@ -691,8 +701,8 @@ async function resolveRole({ firestore, uid, decodedToken }) {
       if (data.isServiceProvider === true) return 'artisan';
       if (data.isUser === true) return 'client';
     }
-  } catch (_) {
-    // ignore
+  } catch (e) {
+    console.warn(`⚠️ Role lookup (users doc) failed for ${uid}:`, e.message);
   }
 
   // Fallback: check the serviceProvider collection — artisan profiles live
@@ -705,8 +715,8 @@ async function resolveRole({ firestore, uid, decodedToken }) {
       const q = await firestore.collection('serviceProvider').where(field, '==', uid).limit(1).get();
       if (!q.empty) return 'artisan';
     }
-  } catch (_) {
-    // ignore
+  } catch (e) {
+    console.warn(`⚠️ Role lookup (serviceProvider) failed for ${uid}:`, e.message);
   }
 
   return 'client';
@@ -1001,7 +1011,8 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
           dailyCounters: { [prefix]: { [dateKey]: seq } }
         }, { merge: true });
       });
-    } catch (_) {
+    } catch (e) {
+      console.warn(`⚠️ Counter increment failed for ${prefix}/${dateKey}: ${e.message}; using timestamp fallback`);
       seq = Date.now() % 1000 + 1;
     }
     return seq;
@@ -3367,10 +3378,10 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     const oai = getOpenAI();
     if (!oai) return { ok: false, status: 500, error: 'ai_unavailable' };
 
-    const category = String(data.category_name || '').trim();
+    const category = sanitizeForPrompt(String(data.category_name || ''), 100);
     const categoryId = String(data.category_id || '').trim();
-    const description = String(data.problem_description || data.description || '').trim();
-    const materialsResp = String(data.materials_responsibility || 'artisan').trim();
+    const description = sanitizeForPrompt(String(data.problem_description || data.description || ''), 1000);
+    const materialsResp = sanitizeForPrompt(String(data.materials_responsibility || 'artisan'), 50);
 
     // Look up pricing guidance
     let laborRate = 150;
@@ -6493,45 +6504,51 @@ app.post('/api/finance/approve', adminLimiter, async (req, res) => {
 
   try {
     if (finReq.type === 'refund' || finReq.type === 'wallet_adjustment') {
-      // Credit the user's wallet balance
+      // Credit/debit the user's wallet balance (atomic transaction to prevent race conditions)
       const userRef = firestore.collection('users').doc(targetUserId);
-      const userSnap = await userRef.get();
-      if (!userSnap.exists) throw new Error('Target user not found');
-
-      const userData = userSnap.data() || {};
-      const currentBalance = Number.parseFloat(String(userData.balance || '0').replace(/[^0-9.\-]/g, '')) || 0;
       const direction = finReq.type === 'refund' ? 'credit' : (amount >= 0 ? 'credit' : 'debit');
-      const newBalance = direction === 'credit' ? currentBalance + Math.abs(amount) : currentBalance - Math.abs(amount);
-
-      if (newBalance < 0 && direction === 'debit') {
-        throw new Error(`Insufficient balance: current R${currentBalance.toFixed(2)}, requested debit R${Math.abs(amount).toFixed(2)}`);
-      }
-
-      await userRef.update({ balance: newBalance.toFixed(2) });
-
-      // Write transaction log
       const txId = randomId('tx-');
-      await firestore.collection('transactionLogs').doc(txId).set({
-        id: txId,
-        transaction_type: finReq.type,
-        amount: amount.toFixed(2),
-        direction: direction === 'credit' ? 'in' : 'out',
-        status: 'success',
-        user_id: targetUserId,
-        booking_id: finReq.booking_id || null,
-        finance_request_id: requestId,
-        previous_balance: currentBalance.toFixed(2),
-        new_balance: newBalance.toFixed(2),
-        reason: finReq.reason,
-        executed_by: decoded.uid,
-        approved_by: approvals.map(a => a.uid),
-        transaction_at: now,
-        created_at: now,
+
+      const { previousBalance, newBalance } = await firestore.runTransaction(async (tx) => {
+        const userSnap = await tx.get(userRef);
+        if (!userSnap.exists) throw new Error('Target user not found');
+
+        const userData = userSnap.data() || {};
+        const currentBalance = Number.parseFloat(String(userData.balance || '0').replace(/[^0-9.\-]/g, '')) || 0;
+        const updatedBalance = direction === 'credit' ? currentBalance + Math.abs(amount) : currentBalance - Math.abs(amount);
+
+        if (updatedBalance < 0 && direction === 'debit') {
+          throw new Error(`Insufficient balance: current R${currentBalance.toFixed(2)}, requested debit R${Math.abs(amount).toFixed(2)}`);
+        }
+
+        tx.update(userRef, { balance: updatedBalance.toFixed(2) });
+
+        // Write transaction log inside the same transaction
+        const txRef = firestore.collection('transactionLogs').doc(txId);
+        tx.set(txRef, {
+          id: txId,
+          transaction_type: finReq.type,
+          amount: amount.toFixed(2),
+          direction: direction === 'credit' ? 'in' : 'out',
+          status: 'success',
+          user_id: targetUserId,
+          booking_id: finReq.booking_id || null,
+          finance_request_id: requestId,
+          previous_balance: currentBalance.toFixed(2),
+          new_balance: updatedBalance.toFixed(2),
+          reason: finReq.reason,
+          executed_by: decoded.uid,
+          approved_by: approvals.map(a => a.uid),
+          transaction_at: now,
+          created_at: now,
+        });
+
+        return { previousBalance: currentBalance, newBalance: updatedBalance };
       });
 
       executionResult = {
         type: finReq.type, amount: amount.toFixed(2),
-        previous_balance: currentBalance.toFixed(2),
+        previous_balance: previousBalance.toFixed(2),
         new_balance: newBalance.toFixed(2),
         transaction_id: txId,
       };
