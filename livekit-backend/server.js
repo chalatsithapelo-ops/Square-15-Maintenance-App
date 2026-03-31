@@ -593,6 +593,19 @@ async function verifyFirebaseAuth(req, res) {
   }
 }
 
+// Express middleware wrapper — verifyFirebaseAuth returns a value but never
+// calls next(), so using it directly as middleware hangs the request.
+function authMiddleware(req, res, next) {
+  verifyFirebaseAuth(req, res).then(decoded => {
+    if (!decoded) return; // response already sent by verifyFirebaseAuth
+    req.user = decoded;
+    next();
+  }).catch(err => {
+    console.error('❌ Auth middleware error:', err);
+    if (!res.headersSent) res.status(500).json({ error: 'Internal auth error' });
+  });
+}
+
 async function verifyFirebaseAppCheck(req, res, { required = false } = {}) {
   initFirebaseIfPossible();
   if (firebaseInitError) {
@@ -4073,11 +4086,11 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       });
 
       // Notify admin
-      await writeAdminNotification(
-        'New complaint',
-        `Complaint from user: ${subject}`,
-        { complaint_id: complaintId, user_id: actorUid }
-      );
+      await writeAdminNotification({
+        title: 'New complaint',
+        message: `Complaint from user: ${subject}`,
+        data: { complaint_id: complaintId, user_id: actorUid },
+      });
 
       return { ok: true, status: 200, data: { complaint_id: complaintId, status: 'open' } };
     } catch (e) {
@@ -5785,7 +5798,7 @@ app.post('/api/admin/fix/service-provider-uid-mapping', async (req, res) => {
 
 // ── Server-side FCM Notification Endpoint ──
 // Replaces client-side admin SDK usage — clients call this instead of loading firebase-adminsdk.json
-app.post('/api/notifications/send', verifyFirebaseAuth, assistantLimiter, async (req, res) => {
+app.post('/api/notifications/send', authMiddleware, assistantLimiter, async (req, res) => {
   try {
     initFirebaseIfPossible();
     if (firebaseInitError) {
@@ -5852,7 +5865,7 @@ app.post('/api/notifications/send', verifyFirebaseAuth, assistantLimiter, async 
 
 // ── Server-side PayFast Payment Initiation ──
 // Replaces client-side hardcoded merchant credentials
-app.post('/api/payment/initiate', verifyFirebaseAuth, assistantLimiter, async (req, res) => {
+app.post('/api/payment/initiate', authMiddleware, assistantLimiter, async (req, res) => {
   try {
     const merchantId = env('PAYFAST_MERCHANT_ID');
     const merchantKey = env('PAYFAST_MERCHANT_KEY');
@@ -5917,9 +5930,10 @@ app.post('/api/payment/itn', async (req, res) => {
       .map(key => `${key}=${encodeURIComponent(String(data[key] || '')).replace(/%20/g, '+')}`)
       .join('&');
 
+    const passphrase = env('PAYFAST_PASSPHRASE') || merchantKey;
     const expectedSignature = crypto
       .createHash('md5')
-      .update(paramString + `&passphrase=${encodeURIComponent(merchantKey)}`)
+      .update(paramString + `&passphrase=${encodeURIComponent(passphrase)}`)
       .digest('hex');
 
     if (receivedSignature !== expectedSignature) {
@@ -5941,7 +5955,7 @@ app.post('/api/payment/itn', async (req, res) => {
 
     if (customStr1) {
       // Update tasksManagement if we have a task ID
-      const taskRef = db.collection('tasksManagement').doc(customStr1);
+      const taskRef = admin.firestore().collection('tasksManagement').doc(customStr1);
       const taskSnap = await taskRef.get();
 
       if (taskSnap.exists) {
@@ -5969,7 +5983,7 @@ app.post('/api/payment/itn', async (req, res) => {
       }
 
       // Create/update transaction log
-      const txRef = db.collection('transactionLogs');
+      const txRef = admin.firestore().collection('transactionLogs');
       const existingTx = await txRef
         .where('payfast_payment_id', '==', pfPaymentId)
         .limit(1)
@@ -6022,7 +6036,7 @@ app.post('/api/payment/itn', async (req, res) => {
  * POST /api/token
  * Body: { roomName: string, participantName: string, metadata?: string }
  */
-app.post('/api/token', verifyFirebaseAuth, async (req, res) => {
+app.post('/api/token', authMiddleware, async (req, res) => {
   try {
     const { roomName, participantName, metadata } = req.body;
 
@@ -6084,7 +6098,7 @@ app.post('/api/token', verifyFirebaseAuth, async (req, res) => {
  * POST /api/create-room
  * Body: { roomName?: string }
  */
-app.post('/api/create-room', verifyFirebaseAuth, async (req, res) => {
+app.post('/api/create-room', authMiddleware, async (req, res) => {
   try {
     const roomName = req.body.roomName || `voice-assistant-${Date.now()}`;
     
@@ -6108,7 +6122,7 @@ app.post('/api/create-room', verifyFirebaseAuth, async (req, res) => {
  * POST /api/dispatch-agent
  * Body: { roomName: string }
  */
-app.post('/api/dispatch-agent', verifyFirebaseAuth, async (req, res) => {
+app.post('/api/dispatch-agent', authMiddleware, async (req, res) => {
   try {
     const { roomName, metadata } = req.body;
 
