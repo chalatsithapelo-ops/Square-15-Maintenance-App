@@ -66,7 +66,24 @@ class _BnplCheckoutViewState extends State<BnplCheckoutView> {
           },
         ),
       )
-      ..loadRequest(Uri.parse(widget.checkoutUrl));
+      ..loadRequest(Uri.parse(
+          widget.checkoutUrl.isNotEmpty
+              ? widget.checkoutUrl
+              : 'about:blank',
+        ));
+
+    if (widget.checkoutUrl.isEmpty) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        Get.showSnackbar(GetSnackBar(
+          backgroundColor: Colors.red.shade800,
+          duration: const Duration(seconds: 3),
+          snackPosition: SnackPosition.TOP,
+          title: 'Error',
+          message: '$_providerName checkout URL is unavailable. Please try again.',
+        ));
+        Future.delayed(const Duration(seconds: 2), () => Get.back());
+      });
+    }
   }
 
   Future<void> _checkRedirect(String url) async {

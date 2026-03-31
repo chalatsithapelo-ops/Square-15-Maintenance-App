@@ -131,7 +131,7 @@ class AppController extends GetxController {
   var webUrl = "".obs;
   // var isWithdraw = false.obs;
   var isPaymentUsingPayFast = false.obs;
-  var isPaymentUsingPayFlex = false.obs;
+  // isPaymentUsingPayFlex removed — replaced by isPaymentUsingBnpl (multi-provider)
   var isPaymentUsingBnpl = false.obs;
   /// Tracks the active payment method: 'wallet', 'payFast', or 'bnpl'.
   var activePaymentMethod = 'wallet'.obs;
@@ -1184,7 +1184,7 @@ class AppController extends GetxController {
 
     //deduct balance value
     var remainingBalance = "";
-    if (!isPaymentUsingPayFast.value && !isPaymentUsingPayFlex.value && !isPaymentUsingBnpl.value) {
+    if (!isPaymentUsingPayFast.value && !isPaymentUsingBnpl.value) {
       DocumentSnapshot dc =
           await FirebaseService.userRef.doc(userId.value).get();
       if (dc.exists) {
@@ -1211,15 +1211,13 @@ class AppController extends GetxController {
     final String paymentMethod;
     if (isPaymentUsingBnpl.value) {
       paymentMethod = 'bnpl';
-    } else if (isPaymentUsingPayFlex.value) {
-      paymentMethod = 'payFlex';
     } else if (isPaymentUsingPayFast.value) {
       paymentMethod = 'payFast';
     } else {
       paymentMethod = 'wallet';
     }
     final bool cashMovement =
-        isPaymentUsingPayFast.value || isPaymentUsingPayFlex.value || isPaymentUsingBnpl.value;
+        isPaymentUsingPayFast.value || isPaymentUsingBnpl.value;
 
     double toDouble(dynamic v) {
       if (v == null) return 0.0;
@@ -1496,7 +1494,7 @@ class AppController extends GetxController {
         }
       }
 
-      if (!isPaymentUsingPayFast.value && !isPaymentUsingPayFlex.value && !isPaymentUsingBnpl.value) {
+      if (!isPaymentUsingPayFast.value && !isPaymentUsingBnpl.value) {
         await FirebaseService.userRef.doc(userId.value).update(userData);
         getUser(id: userId.value);
       }
