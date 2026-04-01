@@ -921,7 +921,7 @@ class _FutureBookingsListScreenState extends State<FutureBookingsListScreen> {
                           color: isRfq
                               ? (status == 'rfq_sent'
                                   ? Colors.blue.shade100
-                                  : status == 'rfq_approved'
+                                  : (status == 'rfq_approved' || status == FutureBookingsListScreen._statusApprovedWaitingAssignment)
                                       ? Colors.green.shade100
                                       : status == 'rfq_rejected'
                                           ? Colors.red.shade100
@@ -936,7 +936,7 @@ class _FutureBookingsListScreenState extends State<FutureBookingsListScreen> {
                             color: isRfq
                                 ? (status == 'rfq_sent'
                                     ? Colors.blue.shade900
-                                    : status == 'rfq_approved'
+                                    : (status == 'rfq_approved' || status == FutureBookingsListScreen._statusApprovedWaitingAssignment)
                                         ? Colors.green.shade900
                                         : status == 'rfq_rejected'
                                             ? Colors.red.shade900
@@ -954,7 +954,7 @@ class _FutureBookingsListScreenState extends State<FutureBookingsListScreen> {
                                   ? 'Awaiting Admin Quote'
                                   : status == 'rfq_sent'
                                       ? 'Quote Ready (Action Required)'
-                                      : status == 'rfq_approved'
+                                      : (status == 'rfq_approved' || status == FutureBookingsListScreen._statusApprovedWaitingAssignment)
                                           ? 'Approved waiting for artisan assignment'
                                           : status == 'rfq_rejected'
                                               ? 'Rejected'
@@ -972,7 +972,7 @@ class _FutureBookingsListScreenState extends State<FutureBookingsListScreen> {
                             color: isRfq
                                 ? (status == 'rfq_sent'
                                     ? Colors.blue.shade900
-                                    : status == 'rfq_approved'
+                                    : (status == 'rfq_approved' || status == FutureBookingsListScreen._statusApprovedWaitingAssignment)
                                         ? Colors.green.shade900
                                         : status == 'rfq_rejected'
                                             ? Colors.red.shade900

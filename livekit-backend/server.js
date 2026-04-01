@@ -4635,6 +4635,25 @@ app.get('/api/test-pricing', async (req, res) => {
 });
 
 /**
+ * Look up real-time Builders.co.za material prices
+ * GET /api/pricing/builders-lookup?q=geyser+150L
+ * Returns: { ok: true, result: { title, url, priceZar, source } }
+ */
+app.get('/api/pricing/builders-lookup', assistantLimiter, async (req, res) => {
+  try {
+    const q = String(req.query.q || req.query.query || '').trim();
+    if (!q) return res.status(400).json({ ok: false, error: 'q parameter required' });
+    const result = await lookupBuildersPriceOne(q);
+    if (!result) return res.json({ ok: true, result: null, message: 'No matching product found on Builders.co.za' });
+    if (result.blocked) return res.json({ ok: true, result: null, message: 'Builders.co.za temporarily blocked this request' });
+    return res.json({ ok: true, result });
+  } catch (e) {
+    console.error('[builders-lookup] Error:', e.message);
+    return res.status(500).json({ ok: false, error: 'Builders lookup failed' });
+  }
+});
+
+/**
  * Start a voice session (recommended for mobile)
  * POST /api/voice/start
  * Body: { roomName?: string, participantName?: string, metadata?: string }

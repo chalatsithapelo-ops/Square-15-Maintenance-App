@@ -327,12 +327,13 @@ const waTools = [
     type: 'function',
     function: {
       name: 'lookup_pricing',
-      description: 'MUST be called BEFORE create_booking. Looks up fixed pricing for a service. Returns the exact fixed price if available, or suggests RFQ if not.',
+      description: 'MUST be called BEFORE create_booking. Looks up fixed pricing for a service and real-time material prices from Builders.co.za. Returns the exact fixed price if available, or suggests RFQ if not.',
       parameters: {
         type: 'object',
         properties: {
           category:    { type: 'string', description: 'Service category (e.g. plumbing, electrical, painting)' },
           subcategory: { type: 'string', description: 'Specific service needed (e.g. toilet unblocking, leak repair, light installation)' },
+          material:    { type: 'string', description: 'Specific material or product to look up on Builders.co.za (e.g. geyser 150L, 20mm copper pipe, circuit breaker)' },
         },
         required: ['category'],
       },
@@ -1355,6 +1356,15 @@ async function executeWaTool(name, args, session) {
         });
       } catch (e) { console.warn('[wa-tool] booking notification failed:', e.message); }
 
+      // Store last booking ID for quick payment follow-up
+      session.lastBookingId = bookingId;
+      session.lastBookingCost = finalCost;
+
+      // Build payment instructions
+      const paymentInstructions = session.linkedUserId
+        ? `\n\n💰 *Payment options:*\n• Reply "pay with wallet" to use your wallet balance\n• Reply "pay" or "pay with card" for a card payment link\n• You can also pay later in the Square 15 app`
+        : `\n\n💰 *To pay:*\n• Reply "pay" for a payment link\n• Or pay in the Square 15 app`;
+
       return {
         success: true,
         bookingId,
@@ -1362,7 +1372,7 @@ async function executeWaTool(name, args, session) {
         estimatedCost: `R${finalCost.toFixed(2)}`,
         promoApplied: promoApplied ? `${promoApplied.code} (-R${promoApplied.discount.toFixed(2)})` : null,
         paymentStatus: 'unpaid',
-        message: `Booking ${orderNo} created! Estimated cost: R${finalCost.toFixed(2)}. Payment is needed to confirm.`,
+        message: `Booking ${orderNo} created! Estimated cost: R${finalCost.toFixed(2)}.${paymentInstructions}`,
       };
     }
 
@@ -1523,6 +1533,23 @@ async function executeWaTool(name, args, session) {
           }
         }
 
+        // 4) Look up real-time Builders.co.za prices for materials
+        let buildersPrice = null;
+        const materialQuery = args.material || args.subcategory || args.item || '';
+        if (materialQuery) {
+          try {
+            const bp = await lookupBuildersPriceOne(materialQuery);
+            if (bp && !bp.blocked && bp.priceZar > 0) {
+              buildersPrice = {
+                title: bp.title,
+                priceZar: `R${bp.priceZar.toFixed(2)}`,
+                url: bp.url,
+                source: 'builders.co.za',
+              };
+            }
+          } catch (e) { console.warn('[lookup_pricing] Builders lookup failed:', e.message); }
+        }
+
         if (matchedService && matchedPrice) {
           return {
             matched: true,
@@ -1530,7 +1557,18 @@ async function executeWaTool(name, args, session) {
             fixedPrice: `R${matchedPrice.toFixed(2)}`,
             category: categoryName,
             allServicesInCategory: allFixedPrices,
+            ...(buildersPrice ? { buildersRetailPrice: buildersPrice } : {}),
             note: 'This is a FIXED price. Use this exact amount when creating the booking.',
+          };
+        }
+
+        if (buildersPrice) {
+          return {
+            matched: false,
+            category: categoryName,
+            buildersRetailPrice: buildersPrice,
+            availableServices: allFixedPrices,
+            note: `Found a retail price on Builders.co.za for "${buildersPrice.title}": ${buildersPrice.priceZar}. This is a retail/material price, not a service price. For a full quote including labor, suggest submitting an RFQ.`,
           };
         }
 
@@ -1607,7 +1645,7 @@ async function executeWaTool(name, args, session) {
     // ═══════════════════════════════════════════
     case 'request_payment_link': {
       if (!firestore) return { error: 'Database unavailable' };
-      const bid = args.bookingId;
+      const bid = args.bookingId || session.lastBookingId;
       if (!bid) return { error: 'Please provide a booking ID.' };
 
       let doc = await firestore.collection('tasksManagement').doc(bid).get();
@@ -1615,14 +1653,58 @@ async function executeWaTool(name, args, session) {
       if (!doc.exists) return { error: `Booking "${bid}" not found.` };
 
       const d = doc.data();
-      const cost = parseFloat(d.cost || '0');
+      const cost = parseFloat(d.cost || d.total_cost || d.quoted_price || '0');
       if (cost <= 0) return { error: 'This booking does not have a confirmed price yet.' };
 
       if (d.payment_status === 'paid' || d.paymentStatus === 'paid') {
         return { message: 'This booking is already paid!', bookingId: bid };
       }
 
-      // Generate a payment reference and store it
+      // Try to generate a real PayFast payment URL via the backend
+      try {
+        const backendUrl = process.env.BACKEND_URL || 'https://square15-livekit-backend.onrender.com';
+        const fetch = (await import('node-fetch')).default;
+        const pfResp = await fetch(`${backendUrl}/api/payment/initiate`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            amount: cost.toFixed(2),
+            item_name: `Square 15 Booking ${d.order_no || d.rfq_no || bid}`,
+            booking_id: bid,
+            email: d.customer_email || d.email || '',
+            phone: session.phone,
+          }),
+        });
+        const pfBody = await pfResp.json();
+
+        if (pfBody.ok && pfBody.payment_url) {
+          // Store payment link record
+          const payRef = `PAY-${bid}-${Date.now().toString(36)}`;
+          await firestore.collection('payment_links').doc(payRef).set({
+            booking_id: bid,
+            amount: cost,
+            phone: session.phone,
+            user_id: session.linkedUserId || '',
+            payment_url: pfBody.payment_url,
+            status: 'pending',
+            source: 'whatsapp',
+            created_at: admin.firestore.FieldValue.serverTimestamp(),
+          });
+
+          return {
+            success: true,
+            message: `Here's your payment link for R${cost.toFixed(2)}:\n\n${pfBody.payment_url}\n\nClick to pay securely via PayFast. Payment is held in escrow until you confirm the job is done.`,
+            amount: `R${cost.toFixed(2)}`,
+            paymentUrl: pfBody.payment_url,
+            reference: payRef,
+            bookingId: bid,
+          };
+        }
+      } catch (e) {
+        console.warn('[request_payment_link] PayFast API call failed:', e.message);
+      }
+
+      // Fallback: store request and notify admin
       const payRef = `PAY-${bid}-${Date.now().toString(36)}`;
       await firestore.collection('payment_links').doc(payRef).set({
         booking_id: bid,
@@ -1634,7 +1716,6 @@ async function executeWaTool(name, args, session) {
         created_at: admin.firestore.FieldValue.serverTimestamp(),
       });
 
-      // Notify admin about pending payment
       await firestore.collection('notifications').add({
         title: 'WhatsApp Payment Request',
         body: `Customer requests payment link for booking ${bid} (R${cost.toFixed(2)})`,
@@ -1646,7 +1727,7 @@ async function executeWaTool(name, args, session) {
       });
 
       return {
-        message: `Payment request for R${cost.toFixed(2)} has been submitted for booking ${bid}. Our admin will share a secure payment link with you shortly. You can also pay via the Square 15 app.`,
+        message: `Payment request for R${cost.toFixed(2)} submitted for booking ${d.order_no || d.rfq_no || bid}. You can also pay via the Square 15 app.\n\nAlternatively, reply "pay with wallet" if you have sufficient balance.`,
         amount: `R${cost.toFixed(2)}`,
         reference: payRef,
         bookingId: bid,
@@ -2336,11 +2417,21 @@ async function executeWaTool(name, args, session) {
       });
 
       const price = data.quoted_price || (data.ai_quote ? data.ai_quote.grand_total : '0');
+      const priceNum = parseFloat(price);
+
+      // Store for quick payment follow-up
+      session.lastBookingId = rfqId;
+      session.lastBookingCost = priceNum;
+
+      const paymentInstructions = session.linkedUserId
+        ? `\n\n💰 *Payment options:*\n• Reply "pay with wallet" to use your wallet balance\n• Reply "pay" or "pay with card" for a card payment link`
+        : `\n\n💰 Reply "pay" to get a payment link.`;
+
       return {
         success: true,
-        message: `Quote accepted! RFQ ${data.rfq_no || rfqId} (R${parseFloat(price).toFixed(2)}) is ready for payment. Reply "pay" to proceed with card or wallet payment.`,
+        message: `Quote accepted! RFQ ${data.rfq_no || rfqId} (R${priceNum.toFixed(2)}) is ready for payment.${paymentInstructions}`,
         rfqId,
-        price: `R${parseFloat(price).toFixed(2)}`,
+        price: `R${priceNum.toFixed(2)}`,
       };
     }
 

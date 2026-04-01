@@ -373,7 +373,33 @@ class AITextChatService {
           });
         }
       }
-      return {'pricing': matches, 'count': matches.length};
+
+      // Also look up real-time Builders.co.za material prices
+      Map<String, dynamic>? buildersResult;
+      try {
+        final resp = await http.get(
+          Uri.parse(
+            'https://square15-livekit-backend.onrender.com/api/pricing/builders-lookup?q=${Uri.encodeComponent(serviceName)}',
+          ),
+        ).timeout(const Duration(seconds: 15));
+        if (resp.statusCode == 200) {
+          final body = json.decode(resp.body);
+          if (body['ok'] == true && body['result'] != null) {
+            buildersResult = {
+              'title': body['result']['title'],
+              'priceZar': body['result']['priceZar'],
+              'url': body['result']['url'],
+              'source': 'builders.co.za',
+            };
+          }
+        }
+      } catch (_) {}
+
+      return {
+        'pricing': matches,
+        'count': matches.length,
+        if (buildersResult != null) 'buildersRetailPrice': buildersResult,
+      };
     } catch (e) {
       return {'error': 'Failed to lookup pricing'};
     }
