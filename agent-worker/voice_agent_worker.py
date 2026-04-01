@@ -2519,6 +2519,11 @@ async def entrypoint(ctx: JobContext):
             get_current_screen,
             analyze_screen,
             list_app_features,
+            # Finance tools (admin-only, read-only)
+            get_finance_overview,
+            get_daily_revenue_report,
+            get_failed_payments_report,
+            get_fraud_alerts_report,
         ],
         # --- Latency optimizations ---
         min_endpointing_delay=0.25,       # default 0.5 — faster turn completion

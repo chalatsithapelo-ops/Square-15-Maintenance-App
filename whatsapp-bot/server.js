@@ -532,6 +532,106 @@ const waTools = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'explain_quote',
+      description: 'Explain the quote/pricing details and cost breakdown for a booking or RFQ',
+      parameters: {
+        type: 'object',
+        properties: {
+          bookingId: { type: 'string', description: 'The booking or RFQ ID to explain the quote for' },
+        },
+        required: ['bookingId'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'check_payment',
+      description: 'Check payment status, method, and history for a booking',
+      parameters: {
+        type: 'object',
+        properties: {
+          bookingId: { type: 'string', description: 'The booking ID to check payment for' },
+        },
+        required: ['bookingId'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_messages',
+      description: 'Get messages/chat history for a booking between client and artisan',
+      parameters: {
+        type: 'object',
+        properties: {
+          bookingId: { type: 'string', description: 'The booking ID to get messages for' },
+        },
+        required: ['bookingId'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'send_message',
+      description: 'Send a message to the artisan or admin related to a booking',
+      parameters: {
+        type: 'object',
+        properties: {
+          bookingId: { type: 'string', description: 'The booking ID the message relates to' },
+          message: { type: 'string', description: 'The message content' },
+          recipient: { type: 'string', description: 'Who to send to: artisan or admin', enum: ['artisan', 'admin'] },
+        },
+        required: ['bookingId', 'message'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'list_cases',
+      description: 'List your support/complaint cases, optionally filtered by state',
+      parameters: {
+        type: 'object',
+        properties: {
+          state: { type: 'string', description: 'Filter by state: open, closed. Omit for all.' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'reply_to_case',
+      description: 'Add a reply or follow-up to an existing support case',
+      parameters: {
+        type: 'object',
+        properties: {
+          caseId: { type: 'string', description: 'The case ID to reply to' },
+          message: { type: 'string', description: 'The reply message' },
+        },
+        required: ['caseId', 'message'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_case_details',
+      description: 'Get full details and reply history for a support case',
+      parameters: {
+        type: 'object',
+        properties: {
+          caseId: { type: 'string', description: 'The case ID' },
+        },
+        required: ['caseId'],
+      },
+    },
+  },
 ];
 
 // ─── Builders.co.za Real-Time Pricing (same logic as Cloud Functions & client app) ───
@@ -2282,6 +2382,197 @@ async function executeWaTool(name, args, session) {
       };
     }
 
+    // ═══════════════════════════════════════════
+    // EXPLAIN QUOTE
+    // ═══════════════════════════════════════════
+    case 'explain_quote': {
+      if (!firestore) return { error: 'Database unavailable' };
+      const bid = args.bookingId;
+      if (!bid) return { error: 'Please provide a booking or RFQ ID.' };
+
+      let doc = await firestore.collection('futureBookings').doc(bid).get();
+      if (!doc.exists) doc = await firestore.collection('tasksManagement').doc(bid).get();
+      if (!doc.exists) return { error: `Booking "${bid}" not found.` };
+
+      const data = doc.data();
+      const result = {
+        booking_id: bid,
+        status: data.status || data.rfq_status || 'unknown',
+        cost: data.cost || data.total_cost || 'N/A',
+      };
+      if (data.quote_breakdown) result.breakdown = data.quote_breakdown;
+      if (data.labour_cost) result.labour = data.labour_cost;
+      if (data.materials_cost) result.materials = data.materials_cost;
+      if (data.equipment_cost) result.equipment = data.equipment_cost;
+      if (data.contingency) result.contingency = data.contingency;
+      if (data.ai_quote) result.ai_quote = data.ai_quote;
+      return result;
+    }
+
+    // ═══════════════════════════════════════════
+    // CHECK PAYMENT
+    // ═══════════════════════════════════════════
+    case 'check_payment': {
+      if (!firestore) return { error: 'Database unavailable' };
+      const bid = args.bookingId;
+      if (!bid) return { error: 'Please provide a booking ID.' };
+
+      let doc = await firestore.collection('tasksManagement').doc(bid).get();
+      if (!doc.exists) doc = await firestore.collection('futureBookings').doc(bid).get();
+      if (!doc.exists) return { error: `Booking "${bid}" not found.` };
+
+      const data = doc.data();
+      return {
+        booking_id: bid,
+        payment_status: data.payment_status || 'unpaid',
+        payment_method: data.payment_method || 'N/A',
+        amount: data.cost || data.total_cost || 'N/A',
+        paid_at: data.paid_at || null,
+      };
+    }
+
+    // ═══════════════════════════════════════════
+    // GET MESSAGES
+    // ═══════════════════════════════════════════
+    case 'get_messages': {
+      if (!firestore) return { error: 'Database unavailable' };
+      const bid = args.bookingId;
+      if (!bid) return { error: 'Please provide a booking ID.' };
+
+      try {
+        const snap = await firestore.collection('messages')
+          .where('booking_id', '==', bid)
+          .orderBy('created_at', 'desc')
+          .limit(20)
+          .get();
+        if (snap.empty) return { messages: [], message: 'No messages found for this booking.' };
+        const msgs = snap.docs.map(d => {
+          const m = d.data();
+          return {
+            sender: m.sender_type || 'unknown',
+            message: m.message || '',
+            time: m.created_at?.toDate?.()?.toISOString() || '',
+          };
+        });
+        return { messages: msgs, count: msgs.length };
+      } catch (e) {
+        return { error: 'Failed to fetch messages' };
+      }
+    }
+
+    // ═══════════════════════════════════════════
+    // SEND MESSAGE
+    // ═══════════════════════════════════════════
+    case 'send_message': {
+      if (!firestore) return { error: 'Database unavailable' };
+      const bid = args.bookingId;
+      const msg = args.message;
+      const recipient = args.recipient || 'admin';
+      if (!bid || !msg) return { error: 'Please provide a booking ID and message.' };
+
+      try {
+        const msgRef = firestore.collection('messages').doc();
+        await msgRef.set({
+          id: msgRef.id,
+          booking_id: bid,
+          sender_id: session.linkedUserId || session.phone,
+          sender_type: 'client',
+          recipient_type: recipient,
+          message: msg,
+          source: 'whatsapp',
+          read: false,
+          created_at: admin.firestore.FieldValue.serverTimestamp(),
+        });
+        return { success: true, message: `Message sent to ${recipient}.` };
+      } catch (e) {
+        return { error: 'Failed to send message' };
+      }
+    }
+
+    // ═══════════════════════════════════════════
+    // LIST CASES
+    // ═══════════════════════════════════════════
+    case 'list_cases': {
+      if (!firestore) return { error: 'Database unavailable' };
+      const userId = session.linkedUserId;
+      if (!userId) return { error: 'Please link your account first to view support cases.' };
+
+      try {
+        let query = firestore.collection('customer_support_cases').where('user_id', '==', userId);
+        if (args.state) query = query.where('status', '==', args.state);
+        const snap = await query.orderBy('created_at', 'desc').limit(10).get();
+        if (snap.empty) return { cases: [], message: 'No support cases found.' };
+        const cases = snap.docs.map(d => {
+          const c = d.data();
+          return {
+            case_id: d.id,
+            subject: c.subject || '',
+            status: c.status || 'unknown',
+            created: c.created_at?.toDate?.()?.toISOString() || '',
+          };
+        });
+        return { cases, count: cases.length };
+      } catch (e) {
+        return { error: 'Failed to fetch cases' };
+      }
+    }
+
+    // ═══════════════════════════════════════════
+    // REPLY TO CASE
+    // ═══════════════════════════════════════════
+    case 'reply_to_case': {
+      if (!firestore) return { error: 'Database unavailable' };
+      const caseId = args.caseId;
+      const msg = args.message;
+      if (!caseId || !msg) return { error: 'Please provide a case ID and message.' };
+
+      try {
+        const caseDoc = await firestore.collection('customer_support_cases').doc(caseId).get();
+        if (!caseDoc.exists) return { error: `Case "${caseId}" not found.` };
+
+        await firestore.collection('customer_support_cases').doc(caseId).collection('replies').add({
+          user_id: session.linkedUserId || session.phone,
+          message: msg,
+          source: 'whatsapp',
+          created_at: admin.firestore.FieldValue.serverTimestamp(),
+        });
+        return { success: true, message: `Reply added to case ${caseId}.` };
+      } catch (e) {
+        return { error: 'Failed to reply to case' };
+      }
+    }
+
+    // ═══════════════════════════════════════════
+    // GET CASE DETAILS
+    // ═══════════════════════════════════════════
+    case 'get_case_details': {
+      if (!firestore) return { error: 'Database unavailable' };
+      const caseId = args.caseId;
+      if (!caseId) return { error: 'Please provide a case ID.' };
+
+      try {
+        const caseDoc = await firestore.collection('customer_support_cases').doc(caseId).get();
+        if (!caseDoc.exists) return { error: `Case "${caseId}" not found.` };
+        const data = caseDoc.data();
+        const repliesSnap = await firestore.collection('customer_support_cases').doc(caseId)
+          .collection('replies').orderBy('created_at', 'asc').limit(20).get();
+        const replies = repliesSnap.docs.map(d => {
+          const r = d.data();
+          return { message: r.message || '', time: r.created_at?.toDate?.()?.toISOString() || '' };
+        });
+        return {
+          case_id: caseId,
+          subject: data.subject || '',
+          status: data.status || 'unknown',
+          description: data.description || '',
+          created: data.created_at?.toDate?.()?.toISOString() || '',
+          replies,
+        };
+      } catch (e) {
+        return { error: 'Failed to fetch case details' };
+      }
+    }
+
     default:
       return { error: `Unknown tool: ${name}` };
   }
@@ -2346,6 +2637,19 @@ PHOTO ANALYSIS FOR RFQ:
 🔗 ACCOUNT:
 - Auto-link WhatsApp number to existing Square 15 app account
 - Inform customers about app features when relevant
+
+💬 MESSAGING:
+- Get messages/chat history for a booking (get_messages)
+- Send a message to the artisan or admin about a booking (send_message)
+
+🎫 SUPPORT CASES:
+- List your support cases (list_cases)
+- Reply to an existing case (reply_to_case)
+- View full case details (get_case_details)
+
+📊 QUOTES & PAYMENTS:
+- Explain a quote breakdown (explain_quote)
+- Check payment status for a booking (check_payment)
 
 CRITICAL PRICING RULES:
 - You MUST call lookup_pricing BEFORE calling create_booking, EVERY TIME, NO EXCEPTIONS.

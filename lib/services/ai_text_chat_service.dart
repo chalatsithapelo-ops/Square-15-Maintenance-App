@@ -225,6 +225,14 @@ class AITextChatService {
         return _applyPromoCode(arguments['code'] as String);
       case 'request_refund':
         return _requestRefund(uid, arguments['booking_id'] as String, arguments['reason'] as String?);
+      case 'send_message':
+        return _sendMessage(uid, arguments['booking_id'] as String, arguments['message'] as String, arguments['recipient'] as String?);
+      case 'list_cases':
+        return _listCases(uid, arguments['state'] as String?);
+      case 'reply_to_case':
+        return _replyToCase(uid, arguments['case_id'] as String, arguments['message'] as String);
+      case 'get_case_details':
+        return _getCaseDetails(arguments['case_id'] as String);
       default:
         return {'status': 'error', 'message': 'Unknown function: $functionName'};
     }
@@ -1065,6 +1073,114 @@ class AITextChatService {
     }
   }
 
+  // ═══════════════════════════════════════════════════════════════
+  // SEND MESSAGE (to artisan, client, or admin)
+  // ═══════════════════════════════════════════════════════════════
+  Future<Map<String, dynamic>> _sendMessage(String uid, String bookingId, String message, String? recipient) async {
+    try {
+      final target = recipient ?? 'admin';
+      final msgId = FirebaseFirestore.instance.collection('messages').doc().id;
+      await FirebaseFirestore.instance.collection('messages').doc(msgId).set({
+        'id': msgId,
+        'booking_id': bookingId,
+        'sender_id': uid,
+        'sender_type': _userRole ?? 'client',
+        'recipient_type': target,
+        'message': message,
+        'source': 'ai_text_chat',
+        'read': false,
+        'created_at': FieldValue.serverTimestamp(),
+      });
+      return {'success': true, 'message_id': msgId, 'message': 'Message sent to $target.'};
+    } catch (e) {
+      return {'error': 'Failed to send message'};
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // LIST CASES
+  // ═══════════════════════════════════════════════════════════════
+  Future<Map<String, dynamic>> _listCases(String uid, String? state) async {
+    try {
+      var query = FirebaseFirestore.instance
+          .collection('customer_support_cases')
+          .where('user_id', isEqualTo: uid);
+      if (state != null && state.isNotEmpty) {
+        query = query.where('status', isEqualTo: state);
+      }
+      final snap = await query.orderBy('created_at', descending: true).limit(10).get();
+      final cases = snap.docs.map((d) {
+        final data = d.data();
+        return {
+          'case_id': d.id,
+          'subject': data['subject'] ?? '',
+          'status': data['status'] ?? 'unknown',
+          'created': data['created_at']?.toDate()?.toString() ?? '',
+          'description': data['description'] ?? '',
+        };
+      }).toList();
+      return {'cases': cases, 'count': cases.length};
+    } catch (e) {
+      return {'error': 'Failed to fetch cases'};
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // REPLY TO CASE
+  // ═══════════════════════════════════════════════════════════════
+  Future<Map<String, dynamic>> _replyToCase(String uid, String caseId, String message) async {
+    try {
+      await FirebaseFirestore.instance
+          .collection('customer_support_cases')
+          .doc(caseId)
+          .collection('replies')
+          .add({
+        'user_id': uid,
+        'message': message,
+        'source': 'ai_text_chat',
+        'created_at': FieldValue.serverTimestamp(),
+      });
+      return {'success': true, 'message': 'Reply added to case $caseId.'};
+    } catch (e) {
+      return {'error': 'Failed to reply to case'};
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // GET CASE DETAILS
+  // ═══════════════════════════════════════════════════════════════
+  Future<Map<String, dynamic>> _getCaseDetails(String caseId) async {
+    try {
+      final doc = await FirebaseFirestore.instance.collection('customer_support_cases').doc(caseId).get();
+      if (!doc.exists) return {'error': 'Case not found'};
+      final data = doc.data()!;
+      final repliesSnap = await FirebaseFirestore.instance
+          .collection('customer_support_cases')
+          .doc(caseId)
+          .collection('replies')
+          .orderBy('created_at', descending: false)
+          .limit(20)
+          .get();
+      final replies = repliesSnap.docs.map((d) {
+        final r = d.data();
+        return {
+          'message': r['message'] ?? '',
+          'created': r['created_at']?.toDate()?.toString() ?? '',
+        };
+      }).toList();
+      return {
+        'case_id': caseId,
+        'subject': data['subject'] ?? '',
+        'status': data['status'] ?? 'unknown',
+        'description': data['description'] ?? '',
+        'created': data['created_at']?.toDate()?.toString() ?? '',
+        'replies': replies,
+      };
+    } catch (e) {
+      return {'error': 'Failed to fetch case details'};
+    }
+  }
+
   void _storeMessage(ChatMessage userMsg, ChatMessage assistantMsg) {
     try {
       final uid = FirebaseAuth.instance.currentUser?.uid;
@@ -1117,6 +1233,18 @@ YOUR CAPABILITIES:
 - Validate promo codes
 - Request refunds
 - Look up service pricing
+- Send messages to artisans, clients, or admin
+- List and manage support cases
+- Reply to support cases
+- View case details
+
+MESSAGING:
+- send_message(booking_id, message, recipient) — send a message to artisan, client, or admin
+
+SUPPORT CASES:
+- list_cases(state) — list your support cases, optionally filtered by state (open/closed)
+- reply_to_case(case_id, message) — add a reply to an existing case
+- get_case_details(case_id) — view full case details and reply history
 
 KEY GUIDELINES:
 - Be helpful, friendly, and concise
@@ -1391,6 +1519,64 @@ KEY GUIDELINES:
                 'reason': {'type': 'string', 'description': 'Reason for the refund request'},
               },
               'required': ['booking_id'],
+            },
+          },
+        },
+        {
+          'type': 'function',
+          'function': {
+            'name': 'send_message',
+            'description': 'Send a message to an artisan, client, or admin related to a booking',
+            'parameters': {
+              'type': 'object',
+              'properties': {
+                'booking_id': {'type': 'string', 'description': 'The booking ID the message relates to'},
+                'message': {'type': 'string', 'description': 'The message content'},
+                'recipient': {'type': 'string', 'description': 'Who to send to: artisan, client, or admin'},
+              },
+              'required': ['booking_id', 'message'],
+            },
+          },
+        },
+        {
+          'type': 'function',
+          'function': {
+            'name': 'list_cases',
+            'description': 'List support cases, optionally filtered by state (open, closed)',
+            'parameters': {
+              'type': 'object',
+              'properties': {
+                'state': {'type': 'string', 'description': 'Filter by state: open, closed. Omit for all.'},
+              },
+            },
+          },
+        },
+        {
+          'type': 'function',
+          'function': {
+            'name': 'reply_to_case',
+            'description': 'Add a reply to an existing support case',
+            'parameters': {
+              'type': 'object',
+              'properties': {
+                'case_id': {'type': 'string', 'description': 'The case ID to reply to'},
+                'message': {'type': 'string', 'description': 'The reply message'},
+              },
+              'required': ['case_id', 'message'],
+            },
+          },
+        },
+        {
+          'type': 'function',
+          'function': {
+            'name': 'get_case_details',
+            'description': 'Get full details and reply history for a support case',
+            'parameters': {
+              'type': 'object',
+              'properties': {
+                'case_id': {'type': 'string', 'description': 'The case ID'},
+              },
+              'required': ['case_id'],
             },
           },
         },
