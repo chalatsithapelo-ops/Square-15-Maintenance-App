@@ -139,9 +139,9 @@ class _PartnerReferralsScreenState extends State<PartnerReferralsScreen> {
 
     // Pre-fill from user profile
     final userData = _appController.userData;
-    nameCtrl.text = '${userData['first_name'] ?? ''} ${userData['last_name'] ?? ''}'.trim();
-    emailCtrl.text = (userData['email'] ?? '').toString();
-    phoneCtrl.text = (userData['phone_number'] ?? '').toString();
+    nameCtrl.text = userData?.name ?? '';
+    emailCtrl.text = userData?.email ?? '';
+    phoneCtrl.text = (userData?.contact ?? '').toString();
 
     final result = await showDialog<bool>(
       context: context,
