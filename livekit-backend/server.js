@@ -5925,9 +5925,14 @@ app.post('/api/payment/initiate', authMiddleware, assistantLimiter, async (req, 
       ...(custom_str1 ? { custom_str1 } : {}),
     };
 
+    // Build a complete payment URL with query params for WhatsApp bot
+    const qs = new URLSearchParams(paymentData).toString();
+    const fullPaymentUrl = `${payfastUrl}?${qs}`;
+
     res.json({
       ok: true,
       payfast_url: payfastUrl,
+      payment_url: fullPaymentUrl,
       payment_data: paymentData,
     });
   } catch (error) {
@@ -6768,12 +6773,22 @@ app.get('/api/finance/fraud-alerts', adminLimiter, async (req, res) => {
   const limit = Math.max(1, Math.min(200, limitRaw));
 
   try {
-    const snap = await firestore.collection('fraud_alerts')
-      .where('status', '==', status)
-      .orderBy('created_at', 'desc')
-      .limit(limit)
-      .get();
-    const items = snap.docs.map(d => d.data() || {});
+    let snap;
+    try {
+      snap = await firestore.collection('fraud_alerts')
+        .where('status', '==', status)
+        .orderBy('created_at', 'desc')
+        .limit(limit)
+        .get();
+    } catch (indexErr) {
+      // Composite index may not exist yet — fall back to status-only query
+      console.warn('[fraud-alerts] composite index missing, falling back:', indexErr.message);
+      snap = await firestore.collection('fraud_alerts')
+        .where('status', '==', status)
+        .limit(limit)
+        .get();
+    }
+    const items = snap.docs.map(d => ({ id: d.id, ...(d.data() || {}) }));
     return res.json({ success: true, count: items.length, items });
   } catch (e) {
     return res.status(500).json({ error: 'internal_error', message: e.message });
