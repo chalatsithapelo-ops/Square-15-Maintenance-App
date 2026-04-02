@@ -6738,7 +6738,18 @@ app.get('/api/finance/requests', adminLimiter, async (req, res) => {
   if (status) q = firestore.collection('finance_requests').where('status', '==', status).orderBy('created_at', 'desc').limit(limit);
 
   try {
-    const snap = await q.get();
+    let snap;
+    try {
+      snap = await q.get();
+    } catch (indexErr) {
+      // Composite index may not exist yet — fall back to simpler query
+      console.warn('[finance-requests] composite index missing, falling back:', indexErr.message);
+      if (status) {
+        snap = await firestore.collection('finance_requests').where('status', '==', status).limit(limit).get();
+      } else {
+        snap = await firestore.collection('finance_requests').limit(limit).get();
+      }
+    }
     const items = snap.docs.map(d => {
       const r = d.data() || {};
       return {
