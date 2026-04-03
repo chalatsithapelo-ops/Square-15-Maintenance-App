@@ -799,6 +799,8 @@ const ACTION_TIERS = Object.freeze({
   admin_close_stale_cases: 'B',
   admin_broadcast_notification: 'B',
   admin_flag_user: 'B',
+  // Payment link generation (Tier B — creates PayFast link + notification)
+  request_payment_link: 'B',
   // Phase 5.1: Finance read-only (Tier A)
   get_finance_summary: 'A',
   get_daily_revenue: 'A',
@@ -3217,6 +3219,99 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       };
     } catch (err) {
       return { ok: false, status: 500, error: `wallet_error: ${err.message}` };
+    }
+  }
+
+  // ── Request Payment Link — generates PayFast URL + stores in payment_links + sends notification ──
+  if (action === 'request_payment_link') {
+    try {
+      const bid = bookingId || String(payload.tasks_management_id || '').trim();
+      if (!bid) return { ok: false, status: 400, error: 'missing_booking_id' };
+
+      const bData = await loadBooking();
+      if (!bData) return { ok: false, status: 404, error: 'booking_not_found' };
+
+      const cost = parseFloat(bData.cost || bData.total_cost || bData.quoted_price || '0');
+      if (cost <= 0) return { ok: false, status: 400, error: 'no_confirmed_price' };
+
+      if ((bData.payment_status || bData.paymentStatus) === 'paid') {
+        return { ok: true, status: 200, data: { message: 'This booking is already paid.', bookingId: bid } };
+      }
+
+      const merchantId = env('PAYFAST_MERCHANT_ID');
+      const merchantKey = env('PAYFAST_MERCHANT_KEY');
+      const payfastUrl = env('PAYFAST_URL') || 'https://www.payfast.co.za/eng/process';
+
+      if (!merchantId || !merchantKey) {
+        // Fallback: store request + notify admin
+        const payRef = `PAY-${bid}-${Date.now().toString(36)}`;
+        await firestore.collection('payment_links').doc(payRef).set({
+          booking_id: bid,
+          amount: cost,
+          user_id: actorUid || '',
+          status: 'pending',
+          source: payload.source || 'voice',
+          created_at: admin.firestore.FieldValue.serverTimestamp(),
+        });
+        await firestore.collection('notifications').add({
+          title: 'Payment Link Request',
+          body: `Payment link requested for booking ${bid} (R${cost.toFixed(2)})`,
+          type: 'payment_request',
+          booking_id: bid,
+          amount: cost,
+          for_role: 'admin',
+          status: 'unread',
+          created_at: admin.firestore.FieldValue.serverTimestamp(),
+        });
+        return { ok: true, status: 200, data: {
+          message: `Payment of R${cost.toFixed(2)} is being processed. You'll receive a payment link shortly.`,
+          reference: payRef, bookingId: bid, amount: cost,
+        }};
+      }
+
+      const itemName = `Square 15 Booking ${bData.order_no || bData.rfq_no || bid}`;
+      const paymentData = {
+        merchant_id: merchantId,
+        merchant_key: merchantKey,
+        amount: cost.toFixed(2),
+        item_name: itemName,
+        custom_str1: bid,
+      };
+      const qs = new (require('url').URLSearchParams)(paymentData).toString();
+      const paymentUrl = `${payfastUrl}?${qs}`;
+
+      const payRef = `PAY-${bid}-${Date.now().toString(36)}`;
+      await firestore.collection('payment_links').doc(payRef).set({
+        booking_id: bid,
+        amount: cost,
+        user_id: actorUid || '',
+        payment_url: paymentUrl,
+        status: 'pending',
+        source: payload.source || 'voice',
+        created_at: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      // Send notification to the customer so they receive the link
+      if (actorUid) {
+        await firestore.collection('notifications').add({
+          title: 'Payment Link Ready',
+          body: `Tap to pay R${cost.toFixed(2)} for booking ${bData.order_no || bData.rfq_no || bid}`,
+          type: 'payment_link',
+          booking_id: bid,
+          amount: cost,
+          payment_url: paymentUrl,
+          userId: actorUid,
+          status: 'unread',
+          created_at: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      }
+
+      return { ok: true, status: 200, data: {
+        message: `Payment link generated for R${cost.toFixed(2)}. A notification with the link has been sent to your phone.`,
+        paymentUrl, reference: payRef, bookingId: bid, amount: cost,
+      }};
+    } catch (err) {
+      return { ok: false, status: 500, error: `payment_link_error: ${err.message}` };
     }
   }
 
@@ -5982,8 +6077,8 @@ app.post('/api/notifications/send', authMiddleware, assistantLimiter, async (req
 });
 
 // ── Server-side PayFast Payment Initiation ──
-// Replaces client-side hardcoded merchant credentials
-app.post('/api/payment/initiate', authMiddleware, assistantLimiter, async (req, res) => {
+// Allows WhatsApp bot and app to generate payment URLs
+app.post('/api/payment/initiate', assistantLimiter, async (req, res) => {
   try {
     const merchantId = env('PAYFAST_MERCHANT_ID');
     const merchantKey = env('PAYFAST_MERCHANT_KEY');
