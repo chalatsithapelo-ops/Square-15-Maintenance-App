@@ -633,6 +633,20 @@ const waTools = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'lookup_builders_product',
+      description: 'Search Builders Warehouse (builders.co.za) for real products with live pricing. Use when a customer wants to see specific materials, compare brands, or choose items for their job. Returns product names, prices, and links.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Product search query (e.g. "150L geyser", "PVC pipe 110mm", "Kwikot geyser")' },
+        },
+        required: ['query'],
+      },
+    },
+  },
 ];
 
 // ─── Builders.co.za Real-Time Pricing (same logic as Cloud Functions & client app) ───
@@ -1107,10 +1121,16 @@ function formatQuoteForWhatsApp(quote, rfqNo) {
     lines.push(`\u{1F4E6} *Materials List (from Builders.co.za):*`);
     quote.materialsBOM.forEach((m, i) => {
       const src = m.matched_by && m.matched_by.startsWith('builders') ? '\u2705' : m.matched_by && m.matched_by.startsWith('catalog') ? '\u{1F4D7}' : '\u{1F4CA}';
-      lines.push(`${i + 1}. ${src} ${m.name} \u2014 ${m.qty} ${m.unit} @ R${m.unit_price.toFixed(2)} = R${m.line_base.toFixed(2)}`);
+      let line = `${i + 1}. ${src} ${m.name} \u2014 ${m.qty} ${m.unit} @ R${m.unit_price.toFixed(2)} = R${m.line_base.toFixed(2)}`;
+      if (m.builders_url) {
+        line += `\n   \u{1F517} ${m.builders_url}`;
+      }
+      lines.push(line);
     });
     lines.push('');
     lines.push('\u2705 = Builders.co.za price | \u{1F4D7} = Catalog | \u{1F4CA} = Estimated');
+    lines.push('');
+    lines.push('\u{1F6D2} _Want a different brand or product? Tell me what you prefer and I\'ll look it up on Builders for you!_');
   }
 
   lines.push('');
@@ -1472,11 +1492,17 @@ async function executeWaTool(name, args, session) {
         // 1) Look up from pricingGuidance by doc ID (e.g. 'plumbing')
         let servicePrices = {};
         let categoryName = args.category || '';
+        let laborCostPerHour = null;
+        let outsourcedLaborRate = null;
+        let materialMultiplier = null;
         const guidanceDoc = await firestore.collection('pricingGuidance').doc(catSlug).get();
         if (guidanceDoc.exists) {
           const gd = guidanceDoc.data();
           servicePrices = gd.service_prices || gd.servicePrices || {};
           categoryName = gd.category_name || gd.categoryName || categoryName;
+          laborCostPerHour = parseFloat(gd.labor_cost_per_hour || gd.laborCostPerHour || 0) || null;
+          outsourcedLaborRate = parseFloat(gd.outsourced_labor_rate || 0) || null;
+          materialMultiplier = parseFloat(gd.material_multiplier || 0) || null;
         }
 
         // 2) Also search the tasks collection for matching service entries
@@ -1556,9 +1582,11 @@ async function executeWaTool(name, args, session) {
             service: matchedService,
             fixedPrice: `R${matchedPrice.toFixed(2)}`,
             category: categoryName,
+            ...(laborCostPerHour ? { laborCostPerHour: `R${laborCostPerHour}/hr` } : {}),
+            ...(materialMultiplier ? { materialMultiplier } : {}),
             allServicesInCategory: allFixedPrices,
             ...(buildersPrice ? { buildersRetailPrice: buildersPrice } : {}),
-            note: 'This is a FIXED price. Use this exact amount when creating the booking.',
+            note: 'This is a FIXED price from the current pricing guide. Use this exact amount when creating the booking.',
           };
         }
 
@@ -1585,6 +1613,66 @@ async function executeWaTool(name, args, session) {
       } catch (e) {
         console.error('[lookup_pricing] Error:', e.message);
         return { estimate: 'R350 – R1,200 (typical range)' };
+      }
+    }
+
+    // ═══════════════════════════════════════════
+    // 5b) LOOKUP BUILDERS PRODUCT (browse items/brands on builders.co.za)
+    // ═══════════════════════════════════════════
+    case 'lookup_builders_product': {
+      const query = (args.query || '').trim();
+      if (!query) return { error: 'Please provide a product search query.' };
+      try {
+        const cfg = await getBuildersBffConfig();
+        if (!cfg) return { error: 'Builders.co.za is temporarily unavailable. Try again later.' };
+
+        const uri = `https://www.builders.co.za/wmapi/bff/graphql/${cfg.searchKey}/${cfg.searchHash}`;
+        let decoded;
+        try {
+          const r = await buildersFetch(uri, {
+            method: 'POST',
+            headers: buildersBffHeaders({ operationName: cfg.searchKey, operationHash: cfg.searchHash }),
+            body: JSON.stringify({ variables: { keyword: query, offset: 0, pageSize: 10, dynamicPriceRange: true, site: cfg.site } }),
+            timeoutMs: 12000,
+          });
+          if (!r.ok) return { error: 'Builders search unavailable right now.' };
+          decoded = await r.json();
+        } catch { return { error: 'Could not reach Builders.co.za.' }; }
+
+        const items = decoded?.data?.search?.data?.results?.items;
+        if (!Array.isArray(items) || !items.length) return { products: [], message: `No products found on Builders.co.za for "${query}".` };
+
+        const products = [];
+        for (const it of items.slice(0, 8)) {
+          if (!it) continue;
+          const title = _str(it.name || it.title || it.productName);
+          if (!title) continue;
+          let urlPath = _str(it.url || it.productUrl || it.seoUrl || it.link);
+          if (!urlPath) { const code = _str(it.code || it.id || it.productCode); if (code) urlPath = `/p/${code}`; }
+          const url = urlPath ? (urlPath.startsWith('http') ? urlPath : `https://www.builders.co.za${urlPath.startsWith('/') ? '' : '/'}${urlPath}`) : '';
+          const price = extractPriceFromBffItem(it);
+          const brand = _str(it.brand || it.brandName || '');
+          products.push({
+            title,
+            brand: brand || undefined,
+            price: price > 0 ? `R${price.toFixed(2)}` : 'Price in-store',
+            priceZar: price > 0 ? price : null,
+            url: url || undefined,
+          });
+        }
+
+        return {
+          products,
+          searchQuery: query,
+          source: 'builders.co.za',
+          message: products.length > 0
+            ? `Found ${products.length} product(s) on Builders.co.za for "${query}". Present these to the customer so they can choose their preferred brand or item.`
+            : `No products found for "${query}".`,
+          instruction: 'Show these products to the customer with prices and ask which one they prefer. Include the Builders link so they can view it.',
+        };
+      } catch (e) {
+        console.error('[lookup_builders_product] Error:', e.message);
+        return { error: 'Product search failed. Try again.' };
       }
     }
 
@@ -2742,13 +2830,27 @@ PHOTO ANALYSIS FOR RFQ:
 - Explain a quote breakdown (explain_quote)
 - Check payment status for a booking (check_payment)
 
+🔍 BUILDERS PRODUCT BROWSING:
+- Search for products, materials, and brands on Builders Warehouse (lookup_builders_product)
+- Help customers compare brands and prices for materials they need
+- Show product names, brands, prices, and direct links to Builders website
+
 CRITICAL PRICING RULES:
 - You MUST call lookup_pricing BEFORE calling create_booking, EVERY TIME, NO EXCEPTIONS.
 - When calling lookup_pricing, pass the specific service as subcategory (e.g. category="plumbing", subcategory="toilet unblocking").
+- lookup_pricing now returns laborCostPerHour, outsourcedLaborRate, and materialMultiplier from admin pricing guidance — use these for accurate quotes.
 - If lookup_pricing returns matched=true with a fixedPrice, use that EXACT price — do NOT estimate or use a different amount.
 - If lookup_pricing returns matched=false and no fixedPrice service matches, tell the customer: "This job needs a detailed quote" and use submit_rfq instead of create_booking.
 - NEVER guess or make up a price. Only use prices returned by lookup_pricing.
 - If create_booking returns an estimated cost of R0.00, it means no fixed price was found — inform the customer and suggest an RFQ.
+
+BUILDERS PRODUCT BROWSING RULES:
+- When presenting RFQ quotes that include materials, mention that you can look up specific products on Builders if they want different brands or options.
+- When a customer asks about specific products, materials, or brands, use lookup_builders_product to search Builders Warehouse.
+- Present results with product name, brand, price, and a direct link to the Builders website.
+- Let the customer choose which product/brand they prefer — then factor that into the quote.
+- If a customer wants to compare brands (e.g. "show me geyser options"), search Builders and present the top options with prices.
+- Always show the Builders link so the customer can view the product details themselves.
 
 GUIDELINES:
 - Be warm, professional, and concise (WhatsApp messages should be short)

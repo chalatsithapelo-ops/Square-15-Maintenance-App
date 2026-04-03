@@ -2965,6 +2965,26 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         return (a.name || '').localeCompare(b.name || '');
       });
 
+      // ── Also load pricingGuidance for the matched category ──
+      let pricingGuidance = null;
+      try {
+        const guidanceSlug = categoryName || (finalServices[0] && finalServices[0].category_name ? finalServices[0].category_name.toLowerCase() : '');
+        if (guidanceSlug) {
+          const gDoc = await firestore.collection('pricingGuidance').doc(guidanceSlug).get();
+          if (gDoc.exists) {
+            const gd = gDoc.data() || {};
+            pricingGuidance = {
+              category: guidanceSlug,
+              laborCostPerHour: gd.laborCostPerHour ?? gd.labor_cost_per_hour ?? null,
+              outsourcedLaborRate: gd.outsourcedLaborRate ?? gd.outsourced_labor_rate ?? null,
+              materialMultiplier: gd.materialMultiplier ?? gd.material_multiplier ?? null,
+              service_prices: gd.service_prices || gd.servicePrices || null,
+              updated_at: gd.updatedAt || gd.updated_at || null,
+            };
+          }
+        }
+      } catch (ge) { console.warn('⚠️ pricingGuidance lookup:', ge.message); }
+
       return {
         ok: true,
         success: true,
@@ -2974,6 +2994,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
           filtered: services.length > 0,
           search_terms: searchTerms || 'all',
           expanded_terms: expandedTerms !== searchTerms ? expandedTerms.trim() : undefined,
+          pricingGuidance: pricingGuidance,
           message: services.length > 0
             ? `Found ${services.length} service(s) matching "${searchTerms}".`
             : allServices.length > 0
@@ -2983,6 +3004,70 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       };
     } catch (e) {
       return { ok: false, success: false, error: 'pricing_lookup_failed', message: String(e) };
+    }
+  }
+
+  // ── Builders Product Lookup ──
+  if (action === 'lookup_builders_product') {
+    try {
+      const query = String(payload.query || payload.search || payload.product || '').trim();
+      if (!query) return { ok: false, error: 'query parameter required' };
+
+      const bffCfg = await getBuildersBffConfig();
+      if (!bffCfg || !bffCfg.searchHash) {
+        return { ok: true, data: { products: [], message: 'Builders search temporarily unavailable.' } };
+      }
+
+      const searchBody = JSON.stringify({
+        persistedQuery: { version: 1, sha256Hash: bffCfg.searchHash },
+        variables: {
+          ...(bffCfg.defaultSearchVars || {}),
+          query: query,
+          pageSize: 8,
+          storeId: bffCfg.storeId || '42',
+          paginationInput: { cursor: '', pageSize: 8 },
+        },
+      });
+
+      const searchResp = await fetchWithTimeout(bffCfg.gqlUrl, {
+        method: 'POST',
+        headers: { ...buildersBffHeaders({ operationName: 'Search', operationHash: bffCfg.searchHash }), 'Content-Type': 'application/json' },
+        body: searchBody,
+        timeoutMs: 15000,
+      });
+
+      if (!searchResp || !searchResp.ok) {
+        return { ok: true, data: { products: [], message: 'Builders search returned no results.' } };
+      }
+
+      const searchJson = await searchResp.json();
+      const items = searchJson?.data?.search?.searchResult?.itemStacks?.[0]?.itemsV2 || [];
+
+      const products = items.slice(0, 8).map(it => {
+        const priceInfo = it.priceInfo?.currentPrice || it.priceInfo?.linePrice;
+        const price = priceInfo?.priceString || priceInfo?.price || null;
+        const name = it.name || it.title || 'Unknown Product';
+        const brand = it.brand || '';
+        const url = it.canonicalUrl
+          ? (it.canonicalUrl.startsWith('http') ? it.canonicalUrl : `https://www.builders.co.za${it.canonicalUrl}`)
+          : null;
+        return { name, brand, price: price ? `R${String(price).replace(/[^0-9.]/g, '')}` : 'Price on request', url };
+      }).filter(p => p.name !== 'Unknown Product');
+
+      return {
+        ok: true,
+        data: {
+          products,
+          query,
+          count: products.length,
+          message: products.length > 0
+            ? `Found ${products.length} product(s) on Builders for "${query}".`
+            : `No products found on Builders for "${query}".`,
+        },
+      };
+    } catch (e) {
+      console.error('[lookup_builders_product]', e.message);
+      return { ok: false, error: 'builders_lookup_failed', message: String(e.message || e) };
     }
   }
 

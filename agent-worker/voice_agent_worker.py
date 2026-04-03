@@ -551,8 +551,15 @@ async def entrypoint(ctx: JobContext):
             "- When user asks how much a service costs, MUST call lookup_service_pricing. Do NOT answer without calling this tool.\n"
             "- Pass query with the service name (e.g. query='plumbing', query='unblock toilet', query='painting').\n"
             "- The tool ALWAYS returns pricing data. Read back the prices from the results.\n"
+            "- lookup_service_pricing now also returns pricingGuidance with laborCostPerHour, outsourcedLaborRate, and materialMultiplier — use these for accurate estimates.\n"
             "- If cost is null for a service, say 'This service requires a quote from an artisan'.\n"
             "- NEVER guess or make up prices. ALWAYS call lookup_service_pricing.\n"
+            "\n"
+            "BUILDERS PRODUCT BROWSING:\n"
+            "- When a customer asks about specific products, materials, or brands, use lookup_builders_product to search Builders Warehouse.\n"
+            "- Present the product name, brand, price, and mention they can view it on the Builders website.\n"
+            "- When presenting RFQ quotes with materials, offer to look up specific products on Builders if the customer wants different brands or options.\n"
+            "- If a customer wants to compare brands (e.g. 'what geyser options are there?'), search Builders and present the options with prices.\n"
             "\n"
             "DIAGNOSIS & QUOTING (IMPORTANT — ASK BEFORE BOOKING):\n"
             "- When a user describes a maintenance problem, DO NOT immediately create a booking.\n"
@@ -1373,6 +1380,55 @@ async def entrypoint(ctx: JobContext):
                 "I'm having a temporary connection issue retrieving our latest prices. "
                 "Please check the services section in the app for current pricing, or try asking me again in a moment."
             )
+
+    @llm.function_tool(
+        description=(
+            "Search for products, materials, and brands on Builders Warehouse. "
+            "Use when customer asks about specific products, wants to compare brands, "
+            "or needs material prices. Returns product names, brands, prices, and links."
+        )
+    )
+    async def lookup_builders_product(query: str = "") -> str:
+        """Search Builders Warehouse for products and materials."""
+        if not query.strip():
+            return "Please tell me what product or material you'd like me to look up on Builders."
+
+        logger.info(f"🔍 lookup_builders_product called: query={query}")
+
+        try:
+            import urllib.parse
+            encoded_q = urllib.parse.quote(query.strip())
+            url = f"{backend_url}/api/pricing/builders-lookup?q={encoded_q}"
+            logger.info(f"🔍 Calling Builders lookup: {url}")
+
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as http_session:
+                async with http_session.get(url) as resp:
+                    if resp.status != 200:
+                        return "Sorry, I couldn't search Builders right now. Please try again."
+                    result = await resp.json()
+
+            if not result.get('ok') or not result.get('result'):
+                return f"I couldn't find any products matching '{query}' on Builders. Try a different search term."
+
+            r = result['result']
+            name = r.get('title', r.get('name', 'Unknown'))
+            price = r.get('priceZar', 0)
+            brand = r.get('brand', '')
+            prod_url = r.get('url', '')
+
+            response = f"Found on Builders: {name}"
+            if brand:
+                response += f" by {brand}"
+            if price and price > 0:
+                response += f" — R{price:.2f}"
+            if prod_url:
+                response += f". You can view it at {prod_url}"
+
+            logger.info(f"🔍 Builders result: {name} R{price}")
+            return response
+        except Exception as e:
+            logger.error(f"lookup_builders_product error: {e}", exc_info=True)
+            return "I'm having trouble searching Builders right now. Please try again in a moment."
 
     # Phase 1: Write operations with propose/confirm
     @llm.function_tool(
@@ -2488,6 +2544,7 @@ async def entrypoint(ctx: JobContext):
             check_payment,
             get_wallet_balance,
             lookup_service_pricing,
+            lookup_builders_product,
             get_transaction_history,
             get_deposit_requests,
             get_service_categories,
