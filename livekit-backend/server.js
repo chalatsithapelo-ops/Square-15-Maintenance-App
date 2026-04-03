@@ -6076,6 +6076,66 @@ app.post('/api/notifications/send', authMiddleware, assistantLimiter, async (req
   }
 });
 
+// ── AI Photo Diagnosis — analyzes maintenance issue photos via GPT-4o Vision ──
+app.post('/api/photo/diagnose', assistantLimiter, async (req, res) => {
+  try {
+    const oai = getOpenAI();
+    if (!oai) return res.status(503).json({ error: 'AI service not configured' });
+
+    const { image_base64, image_url, user_description, location_context } = req.body;
+    if (!image_base64 && !image_url) {
+      return res.status(400).json({ error: 'Provide image_base64 or image_url' });
+    }
+
+    const imageContent = image_base64
+      ? { type: 'image_url', image_url: { url: image_base64.startsWith('data:') ? image_base64 : `data:image/jpeg;base64,${image_base64}`, detail: 'high' } }
+      : { type: 'image_url', image_url: { url: image_url, detail: 'high' } };
+
+    const userText = user_description
+      ? `The tenant describes the issue as: "${user_description}"${location_context ? `. Location: ${location_context}` : ''}`
+      : `Please analyze this maintenance issue photo.${location_context ? ` Location: ${location_context}` : ''}`;
+
+    const completion = await oai.chat.completions.create({
+      model: 'gpt-4o',
+      temperature: 0.2,
+      max_tokens: 800,
+      response_format: { type: 'json_object' },
+      messages: [
+        {
+          role: 'system',
+          content: `You are an expert maintenance diagnostics AI for a South African property maintenance company called Square 15 Maintenance.
+
+Analyze the photo of a maintenance issue and return a JSON object with these fields:
+- "issue_type": specific issue (e.g. "burst geyser element", "leaking tap", "cracked wall", "faulty outlet")
+- "service_category": one of: Plumbing, Electrical, Painting, Carpentry, Roofing, Tiling, Locksmith, Appliance Repair, Landscaping, General Maintenance
+- "severity": one of: low, medium, high, emergency
+- "urgency_flag": boolean — true if immediate action required (water damage, electrical hazard, security risk)
+- "description": 2-3 sentence description of what you see and the likely cause
+- "recommended_action": what should be done to fix it
+- "estimated_complexity": 1-5 (1=simple fix, 5=major project)
+- "materials_likely_needed": array of likely materials/parts needed
+- "safety_warnings": array of any safety concerns (empty array if none)
+- "confidence": 0.0-1.0 how confident you are in the diagnosis
+
+If the image is not a maintenance issue, set issue_type to "not_maintenance" and describe what you see.
+Return ONLY valid JSON.`,
+        },
+        {
+          role: 'user',
+          content: [imageContent, { type: 'text', text: userText }],
+        },
+      ],
+    });
+
+    const content = completion.choices[0]?.message?.content || '{}';
+    const diagnosis = JSON.parse(content);
+    res.json({ ok: true, diagnosis });
+  } catch (error) {
+    console.error('❌ Photo diagnosis error:', error.message);
+    res.status(500).json({ error: 'Photo diagnosis failed', details: error.message });
+  }
+});
+
 // ── Server-side PayFast Payment Initiation ──
 // Allows WhatsApp bot and app to generate payment URLs
 app.post('/api/payment/initiate', assistantLimiter, async (req, res) => {
@@ -7044,5 +7104,220 @@ if (require.main === module) {
     console.log(`🧠 Voice start endpoint: http://localhost:${PORT}/api/voice/start`);
     console.log(`📦 Environment: ${process.env.NODE_ENV}`);
     console.log('✅ Server ready to accept requests\n');
+
+    // ── Retargeting Queue Processor — runs every 15 minutes ──
+    if (firestore) {
+      const RETARGET_INTERVAL = 15 * 60 * 1000; // 15 min
+      async function processRetargetingQueue() {
+        try {
+          const now = new Date();
+          const nowStr = now.toISOString();
+          const dueSnap = await firestore.collection('retargeting_queue')
+            .where('status', '==', 'active')
+            .where('next_send_at', '<=', nowStr)
+            .limit(20)
+            .get();
+
+          if (dueSnap.empty) return;
+          console.log(`🔄 Retargeting: processing ${dueSnap.size} due items`);
+
+          for (const doc of dueSnap.docs) {
+            try {
+              const data = doc.data() || {};
+              const userId = String(data.user_id || '').trim();
+              const category = String(data.category_name || 'maintenance').trim();
+              const step = parseInt(data.next_step) || 1;
+              const amount = parseFloat(data.quoted_amount) || 0;
+
+              if (!userId) { await doc.ref.update({ status: 'expired' }); continue; }
+
+              // Check if user booked since (cancel retargeting)
+              const recentBookings = await firestore.collection('futureBookings')
+                .where('userId', '==', userId)
+                .where('status', 'in', ['pending', 'in_progress', 'completed'])
+                .limit(1)
+                .get();
+              const recentTasks = await firestore.collection('tasksManagement')
+                .where('userId', '==', userId)
+                .where('status', 'in', ['pending', 'in_progress', 'completed'])
+                .limit(1)
+                .get();
+              if (!recentBookings.empty || !recentTasks.empty) {
+                await doc.ref.update({ status: 'converted' });
+                continue;
+              }
+
+              // Get user's push tokens
+              const tokens = await getUserTokens(userId);
+              if (tokens.length === 0) {
+                await doc.ref.update({ status: 'expired', expired_reason: 'no_push_token' });
+                continue;
+              }
+
+              // Get user name
+              const userSnap = await firestore.collection('users').doc(userId).get();
+              const userName = String((userSnap.data() || {}).name || 'there').split(' ')[0];
+
+              const amountStr = amount > 0 ? ` (R${amount.toFixed(0)})` : '';
+
+              switch (step) {
+                case 1: // 1 hour: reminder
+                  await sendPushToTokens({
+                    tokens,
+                    title: `Still need that ${category} done?`,
+                    body: `Hi ${userName}, your quote${amountStr} is waiting! Tap to continue booking.`,
+                    data: { type: 'retarget_reminder', session_id: doc.id },
+                  });
+                  await doc.ref.update({
+                    next_step: 2,
+                    next_send_at: new Date(now.getTime() + 23 * 3600000).toISOString(),
+                    last_sent_at: nowStr,
+                  });
+                  break;
+
+                case 2: { // 24 hours: 5% discount
+                  const code = `BACK5-${doc.id.slice(-6).toUpperCase()}`;
+                  const expires = new Date(now.getTime() + 48 * 3600000);
+                  await firestore.collection('promo_codes').doc(code).set({
+                    code, discount_percent: 5, created_at: now.toISOString(),
+                    expires_at: expires.toISOString(), user_id: userId,
+                    type: 'retargeting', status: 'active', max_uses: 1, uses: 0,
+                  });
+                  await sendPushToTokens({
+                    tokens,
+                    title: `5% off your ${category} booking!`,
+                    body: `Hi ${userName}, use code ${code} for 5% off${amountStr}. Valid 48 hours!`,
+                    data: { type: 'retarget_discount', promo_code: code },
+                  });
+                  await doc.ref.update({
+                    next_step: 3,
+                    next_send_at: new Date(now.getTime() + 48 * 3600000).toISOString(),
+                    last_sent_at: nowStr, promo_code: code,
+                  });
+                  break;
+                }
+
+                case 3: { // 72 hours: 10% discount
+                  const code = `BACK10-${doc.id.slice(-6).toUpperCase()}`;
+                  const expires = new Date(now.getTime() + 96 * 3600000);
+                  await firestore.collection('promo_codes').doc(code).set({
+                    code, discount_percent: 10, created_at: now.toISOString(),
+                    expires_at: expires.toISOString(), user_id: userId,
+                    type: 'retargeting', status: 'active', max_uses: 1, uses: 0,
+                  });
+                  await sendPushToTokens({
+                    tokens,
+                    title: '10% off — limited time!',
+                    body: `Hi ${userName}, your ${category} issue won't fix itself. Use ${code} for 10% off!`,
+                    data: { type: 'retarget_discount', promo_code: code },
+                  });
+                  await doc.ref.update({
+                    next_step: 4,
+                    next_send_at: new Date(now.getTime() + 4 * 24 * 3600000).toISOString(),
+                    last_sent_at: nowStr, promo_code: code,
+                  });
+                  break;
+                }
+
+                case 4: { // 7 days: final 15%
+                  const code = `FINAL15-${doc.id.slice(-6).toUpperCase()}`;
+                  const expires = new Date(now.getTime() + 24 * 3600000);
+                  await firestore.collection('promo_codes').doc(code).set({
+                    code, discount_percent: 15, created_at: now.toISOString(),
+                    expires_at: expires.toISOString(), user_id: userId,
+                    type: 'retargeting', status: 'active', max_uses: 1, uses: 0,
+                  });
+                  await sendPushToTokens({
+                    tokens,
+                    title: 'Last chance: 15% off expires tomorrow!',
+                    body: `${userName}, final offer on your ${category} booking. Code ${code} — 24 hours only.`,
+                    data: { type: 'retarget_final', promo_code: code },
+                  });
+                  await doc.ref.update({
+                    status: 'expired', last_sent_at: nowStr, promo_code: code,
+                  });
+                  break;
+                }
+
+                default:
+                  await doc.ref.update({ status: 'expired' });
+              }
+            } catch (itemErr) {
+              console.warn(`⚠️ Retargeting item ${doc.id} error:`, itemErr.message);
+            }
+          }
+        } catch (e) {
+          console.warn('⚠️ Retargeting queue error:', e.message);
+        }
+      }
+
+      // Also detect stale bookings and queue them for retargeting
+      async function detectStaleBookings() {
+        try {
+          const staleThreshold = new Date(Date.now() - 24 * 3600000); // 24h old
+          const staleStatuses = [
+            'pending', 'pending_payment', 'pending_client_response',
+            'rfq_submitted', 'rfq_pending',
+          ];
+
+          for (const collection of ['futureBookings', 'tasksManagement']) {
+            for (const status of staleStatuses) {
+              const staleSnap = await firestore.collection(collection)
+                .where('status', '==', status)
+                .limit(10)
+                .get();
+
+              for (const doc of staleSnap.docs) {
+                const data = doc.data() || {};
+                const createdAt = data.createdAt?.toDate?.() || data.created_at?.toDate?.();
+                if (!createdAt || createdAt > staleThreshold) continue;
+
+                const uid = String(data.userId || data.user_id || data.clientId || '').trim();
+                if (!uid) continue;
+
+                // Check if already queued
+                const existing = await firestore.collection('retargeting_queue')
+                  .where('session_id', '==', doc.id)
+                  .limit(1)
+                  .get();
+                if (!existing.empty) continue;
+
+                const category = String(data.category || data.serviceCategory || 'maintenance').trim();
+                const amount = parseFloat(data.cost || data.total_cost || data.quoted_price || '0');
+
+                await firestore.collection('retargeting_queue').doc(doc.id).set({
+                  user_id: uid,
+                  session_id: doc.id,
+                  booking_id: doc.id,
+                  category_name: category,
+                  quoted_amount: amount,
+                  stale_status: status,
+                  source: 'stale_detection',
+                  created_at: new Date().toISOString(),
+                  status: 'active',
+                  next_step: 1,
+                  next_send_at: new Date().toISOString(), // Send immediately
+                });
+              }
+            }
+          }
+        } catch (e) {
+          console.warn('⚠️ Stale booking detection error:', e.message);
+        }
+      }
+
+      // Run every 15 minutes
+      setInterval(async () => {
+        await detectStaleBookings();
+        await processRetargetingQueue();
+      }, RETARGET_INTERVAL).unref?.();
+
+      // Also run once on startup (after 30s warm-up)
+      setTimeout(async () => {
+        await detectStaleBookings();
+        await processRetargetingQueue();
+      }, 30_000);
+      console.log('📋 Retargeting queue processor started (every 15 min)');
+    }
   });
 }
