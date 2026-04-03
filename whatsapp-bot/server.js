@@ -383,9 +383,9 @@ const waTools = [
       parameters: {
         type: 'object',
         properties: {
-          bookingId: { type: 'string', description: 'The booking ID to pay for' },
+          bookingId: { type: 'string', description: 'The booking ID to pay for (optional, uses last booking if not provided)' },
         },
-        required: ['bookingId'],
+        required: [],
       },
     },
   },
@@ -1850,11 +1850,16 @@ async function executeWaTool(name, args, session) {
         else return { error: 'Your WhatsApp number is not linked to a Square 15 account. Wallet payment requires an app account.' };
       }
 
-      const bid = args.bookingId;
+      const bid = args.bookingId || session.lastBookingId;
       if (!bid) return { error: 'Please provide a booking ID.' };
 
-      // Get booking
+      // Get booking — check both collections (RFQs live in futureBookings only)
       let bookDoc = await firestore.collection('tasksManagement').doc(bid).get();
+      let bookingCollection = 'tasksManagement';
+      if (!bookDoc.exists) {
+        bookDoc = await firestore.collection('futureBookings').doc(bid).get();
+        bookingCollection = 'futureBookings';
+      }
       if (!bookDoc.exists) return { error: `Booking "${bid}" not found.` };
       const bookData = bookDoc.data();
 
@@ -1875,19 +1880,23 @@ async function executeWaTool(name, args, session) {
 
           const newBalance = balance - cost;
           txn.update(userRef, { balance: newBalance.toFixed(2) });
-          txn.update(firestore.collection('tasksManagement').doc(bid), {
+
+          // Update the primary collection where the booking was found
+          txn.update(firestore.collection(bookingCollection).doc(bid), {
             payment_status: 'paid',
             paymentStatus: 'paid',
             payment_method: 'wallet',
             paid_at: new Date().toISOString(),
           });
 
-          // Also update futureBookings if exists
-          const fbRef = firestore.collection('futureBookings').doc(bid);
-          const fbSnap = await txn.get(fbRef);
-          if (fbSnap.exists) {
-            txn.update(fbRef, {
+          // Also update the OTHER collection if it exists there too
+          const otherCollection = bookingCollection === 'tasksManagement' ? 'futureBookings' : 'tasksManagement';
+          const otherRef = firestore.collection(otherCollection).doc(bid);
+          const otherSnap = await txn.get(otherRef);
+          if (otherSnap.exists) {
+            txn.update(otherRef, {
               payment_status: 'paid',
+              paymentStatus: 'paid',
               wallet_deducted: true,
               paid_at: new Date().toISOString(),
             });
@@ -2033,6 +2042,7 @@ async function executeWaTool(name, args, session) {
       if (!bid) return { error: 'Please provide a booking ID.' };
 
       let doc = await firestore.collection('tasksManagement').doc(bid).get();
+      if (!doc.exists) doc = await firestore.collection('futureBookings').doc(bid).get();
       if (!doc.exists) return { error: `Booking "${bid}" not found.` };
 
       const d = doc.data();
@@ -2053,28 +2063,17 @@ async function executeWaTool(name, args, session) {
       const now = new Date().toISOString();
       const wasPaid = d.payment_status === 'paid' || d.paymentStatus === 'paid';
 
-      // Cancel in tasksManagement
-      await firestore.collection('tasksManagement').doc(bid).update({
+      const cancelUpdate = {
         status: 'cancelled',
         cancelled_at: now,
         cancelled_by: 'client_whatsapp',
         cancel_reason: args.reason || 'Cancelled via WhatsApp',
         cancellation_reason: args.reason || 'Cancelled via WhatsApp',
-      });
+      };
 
-      // Cancel in futureBookings if exists
-      try {
-        const fbDoc = await firestore.collection('futureBookings').doc(bid).get();
-        if (fbDoc.exists) {
-          await firestore.collection('futureBookings').doc(bid).update({
-            status: 'cancelled',
-            cancelled_at: now,
-            cancelled_by: 'client_whatsapp',
-            cancel_reason: args.reason || 'Cancelled via WhatsApp',
-            cancellation_reason: args.reason || 'Cancelled via WhatsApp',
-          });
-        }
-      } catch (e) { console.warn('[wa-tool] futureBookings cancel sync failed:', e.message); }
+      // Cancel in both collections (safe — only updates if doc exists)
+      try { await firestore.collection('tasksManagement').doc(bid).update(cancelUpdate); } catch (e) { /* doc may not exist */ }
+      try { await firestore.collection('futureBookings').doc(bid).update(cancelUpdate); } catch (e) { /* doc may not exist */ }
 
       // Initiate refund if paid
       let refundMsg = '';
@@ -2263,6 +2262,7 @@ async function executeWaTool(name, args, session) {
       if (!bid) return { error: 'Please provide a booking ID.' };
 
       let doc = await firestore.collection('tasksManagement').doc(bid).get();
+      if (!doc.exists) doc = await firestore.collection('futureBookings').doc(bid).get();
       if (!doc.exists) return { error: `Booking "${bid}" not found.` };
 
       const d = doc.data();
@@ -2493,6 +2493,37 @@ async function executeWaTool(name, args, session) {
         accepted_via: 'whatsapp',
       });
 
+      // Mirror accepted RFQ to tasksManagement so all downstream handlers
+      // (cancel, reschedule, wallet payment, admin app) can find it
+      const price = data.quoted_price || (data.ai_quote ? data.ai_quote.grand_total : '0');
+      const priceNum = parseFloat(price);
+
+      await firestore.collection('tasksManagement').doc(rfqId).set({
+        id: rfqId,
+        order_no: data.order_no || data.rfq_no || rfqId,
+        user_id: data.user_id || session.linkedUserId || '',
+        user_name: data.user_name || '',
+        user_phone: data.user_phone || session.phone,
+        category_name: data.category_name || '',
+        description: data.description || data.problem_description || '',
+        problem_description: data.problem_description || data.description || '',
+        address: data.address || '',
+        status: 'pending_payment',
+        payment_status: 'unpaid',
+        cost: priceNum.toFixed(2),
+        total_cost: priceNum.toFixed(2),
+        source: 'whatsapp_rfq',
+        is_rfq: 'yes',
+        rfq_status: 'accepted_converted',
+        service_provider_id: data.service_provider_id || '',
+        service_provider_name: data.service_provider_name || '',
+        scheduled_date: data.scheduled_date || '',
+        scheduled_time: data.scheduled_time || '',
+        created_at: data.created_at || new Date().toISOString(),
+        accepted_at: new Date().toISOString(),
+        accepted_via: 'whatsapp',
+      }, { merge: true });
+
       // Notify admin
       await firestore.collection('notifications').add({
         title: 'RFQ Quote Accepted',
@@ -2503,9 +2534,6 @@ async function executeWaTool(name, args, session) {
         read: false,
         created_at: admin.firestore.FieldValue.serverTimestamp(),
       });
-
-      const price = data.quoted_price || (data.ai_quote ? data.ai_quote.grand_total : '0');
-      const priceNum = parseFloat(price);
 
       // Store for quick payment follow-up
       session.lastBookingId = rfqId;
