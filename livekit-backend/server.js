@@ -3231,11 +3231,28 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       const bData = await loadBooking();
       if (!bData) return { ok: false, status: 404, error: 'booking_not_found' };
 
+      // Enforce artisan acceptance before payment
+      const artisanAccepted = bData.accept === '1' || bData.accept === 1 || bData.artisan_confirmed === 'yes';
+      if (!artisanAccepted) {
+        return { ok: false, status: 400, error: 'An artisan hasn\'t accepted this job yet. Payment is only available after an artisan accepts.' };
+      }
+
       const cost = parseFloat(bData.cost || bData.total_cost || bData.quoted_price || '0');
       if (cost <= 0) return { ok: false, status: 400, error: 'no_confirmed_price' };
 
       if ((bData.payment_status || bData.paymentStatus) === 'paid') {
         return { ok: true, status: 200, data: { message: 'This booking is already paid.', bookingId: bid } };
+      }
+
+      // Support deposit vs full payment
+      const paymentType = payload.payment_type || 'full';
+      let payAmount;
+      if (bData.deposit_paid === true && bData.balance_paid !== true) {
+        payAmount = parseFloat(bData.balance_amount || cost);
+      } else if (paymentType === 'deposit') {
+        payAmount = Math.round(cost * 0.35 * 100) / 100;
+      } else {
+        payAmount = cost;
       }
 
       const merchantId = env('PAYFAST_MERCHANT_ID');
@@ -3247,7 +3264,8 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         const payRef = `PAY-${bid}-${Date.now().toString(36)}`;
         await firestore.collection('payment_links').doc(payRef).set({
           booking_id: bid,
-          amount: cost,
+          amount: payAmount,
+          payment_type: paymentType,
           user_id: actorUid || '',
           status: 'pending',
           source: payload.source || 'voice',
@@ -3255,25 +3273,26 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         });
         await firestore.collection('notifications').add({
           title: 'Payment Link Request',
-          body: `Payment link requested for booking ${bid} (R${cost.toFixed(2)})`,
+          body: `Payment link requested for booking ${bid} (R${payAmount.toFixed(2)}, ${paymentType})`,
           type: 'payment_request',
           booking_id: bid,
-          amount: cost,
+          amount: payAmount,
           for_role: 'admin',
           status: 'unread',
           created_at: admin.firestore.FieldValue.serverTimestamp(),
         });
         return { ok: true, status: 200, data: {
-          message: `Payment of R${cost.toFixed(2)} is being processed. You'll receive a payment link shortly.`,
-          reference: payRef, bookingId: bid, amount: cost,
+          message: `Payment of R${payAmount.toFixed(2)} is being processed. You'll receive a payment link shortly.`,
+          reference: payRef, bookingId: bid, amount: payAmount,
         }};
       }
 
-      const itemName = `Square 15 Booking ${bData.order_no || bData.rfq_no || bid}`;
+      const itemSuffix = paymentType === 'deposit' ? '(35% Deposit)' : (bData.deposit_paid === true ? '(Balance)' : '(Full)');
+      const itemName = `Square 15 Booking ${bData.order_no || bData.rfq_no || bid} ${itemSuffix}`;
       const paymentData = {
         merchant_id: merchantId,
         merchant_key: merchantKey,
-        amount: cost.toFixed(2),
+        amount: payAmount.toFixed(2),
         item_name: itemName,
         custom_str1: bid,
       };
@@ -3283,7 +3302,8 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       const payRef = `PAY-${bid}-${Date.now().toString(36)}`;
       await firestore.collection('payment_links').doc(payRef).set({
         booking_id: bid,
-        amount: cost,
+        amount: payAmount,
+        payment_type: paymentType,
         user_id: actorUid || '',
         payment_url: paymentUrl,
         status: 'pending',
@@ -3295,10 +3315,11 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       if (actorUid) {
         await firestore.collection('notifications').add({
           title: 'Payment Link Ready',
-          body: `Tap to pay R${cost.toFixed(2)} for booking ${bData.order_no || bData.rfq_no || bid}`,
+          body: `Tap to pay R${payAmount.toFixed(2)} ${itemSuffix} for booking ${bData.order_no || bData.rfq_no || bid}`,
           type: 'payment_link',
           booking_id: bid,
-          amount: cost,
+          amount: payAmount,
+          payment_type: paymentType,
           payment_url: paymentUrl,
           userId: actorUid,
           status: 'unread',
@@ -3307,8 +3328,8 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       }
 
       return { ok: true, status: 200, data: {
-        message: `Payment link generated for R${cost.toFixed(2)}. A notification with the link has been sent to your phone.`,
-        paymentUrl, reference: payRef, bookingId: bid, amount: cost,
+        message: `Payment link generated for R${payAmount.toFixed(2)} ${itemSuffix}. A notification with the link has been sent to your phone.`,
+        paymentUrl, reference: payRef, bookingId: bid, amount: payAmount, payment_type: paymentType,
       }};
     } catch (err) {
       return { ok: false, status: 500, error: `payment_link_error: ${err.message}` };
@@ -3718,15 +3739,25 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     if (!data) return { ok: false, status: 404, error: 'booking_not_found' };
     if (!data.ai_quote && !data.quoted_price) return { ok: false, status: 400, error: 'no_quote_available' };
 
+    const price = data.quoted_price || (data.ai_quote ? String(data.ai_quote.grand_total) : '0');
+    const priceNum = parseFloat(price);
+    const depositAmount = Math.round(priceNum * 0.35 * 100) / 100;
+    const balanceAmount = Math.round((priceNum - depositAmount) * 100) / 100;
+
     await bookingRef.update({
       rfq_status: 'accepted_converted',
-      status: 'pending_payment',
+      status: 'pending_artisan_acceptance',
+      artisan_confirmed: 'pending',
+      deposit_amount: depositAmount.toFixed(2),
+      balance_amount: balanceAmount.toFixed(2),
+      payment_type: '',
+      deposit_paid: false,
+      balance_paid: false,
       accepted_at: now,
       accepted_via: payload.source || 'voice',
       updated_at: now,
     });
 
-    const price = data.quoted_price || (data.ai_quote ? String(data.ai_quote.grand_total) : '0');
     return { ok: true, status: 200, data: { accepted: true, price, rfq_no: String(data.rfq_no || '').trim() } };
   }
 

@@ -357,13 +357,14 @@ const waTools = [
     type: 'function',
     function: {
       name: 'request_payment_link',
-      description: 'Generate a payment link for an unpaid booking so the customer can pay via card. Use when customer asks to pay.',
+      description: 'Generate a payment link for an unpaid booking so the customer can pay via card. Customer must choose deposit (35%) or full payment. Artisan must have accepted the job first.',
       parameters: {
         type: 'object',
         properties: {
           bookingId: { type: 'string', description: 'The booking ID to generate payment for' },
+          payment_type: { type: 'string', enum: ['deposit', 'full'], description: 'Whether to pay the deposit (35%) or the full amount. Ask the customer to choose.' },
         },
-        required: ['bookingId'],
+        required: ['bookingId', 'payment_type'],
       },
     },
   },
@@ -379,13 +380,14 @@ const waTools = [
     type: 'function',
     function: {
       name: 'pay_with_wallet',
-      description: 'Pay for a booking using wallet balance',
+      description: 'Pay for a booking using wallet balance. Customer must choose deposit (35%) or full payment. Artisan must have accepted the job first.',
       parameters: {
         type: 'object',
         properties: {
           bookingId: { type: 'string', description: 'The booking ID to pay for (optional, uses last booking if not provided)' },
+          payment_type: { type: 'string', enum: ['deposit', 'full'], description: 'Whether to pay the deposit (35%) or the full amount. Ask the customer to choose.' },
         },
-        required: [],
+        required: ['payment_type'],
       },
     },
   },
@@ -1249,6 +1251,10 @@ async function executeWaTool(name, args, session) {
         promoApplied = { code: session.promoCode, discount, type: session.promoDiscountType || 'fixed' };
       }
 
+      // Calculate deposit amount (35% of total, matching app's deposit_service.dart)
+      const depositAmount = Math.round(finalCost * 0.35 * 100) / 100;
+      const balanceAmount = Math.round((finalCost - depositAmount) * 100) / 100;
+
       // Core booking doc (compatible with Flutter app tasksManagement queries)
       const booking = {
         id: bookingId,
@@ -1266,9 +1272,15 @@ async function executeWaTool(name, args, session) {
         contact: session.phone,
         user_id: session.linkedUserId || '',
         source: 'whatsapp',
-        status: 'pending',
+        status: 'pending_artisan_acceptance',
         accept: '',
+        artisan_confirmed: 'pending',
         cost: finalCost.toFixed(2),
+        deposit_amount: depositAmount.toFixed(2),
+        balance_amount: balanceAmount.toFixed(2),
+        payment_type: '',
+        deposit_paid: false,
+        balance_paid: false,
         payment_status: 'unpaid',
         paymentStatus: 'pending',
         promo_code: promoApplied ? promoApplied.code : null,
@@ -1293,7 +1305,13 @@ async function executeWaTool(name, args, session) {
         address: args.address || '',
         urgency: args.urgency || 'normal',
         cost: finalCost.toFixed(2),
-        status: 'pending',
+        deposit_amount: depositAmount.toFixed(2),
+        balance_amount: balanceAmount.toFixed(2),
+        payment_type: '',
+        deposit_paid: false,
+        balance_paid: false,
+        status: 'pending_artisan_acceptance',
+        artisan_confirmed: 'pending',
         payment_status: 'unpaid',
         source: 'whatsapp',
         service_provider_id: '',
@@ -1380,19 +1398,16 @@ async function executeWaTool(name, args, session) {
       session.lastBookingId = bookingId;
       session.lastBookingCost = finalCost;
 
-      // Build payment instructions
-      const paymentInstructions = session.linkedUserId
-        ? `\n\n💰 *Payment options:*\n• Reply "pay with wallet" to use your wallet balance\n• Reply "pay" or "pay with card" for a card payment link\n• You can also pay later in the Square 15 app`
-        : `\n\n💰 *To pay:*\n• Reply "pay" for a payment link\n• Or pay in the Square 15 app`;
-
       return {
         success: true,
         bookingId,
         orderNo,
         estimatedCost: `R${finalCost.toFixed(2)}`,
+        depositAmount: `R${depositAmount.toFixed(2)}`,
+        balanceAmount: `R${balanceAmount.toFixed(2)}`,
         promoApplied: promoApplied ? `${promoApplied.code} (-R${promoApplied.discount.toFixed(2)})` : null,
-        paymentStatus: 'unpaid',
-        message: `Booking ${orderNo} created! Estimated cost: R${finalCost.toFixed(2)}.${paymentInstructions}`,
+        paymentStatus: 'awaiting_artisan',
+        message: `Booking ${orderNo} created! Estimated cost: R${finalCost.toFixed(2)}.\n\n⏳ *Next step:* An artisan needs to accept your job before payment. We're dispatching the nearest available artisan now — you'll be notified as soon as one accepts.\n\n🔒 *Your money is protected:* When it's time to pay, your payment is held in a secure escrow account. The artisan does NOT receive your money until you confirm you are satisfied with the completed work.\n\n💰 *Payment options (after artisan accepts):*\n• Full amount: R${finalCost.toFixed(2)}\n• Deposit (35%): R${depositAmount.toFixed(2)} now, R${balanceAmount.toFixed(2)} after job completion`,
       };
     }
 
@@ -1741,11 +1756,38 @@ async function executeWaTool(name, args, session) {
       if (!doc.exists) return { error: `Booking "${bid}" not found.` };
 
       const d = doc.data();
+
+      // Enforce artisan acceptance before payment
+      const artisanAccepted = d.accept === '1' || d.accept === 1 || d.artisan_confirmed === 'yes';
+      if (!artisanAccepted) {
+        return { error: `An artisan hasn't accepted this job yet. You'll be notified when an artisan accepts, and then you can proceed to payment. Your booking ${d.order_no || bid} is in the queue.` };
+      }
+
       const cost = parseFloat(d.cost || d.total_cost || d.quoted_price || '0');
       if (cost <= 0) return { error: 'This booking does not have a confirmed price yet.' };
 
       if (d.payment_status === 'paid' || d.paymentStatus === 'paid') {
         return { message: 'This booking is already paid!', bookingId: bid };
+      }
+
+      // If deposit already paid, only balance remains
+      if (d.deposit_paid === true && d.balance_paid !== true) {
+        const bal = parseFloat(d.balance_amount || '0');
+        if (bal <= 0) return { message: 'Deposit already paid. No balance due yet.', bookingId: bid };
+        // For balance payment, force full remaining amount
+        args.payment_type = 'full';
+      }
+
+      // Determine payment amount based on deposit vs full
+      const paymentType = args.payment_type || 'full';
+      let payAmount;
+      let itemSuffix;
+      if (paymentType === 'deposit') {
+        payAmount = Math.round(cost * 0.35 * 100) / 100;
+        itemSuffix = '(35% Deposit)';
+      } else {
+        payAmount = d.deposit_paid === true ? parseFloat(d.balance_amount || cost) : cost;
+        itemSuffix = d.deposit_paid === true ? '(Balance Payment)' : '(Full Payment)';
       }
 
       // Try to generate a real PayFast payment URL via the backend
@@ -1756,11 +1798,12 @@ async function executeWaTool(name, args, session) {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            amount: cost.toFixed(2),
-            item_name: `Square 15 Booking ${d.order_no || d.rfq_no || bid}`,
+            amount: payAmount.toFixed(2),
+            item_name: `Square 15 Booking ${d.order_no || d.rfq_no || bid} ${itemSuffix}`,
             booking_id: bid,
             email: d.customer_email || d.email || '',
             phone: session.phone,
+            payment_type: paymentType,
           }),
         });
         const pfBody = await pfResp.json();
@@ -1770,7 +1813,8 @@ async function executeWaTool(name, args, session) {
           const payRef = `PAY-${bid}-${Date.now().toString(36)}`;
           await firestore.collection('payment_links').doc(payRef).set({
             booking_id: bid,
-            amount: cost,
+            amount: payAmount,
+            payment_type: paymentType,
             phone: session.phone,
             user_id: session.linkedUserId || '',
             payment_url: pfBody.payment_url,
@@ -1779,10 +1823,20 @@ async function executeWaTool(name, args, session) {
             created_at: admin.firestore.FieldValue.serverTimestamp(),
           });
 
+          // Update booking with payment_type
+          try {
+            await firestore.collection('tasksManagement').doc(bid).update({ payment_type: paymentType }).catch(() => {});
+            await firestore.collection('futureBookings').doc(bid).update({ payment_type: paymentType }).catch(() => {});
+          } catch (e) { /* ignore */ }
+
+          const escrowMsg = paymentType === 'deposit'
+            ? `\n\n🔒 Your deposit of R${payAmount.toFixed(2)} is held securely in escrow. The remaining R${(cost - payAmount).toFixed(2)} is due after job completion. The artisan does NOT receive your money until you confirm satisfaction.`
+            : `\n\n🔒 Your payment is held securely in escrow. The artisan does NOT receive your money until you confirm you are satisfied with the completed work.`;
+
           return {
             success: true,
-            message: `Here's your payment link for R${cost.toFixed(2)}:\n\n${pfBody.payment_url}\n\nClick to pay securely via PayFast. Payment is held in escrow until you confirm the job is done.`,
-            amount: `R${cost.toFixed(2)}`,
+            message: `Here's your ${itemSuffix} link for R${payAmount.toFixed(2)}:\n\n${pfBody.payment_url}\n\nClick to pay securely via PayFast.${escrowMsg}\n\n✅ 100% Money-Back Guarantee — not satisfied? Full refund, no questions asked within 24 hours.\n🚫 Free cancellation before artisan dispatch.`,
+            amount: `R${payAmount.toFixed(2)}`,
             paymentUrl: pfBody.payment_url,
             reference: payRef,
             bookingId: bid,
@@ -1796,7 +1850,8 @@ async function executeWaTool(name, args, session) {
       const payRef = `PAY-${bid}-${Date.now().toString(36)}`;
       await firestore.collection('payment_links').doc(payRef).set({
         booking_id: bid,
-        amount: cost,
+        amount: payAmount,
+        payment_type: paymentType,
         phone: session.phone,
         user_id: session.linkedUserId || '',
         status: 'pending',
@@ -1806,7 +1861,7 @@ async function executeWaTool(name, args, session) {
 
       await firestore.collection('notifications').add({
         title: 'WhatsApp Payment Request',
-        body: `Customer requests payment link for booking ${bid} (R${cost.toFixed(2)})`,
+        body: `Customer requests ${itemSuffix} for booking ${bid} (R${payAmount.toFixed(2)})`,
         type: 'payment_request',
         user_type: 'admin',
         booking_id: bid,
@@ -1815,8 +1870,8 @@ async function executeWaTool(name, args, session) {
       });
 
       return {
-        message: `Payment request for R${cost.toFixed(2)} submitted for booking ${d.order_no || d.rfq_no || bid}. You can also pay via the Square 15 app.\n\nAlternatively, reply "pay with wallet" if you have sufficient balance.`,
-        amount: `R${cost.toFixed(2)}`,
+        message: `${itemSuffix} request for R${payAmount.toFixed(2)} submitted for booking ${d.order_no || d.rfq_no || bid}. You can also pay via the Square 15 app.\n\nAlternatively, reply "pay with wallet" if you have sufficient balance.\n\n🔒 Your money is protected in escrow until you confirm satisfaction.`,
+        amount: `R${payAmount.toFixed(2)}`,
         reference: payRef,
         bookingId: bid,
       };
@@ -1865,8 +1920,26 @@ async function executeWaTool(name, args, session) {
 
       if (bookData.payment_status === 'paid') return { message: 'This booking is already paid!' };
 
+      // Enforce artisan acceptance before payment
+      const artisanAccepted = bookData.accept === '1' || bookData.accept === 1 || bookData.artisan_confirmed === 'yes';
+      if (!artisanAccepted) {
+        return { error: `An artisan hasn't accepted this job yet. You'll be notified when an artisan accepts, and then you can proceed to payment.` };
+      }
+
       const cost = parseFloat(bookData.cost || '0');
       if (cost <= 0) return { error: 'This booking does not have a confirmed price yet.' };
+
+      // Determine payment amount based on deposit vs full
+      const paymentType = args.payment_type || 'full';
+      let payAmount;
+      if (bookData.deposit_paid === true && bookData.balance_paid !== true) {
+        // Deposit already paid, only balance remains
+        payAmount = parseFloat(bookData.balance_amount || cost);
+      } else if (paymentType === 'deposit') {
+        payAmount = Math.round(cost * 0.35 * 100) / 100;
+      } else {
+        payAmount = cost;
+      }
 
       // Get user balance (atomic transaction)
       try {
@@ -1876,30 +1949,41 @@ async function executeWaTool(name, args, session) {
           if (!userSnap.exists) throw new Error('User not found');
 
           const balance = parseFloat(userSnap.data().balance || '0');
-          if (balance < cost) throw new Error(`Insufficient balance. You have R${balance.toFixed(2)} but need R${cost.toFixed(2)}.`);
+          if (balance < payAmount) throw new Error(`Insufficient balance. You have R${balance.toFixed(2)} but need R${payAmount.toFixed(2)}.`);
 
-          const newBalance = balance - cost;
+          const newBalance = balance - payAmount;
           txn.update(userRef, { balance: newBalance.toFixed(2) });
 
+          // Determine payment status fields
+          const isDeposit = paymentType === 'deposit' && bookData.deposit_paid !== true;
+          const paymentFields = isDeposit
+            ? {
+                payment_status: 'deposit_paid',
+                paymentStatus: 'deposit_paid',
+                deposit_paid: true,
+                payment_type: 'deposit',
+                payment_method: 'wallet',
+                paid_at: new Date().toISOString(),
+              }
+            : {
+                payment_status: 'paid',
+                paymentStatus: 'paid',
+                balance_paid: bookData.deposit_paid === true ? true : false,
+                deposit_paid: bookData.deposit_paid === true ? true : true,
+                payment_type: bookData.deposit_paid === true ? 'deposit' : 'full',
+                payment_method: 'wallet',
+                paid_at: new Date().toISOString(),
+              };
+
           // Update the primary collection where the booking was found
-          txn.update(firestore.collection(bookingCollection).doc(bid), {
-            payment_status: 'paid',
-            paymentStatus: 'paid',
-            payment_method: 'wallet',
-            paid_at: new Date().toISOString(),
-          });
+          txn.update(firestore.collection(bookingCollection).doc(bid), paymentFields);
 
           // Also update the OTHER collection if it exists there too
           const otherCollection = bookingCollection === 'tasksManagement' ? 'futureBookings' : 'tasksManagement';
           const otherRef = firestore.collection(otherCollection).doc(bid);
           const otherSnap = await txn.get(otherRef);
           if (otherSnap.exists) {
-            txn.update(otherRef, {
-              payment_status: 'paid',
-              paymentStatus: 'paid',
-              wallet_deducted: true,
-              paid_at: new Date().toISOString(),
-            });
+            txn.update(otherRef, { ...paymentFields, wallet_deducted: true });
           }
         });
 
@@ -1907,15 +1991,32 @@ async function executeWaTool(name, args, session) {
         await firestore.collection('transactionLogs').add({
           user_id: session.linkedUserId,
           type: 'payment',
-          subtype: 'wallet_deduction',
-          amount: cost,
+          subtype: paymentType === 'deposit' ? 'wallet_deposit_payment' : 'wallet_deduction',
+          amount: payAmount,
           booking_id: bid,
+          payment_type: paymentType,
           source: 'whatsapp',
           status: 'success',
           created_at: admin.firestore.FieldValue.serverTimestamp(),
         });
 
-        return { success: true, message: `Payment of R${cost.toFixed(2)} successful via wallet! Your booking ${bid} is now confirmed.`, paid: `R${cost.toFixed(2)}` };
+        const isDeposit = paymentType === 'deposit' && bookData.deposit_paid !== true;
+        const balanceRemaining = Math.round((cost - payAmount) * 100) / 100;
+
+        if (isDeposit) {
+          return {
+            success: true,
+            message: `Deposit payment of R${payAmount.toFixed(2)} successful via wallet! 🔒 Your deposit is held securely in escrow.\n\nRemaining balance: R${balanceRemaining.toFixed(2)} (due after job completion).\nThe artisan does NOT receive your money until you confirm satisfaction.\n\n✅ 100% Money-Back Guarantee`,
+            paid: `R${payAmount.toFixed(2)}`,
+            paymentType: 'deposit',
+          };
+        }
+        return {
+          success: true,
+          message: `Payment of R${payAmount.toFixed(2)} successful via wallet! 🔒 Your payment is held securely in escrow. The artisan does NOT receive your money until you confirm you are satisfied with the completed work.\n\n✅ 100% Money-Back Guarantee — not satisfied? Full refund, no questions asked within 24 hours.`,
+          paid: `R${payAmount.toFixed(2)}`,
+          paymentType: 'full',
+        };
       } catch (e) {
         return { error: e.message || 'Payment failed. Please try again.' };
       }
@@ -2486,18 +2587,26 @@ async function executeWaTool(name, args, session) {
         return { error: 'This RFQ does not have a quote yet. Please wait for the quote to be generated.' };
       }
 
+      const price = data.quoted_price || (data.ai_quote ? data.ai_quote.grand_total : '0');
+      const priceNum = parseFloat(price);
+      const depositAmount = Math.round(priceNum * 0.35 * 100) / 100;
+      const balanceAmount = Math.round((priceNum - depositAmount) * 100) / 100;
+
       await firestore.collection('futureBookings').doc(rfqId).update({
         rfq_status: 'accepted_converted',
-        status: 'pending_payment',
+        status: 'pending_artisan_acceptance',
+        artisan_confirmed: 'pending',
+        deposit_amount: depositAmount.toFixed(2),
+        balance_amount: balanceAmount.toFixed(2),
+        payment_type: '',
+        deposit_paid: false,
+        balance_paid: false,
         accepted_at: new Date().toISOString(),
         accepted_via: 'whatsapp',
       });
 
       // Mirror accepted RFQ to tasksManagement so all downstream handlers
       // (cancel, reschedule, wallet payment, admin app) can find it
-      const price = data.quoted_price || (data.ai_quote ? data.ai_quote.grand_total : '0');
-      const priceNum = parseFloat(price);
-
       await firestore.collection('tasksManagement').doc(rfqId).set({
         id: rfqId,
         order_no: data.order_no || data.rfq_no || rfqId,
@@ -2508,10 +2617,17 @@ async function executeWaTool(name, args, session) {
         description: data.description || data.problem_description || '',
         problem_description: data.problem_description || data.description || '',
         address: data.address || '',
-        status: 'pending_payment',
+        status: 'pending_artisan_acceptance',
+        artisan_confirmed: 'pending',
+        accept: '',
         payment_status: 'unpaid',
         cost: priceNum.toFixed(2),
         total_cost: priceNum.toFixed(2),
+        deposit_amount: depositAmount.toFixed(2),
+        balance_amount: balanceAmount.toFixed(2),
+        payment_type: '',
+        deposit_paid: false,
+        balance_paid: false,
         source: 'whatsapp_rfq',
         is_rfq: 'yes',
         rfq_status: 'accepted_converted',
@@ -2524,10 +2640,10 @@ async function executeWaTool(name, args, session) {
         accepted_via: 'whatsapp',
       }, { merge: true });
 
-      // Notify admin
+      // Notify admin to assign an artisan
       await firestore.collection('notifications').add({
-        title: 'RFQ Quote Accepted',
-        body: `Customer accepted quote for RFQ ${data.rfq_no || rfqId}`,
+        title: 'RFQ Quote Accepted — Assign Artisan',
+        body: `Customer accepted quote for RFQ ${data.rfq_no || rfqId} (R${priceNum.toFixed(2)}). Please assign an artisan.`,
         type: 'rfq_accepted',
         user_type: 'admin',
         booking_id: rfqId,
@@ -2539,13 +2655,9 @@ async function executeWaTool(name, args, session) {
       session.lastBookingId = rfqId;
       session.lastBookingCost = priceNum;
 
-      const paymentInstructions = session.linkedUserId
-        ? `\n\n💰 *Payment options:*\n• Reply "pay with wallet" to use your wallet balance\n• Reply "pay" or "pay with card" for a card payment link`
-        : `\n\n💰 Reply "pay" to get a payment link.`;
-
       return {
         success: true,
-        message: `Quote accepted! RFQ ${data.rfq_no || rfqId} (R${priceNum.toFixed(2)}) is ready for payment.${paymentInstructions}`,
+        message: `Quote accepted! RFQ ${data.rfq_no || rfqId} — Total: R${priceNum.toFixed(2)}.\n\n⏳ *Next step:* An artisan needs to accept your job before payment. We'll notify you as soon as one accepts.\n\n🔒 *Your money is protected:* When it's time to pay, your payment is held in a secure escrow account. The artisan does NOT receive your money until you confirm you are satisfied with the completed work.\n\n💰 *Payment options (after artisan accepts):*\n• Full amount: R${priceNum.toFixed(2)}\n• Deposit (35%): R${depositAmount.toFixed(2)} now, R${balanceAmount.toFixed(2)} after job completion`,
         rfqId,
         price: `R${priceNum.toFixed(2)}`,
       };
@@ -2805,13 +2917,22 @@ YOUR FULL CAPABILITIES:
 - Generate secure PayFast payment links for card payment
 - Apply promo/discount codes before booking
 
-PAYMENT FLOW (CRITICAL — Complete the loop):
-1. After creating a booking or accepting an RFQ quote, ALWAYS present payment options
-2. If customer says "pay", "pay with card", or asks for a payment link → call request_payment_link
-3. request_payment_link generates a REAL PayFast payment link — share it directly with the customer
-4. If customer says "pay with wallet" → call pay_with_wallet
-5. NEVER tell the customer "admin will send a link" — YOU generate and send the link immediately
-6. After payment, confirm the booking is paid and explain the escrow system
+PAYMENT FLOW (CRITICAL — Artisan must accept BEFORE payment):
+1. After creating a booking or accepting an RFQ quote, DO NOT offer payment immediately.
+2. Tell the customer: "An artisan needs to accept your job first. You'll be notified when one accepts, and then you can pay."
+3. ONLY offer payment AFTER the booking status shows an artisan has accepted (accept='1' or artisan_confirmed='yes').
+4. When an artisan has accepted and customer wants to pay, ALWAYS ask: "Would you like to pay the full amount (R{total}) or a 35% deposit (R{deposit}) with the balance due after job completion?"
+5. If customer says "pay deposit" or "35%" → call request_payment_link or pay_with_wallet with payment_type='deposit'
+6. If customer says "pay full" or "pay everything" → call request_payment_link or pay_with_wallet with payment_type='full'
+7. NEVER skip the deposit/full question — ALWAYS let the customer choose
+8. After payment, explain the escrow protection and guarantee
+
+🔒 FINANCIAL SECURITY (ALWAYS mention these when discussing payment):
+- "Your payment is held in a secure escrow account. The artisan does NOT receive your money until you confirm you are satisfied with the completed work. You are always in control."
+- "100% Money-Back Guarantee — not satisfied? Full refund, no questions asked within 24 hours."
+- "Free cancellation before artisan dispatch. Full refund within 2 hours of payment."
+- When a customer asks "is my money safe?" or expresses concern, explain all three protections
+- If deposit is chosen: "Your deposit of R{amount} is protected in escrow. The remaining R{balance} is only due after the job is completed to your satisfaction."
 
 📝 RFQ (Request for Quote) — AI-POWERED QUOTING:
 - Submit RFQ for complex/large jobs that need a detailed quote first
@@ -2895,12 +3016,13 @@ GUIDELINES:
 - Use South African Rands (R) for all pricing
 - When a customer sends a photo, ANALYSE the image using your vision capabilities. Identify the maintenance issue (e.g. leaking pipe, broken socket, cracked wall), suggest the correct service category, and offer to create a booking or RFQ
 - For emergencies, emphasise urgency and prioritise booking creation
-- When a booking is created, always mention the estimated cost and payment options
-- After creating a booking, ALWAYS offer to generate a payment link immediately — do NOT leave the customer hanging
-- After accepting an RFQ quote, ALWAYS offer payment options immediately — call request_payment_link if they want to pay
-- NEVER say "admin will send a link" or "you'll receive a link soon" — generate the link yourself using request_payment_link
-- After job completion, encourage rating
-- If payment is discussed, explain: "Payment is held securely in escrow and only released to the artisan once you confirm the job is done"
+- When a booking is created, mention the estimated cost and explain that an artisan needs to accept first before payment
+- NEVER offer payment immediately after booking creation — artisan must accept first
+- After an artisan accepts, ask the customer to choose between FULL PAYMENT or 35% DEPOSIT before generating a payment link
+- After accepting an RFQ quote, tell the customer an artisan needs to accept the job — do NOT offer payment immediately
+- If customer asks to pay but artisan hasn't accepted, explain: "An artisan needs to accept your job first. You'll be notified when one accepts."
+- NEVER say "admin will send a link" or "you'll receive a link soon" — when artisan has accepted, generate the link yourself using request_payment_link
+- After payment, explain: "Your payment is held securely in escrow. The artisan does NOT receive your money until you confirm you are satisfied. 100% money-back guarantee."
 - For promo codes, apply them BEFORE creating the booking
 - Keep messages under 500 characters when possible
 - Always include the booking ID/order number in responses about specific bookings

@@ -499,7 +499,7 @@ async def entrypoint(ctx: JobContext):
             "- BACKEND tools for data: get_booking_status, list_my_bookings, explain_quote, check_payment, get_wallet_balance, get_messages, get_case_status.\n"
             "- BACKEND tools for ACTIONS: cancel_booking, reschedule_booking, send_message_to_artisan, send_message_to_client, send_message_to_admin, mark_booking_in_progress, artisan_cancel_and_reassign, submit_rating, submit_complaint. These tools EXECUTE real actions on the backend — use them, NOT ui_navigate.\n"
             "- RFQ QUOTE tools: generate_rfq_quote (trigger AI quote), accept_rfq (accept quote → payment), reject_rfq (negotiate quote). Use when handling RFQ requests.\n"
-            "- PAYMENT tools: request_payment_link (generates a PayFast payment link and sends it to the customer's phone). After creating a booking or accepting an RFQ quote, ALWAYS offer to send a payment link. NEVER say 'pay in the app' — offer to send the link right now.\n"
+            "- PAYMENT tools: request_payment_link (generates a PayFast payment link and sends it to the customer's phone). IMPORTANT: Only offer payment AFTER an artisan has accepted the job. NEVER offer payment immediately after booking creation. When customer wants to pay, ALWAYS ask 'Would you like to pay the full amount or a 35 percent deposit?' before calling request_payment_link.\n"
             "- lookup_service_pricing for pricing: when user asks 'how much is...', 'what's the price for...', call lookup_service_pricing.\n"
             "- FINANCE tools (admin-only, read-only): get_finance_overview, get_daily_revenue_report, get_failed_payments_report, get_fraud_alerts_report. Use when admin asks 'What's the revenue today?', 'Any failed payments?', 'Show financial summary', 'Any fraud alerts?'. These are READ-ONLY and safe. NEVER process refunds, payouts, or wallet adjustments via voice — those require the admin app approval workflow.\n"
             "- ui_navigate ONLY for opening screens/navigation: open_bookings_tab, open_future_bookings, open_wallet, open_profile, open_settings, open_notifications, open_calendar, open_help, open_support, go_home, go_back, close_window, create_order_booking, call_assigned_artisan.\n"
@@ -595,9 +595,22 @@ async def entrypoint(ctx: JobContext):
             "  1. Call list_my_bookings() to find the RFQ booking.\n"
             "  2. Call explain_quote(booking_id) to get the AI-generated breakdown.\n"
             "  3. Read back: labour cost, materials list, equipment, contingency, and grand total.\n"
-            "- QUOTE ACCEPTANCE: When user says 'accept the quote' or 'go ahead' → call accept_rfq(booking_id)\n"
+            "- QUOTE ACCEPTANCE: When user says 'accept the quote' or 'go ahead' → call accept_rfq(booking_id). After acceptance, tell them an artisan needs to accept the job before payment.\n"
             "- QUOTE NEGOTIATION: When user says 'too expensive' or 'can you adjust' → call reject_rfq(booking_id, reason)\n"
             "- ALWAYS present the quote breakdown verbally: labour hours and rate, materials with markup, contingency, and grand total.\n"
+            "\n"
+            "PAYMENT FLOW (CRITICAL — Artisan must accept BEFORE payment):\n"
+            "- NEVER offer payment immediately after creating a booking or accepting an RFQ quote.\n"
+            "- Tell customer: 'An artisan needs to accept your job first. You will be notified when one accepts, and then you can pay.'\n"
+            "- When artisan has accepted and customer wants to pay, ALWAYS ask: 'Would you like to pay the full amount or a 35 percent deposit with the balance due after job completion?'\n"
+            "- If customer says 'deposit' or '35 percent' → call request_payment_link with payment_type='deposit'\n"
+            "- If customer says 'full' or 'pay everything' → call request_payment_link with payment_type='full'\n"
+            "\n"
+            "FINANCIAL SECURITY (ALWAYS mention when discussing payment):\n"
+            "- 'Your payment is held in a secure escrow account. The artisan does not receive your money until you confirm you are satisfied with the completed work.'\n"
+            "- '100 percent money-back guarantee. Not satisfied? Full refund, no questions asked within 24 hours.'\n"
+            "- 'Free cancellation before artisan dispatch.'\n"
+            "- If deposit chosen: 'Your deposit is protected in escrow. The remaining balance is only due after the job is completed to your satisfaction.'\n"
             "- If the quote is not ready yet, say: 'The quote is still being prepared. Check back in a moment.'\n"
             "\n"
             "BOOKING CREATION (IMPORTANT):\n"
@@ -1227,7 +1240,7 @@ async def entrypoint(ctx: JobContext):
             data = result.get('data', result.get('result', {}))
             price = data.get('price', '0')
             rfq_no = data.get('rfq_no', booking_id)
-            return f"Quote accepted for RFQ {rfq_no}! The total is {price} rand. Would you like me to send you a payment link now? You can pay securely via PayFast, or if you prefer, you can pay from your wallet in the app."
+            return f"Quote accepted for RFQ {rfq_no}! The total is {price} rand. Next step: an artisan needs to accept your job before payment. You'll be notified as soon as one accepts. Your money will be held securely in escrow — the artisan does not receive payment until you confirm you are satisfied. Once an artisan accepts, you can choose to pay the full amount or a 35 percent deposit."
         except Exception as e:
             logger.error(f"accept_rfq error: {e}", exc_info=True)
             return "Sorry, I had trouble accepting the quote. Please try again."
@@ -1301,11 +1314,13 @@ async def entrypoint(ctx: JobContext):
         description=(
             "Request a payment link for a booking. Generates a secure PayFast payment link "
             "and sends it to the customer's phone as a notification. "
+            "IMPORTANT: Only use this AFTER an artisan has accepted the job. "
+            "ALWAYS ask the customer to choose payment_type: 'deposit' (35%) or 'full' before calling. "
             "Use when the customer says 'I want to pay', 'send me a payment link', "
-            "'how do I pay', or after accepting an RFQ quote or creating a booking."
+            "'how do I pay', or after an artisan has accepted."
         )
     )
-    async def request_payment_link(booking_id: str) -> str:
+    async def request_payment_link(booking_id: str, payment_type: str = "full") -> str:
         """Request a payment link via the backend."""
         nonlocal backend_client
         if not backend_client:
@@ -1315,21 +1330,25 @@ async def entrypoint(ctx: JobContext):
         try:
             result = await backend_client.call_backend_action(
                 'request_payment_link',
-                {'booking_id': booking_id, 'source': 'voice'}
+                {'booking_id': booking_id, 'source': 'voice', 'payment_type': payment_type}
             )
             if not result.get('ok') and not result.get('success'):
                 error = result.get('error', 'unknown_error')
                 if error == 'no_confirmed_price':
                     return "This booking doesn't have a confirmed price yet. The quote needs to be accepted first."
+                if 'artisan' in error.lower():
+                    return "An artisan hasn't accepted this job yet. You'll be notified when an artisan accepts, and then you can pay."
                 return f"Could not generate payment link: {error}"
 
             data = result.get('data', result.get('result', {}))
             message = data.get('message', '')
             amount = data.get('amount', 0)
 
+            escrow_msg = " Your money is held securely in escrow until you confirm you are satisfied with the work. 100 percent money-back guarantee."
             if message:
-                return message + " Payment is held securely in escrow until you confirm the job is complete."
-            return f"A payment link for {amount} rand has been sent to your phone. Check your notifications to complete payment. Your money is held in escrow until the job is done."
+                return message + escrow_msg
+            pt_label = "deposit" if payment_type == "deposit" else "full payment"
+            return f"A {pt_label} link for {amount} rand has been sent to your phone. Check your notifications to complete payment.{escrow_msg}"
         except Exception as e:
             logger.error(f"request_payment_link error: {e}", exc_info=True)
             return "Sorry, I had trouble generating the payment link. Please try again or use the app to pay directly."
@@ -1554,7 +1573,7 @@ async def entrypoint(ctx: JobContext):
 
                 return f"Your RFQ request has been submitted (booking {booking_id}). A detailed quote is being prepared. Ask me to check the quote status anytime."
             else:
-                return f"Booking {booking_id} created successfully! Dispatching the nearest available artisan now. You'll be notified once an artisan accepts. Would you like me to send you a payment link now, or would you prefer to pay later?"
+                return f"Booking {booking_id} created successfully! Dispatching the nearest available artisan now. You'll be notified once an artisan accepts. Important: payment is only required after an artisan accepts your job. Your money will be held securely in escrow, so the artisan does not receive payment until you confirm you are satisfied with the work. Once an artisan accepts, you can choose to pay the full amount or a 35 percent deposit."
 
         except Exception as e:
             logger.error(f"create_booking error: {e}", exc_info=True)
