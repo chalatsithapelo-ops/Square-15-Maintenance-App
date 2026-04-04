@@ -194,6 +194,8 @@ async function downloadWhatsAppMedia(mediaId) {
     return { base64, mimeType, dataUrl: `data:${mimeType};base64,${base64}`, buffer };
   } catch (e) {
     console.error('[wa-media] error:', e.message);
+    // Log media download failure to admin
+    logErrorToAdmin('media_download_error', 'WhatsApp media download failed', 'whatsapp_bot', e.message).catch(() => {});
     return null;
   }
 }
@@ -219,6 +221,61 @@ async function transcribeAudio(mediaId) {
     return transcription.text || null;
   } catch (e) {
     console.warn('[whisper] Transcription failed:', e.message);
+    // Log transcription failure to admin
+    logErrorToAdmin('transcription_error', 'Voice note transcription failed', 'whatsapp_bot', e.message).catch(() => {});
+    return null;
+  }
+}
+
+// ─── Error reporting helper — logs to Firestore for admin real-time monitoring ───
+
+async function logErrorToAdmin(errorType, description, source, errorDetails, bookingId, severity) {
+  const firestore = db();
+  if (!firestore) return null;
+  try {
+    const errorId = firestore.collection('error_logs').doc().id;
+    const sev = severity || 'medium';
+    const icons = { critical: '🔴', high: '🟠', medium: '🟡', low: '🔵' };
+    const labels = {
+      payment_error: 'Payment Error',
+      image_upload_error: 'Image Upload Failed',
+      booking_error: 'Booking Creation Failed',
+      media_download_error: 'Media Download Failed',
+      transcription_error: 'Voice Transcription Failed',
+      rfq_quote_error: 'RFQ Quote Generation Failed',
+      network_error: 'Network/API Error',
+    };
+    const label = labels[errorType] || `System Error: ${errorType}`;
+
+    await firestore.collection('error_logs').doc(errorId).set({
+      id: errorId,
+      error_type: errorType,
+      description,
+      source: source || 'whatsapp_bot',
+      error_details: errorDetails || '',
+      booking_id: bookingId || '',
+      user_id: '',
+      severity: sev,
+      status: 'open',
+      created_at: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    await firestore.collection('Notifications').add({
+      title: `${icons[sev] || '🔵'} ${label}`,
+      body: description,
+      type: 'error_report',
+      error_id: errorId,
+      booking_id: bookingId || '',
+      target: 'admin',
+      user_type: 'admin',
+      read: false,
+      timestamp: admin.firestore.FieldValue.serverTimestamp(),
+      created_at: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    return errorId;
+  } catch (err) {
+    console.error('[errorReport] Failed to log error:', err.message);
     return null;
   }
 }
@@ -248,6 +305,31 @@ function getSession(phone) {
   }
   s.lastActivity = Date.now();
   return s;
+}
+
+/** Restore session context from Firestore when server restarts (best-effort). */
+async function restoreSessionFromFirestore(session) {
+  if (session._restored) return;
+  session._restored = true;
+  const firestore = db();
+  if (!firestore) return;
+  try {
+    const doc = await firestore.collection('wa_sessions').doc(session.phone).get();
+    if (!doc.exists) return;
+    const data = doc.data();
+    // Only restore if Firestore data is recent (within TTL)
+    const lastTs = data.lastActivity?.toMillis?.() || data.lastActivity || 0;
+    if (Date.now() - lastTs > SESSION_TTL_MS) return;
+    // Restore conversation history
+    if (Array.isArray(data.messages) && data.messages.length > 0) {
+      session.messages = data.messages;
+    }
+    // Restore linked account
+    if (data.linkedUserId) session.linkedUserId = data.linkedUserId;
+    console.log(`[session] Restored ${session.phone} from Firestore (${session.messages.length} msgs)`);
+  } catch (e) {
+    console.warn('[session] Firestore restore failed:', e.message);
+  }
 }
 
 // ─── Helper: find app user by phone ───
@@ -646,6 +728,22 @@ const waTools = [
           query: { type: 'string', description: 'Product search query (e.g. "150L geyser", "PVC pipe 110mm", "Kwikot geyser")' },
         },
         required: ['query'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'report_issue',
+      description: 'Report a technical issue the customer is experiencing (payment failure, photo upload problem, app error, etc.). Auto-creates a support case and alerts admin for real-time fixing.',
+      parameters: {
+        type: 'object',
+        properties: {
+          error_type: { type: 'string', description: 'Type of error: payment_error, image_upload_error, booking_error, network_error, app_crash, loading_error' },
+          description: { type: 'string', description: 'What happened — what the customer was trying to do and what went wrong' },
+          booking_id: { type: 'string', description: 'Related booking ID if applicable' },
+        },
+        required: ['error_type', 'description'],
       },
     },
   },
@@ -2157,6 +2255,18 @@ async function executeWaTool(name, args, session) {
         }
       } catch (quoteErr) {
         console.error('[submit_rfq] AI quote generation error:', quoteErr.message);
+        // Notify admin that AI quote failed so they can manually create one
+        try {
+          await firestore.collection('notifications').add({
+            title: '⚠️ AI Quote Generation Failed',
+            body: `AI quote failed for RFQ ${rfqNo} (${args.category || 'unknown category'}). Error: ${quoteErr.message}. Please create a manual quote.`,
+            type: 'rfq_quote_failed',
+            user_type: 'admin',
+            booking_id: rfqId,
+            read: false,
+            created_at: admin.firestore.FieldValue.serverTimestamp(),
+          });
+        } catch (nErr) { console.warn('[submit_rfq] Failed to notify admin of quote failure:', nErr.message); }
       }
 
       // Fallback if quote generation fails
@@ -2957,6 +3067,42 @@ async function executeWaTool(name, args, session) {
       }
     }
 
+    // ═══════════════════════════════════════════
+    // REPORT ISSUE (auto-escalation to admin)
+    // ═══════════════════════════════════════════
+    case 'report_issue': {
+      if (!firestore) return { error: 'Database unavailable' };
+      try {
+        const caseId = firestore.collection('customer_support_cases').doc().id;
+        await firestore.collection('customer_support_cases').doc(caseId).set({
+          id: caseId,
+          user_id: session.linkedUserId || '',
+          phone: session.phone || '',
+          subject: (args.error_type || 'technical_error').replace(/_/g, ' '),
+          description: `${args.description || 'Technical issue reported'}\n\nAuto-detected by: whatsapp_bot\nPhone: ${session.phone || 'unknown'}`,
+          booking_id: args.booking_id || '',
+          status: 'open',
+          priority: 'high',
+          source: 'whatsapp_bot',
+          auto_generated: true,
+          error_type: args.error_type || 'technical_error',
+          created_at: admin.firestore.FieldValue.serverTimestamp(),
+        });
+        // Also log to error_logs + notify admin
+        await logErrorToAdmin(
+          args.error_type || 'technical_error',
+          args.description || 'Issue reported via WhatsApp',
+          'whatsapp_bot',
+          '',
+          args.booking_id,
+          'high',
+        );
+        return { success: true, case_id: caseId, message: `Issue logged (ref: ${caseId}). Our tech team has been notified and will look into it right away.` };
+      } catch (e) {
+        return { error: 'Failed to report issue' };
+      }
+    }
+
     default:
       return { error: `Unknown tool: ${name}` };
   }
@@ -3091,7 +3237,14 @@ GUIDELINES:
 - For promo codes, apply them BEFORE creating the booking
 - Keep messages under 500 characters when possible
 - Always include the booking ID/order number in responses about specific bookings
-- The customer's phone number is automatically captured from WhatsApp — never ask for it`;
+- The customer's phone number is automatically captured from WhatsApp — never ask for it
+
+🚨 ERROR DETECTION & AUTO-REPORTING (CRITICAL):
+- report_issue(error_type, description, booking_id?) — auto-logs and alerts admin in real time
+- When a customer reports ANY technical problem (payment failed, photos won't upload, app crashed, booking error, screen not loading, etc.), you MUST call report_issue IMMEDIATELY — do NOT just sympathise or acknowledge
+- error_type values: payment_error, image_upload_error, booking_error, network_error, app_crash, loading_error
+- After calling report_issue, reassure the customer: "I've logged this issue and our tech team has been notified. They'll look into it right away."
+- If the customer describes symptoms that sound like a bug (e.g. "the page is blank", "I keep getting an error", "my photos won't send", "payment keeps failing"), treat it as a technical error and report it`;
 
 async function handleMessage(session, userMessage, imageDataUrl) {
   // Build user message content — supports text-only or text+image (vision)
@@ -3181,6 +3334,32 @@ async function handleMessage(session, userMessage, imageDataUrl) {
   }
 }
 
+// ─── Rate limiting (per-phone, in-memory) ───
+
+const _rateLimits = new Map();
+const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minute
+const RATE_LIMIT_MAX = 12;              // max 12 messages per minute per phone
+
+function isRateLimited(phone) {
+  const now = Date.now();
+  const entry = _rateLimits.get(phone);
+  if (!entry || now > entry.resetAt) {
+    _rateLimits.set(phone, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
+    return false;
+  }
+  entry.count++;
+  if (entry.count > RATE_LIMIT_MAX) return true;
+  return false;
+}
+
+// Periodic cleanup of stale rate-limit entries (every 5 min)
+setInterval(() => {
+  const now = Date.now();
+  for (const [phone, entry] of _rateLimits) {
+    if (now > entry.resetAt) _rateLimits.delete(phone);
+  }
+}, 5 * 60 * 1000);
+
 // ─── Webhook routes ───
 
 // Meta verification handshake
@@ -3210,7 +3389,17 @@ app.post('/webhook', async (req, res) => {
 
     for (const msg of value.messages) {
       const from = msg.from; // phone number
+
+      // Rate-limit check (prevents abuse / runaway OpenAI costs)
+      if (isRateLimited(from)) {
+        console.warn(`[webhook] Rate limited: ${from}`);
+        continue;
+      }
+
       const session = getSession(from);
+
+      // Restore session from Firestore if this is a fresh in-memory session
+      await restoreSessionFromFirestore(session);
 
       let userText = '';
 
