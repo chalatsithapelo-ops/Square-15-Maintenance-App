@@ -1694,16 +1694,46 @@ class FutureBookingService {
         }
 
         if (assignedArtisanIds.isNotEmpty) {
-          // Update booking with auto-assigned artisans
+          // Update booking with auto-assigned artisans.
+          // Use 'pending_artisan_acceptance' so artisan request screen can detect it.
           await futureBookingsRef.doc(bookingId).update({
-            'rfq_status': 'rfq_published_to_artisans',
+            'rfq_status': 'pending_artisan_acceptance',
+            'rfq_submitted_to': 'artisan',
             'rfq_assigned_artisan_ids': assignedArtisanIds,
             'rfq_auto_assigned': true,
             'rfq_auto_assign_reason': 'client_buys_materials',
             'rfq_artisan_rejection_count': 0,
             'rfq_artisan_rejections': [],
-            'status': 'rfq_assigned',
+            'status': 'rfq_pending',
           });
+
+          // Create tasksManagement bridge records for each artisan so the RFQ
+          // appears in their Requests screen (artisan discovers work via bridges).
+          for (final artId in assignedArtisanIds) {
+            try {
+              final bridgeId = await _createTasksManagementRequestForFutureBooking(
+                bookingId: bookingId,
+                userId: userId,
+                artisanId: artId,
+                taskId: taskId,
+                jobIds: effectiveJobIds,
+                taskCostsById: effectiveTaskCostsById,
+                scheduledDate: scheduledDate,
+                scheduledTime: scheduledTime,
+                serviceOnCurrentLocation: serviceOnCurrentLocation,
+                providedAddress: providedAddress,
+                otherLat: otherLat,
+                otherLng: otherLng,
+                userLat: userLat,
+                userLng: userLng,
+                workImageUrls: workImageUrls,
+                description: description,
+              );
+              print('[RFQ_AUTO] Created bridge $bridgeId for artisan $artId');
+            } catch (e) {
+              print('[RFQ_AUTO] Failed to create bridge for artisan $artId: $e');
+            }
+          }
 
           // Notify each artisan
           for (final artId in assignedArtisanIds) {

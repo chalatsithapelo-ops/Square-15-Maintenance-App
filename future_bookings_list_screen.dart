@@ -911,6 +911,88 @@ class _FutureBookingsListScreenState extends State<FutureBookingsListScreen> {
                   ),
                   const SizedBox(height: 10),
 
+                  // Assigned artisan info card (photo, name, rating, jobs done)
+                  if ((booking.serviceProviderId ?? '').trim().isNotEmpty &&
+                      (booking.serviceProviderId ?? '').trim().toLowerCase() != 'admin') ...[
+                    FutureBuilder<DocumentSnapshot>(
+                      future: _appController.serviceProviderRef
+                          .doc(booking.serviceProviderId!.trim())
+                          .get(),
+                      builder: (context, spSnap) {
+                        if (!spSnap.hasData || spSnap.data == null || !spSnap.data!.exists) {
+                          return const SizedBox.shrink();
+                        }
+                        final sp = spSnap.data!.data() as Map<String, dynamic>? ?? {};
+                        final artisanName = (sp['name'] ?? '').toString().trim();
+                        final artisanImage = (sp['imageUrl'] ?? sp['image'] ?? '').toString().trim();
+                        final avgRating = sp['average_rating'] is num
+                            ? (sp['average_rating'] as num).toDouble()
+                            : double.tryParse((sp['average_rating'] ?? '').toString()) ?? 0.0;
+                        final jobsDone = sp['total_jobs_done'] ?? sp['jobs_completed'] ?? 0;
+                        final jobsCount = jobsDone is num
+                            ? jobsDone.toInt()
+                            : int.tryParse(jobsDone.toString()) ?? 0;
+
+                        return Container(
+                          padding: const EdgeInsets.all(10),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFFc5a520).withOpacity(0.07),
+                            borderRadius: BorderRadius.circular(10),
+                            border: Border.all(color: const Color(0xFFc5a520).withOpacity(0.3)),
+                          ),
+                          child: Row(
+                            children: [
+                              CircleAvatar(
+                                radius: 24,
+                                backgroundColor: Colors.grey.shade300,
+                                backgroundImage: artisanImage.isNotEmpty
+                                    ? NetworkImage(artisanImage)
+                                    : null,
+                                child: artisanImage.isEmpty
+                                    ? Icon(Icons.person, color: Colors.grey.shade600, size: 28)
+                                    : null,
+                              ),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      artisanName.isNotEmpty ? artisanName : 'Artisan',
+                                      style: GoogleFonts.roboto(
+                                        fontSize: 14,
+                                        fontWeight: FontWeight.w600,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 4),
+                                    Row(
+                                      children: [
+                                        const Icon(Icons.star, color: Color(0xFFc5a520), size: 16),
+                                        const SizedBox(width: 3),
+                                        Text(
+                                          avgRating > 0 ? avgRating.toStringAsFixed(1) : 'New',
+                                          style: GoogleFonts.roboto(fontSize: 13, fontWeight: FontWeight.w500),
+                                        ),
+                                        const SizedBox(width: 12),
+                                        Icon(Icons.work_outline, color: Colors.grey.shade600, size: 15),
+                                        const SizedBox(width: 3),
+                                        Text(
+                                          '$jobsCount job${jobsCount == 1 ? '' : 's'} done',
+                                          style: GoogleFonts.roboto(fontSize: 13, color: Colors.grey.shade700),
+                                        ),
+                                      ],
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ),
+                        );
+                      },
+                    ),
+                    const SizedBox(height: 10),
+                  ],
+
                   // Time Until
                   if (timeUntil != null && timeUntil.isNegative == false) ...[
                     Row(
