@@ -184,7 +184,7 @@ class _DashboardState extends State<Dashboard> {
                                             borderRadius: BorderRadius.circular(10),
                                             color: Colors.white
                                         ),
-                                        child: item["image"] == ""
+                                        child: (item["image"] == null || item["image"] == "")
                                             ? Image.asset('assets/images/no_image.png',
                                               width: width*0.15,
                                               height: height*0.065,)

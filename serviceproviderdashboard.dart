@@ -9,6 +9,7 @@ import 'package:get/get.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:maintenanceapp/controller/service_provider_controller.dart';
+import 'package:maintenanceapp/controller/app_controller.dart';
 import 'package:maintenanceapp/providers/position_provider.dart';
 import 'package:maintenanceapp/screens/auth/login.dart';
 import 'package:maintenanceapp/screens/service_provider_panel/Serviceprovider/notification_screen.dart';
@@ -17,7 +18,9 @@ import 'package:maintenanceapp/screens/service_provider_panel/Serviceprovider/to
 import 'package:maintenanceapp/screens/service_provider_panel/service_provider_request_screen.dart';
 import 'package:maintenanceapp/screens/service_provider_panel/wallet_page.dart';
 import 'package:maintenanceapp/screens/home/livekit_voice_assistant.dart';
+import 'package:maintenanceapp/screens/home/ai_text_chat_screen.dart';
 import 'package:maintenanceapp/services/notification_services.dart';
+import 'package:maintenanceapp/screens/service_provider_panel/Serviceprovider/artisan_settings_screen.dart';
 import 'package:maintenanceapp/utils/navigation.dart';
 import 'package:maintenanceapp/utils/splash_timer.dart';
 import 'package:provider/provider.dart';
@@ -79,6 +82,13 @@ class _ServiceProviderDashboardState extends State<ServiceProviderDashboard> {
 
     nameController = TextEditingController();
     // NOTE: Requests will be started once we have the provider doc from the StreamBuilder.
+
+    // Sync artisan GPS location to Firestore on dashboard load so dispatch
+    // uses the real position (not the one from registration).
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final appController = Get.find<AppController>();
+      appController.getCurrentPosition(context);
+    });
 
     ///for user side
 
@@ -167,7 +177,6 @@ class _ServiceProviderDashboardState extends State<ServiceProviderDashboard> {
         stream: FirebaseFirestore.instance
             .collection("serviceProvider")
             .where("email", isEqualTo: widget.email)
-            .where("password", isEqualTo: widget.password)
             .snapshots(),
         builder: (context, snapshot) {
           if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
@@ -177,19 +186,36 @@ class _ServiceProviderDashboardState extends State<ServiceProviderDashboard> {
           final DocumentSnapshot providerDoc = snapshot.data!.docs.first;
           final providerListenerId = _providerListenerIdFromDoc(providerDoc);
 
-          return FloatingActionButton(
-            backgroundColor: const Color(0xFFc5a520),
-            onPressed: () {
-              Get.to(
-                () => LivekitVoiceAssistant(
-                  role: 'artisan',
-                  providerDoc: providerDoc,
-                  providerListenerId: providerListenerId,
+          return Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              FloatingActionButton(
+                heroTag: 'artisan_chat_fab',
+                mini: true,
+                backgroundColor: Colors.blue.shade600,
+                onPressed: () => Get.to(
+                  () => const AITextChatScreen(userRole: 'artisan'),
+                  transition: Transition.fadeIn,
                 ),
-                transition: Transition.fadeIn,
-              );
-            },
-            child: const Icon(Icons.mic, color: Colors.white),
+                child: const Icon(Icons.chat_outlined, color: Colors.white, size: 20),
+              ),
+              const SizedBox(height: 10),
+              FloatingActionButton(
+                heroTag: 'artisan_voice_fab',
+                backgroundColor: const Color(0xFFc5a520),
+                onPressed: () {
+                  Get.to(
+                    () => LivekitVoiceAssistant(
+                      role: 'artisan',
+                      providerDoc: providerDoc,
+                      providerListenerId: providerListenerId,
+                    ),
+                    transition: Transition.fadeIn,
+                  );
+                },
+                child: const Icon(Icons.mic, color: Colors.white),
+              ),
+            ],
           );
         },
       ),
@@ -204,7 +230,6 @@ class _ServiceProviderDashboardState extends State<ServiceProviderDashboard> {
               stream: FirebaseFirestore.instance
                   .collection("serviceProvider")
                   .where("email", isEqualTo: widget.email)
-                  .where("password", isEqualTo: widget.password)
                   .snapshots(),
               builder: (BuildContext context, AsyncSnapshot<dynamic> snapshot) {
                 if (snapshot.hasData && snapshot.data!.docs.isNotEmpty) {
@@ -485,6 +510,44 @@ class _ServiceProviderDashboardState extends State<ServiceProviderDashboard> {
                           children: [
                             SizedBox(
                               height: height * 0.03,
+                            ),
+                            GestureDetector(
+                              onTap: () {
+                                Get.to(
+                                  () => ArtisanSettingsScreen(
+                                    providerId: snapshot.data!.docs[0]["docId"],
+                                  ),
+                                  transition: Transition.fadeIn,
+                                );
+                              },
+                              child: SizedBox(
+                                height: height * 0.065,
+                                child: Card(
+                                  color: Colors.white,
+                                  elevation: 0.5,
+                                  child: Center(
+                                    child: Row(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      children: [
+                                        const SizedBox(width: 10),
+                                        const Icon(
+                                          Icons.settings,
+                                          color: Color(0xff252525),
+                                        ),
+                                        const SizedBox(width: 10),
+                                        Text(
+                                          'Settings',
+                                          style: GoogleFonts.inter(
+                                              color: Colors.black,
+                                              fontSize: 16,
+                                              fontWeight: FontWeight.w500),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              ),
                             ),
                             GestureDetector(
                               onTap: () {},
@@ -971,21 +1034,40 @@ class _ServiceProviderDashboardState extends State<ServiceProviderDashboard> {
                     ],
                   );
                 } else {
-                  return Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    crossAxisAlignment: CrossAxisAlignment.center,
-                    children: [
-                      SizedBox(
-                          height:
-                              MediaQuery.of(context).size.height / 1.8 - 100),
-                      const Text("Please wait...!"),
-                      const SizedBox(height: 20),
-                      const CircularProgressIndicator(color: Color(0xFFc5a520)),
-                      const SizedBox(height: 20),
-                      const Text("No Artisan is found"),
-                      SizedBox(
-                          height: MediaQuery.of(context).size.height / 2 - 100),
-                    ],
+                  return Center(
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        const Icon(Icons.person_search,
+                            size: 64, color: Colors.grey),
+                        const SizedBox(height: 16),
+                        const Text(
+                          'No artisan profile found',
+                          style: TextStyle(
+                              fontSize: 16, fontWeight: FontWeight.w500),
+                        ),
+                        const SizedBox(height: 8),
+                        const Text(
+                          'Your profile may still be loading.',
+                          style: TextStyle(color: Colors.grey),
+                        ),
+                        const SizedBox(height: 20),
+                        ElevatedButton.icon(
+                          onPressed: () async {
+                            await FirebaseAuth.instance.signOut();
+                            final appCtrl = Get.find<AppController>();
+                            appCtrl.clearCredentials();
+                            Get.offAll(() => const Login());
+                          },
+                          icon: const Icon(Icons.login),
+                          label: const Text('Go to Login'),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: const Color(0xFFc5a520),
+                            foregroundColor: Colors.white,
+                          ),
+                        ),
+                      ],
+                    ),
                   );
                 }
               },

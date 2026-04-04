@@ -5,7 +5,344 @@ const { AccessToken, AgentDispatchClient } = require('livekit-server-sdk');
 const admin = require('firebase-admin');
 const crypto = require('crypto');
 const fs = require('fs');
+const OpenAI = require('openai');
 require('dotenv').config();
+
+// ─── Prompt sanitization (prevent injection via user-supplied text) ───
+function sanitizeForPrompt(text, maxLen = 500) {
+  if (!text || typeof text !== 'string') return '';
+  return text
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '') // strip control chars
+    .replace(/\r\n|\r/g, '\n')                       // normalise line endings
+    .slice(0, maxLen)
+    .trim();
+}
+
+// ─── OpenAI (for AI RFQ quote generation) ───
+let _openai = null;
+function getOpenAI() {
+  if (_openai) return _openai;
+  const key = process.env.OPENAI_API_KEY;
+  if (!key) { console.warn('[openai] No OPENAI_API_KEY set'); return null; }
+  _openai = new OpenAI({ apiKey: key });
+  return _openai;
+}
+
+// ─── Builders.co.za Real-Time Pricing (ported from Cloud Functions) ───
+
+let _buildersBffCache = { fetchedAt: 0, ttlMs: 12 * 60 * 60 * 1000, value: null };
+
+function _asString(v) { return v == null ? '' : String(v); }
+
+function normalizeBuildersQuery(name) {
+  let q = _asString(name);
+  q = q.replace(/\b(size\s+tbd|tbd|-\s*size\s+tbd)\b/gi, ' ');
+  q = q.replace(/\([^)]*\)/g, ' ');
+  q = q.replace(/\s+/g, ' ').trim();
+  return q;
+}
+
+function buildersHeaders({ referer } = {}) {
+  const h = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-ZA,en;q=0.9',
+    'Cache-Control': 'no-cache',
+    Pragma: 'no-cache',
+  };
+  if (referer) h.Referer = referer;
+  h.Origin = 'https://www.builders.co.za';
+  return h;
+}
+
+function buildersCorrelationId() {
+  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 14)}`;
+}
+
+async function fetchWithTimeout(url, { method = 'GET', headers, body, timeoutMs = 15000 } = {}) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { method, headers, body, signal: controller.signal });
+  } finally {
+    clearTimeout(id);
+  }
+}
+
+function extractLiters(s) {
+  const lowerS = _asString(s).toLowerCase();
+  const m = lowerS.match(/\b(\d{2,4})\s*(?:l|lt|litre|liter|litres|liters)\b/);
+  if (!m) return null;
+  const v = parseInt(m[1], 10);
+  if (!Number.isFinite(v) || v < 40 || v > 600) return null;
+  return v;
+}
+
+function buildersTokens(s) {
+  const cleaned = _asString(s).toLowerCase().replace(/[()[\],]/g, ' ').replace(/[^a-z0-9\s./-]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!cleaned) return [];
+  return cleaned.split(' ').map(t => t.trim()).filter(t => t.length > 2);
+}
+
+function parseZarPrice(raw) {
+  const s = _asString(raw);
+  if (!s) return null;
+  const cleaned = s.replace(/[^0-9,.]/g, '');
+  if (!cleaned) return null;
+  const normalized = cleaned.replace(/,/g, '');
+  const v = parseFloat(normalized);
+  return Number.isFinite(v) ? v : null;
+}
+
+function extractRetailPriceFromProductHtml(html) {
+  const meta = html.match(/(product:price:amount|og:price:amount|twitter:data1)"\s+content="([0-9.,]+)"/i);
+  if (meta && meta[2]) { const p = parseZarPrice(meta[2]); if (p && p > 0) return p; }
+  const jsonLd = html.match(/"price"\s*:\s*"?([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?)"?/i);
+  if (jsonLd && jsonLd[1]) { const p = parseZarPrice(jsonLd[1]); if (p && p > 0) return p; }
+  const visible = html.match(/R\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?)/);
+  if (visible && visible[1]) { const p = parseZarPrice(visible[1]); if (p && p > 0) return p; }
+  return null;
+}
+
+function buildersBffHeaders({ operationName, operationHash } = {}) {
+  return {
+    ...buildersHeaders({ referer: 'https://www.builders.co.za/' }),
+    Accept: 'application/json, text/plain, */*',
+    'Content-Type': 'application/json',
+    WM_TENANT_ID: '32',
+    request_origin: 'web',
+    'wm_qos.correlation_id': buildersCorrelationId(),
+    'x-apollo-operation-name': operationName || 'search',
+    'x-apollo-operation-hash': operationHash || '',
+  };
+}
+
+function extractPriceFromBffItem(item) {
+  const candidate = item?.price ?? item?.prices ?? item?.priceData ?? item?.pricing;
+  const fromAny = (v) => {
+    if (v == null) return null;
+    if (typeof v === 'number') return v;
+    if (typeof v === 'string') return parseZarPrice(v);
+    if (typeof v === 'object') {
+      const formatted = v.formattedValue ?? v.formatted ?? v.display;
+      const p1 = parseZarPrice(formatted);
+      if (p1 && p1 > 0) return p1;
+      if (typeof v.value === 'number') return v.value;
+      const p2 = parseZarPrice(v.value); if (p2 && p2 > 0) return p2;
+      if (typeof v.current === 'number') return v.current;
+      const p3 = parseZarPrice(v.current); if (p3 && p3 > 0) return p3;
+      if (typeof v.retail === 'number') return v.retail;
+      const p4 = parseZarPrice(v.retail); if (p4 && p4 > 0) return p4;
+      return null;
+    }
+    return null;
+  };
+  let p = fromAny(candidate);
+  if (p && p > 0) return p;
+  if (candidate && typeof candidate === 'object') {
+    p = fromAny(candidate.retail) ?? fromAny(candidate.current) ?? fromAny(candidate.selling);
+    if (p && p > 0) return p;
+  }
+  for (const k of ['formattedPrice', 'priceFormatted', 'sellingPrice', 'retailPrice', 'priceInclVat', 'price_incl_vat']) {
+    p = parseZarPrice(item?.[k]); if (p && p > 0) return p;
+  }
+  return null;
+}
+
+async function getBuildersBffConfig() {
+  const now = Date.now();
+  if (now - _buildersBffCache.fetchedAt <= _buildersBffCache.ttlMs) return _buildersBffCache.value;
+  try {
+    const extractScriptSrcs = (htmlText) => {
+      const out = [];
+      const re = /\bsrc="([^"]+\.js[^"]*)"/gi;
+      for (const m of htmlText.matchAll(re)) {
+        const s = _asString(m[1]);
+        if (!s || /googletagmanager|google-analytics|gtm\.js/i.test(s)) continue;
+        out.push(s);
+      }
+      return [...new Set(out)];
+    };
+    const toAbs = (u) => { if (!u) return null; return u.startsWith('http') ? u : `https://www.builders.co.za${u.startsWith('/') ? '' : '/'}${u}`; };
+    const bootstrapUrls = [
+      'https://www.builders.co.za/',
+      'https://www.builders.co.za/Plumbing-Bathroom-and-Kitchen/Geysers-and-Water-Heaters/Geysers/Kwikot-DSG-200-5-400KPA-Superline-Dual-Geyser-200-L/p/000000000000659070',
+    ];
+    let html = null;
+    for (const u of bootstrapUrls) {
+      const htmlResp = await fetchWithTimeout(u, { headers: buildersHeaders({ referer: 'https://www.builders.co.za/' }), timeoutMs: 20000 });
+      if (!htmlResp.ok || _asString(htmlResp.url).includes('/blocked?')) continue;
+      const text = await htmlResp.text();
+      if (text) { html = text; break; }
+    }
+    if (!html) { _buildersBffCache = { ..._buildersBffCache, fetchedAt: now, value: null }; return null; }
+    const scriptSrcs = extractScriptSrcs(html).map(toAbs).filter(Boolean);
+    if (!scriptSrcs.length) { _buildersBffCache = { ..._buildersBffCache, fetchedAt: now, value: null }; return null; }
+    const preferred = [...scriptSrcs].sort((a, b) => {
+      const score = (u) => { const s = _asString(u); if (/\/main\.[a-z0-9]{8,40}\.js/i.test(s)) return 0; if (/runtimechunk~main\.[a-z0-9]{8,40}\.js/i.test(s)) return 2; if (/\.js$/i.test(s)) return 5; return 9; };
+      return score(a) - score(b);
+    });
+    let hash = null, site = null;
+    for (const jsUrl of preferred.slice(0, 12)) {
+      const jsResp = await fetchWithTimeout(jsUrl, { headers: buildersHeaders({ referer: 'https://www.builders.co.za/' }), timeoutMs: 25000 });
+      if (!jsResp.ok) continue;
+      const js = await jsResp.text();
+      if (!js) continue;
+      const hashMatch = js.match(/SearchHash\s*=\s*"([a-f0-9]{32,80})"/i) || js.match(/\/wmapi\/bff\/graphql\/search\/([a-f0-9]{32,80})/i);
+      hash = hashMatch ? hashMatch[1] : null;
+      const siteMatch = js.match(/BFF_SITE_VALUE\s*=\s*"([A-Z0-9]{3,10})"/);
+      site = siteMatch ? siteMatch[1] : null;
+      if (hash) break;
+    }
+    if (!hash) { _buildersBffCache = { ..._buildersBffCache, fetchedAt: now, value: null }; return null; }
+    const cfg = { searchKey: 'search', searchHash: hash, site: site || 'BWH1' };
+    _buildersBffCache = { ..._buildersBffCache, fetchedAt: now, value: cfg };
+    return cfg;
+  } catch (e) {
+    console.error('[builders] BFF config fetch failed:', e.message);
+    _buildersBffCache = { ..._buildersBffCache, fetchedAt: now, value: null };
+    return null;
+  }
+}
+
+async function hydrateCandidateFromProductPage(candidate, { referer } = {}) {
+  try {
+    const resp = await fetchWithTimeout(candidate.url, { headers: buildersHeaders({ referer }), timeoutMs: 20000 });
+    if (!resp.ok) return null;
+    const html = await resp.text();
+    const price = extractRetailPriceFromProductHtml(html);
+    if (!price || price <= 0) return null;
+    const og = html.match(/property="og:title"\s+content="([^"]{3,200})"/i);
+    const title = og && og[1] ? og[1] : candidate.title;
+    return { ...candidate, title, priceZar: price };
+  } catch (e) { console.warn('\u26a0\ufe0f buildersProductPage fetch:', e.message); return null; }
+}
+
+async function lookupBuildersPriceOne(rawName) {
+  const q = normalizeBuildersQuery(rawName);
+  if (!q) return null;
+  const targetLiters = extractLiters(q);
+  const wantsKwikot = q.toLowerCase().includes('kwikot');
+  const cfg = await getBuildersBffConfig();
+  if (!cfg) return null;
+  const uri = `https://www.builders.co.za/wmapi/bff/graphql/${cfg.searchKey}/${cfg.searchHash}`;
+  const variables = { keyword: q, offset: 0, pageSize: 20, dynamicPriceRange: true, site: cfg.site };
+  let decoded;
+  try {
+    const resp = await fetchWithTimeout(uri, {
+      method: 'POST',
+      headers: buildersBffHeaders({ operationName: cfg.searchKey, operationHash: cfg.searchHash }),
+      body: JSON.stringify({ variables }),
+      timeoutMs: 12000,
+    });
+    if (!resp.ok) {
+      if (resp.status === 412) return { title: '', url: '', priceZar: 0, source: 'builders_blocked', blocked: true };
+      return null;
+    }
+    decoded = await resp.json();
+  } catch (e) { console.warn('\u26a0\ufe0f buildersProductPrice JSON parse:', e.message); return null; }
+  if (decoded?.redirectUrl && _asString(decoded.redirectUrl).includes('/blocked')) {
+    return { title: '', url: '', priceZar: 0, source: 'builders_blocked', blocked: true };
+  }
+  const items = decoded?.data?.search?.data?.results?.items;
+  if (!Array.isArray(items) || items.length === 0) return null;
+  const qt = new Set(buildersTokens(q));
+  const referer = `https://www.builders.co.za/search?text=${encodeURIComponent(q)}`;
+  const scored = [];
+  for (const it of items) {
+    if (!it || typeof it !== 'object') continue;
+    const title = _asString(it.name || it.title || it.productName);
+    if (!title) continue;
+    const liters = extractLiters(title);
+    if (targetLiters != null && liters != null && liters !== targetLiters) continue;
+    let urlPath = _asString(it.url || it.productUrl || it.seoUrl || it.link);
+    if (!urlPath) { const code = _asString(it.code || it.id || it.productCode); if (code) urlPath = `/p/${code}`; }
+    if (!urlPath) continue;
+    const url = urlPath.startsWith('http') ? urlPath : `https://www.builders.co.za${urlPath.startsWith('/') ? '' : '/'}${urlPath}`;
+    const tt = new Set(buildersTokens(title));
+    let score = 0;
+    for (const t of qt) if (tt.has(t)) score += 1;
+    if (targetLiters != null) { if (liters === targetLiters) score += 6; if (liters == null) score -= 2; }
+    const hasKwikot = title.toLowerCase().includes('kwikot');
+    if (hasKwikot) score += 2;
+    if (wantsKwikot && !hasKwikot) score -= 3;
+    const price = extractPriceFromBffItem(it);
+    const hasPrice = price != null && price > 0;
+    if (hasPrice) score += 2;
+    scored.push({ score, candidate: { title, url, priceZar: hasPrice ? price : 0, source: hasPrice ? 'builders_bff' : 'builders_bff_no_price' } });
+  }
+  if (!scored.length) return null;
+  scored.sort((a, b) => (b.score || 0) - (a.score || 0));
+  for (const row of scored.slice(0, 4)) {
+    const c = row.candidate;
+    if (c.priceZar && c.priceZar > 0) return c;
+    const hydrated = await hydrateCandidateFromProductPage(c, { referer });
+    if (!hydrated) continue;
+    if (targetLiters != null) { const hl = extractLiters(hydrated.title); if (hl != null && hl !== targetLiters) continue; }
+    return { ...hydrated, source: 'builders_bff_hydrated' };
+  }
+  return null;
+}
+
+async function buildersPriceLookupBatch(materialNames, concurrency = 4) {
+  const results = new Array(materialNames.length);
+  let i = 0;
+  const workers = new Array(Math.min(concurrency, materialNames.length)).fill(0).map(async () => {
+    while (true) {
+      const idx = i++;
+      if (idx >= materialNames.length) return;
+      try { results[idx] = await lookupBuildersPriceOne(materialNames[idx]); } catch (e) { console.warn('\u26a0\ufe0f buildersPriceLookupBatch worker:', e.message); results[idx] = null; }
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+async function lookupMaterialsCatalog(firestore, name) {
+  if (!firestore || !name) return null;
+  try {
+    const normalized = name.toLowerCase().replace(/\s+/g, '_');
+    // Try by doc ID
+    let doc = await firestore.collection('materialsCatalog').doc(normalized).get();
+    if (doc.exists) { const d = doc.data(); const p = parseFloat(d.unit_price || d.price_incl_vat || d.price || 0); if (p > 0) return { price: p, source: 'catalog_doc_id' }; }
+    // Try by name_lower field
+    let snap = await firestore.collection('materialsCatalog').where('name_lower', '==', normalized).limit(1).get();
+    if (!snap.empty) { const d = snap.docs[0].data(); const p = parseFloat(d.unit_price || d.price_incl_vat || d.price || 0); if (p > 0) return { price: p, source: 'catalog_name_lower' }; }
+    // Try by aliases
+    snap = await firestore.collection('materialsCatalog').where('aliases', 'array-contains', name.toLowerCase()).limit(1).get();
+    if (!snap.empty) { const d = snap.docs[0].data(); const p = parseFloat(d.unit_price || d.price_incl_vat || d.price || 0); if (p > 0) return { price: p, source: 'catalog_alias' }; }
+  } catch (e) { console.error('[catalog] lookup error:', e.message); }
+  return null;
+}
+
+async function getLearningFactor(firestore, categoryId, categoryName) {
+  if (!firestore) return 1.0;
+  try {
+    const catSlug = (categoryId || categoryName || '').toLowerCase().replace(/\s+/g, '_');
+    if (!catSlug) return 1.0;
+    const snap = await firestore.collection('aiQuoteCorrections')
+      .where('category_id', '==', catSlug)
+      .orderBy('created_at', 'desc')
+      .limit(20)
+      .get();
+    if (snap.empty) return 1.0;
+    let total = 0, count = 0;
+    snap.docs.forEach(doc => {
+      const d = doc.data();
+      const aiTotal = parseFloat(d.ai_total);
+      const adminTotal = parseFloat(d.admin_total);
+      if (aiTotal > 0 && adminTotal > 0) { total += adminTotal / aiTotal; count++; }
+    });
+    if (count === 0) return 1.0;
+    const avg = total / count;
+    return Math.max(0.6, Math.min(1.6, avg)); // Clamped [0.6, 1.6]
+  } catch (e) {
+    console.error('[learning-factor] error:', e.message);
+    return 1.0;
+  }
+}
+
+// ─── End Builders Pricing ───
 
 function sanitizeEnvValue(value) {
   if (typeof value !== 'string') return value;
@@ -266,6 +603,19 @@ async function verifyFirebaseAuth(req, res) {
   }
 }
 
+// Express middleware wrapper — verifyFirebaseAuth returns a value but never
+// calls next(), so using it directly as middleware hangs the request.
+function authMiddleware(req, res, next) {
+  verifyFirebaseAuth(req, res).then(decoded => {
+    if (!decoded) return; // response already sent by verifyFirebaseAuth
+    req.user = decoded;
+    next();
+  }).catch(err => {
+    console.error('❌ Auth middleware error:', err);
+    if (!res.headersSent) res.status(500).json({ error: 'Internal auth error' });
+  });
+}
+
 async function verifyFirebaseAppCheck(req, res, { required = false } = {}) {
   initFirebaseIfPossible();
   if (firebaseInitError) {
@@ -351,8 +701,8 @@ async function resolveRole({ firestore, uid, decodedToken }) {
       if (data.isServiceProvider === true) return 'artisan';
       if (data.isUser === true) return 'client';
     }
-  } catch (_) {
-    // ignore
+  } catch (e) {
+    console.warn(`⚠️ Role lookup (users doc) failed for ${uid}:`, e.message);
   }
 
   // Fallback: check the serviceProvider collection — artisan profiles live
@@ -365,8 +715,8 @@ async function resolveRole({ firestore, uid, decodedToken }) {
       const q = await firestore.collection('serviceProvider').where(field, '==', uid).limit(1).get();
       if (!q.empty) return 'artisan';
     }
-  } catch (_) {
-    // ignore
+  } catch (e) {
+    console.warn(`⚠️ Role lookup (serviceProvider) failed for ${uid}:`, e.message);
   }
 
   return 'client';
@@ -444,6 +794,27 @@ const ACTION_TIERS = Object.freeze({
   check_sla_escalation: 'B',
   submit_rating: 'B',
   submit_complaint: 'B',
+  // Phase 4: Admin automation tools (Tier B — admin role required)
+  admin_bulk_reassign: 'B',
+  admin_close_stale_cases: 'B',
+  admin_broadcast_notification: 'B',
+  admin_flag_user: 'B',
+  // Payment link generation (Tier B — creates PayFast link + notification)
+  request_payment_link: 'B',
+  // Phase 5.1: Finance read-only (Tier A)
+  get_finance_summary: 'A',
+  get_daily_revenue: 'A',
+  get_failed_payments: 'A',
+  get_refund_history: 'A',
+  get_payout_status: 'A',
+  get_fraud_alerts: 'A',
+  // Phase 5.2: Money-moving (Tier C — requires approval pipeline)
+  request_refund: 'C',
+  request_wallet_adjustment: 'C',
+  request_payout: 'C',
+  request_fee_override: 'C',
+  approve_finance_request: 'C',
+  reject_finance_request: 'C',
 });
 
 function actionTier(action) {
@@ -553,7 +924,7 @@ async function enforceAssistantSessionBinding({ firestore, req, actorUid, action
       { last_used_at: nowIso(), last_action: action, last_request_id: req.requestId || null },
       { merge: true }
     );
-  } catch (_) {
+  } catch (e) { console.warn('\u26a0\ufe0f voice session metadata write:', e.message);
     // Best-effort only
   }
 
@@ -587,7 +958,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
               bookingRef = q.docs[0].ref;
               return q.docs[0].data() || {};
             }
-          } catch (_) { /* ignore */ }
+          } catch (e) { console.warn('\u26a0\ufe0f booking lookup by alt field:', e.message); }
         }
       }
     }
@@ -642,7 +1013,8 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
           dailyCounters: { [prefix]: { [dateKey]: seq } }
         }, { merge: true });
       });
-    } catch (_) {
+    } catch (e) {
+      console.warn(`⚠️ Counter increment failed for ${prefix}/${dateKey}: ${e.message}; using timestamp fallback`);
       seq = Date.now() % 1000 + 1;
     }
     return seq;
@@ -817,7 +1189,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     try {
       const doc = await firestore.collection('serviceProvider').doc(key).get();
       if (doc.exists) return doc;
-    } catch (_) {
+    } catch (e) { console.warn('\u26a0\ufe0f getServiceProviderDoc direct fetch:', e.message);
       // ignore and try query fallbacks
     }
 
@@ -826,7 +1198,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         const snap = await firestore.collection('serviceProvider').where(field, '==', key).limit(1).get();
         if (snap.empty) return null;
         return snap.docs[0];
-      } catch (_) {
+      } catch (e) { console.warn('\u26a0\ufe0f getServiceProviderDoc field query:', e.message);
         return null;
       }
     }
@@ -877,14 +1249,14 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     let snap = null;
     try {
       snap = await firestore.collection('userTasks').where('task_id', '==', t).get();
-    } catch (_) {
+    } catch (e) { console.warn('\u26a0\ufe0f candidateArtisans task_id query:', e.message);
       snap = null;
     }
 
     if (!snap || snap.empty) {
       try {
         snap = await firestore.collection('userTasks').where('taskId', '==', t).get();
-      } catch (_) {
+      } catch (e) { console.warn('\u26a0\ufe0f candidateArtisans taskId query:', e.message);
         snap = null;
       }
     }
@@ -893,7 +1265,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       try {
         const catSnap = await firestore.collection('userTasks').where('category_id', '==', t).get();
         if (!catSnap.empty) snap = catSnap;
-      } catch (_) {
+      } catch (e) { console.warn('\u26a0\ufe0f candidateArtisans category_id query:', e.message);
         // ignore
       }
     }
@@ -902,7 +1274,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       try {
         const catSnap2 = await firestore.collection('userTasks').where('categoryId', '==', t).get();
         if (!catSnap2.empty) snap = catSnap2;
-      } catch (_) {
+      } catch (e) { console.warn('\u26a0\ufe0f candidateArtisans categoryId query:', e.message);
         // ignore
       }
     }
@@ -928,7 +1300,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     let bookingsSnap;
     try {
       bookingsSnap = await firestore.collection('futureBookings').where('service_provider_id', '==', artisanId).get();
-    } catch (_) {
+    } catch (e) { console.warn('\u26a0\ufe0f checkArtisanAvailability:', e.message);
       return true;
     }
     if (!bookingsSnap || bookingsSnap.empty) return true;
@@ -965,6 +1337,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     excludeArtisanId,
     categoryId,
     categoryName,
+    bookingId,
   }) {
     const clientLat = Number.parseFloat(String(userLat || '0')) || 0.0;
     const clientLng = Number.parseFloat(String(userLng || '0')) || 0.0;
@@ -1000,7 +1373,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       try {
         snap = await firestore.collection('serviceProvider').where('status', '==', 'publish').limit(200).get();
         if (snap.empty) snap = await firestore.collection('serviceProvider').limit(200).get();
-      } catch (_) {
+      } catch (e) { console.warn('\u26a0\ufe0f findAvailableArtisan fallback query:', e.message);
         snap = await firestore.collection('serviceProvider').limit(200).get();
       }
 
@@ -1051,7 +1424,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       const data = doc.data() || {};
       const amount = toNumber(data.cost ?? data.price ?? data.amount ?? data.unit_price);
       return amount && amount > 0 ? amount : null;
-    } catch (_) {
+    } catch (e) { console.warn('\u26a0\ufe0f resolveTaskCost:', e.message);
       return null;
     }
   }
@@ -1179,7 +1552,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         success: resp.successCount || 0,
         failure: resp.failureCount || 0,
       };
-    } catch (_) {
+    } catch (e) { console.warn('\u26a0\ufe0f sendPushToTokens:', e.message);
       return { attempted: tokens.length, success: 0, failure: tokens.length };
     }
   }
@@ -1191,7 +1564,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       const snap = await firestore.collection('users').doc(id).get();
       if (!snap.exists) return [];
       return collectTokensFromDocData(snap.data() || {});
-    } catch (_) {
+    } catch (e) { console.warn('\u26a0\ufe0f getUserTokens:', e.message);
       return [];
     }
   }
@@ -1239,7 +1612,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
                 if (!tokens.includes(t)) tokens.push(t);
               }
             }
-          } catch (_) { /* ignore */ }
+          } catch (e) { console.warn('\u26a0\ufe0f FCM token collection:', e.message); }
           // Also try user doc tokens for artisans (they may also have a users doc)
           for (const t of await getUserTokens(uid)) {
             if (!tokens.includes(t)) tokens.push(t);
@@ -1269,7 +1642,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
           { merge: true }
         );
       }
-    } catch (_) {
+    } catch (e) { console.warn('\u26a0\ufe0f writeNotification impl:', e.message);
       // ignore
     }
   }
@@ -1393,7 +1766,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
           userLatLocal = String((ud.lat ?? userLatLocal) || '0');
           userLngLocal = String((ud.lng ?? userLngLocal) || '0');
         }
-      } catch (_) {
+      } catch (e) { console.warn('\u26a0\ufe0f user location lookup:', e.message);
         // ignore
       }
     }
@@ -1422,7 +1795,8 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
           tx.set(counterRef, { taskManagementCounter: { nextOrderNo: next } }, { merge: true });
           orderSeq = next;
         });
-      } catch (_) {
+      } catch (e) {
+        console.warn(`⚠️ Order counter transaction failed: ${e.message}; falling back to date-based order number`);
         orderSeq = null;
       }
     }
@@ -1653,7 +2027,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         const snap = await firestore.collection('users').doc(id).get();
         if (!snap.exists) return null;
         return snap.data() || {};
-      } catch (_) {
+      } catch (e) { console.warn('\u26a0\ufe0f resolveClientDoc:', e.message);
         return null;
       }
     }
@@ -1666,7 +2040,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         if (!doc.exists) return '';
         const data = doc.data() || {};
         return String(data.name || data.task_name || '').trim();
-      } catch (_) {
+      } catch (e) { console.warn('\u26a0\ufe0f resolveTaskName:', e.message);
         return '';
       }
     }
@@ -1851,7 +2225,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       imageUrls: workImages,
       has_photos: workImages.length > 0 ? 'yes' : 'no',
 
-      order_no: '',
+      order_no: isRFQFlag ? '' : await generateDateBasedOrderNo(),
       rfq_no: isRFQFlag ? await generateDateBasedRfqNo() : '',
 
       client_name: clientName,
@@ -1896,7 +2270,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         providerDoc,
         'New booking assigned',
         `New booking request for ${scheduledDate} at ${scheduledTime} for ${categoryName || 'a service'}.`,
-        { booking_id: bookingIdLocal, tasks_management_id: tasksManagementId || null, order_type: 'order' }
+        { booking_id: bookingIdLocal, tasks_management_id: tasksManagementId || null, order_type: 'order', type: 'new_booking' }
       );
       await writePersonalNotification({
         userId: actorUid,
@@ -2048,7 +2422,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         last_message_at: now,
         last_message_by: 'client',
       }, { merge: true });
-    } catch (_) { /* best-effort */ }
+    } catch (e) { console.warn('\u26a0\ufe0f chat unread count update:', e.message); }
 
     try {
       const providerDoc = await getServiceProviderDocByAnyId(smArtisanId);
@@ -2108,7 +2482,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         last_message_at: now,
         last_message_by: 'artisan',
       }, { merge: true });
-    } catch (_) { /* best-effort */ }
+    } catch (e) { console.warn('\u26a0\ufe0f chat unread count update (artisan):', e.message); }
 
     try {
       await writePersonalNotification({
@@ -2319,7 +2693,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
           data: { case_id: rcCaseId, type: 'case_reply' },
         });
       }
-    } catch (_) { /* best-effort */ }
+    } catch (e) { console.warn('\u26a0\ufe0f case reply notification:', e.message); }
 
     return {
       ok: true, status: 200,
@@ -2522,14 +2896,14 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
             taskDocs = r.docs;
             break;
           }
-        } catch (_) {}
+        } catch (e) { console.warn('\u26a0\ufe0f task status query:', e.message); }
       }
       // Fallback: all tasks without status filter
       if (taskDocs.length === 0) {
         try {
           const r = await firestore.collection('tasks').limit(200).get();
           taskDocs = r.docs;
-        } catch (_) {}
+        } catch (e) { console.warn('\u26a0\ufe0f task fallback query:', e.message); }
       }
 
       if (taskDocs.length === 0) {
@@ -2593,6 +2967,26 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         return (a.name || '').localeCompare(b.name || '');
       });
 
+      // ── Also load pricingGuidance for the matched category ──
+      let pricingGuidance = null;
+      try {
+        const guidanceSlug = categoryName || (finalServices[0] && finalServices[0].category_name ? finalServices[0].category_name.toLowerCase() : '');
+        if (guidanceSlug) {
+          const gDoc = await firestore.collection('pricingGuidance').doc(guidanceSlug).get();
+          if (gDoc.exists) {
+            const gd = gDoc.data() || {};
+            pricingGuidance = {
+              category: guidanceSlug,
+              laborCostPerHour: gd.laborCostPerHour ?? gd.labor_cost_per_hour ?? null,
+              outsourcedLaborRate: gd.outsourcedLaborRate ?? gd.outsourced_labor_rate ?? null,
+              materialMultiplier: gd.materialMultiplier ?? gd.material_multiplier ?? null,
+              service_prices: gd.service_prices || gd.servicePrices || null,
+              updated_at: gd.updatedAt || gd.updated_at || null,
+            };
+          }
+        }
+      } catch (ge) { console.warn('⚠️ pricingGuidance lookup:', ge.message); }
+
       return {
         ok: true,
         success: true,
@@ -2602,6 +2996,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
           filtered: services.length > 0,
           search_terms: searchTerms || 'all',
           expanded_terms: expandedTerms !== searchTerms ? expandedTerms.trim() : undefined,
+          pricingGuidance: pricingGuidance,
           message: services.length > 0
             ? `Found ${services.length} service(s) matching "${searchTerms}".`
             : allServices.length > 0
@@ -2611,6 +3006,70 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       };
     } catch (e) {
       return { ok: false, success: false, error: 'pricing_lookup_failed', message: String(e) };
+    }
+  }
+
+  // ── Builders Product Lookup ──
+  if (action === 'lookup_builders_product') {
+    try {
+      const query = String(payload.query || payload.search || payload.product || '').trim();
+      if (!query) return { ok: false, error: 'query parameter required' };
+
+      const bffCfg = await getBuildersBffConfig();
+      if (!bffCfg || !bffCfg.searchHash) {
+        return { ok: true, data: { products: [], message: 'Builders search temporarily unavailable.' } };
+      }
+
+      const searchBody = JSON.stringify({
+        persistedQuery: { version: 1, sha256Hash: bffCfg.searchHash },
+        variables: {
+          ...(bffCfg.defaultSearchVars || {}),
+          query: query,
+          pageSize: 8,
+          storeId: bffCfg.storeId || '42',
+          paginationInput: { cursor: '', pageSize: 8 },
+        },
+      });
+
+      const searchResp = await fetchWithTimeout(bffCfg.gqlUrl, {
+        method: 'POST',
+        headers: { ...buildersBffHeaders({ operationName: 'Search', operationHash: bffCfg.searchHash }), 'Content-Type': 'application/json' },
+        body: searchBody,
+        timeoutMs: 15000,
+      });
+
+      if (!searchResp || !searchResp.ok) {
+        return { ok: true, data: { products: [], message: 'Builders search returned no results.' } };
+      }
+
+      const searchJson = await searchResp.json();
+      const items = searchJson?.data?.search?.searchResult?.itemStacks?.[0]?.itemsV2 || [];
+
+      const products = items.slice(0, 8).map(it => {
+        const priceInfo = it.priceInfo?.currentPrice || it.priceInfo?.linePrice;
+        const price = priceInfo?.priceString || priceInfo?.price || null;
+        const name = it.name || it.title || 'Unknown Product';
+        const brand = it.brand || '';
+        const url = it.canonicalUrl
+          ? (it.canonicalUrl.startsWith('http') ? it.canonicalUrl : `https://www.builders.co.za${it.canonicalUrl}`)
+          : null;
+        return { name, brand, price: price ? `R${String(price).replace(/[^0-9.]/g, '')}` : 'Price on request', url };
+      }).filter(p => p.name !== 'Unknown Product');
+
+      return {
+        ok: true,
+        data: {
+          products,
+          query,
+          count: products.length,
+          message: products.length > 0
+            ? `Found ${products.length} product(s) on Builders for "${query}".`
+            : `No products found on Builders for "${query}".`,
+        },
+      };
+    } catch (e) {
+      console.error('[lookup_builders_product]', e.message);
+      return { ok: false, error: 'builders_lookup_failed', message: String(e.message || e) };
     }
   }
 
@@ -2763,6 +3222,120 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     }
   }
 
+  // ── Request Payment Link — generates PayFast URL + stores in payment_links + sends notification ──
+  if (action === 'request_payment_link') {
+    try {
+      const bid = bookingId || String(payload.tasks_management_id || '').trim();
+      if (!bid) return { ok: false, status: 400, error: 'missing_booking_id' };
+
+      const bData = await loadBooking();
+      if (!bData) return { ok: false, status: 404, error: 'booking_not_found' };
+
+      // Enforce artisan acceptance before payment
+      const artisanAccepted = bData.accept === '1' || bData.accept === 1 || bData.artisan_confirmed === 'yes';
+      if (!artisanAccepted) {
+        return { ok: false, status: 400, error: 'An artisan hasn\'t accepted this job yet. Payment is only available after an artisan accepts.' };
+      }
+
+      const cost = parseFloat(bData.cost || bData.total_cost || bData.quoted_price || '0');
+      if (cost <= 0) return { ok: false, status: 400, error: 'no_confirmed_price' };
+
+      if ((bData.payment_status || bData.paymentStatus) === 'paid') {
+        return { ok: true, status: 200, data: { message: 'This booking is already paid.', bookingId: bid } };
+      }
+
+      // Support deposit vs full payment
+      const paymentType = payload.payment_type || 'full';
+      let payAmount;
+      if (bData.deposit_paid === true && bData.balance_paid !== true) {
+        payAmount = parseFloat(bData.balance_amount || cost);
+      } else if (paymentType === 'deposit') {
+        payAmount = Math.round(cost * 0.35 * 100) / 100;
+      } else {
+        payAmount = cost;
+      }
+
+      const merchantId = env('PAYFAST_MERCHANT_ID');
+      const merchantKey = env('PAYFAST_MERCHANT_KEY');
+      const payfastUrl = env('PAYFAST_URL') || 'https://www.payfast.co.za/eng/process';
+
+      if (!merchantId || !merchantKey) {
+        // Fallback: store request + notify admin
+        const payRef = `PAY-${bid}-${Date.now().toString(36)}`;
+        await firestore.collection('payment_links').doc(payRef).set({
+          booking_id: bid,
+          amount: payAmount,
+          payment_type: paymentType,
+          user_id: actorUid || '',
+          status: 'pending',
+          source: payload.source || 'voice',
+          created_at: admin.firestore.FieldValue.serverTimestamp(),
+        });
+        await firestore.collection('notifications').add({
+          title: 'Payment Link Request',
+          body: `Payment link requested for booking ${bid} (R${payAmount.toFixed(2)}, ${paymentType})`,
+          type: 'payment_request',
+          booking_id: bid,
+          amount: payAmount,
+          for_role: 'admin',
+          status: 'unread',
+          created_at: admin.firestore.FieldValue.serverTimestamp(),
+        });
+        return { ok: true, status: 200, data: {
+          message: `Payment of R${payAmount.toFixed(2)} is being processed. You'll receive a payment link shortly.`,
+          reference: payRef, bookingId: bid, amount: payAmount,
+        }};
+      }
+
+      const itemSuffix = paymentType === 'deposit' ? '(35% Deposit)' : (bData.deposit_paid === true ? '(Balance)' : '(Full)');
+      const itemName = `Square 15 Booking ${bData.order_no || bData.rfq_no || bid} ${itemSuffix}`;
+      const paymentData = {
+        merchant_id: merchantId,
+        merchant_key: merchantKey,
+        amount: payAmount.toFixed(2),
+        item_name: itemName,
+        custom_str1: bid,
+      };
+      const qs = new (require('url').URLSearchParams)(paymentData).toString();
+      const paymentUrl = `${payfastUrl}?${qs}`;
+
+      const payRef = `PAY-${bid}-${Date.now().toString(36)}`;
+      await firestore.collection('payment_links').doc(payRef).set({
+        booking_id: bid,
+        amount: payAmount,
+        payment_type: paymentType,
+        user_id: actorUid || '',
+        payment_url: paymentUrl,
+        status: 'pending',
+        source: payload.source || 'voice',
+        created_at: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      // Send notification to the customer so they receive the link
+      if (actorUid) {
+        await firestore.collection('notifications').add({
+          title: 'Payment Link Ready',
+          body: `Tap to pay R${payAmount.toFixed(2)} ${itemSuffix} for booking ${bData.order_no || bData.rfq_no || bid}`,
+          type: 'payment_link',
+          booking_id: bid,
+          amount: payAmount,
+          payment_type: paymentType,
+          payment_url: paymentUrl,
+          userId: actorUid,
+          status: 'unread',
+          created_at: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      }
+
+      return { ok: true, status: 200, data: {
+        message: `Payment link generated for R${payAmount.toFixed(2)} ${itemSuffix}. A notification with the link has been sent to your phone.`,
+        paymentUrl, reference: payRef, bookingId: bid, amount: payAmount, payment_type: paymentType,
+      }};
+    } catch (err) {
+      return { ok: false, status: 500, error: `payment_link_error: ${err.message}` };
+    }
+  }
+
   // ── Check Payment Status (can work with booking_id OR tasks_management_id) ──
   if (action === 'check_payment' || action === 'get_payment_status') {
     if (!actorUid) return { ok: false, status: 401, error: 'unauthorized' };
@@ -2879,7 +3452,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
             trade: String(pd.profession || pd.trade || pd.specialization || '').trim() || null,
           };
         }
-      } catch (_) { /* best-effort */ }
+      } catch (e) { console.warn('\u26a0\ufe0f artisan info lookup:', e.message); }
     }
 
     return {
@@ -2948,7 +3521,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
             }
             return { ok: true, status: 200, data: result };
           }
-        } catch (_) {}
+        } catch (e) { console.warn('\u26a0\ufe0f RFQ data lookup:', e.message); }
       }
       return { ok: false, status: 404, error: 'booking_not_found' };
     }
@@ -2983,6 +3556,232 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     }
 
     return { ok: true, status: 200, data: result };
+  }
+
+  // ── Generate AI RFQ Quote (with Builders.co.za real-time pricing) ──
+  if (action === 'generate_rfq_quote') {
+    const data = await loadBooking();
+    if (!data) return { ok: false, status: 404, error: 'booking_not_found' };
+
+    const isRfq = String(data.is_rfq || data.is_rfq_requested || '').toLowerCase() === 'yes';
+    if (!isRfq) return { ok: false, status: 400, error: 'not_an_rfq' };
+
+    // If already quoted, return existing quote
+    if (data.ai_quote && data.ai_quote.grand_total) {
+      return {
+        ok: true, status: 200, data: {
+          already_quoted: true,
+          ai_quote: data.ai_quote,
+          grand_total: data.ai_quote.grand_total,
+          rfq_no: String(data.rfq_no || '').trim(),
+        }
+      };
+    }
+
+    const oai = getOpenAI();
+    if (!oai) return { ok: false, status: 500, error: 'ai_unavailable' };
+
+    const category = sanitizeForPrompt(String(data.category_name || ''), 100);
+    const categoryId = String(data.category_id || '').trim();
+    const description = sanitizeForPrompt(String(data.problem_description || data.description || ''), 1000);
+    const materialsResp = sanitizeForPrompt(String(data.materials_responsibility || 'artisan'), 50);
+
+    // Look up pricing guidance
+    let laborRate = 150;
+    let pricingCtx = '';
+    try {
+      const catSlug = category.toLowerCase().replace(/\s+/g, '_');
+      const guidanceDoc = await firestore.collection('pricingGuidance').doc(catSlug).get();
+      if (guidanceDoc.exists) {
+        const gd = guidanceDoc.data();
+        laborRate = parseFloat(gd.labor_cost_per_hour || gd.laborCostPerHour || 150);
+        const sp = gd.service_prices || gd.servicePrices || {};
+        pricingCtx = `Labor rate: R${laborRate}/hr. Service prices: ${JSON.stringify(sp)}`;
+      }
+    } catch (e) { console.warn('\u26a0\ufe0f pricing guidance fetch:', e.message); }
+
+    try {
+      // Step 1: Generate BOM with GPT (same as before, but instruct to use Builders-stocked items)
+      const completion = await oai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        temperature: 0.3,
+        max_tokens: 1500,
+        response_format: { type: 'json_object' },
+        messages: [
+          { role: 'system', content: 'You are a South African maintenance quotation expert. CRITICAL: Every material in materialsBOM MUST be a real product available on builders.co.za (Builders Warehouse). Do NOT include specialty items or proprietary accessories that Builders does not stock. Return only valid JSON.' },
+          {
+            role: 'user',
+            content: `Generate a detailed maintenance quote:\nCategory: ${category}\nDescription: ${description}\nMaterials: ${materialsResp}\n${pricingCtx ? `Pricing: ${pricingCtx}` : ''}\n\nReturn JSON: {"laborHours":<num>,"laborCostPerHour":${laborRate},"complexity":<1-5>,"equipmentCost":<num>,"scopeOfWork":"<text>","estimatedDuration":"<text>","materialsBOM":[{"name":"<text>","qty":<num>,"unit":"<text>","estimated_price":<num>}]}`,
+          },
+        ],
+      });
+
+      const draft = JSON.parse(completion.choices[0]?.message?.content || '{}');
+      const laborHours = parseFloat(draft.laborHours) || 4;
+      const lrUsed = parseFloat(draft.laborCostPerHour) || laborRate;
+
+      // Step 2: Look up real Builders.co.za prices for each BOM item
+      const rawBom = draft.materialsBOM || [];
+      const materialNames = rawBom.map(m => m.name || '');
+      console.log(`[generate_rfq_quote] Looking up ${materialNames.length} items on Builders.co.za...`);
+
+      let buildersResults = [];
+      try {
+        buildersResults = await buildersPriceLookupBatch(materialNames, 4);
+        console.log(`[generate_rfq_quote] Builders lookup complete: ${buildersResults.filter(r => r && r.priceZar > 0).length}/${materialNames.length} priced`);
+      } catch (e) {
+        console.error('[generate_rfq_quote] Builders batch lookup error:', e.message);
+      }
+
+      // Step 3: Build BOM with real prices (Builders > Catalog > AI estimate fallback)
+      const materialsMultiplier = 1.5;
+      let matSubtotal = 0;
+      const bom = [];
+      for (let i = 0; i < rawBom.length; i++) {
+        const m = rawBom[i];
+        const qty = parseFloat(m.qty) || 1;
+        const aiEstimate = parseFloat(m.estimated_price) || 0;
+        const br = buildersResults[i];
+
+        let unitPrice = aiEstimate;
+        let matchedBy = 'ai_estimate';
+        let buildersTitle = null;
+        let buildersUrl = null;
+
+        // Priority 1: Builders.co.za real price
+        if (br && !br.blocked && br.priceZar > 0) {
+          unitPrice = br.priceZar;
+          matchedBy = br.source || 'builders_bff';
+          buildersTitle = br.title || null;
+          buildersUrl = br.url || null;
+        }
+        // Priority 2: Firestore materialsCatalog fallback
+        else {
+          const catalogResult = await lookupMaterialsCatalog(firestore, m.name);
+          if (catalogResult && catalogResult.price > 0) {
+            unitPrice = catalogResult.price;
+            matchedBy = catalogResult.source;
+          }
+          // Priority 3: AI estimate (already set as default)
+        }
+
+        const lineBase = qty * unitPrice;
+        matSubtotal += lineBase;
+
+        const bomItem = { name: m.name, qty, unit: m.unit || 'each', unit_price: unitPrice, line_base: lineBase, matched_by: matchedBy };
+        if (buildersTitle) bomItem.builders_title = buildersTitle;
+        if (buildersUrl) bomItem.builders_url = buildersUrl;
+        bom.push(bomItem);
+      }
+
+      // Step 4: Apply learning factor from historical admin corrections
+      const learningFactor = await getLearningFactor(firestore, categoryId, category);
+      console.log(`[generate_rfq_quote] Learning factor for ${category}: ${learningFactor.toFixed(3)}`);
+
+      const laborCost = laborHours * lrUsed * learningFactor;
+      const artisanBuys = materialsResp === 'artisan';
+      const matWithMarkup = matSubtotal * materialsMultiplier * learningFactor;
+      const matForTotals = artisanBuys ? matWithMarkup : 0;
+      const eqCost = (parseFloat(draft.equipmentCost) || 0) * learningFactor;
+      const subtotal = laborCost + matForTotals + eqCost;
+      const contingency = subtotal * 0.15;
+      const grandTotal = subtotal + contingency;
+
+      const buildersCount = bom.filter(b => b.matched_by && b.matched_by.startsWith('builders')).length;
+      const catalogCount = bom.filter(b => b.matched_by && b.matched_by.startsWith('catalog')).length;
+      const aiCount = bom.filter(b => b.matched_by === 'ai_estimate').length;
+
+      const r2 = (v) => Math.round(v * 100) / 100;
+      const aiQuote = {
+        laborHours, laborCostPerHour: lrUsed, laborCost: r2(laborCost),
+        complexity: draft.complexity || 3,
+        materialsBOM: bom, materialsMultiplier,
+        materials_subtotal: r2(matSubtotal), materials_with_markup: r2(matWithMarkup),
+        materials_responsibility: materialsResp,
+        equipmentCost: r2(eqCost), subtotal: r2(subtotal),
+        contingency: r2(contingency), grand_total: r2(grandTotal),
+        scope_of_work: draft.scopeOfWork || description,
+        estimated_duration: draft.estimatedDuration || 'TBD',
+        learning_factor: r2(learningFactor),
+        pricing_sources: { builders: buildersCount, catalog: catalogCount, ai_estimate: aiCount },
+        breakdown: [
+          { description: `Labour (${laborHours}hrs @ R${lrUsed}/hr${learningFactor !== 1 ? ` × ${learningFactor.toFixed(2)} adj` : ''})`, cost: laborCost.toFixed(2) },
+          ...(artisanBuys && bom.length > 0 ? [{ description: `Materials & Supplies (${buildersCount} Builders-priced, ${catalogCount} catalog, ${aiCount} estimated)`, cost: matWithMarkup.toFixed(2) }] : []),
+          ...(eqCost > 0 ? [{ description: 'Equipment & Tools', cost: eqCost.toFixed(2) }] : []),
+          { description: 'Contingency (15%)', cost: contingency.toFixed(2) },
+        ],
+        disclaimer: 'Quote uses real-time Builders.co.za pricing where available. Final costs may vary based on actual site conditions.',
+        generated_at: now, source: 'backend_ai_builders',
+      };
+
+      // Save to Firestore
+      await bookingRef.update({
+        ai_quote: aiQuote,
+        quoted_price: grandTotal.toString(),
+        quote_details: aiQuote.scope_of_work,
+        rfq_status: 'pending_client_response',
+        total_price: grandTotal.toString(),
+        cost: grandTotal.toString(),
+        updated_at: now,
+      });
+
+      console.log(`[generate_rfq_quote] Quote saved: R${grandTotal.toFixed(2)} (${buildersCount}/${bom.length} Builders-priced, LF=${learningFactor.toFixed(2)})`);
+      return { ok: true, status: 200, data: { ai_quote: aiQuote, grand_total: grandTotal, rfq_no: String(data.rfq_no || '').trim() } };
+    } catch (e) {
+      console.error('[generate_rfq_quote] AI error:', e.message);
+      return { ok: false, status: 500, error: 'ai_generation_failed', detail: e.message };
+    }
+  }
+
+  // ── Accept RFQ Quote ──
+  if (action === 'accept_rfq_quote') {
+    const data = await loadBooking();
+    if (!data) return { ok: false, status: 404, error: 'booking_not_found' };
+    if (!data.ai_quote && !data.quoted_price) return { ok: false, status: 400, error: 'no_quote_available' };
+
+    const price = data.quoted_price || (data.ai_quote ? String(data.ai_quote.grand_total) : '0');
+    const priceNum = parseFloat(price);
+    const depositAmount = Math.round(priceNum * 0.35 * 100) / 100;
+    const balanceAmount = Math.round((priceNum - depositAmount) * 100) / 100;
+
+    await bookingRef.update({
+      rfq_status: 'accepted_converted',
+      status: 'pending_artisan_acceptance',
+      artisan_confirmed: 'pending',
+      deposit_amount: depositAmount.toFixed(2),
+      balance_amount: balanceAmount.toFixed(2),
+      payment_type: '',
+      deposit_paid: false,
+      balance_paid: false,
+      accepted_at: now,
+      accepted_via: payload.source || 'voice',
+      updated_at: now,
+    });
+
+    return { ok: true, status: 200, data: { accepted: true, price, rfq_no: String(data.rfq_no || '').trim() } };
+  }
+
+  // ── Reject / Negotiate RFQ Quote ──
+  if (action === 'reject_rfq_quote') {
+    const data = await loadBooking();
+    if (!data) return { ok: false, status: 404, error: 'booking_not_found' };
+
+    const reason = String(payload.reason || 'Customer wants negotiation').trim();
+    await bookingRef.update({
+      rfq_status: 'under_negotiation',
+      negotiation_reason: reason,
+      negotiation_at: now,
+      negotiation_via: payload.source || 'voice',
+      updated_at: now,
+    });
+
+    await writeAdminNotification({
+      title: 'RFQ Quote Negotiation',
+      message: `Customer wants to negotiate RFQ ${data.rfq_no || bookingId}. Reason: ${reason}`,
+      data: { type: 'rfq_negotiation', bookingId },
+    });
+
+    return { ok: true, status: 200, data: { negotiation: true, rfq_no: String(data.rfq_no || '').trim() } };
   }
 
   const bookingData = await loadBooking();
@@ -3130,7 +3929,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
           clientLat = String(ud.lat ?? '0');
           clientLng = String(ud.lng ?? '0');
         }
-      } catch (_) {
+      } catch (e) { console.warn('\u26a0\ufe0f user geo lookup for reassign:', e.message);
         // ignore
       }
     } else {
@@ -3153,6 +3952,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       excludeArtisanId: artisanId || null,
       categoryId,
       categoryName,
+      bookingId,
     });
 
     if (!newArtisanId) {
@@ -3240,7 +4040,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       providerDoc,
       'New booking assigned',
       `New booking assigned for ${scheduledDate || 'the scheduled date'} at ${scheduledTime || 'the scheduled time'}.`,
-      { booking_id: bookingId, tasks_management_id: newTmId || null, is_reassignment: true }
+      { booking_id: bookingId, tasks_management_id: newTmId || null, is_reassignment: true, type: 'new_booking' }
     );
 
     await writePersonalNotification({
@@ -3481,7 +4281,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
               created_at: now,
             });
         }
-      } catch (_) { /* best effort */ }
+      } catch (e) { console.warn('\u26a0\ufe0f review write best-effort:', e.message); }
 
       return { ok: true, status: 200, data: { rated: true, booking_id: targetBookingId, rating } };
     } catch (e) {
@@ -3511,15 +4311,309 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       });
 
       // Notify admin
-      await writeAdminNotification(
-        'New complaint',
-        `Complaint from user: ${subject}`,
-        { complaint_id: complaintId, user_id: actorUid }
-      );
+      await writeAdminNotification({
+        title: 'New complaint',
+        message: `Complaint from user: ${subject}`,
+        data: { complaint_id: complaintId, user_id: actorUid },
+      });
 
       return { ok: true, status: 200, data: { complaint_id: complaintId, status: 'open' } };
     } catch (e) {
       return { ok: false, status: 500, error: e.message || 'failed' };
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // PHASE 4 — Admin Automation Tools (Tier B, admin-only)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  if (action === 'admin_bulk_reassign') {
+    if (actorRole !== 'admin') return { ok: false, status: 403, error: 'admin_only' };
+    const bookingIds = Array.isArray(payload.booking_ids) ? payload.booking_ids : [];
+    const newArtisanId = String(payload.new_artisan_id || '').trim();
+    const reason = String(payload.reason || 'Admin bulk reassignment').trim();
+    if (!bookingIds.length || !newArtisanId) {
+      return { ok: false, status: 400, error: 'missing_booking_ids_or_new_artisan_id' };
+    }
+    if (bookingIds.length > 20) {
+      return { ok: false, status: 400, error: 'max_20_bookings_per_bulk_reassign' };
+    }
+    const results = [];
+    for (const bid of bookingIds) {
+      const id = String(bid).trim();
+      if (!id) continue;
+      try {
+        const bRef = firestore.collection('futureBookings').doc(id);
+        const bSnap = await bRef.get();
+        if (!bSnap.exists) { results.push({ booking_id: id, ok: false, error: 'not_found' }); continue; }
+        await bRef.update({
+          service_provider_id: newArtisanId,
+          reassigned_at: now,
+          reassigned_by: actorUid,
+          reassignment_reason: reason,
+        });
+        results.push({ booking_id: id, ok: true });
+      } catch (e) {
+        results.push({ booking_id: id, ok: false, error: e.message });
+      }
+    }
+    return { ok: true, status: 200, data: { reassigned: results.filter(r => r.ok).length, total: bookingIds.length, results } };
+  }
+
+  if (action === 'admin_close_stale_cases') {
+    if (actorRole !== 'admin') return { ok: false, status: 403, error: 'admin_only' };
+    const maxAgeHours = Number(payload.max_age_hours) || 48;
+    const cutoff = new Date(Date.now() - maxAgeHours * 3600 * 1000).toISOString();
+    try {
+      const snap = await firestore.collection('assistant_cases')
+        .where('state', 'in', ['open', 'in_progress'])
+        .where('created_at', '<', cutoff)
+        .limit(50)
+        .get();
+      let closed = 0;
+      for (const doc of snap.docs) {
+        await doc.ref.update({
+          state: 'resolved',
+          resolved_at: now,
+          resolved_by: actorUid,
+          resolution_note: `Auto-closed: stale for ${maxAgeHours}+ hours`,
+        });
+        closed++;
+      }
+      return { ok: true, status: 200, data: { closed, checked: snap.size } };
+    } catch (e) {
+      return { ok: false, status: 500, error: e.message };
+    }
+  }
+
+  if (action === 'admin_broadcast_notification') {
+    if (actorRole !== 'admin') return { ok: false, status: 403, error: 'admin_only' };
+    const title = String(payload.title || '').trim();
+    const body = String(payload.body || '').trim();
+    const targetRole = String(payload.target_role || 'all').trim();
+    if (!title || !body) return { ok: false, status: 400, error: 'missing_title_or_body' };
+    if (title.length > 100 || body.length > 500) return { ok: false, status: 400, error: 'title_max_100_body_max_500' };
+    try {
+      const notifId = randomId('broadcast-');
+      await firestore.collection('admin_broadcasts').doc(notifId).set({
+        id: notifId,
+        title, body,
+        target_role: targetRole,
+        sent_by: actorUid,
+        sent_at: now,
+        status: 'pending',
+      });
+      return { ok: true, status: 200, data: { broadcast_id: notifId, target_role: targetRole } };
+    } catch (e) {
+      return { ok: false, status: 500, error: e.message };
+    }
+  }
+
+  if (action === 'admin_flag_user') {
+    if (actorRole !== 'admin') return { ok: false, status: 403, error: 'admin_only' };
+    const targetUid = String(payload.user_id || payload.uid || '').trim();
+    const flagReason = String(payload.reason || '').trim();
+    const flagType = String(payload.flag_type || 'warning').trim();
+    if (!targetUid) return { ok: false, status: 400, error: 'missing_user_id' };
+    if (!flagReason) return { ok: false, status: 400, error: 'missing_reason' };
+    if (!['warning', 'suspend', 'ban'].includes(flagType)) {
+      return { ok: false, status: 400, error: 'flag_type_must_be_warning_suspend_or_ban' };
+    }
+    try {
+      const flagId = randomId('flag-');
+      await firestore.collection('user_flags').doc(flagId).set({
+        id: flagId,
+        user_id: targetUid,
+        flag_type: flagType,
+        reason: flagReason,
+        flagged_by: actorUid,
+        flagged_at: now,
+        status: 'active',
+      });
+      if (flagType === 'suspend' || flagType === 'ban') {
+        await firestore.collection('users').doc(targetUid).update({
+          account_status: flagType === 'ban' ? 'banned' : 'suspended',
+          account_status_reason: flagReason,
+          account_status_updated_at: now,
+          account_status_updated_by: actorUid,
+        });
+      }
+      return { ok: true, status: 200, data: { flag_id: flagId, flag_type: flagType, user_id: targetUid } };
+    } catch (e) {
+      return { ok: false, status: 500, error: e.message };
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // PHASE 5.1 — Finance Read-Only Tools (Tier A)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  if (action === 'get_finance_summary') {
+    if (actorRole !== 'admin') return { ok: false, status: 403, error: 'admin_only' };
+    const period = String(payload.period || 'today').trim().toLowerCase();
+    try {
+      let startDate;
+      const nowDate = new Date();
+      if (period === 'today') {
+        startDate = new Date(nowDate.getFullYear(), nowDate.getMonth(), nowDate.getDate());
+      } else if (period === 'week') {
+        startDate = new Date(Date.now() - 7 * 86400000);
+      } else if (period === 'month') {
+        startDate = new Date(Date.now() - 30 * 86400000);
+      } else {
+        startDate = new Date(Date.now() - 86400000);
+      }
+      const snap = await firestore.collection('transactionLogs')
+        .where('transaction_at', '>=', startDate.toISOString())
+        .orderBy('transaction_at', 'desc')
+        .limit(1000)
+        .get();
+      let totalIn = 0, totalOut = 0, refunds = 0, fees = 0, count = 0;
+      for (const d of snap.docs) {
+        const tx = d.data() || {};
+        const amt = toNumber(tx.amount) || 0;
+        const dir = String(tx.direction || '').trim().toLowerCase();
+        const type = String(tx.transaction_type || tx.type || '').trim().toLowerCase();
+        if (dir === 'in') totalIn += amt;
+        if (dir === 'out') totalOut += amt;
+        if (type.includes('refund')) refunds += amt;
+        if (type.includes('fee') || type.includes('commission')) fees += amt;
+        count++;
+      }
+      return {
+        ok: true, status: 200, data: {
+          period, transaction_count: count,
+          total_in: Number(totalIn.toFixed(2)),
+          total_out: Number(totalOut.toFixed(2)),
+          net: Number((totalIn - totalOut).toFixed(2)),
+          refunds: Number(refunds.toFixed(2)),
+          fees_commissions: Number(fees.toFixed(2)),
+        }
+      };
+    } catch (e) {
+      return { ok: false, status: 500, error: e.message };
+    }
+  }
+
+  if (action === 'get_daily_revenue') {
+    if (actorRole !== 'admin') return { ok: false, status: 403, error: 'admin_only' };
+    const days = Math.min(30, Math.max(1, Number(payload.days) || 7));
+    try {
+      const startDate = new Date(Date.now() - days * 86400000).toISOString();
+      const snap = await firestore.collection('transactionLogs')
+        .where('transaction_at', '>=', startDate)
+        .where('direction', '==', 'in')
+        .orderBy('transaction_at', 'desc')
+        .limit(2000)
+        .get();
+      const byDay = {};
+      for (const d of snap.docs) {
+        const tx = d.data() || {};
+        const dateStr = String(tx.transaction_at || '').slice(0, 10);
+        if (!dateStr) continue;
+        byDay[dateStr] = (byDay[dateStr] || 0) + (toNumber(tx.amount) || 0);
+      }
+      return { ok: true, status: 200, data: { days, revenue_by_day: byDay } };
+    } catch (e) {
+      return { ok: false, status: 500, error: e.message };
+    }
+  }
+
+  if (action === 'get_failed_payments') {
+    if (actorRole !== 'admin') return { ok: false, status: 403, error: 'admin_only' };
+    const limit = Math.min(100, Math.max(1, Number(payload.limit) || 20));
+    try {
+      const snap = await firestore.collection('transactionLogs')
+        .where('status', 'in', ['failed', 'error', 'declined', 'cancelled'])
+        .orderBy('transaction_at', 'desc')
+        .limit(limit)
+        .get();
+      const failures = snap.docs.map(d => {
+        const tx = d.data() || {};
+        return {
+          id: d.id,
+          amount: String(tx.amount || ''),
+          status: String(tx.status || ''),
+          type: String(tx.transaction_type || tx.type || ''),
+          user_id: String(tx.user_id || tx.client_id || ''),
+          booking_id: String(tx.booking_id || ''),
+          error_reason: String(tx.error_reason || tx.failure_reason || ''),
+          transaction_at: String(tx.transaction_at || ''),
+        };
+      });
+      return { ok: true, status: 200, data: { count: failures.length, failures } };
+    } catch (e) {
+      return { ok: false, status: 500, error: e.message };
+    }
+  }
+
+  if (action === 'get_refund_history') {
+    if (actorRole !== 'admin') return { ok: false, status: 403, error: 'admin_only' };
+    const limit = Math.min(100, Math.max(1, Number(payload.limit) || 20));
+    try {
+      const snap = await firestore.collection('finance_requests')
+        .where('type', '==', 'refund')
+        .orderBy('created_at', 'desc')
+        .limit(limit)
+        .get();
+      const refunds = snap.docs.map(d => {
+        const r = d.data() || {};
+        return {
+          id: d.id, amount: String(r.amount || ''),
+          status: String(r.status || ''), reason: String(r.reason || ''),
+          user_id: String(r.target_user_id || ''), booking_id: String(r.booking_id || ''),
+          requested_by: String(r.requested_by || ''), approved_by: String(r.approved_by || ''),
+          created_at: String(r.created_at || ''), resolved_at: String(r.resolved_at || ''),
+        };
+      });
+      return { ok: true, status: 200, data: { count: refunds.length, refunds } };
+    } catch (e) {
+      return { ok: false, status: 500, error: e.message };
+    }
+  }
+
+  if (action === 'get_payout_status') {
+    if (actorRole !== 'admin') return { ok: false, status: 403, error: 'admin_only' };
+    const targetId = String(payload.user_id || payload.artisan_id || payload.partner_id || '').trim();
+    try {
+      let q = firestore.collection('finance_requests').where('type', '==', 'payout').orderBy('created_at', 'desc').limit(20);
+      if (targetId) q = firestore.collection('finance_requests').where('type', '==', 'payout').where('target_user_id', '==', targetId).orderBy('created_at', 'desc').limit(20);
+      const snap = await q.get();
+      const payouts = snap.docs.map(d => {
+        const p = d.data() || {};
+        return {
+          id: d.id, amount: String(p.amount || ''), status: String(p.status || ''),
+          target_user_id: String(p.target_user_id || ''), method: String(p.method || ''),
+          created_at: String(p.created_at || ''), resolved_at: String(p.resolved_at || ''),
+        };
+      });
+      return { ok: true, status: 200, data: { count: payouts.length, payouts } };
+    } catch (e) {
+      return { ok: false, status: 500, error: e.message };
+    }
+  }
+
+  if (action === 'get_fraud_alerts') {
+    if (actorRole !== 'admin') return { ok: false, status: 403, error: 'admin_only' };
+    const limit = Math.min(100, Math.max(1, Number(payload.limit) || 20));
+    try {
+      const snap = await firestore.collection('fraud_alerts')
+        .where('status', '==', 'open')
+        .orderBy('created_at', 'desc')
+        .limit(limit)
+        .get();
+      const alerts = snap.docs.map(d => {
+        const a = d.data() || {};
+        return {
+          id: d.id, alert_type: String(a.alert_type || ''),
+          severity: String(a.severity || ''), description: String(a.description || ''),
+          user_id: String(a.user_id || ''), amount: String(a.amount || ''),
+          created_at: String(a.created_at || ''), status: String(a.status || ''),
+        };
+      });
+      return { ok: true, status: 200, data: { count: alerts.length, alerts } };
+    } catch (e) {
+      return { ok: false, status: 500, error: e.message };
     }
   }
 
@@ -3570,7 +4664,7 @@ function getSdkVersion() {
   try {
     // eslint-disable-next-line global-require
     return require('livekit-server-sdk/package.json').version;
-  } catch {
+  } catch (e) { console.warn('\u26a0\ufe0f SDK version require:', e.message);
     // Some package managers / export maps may prevent requiring package.json.
     // Fall back to the version range declared in this service's package.json.
     try {
@@ -3581,7 +4675,7 @@ function getSdkVersion() {
         (pkg.devDependencies && pkg.devDependencies['livekit-server-sdk']) ||
         'unknown'
       );
-    } catch {
+    } catch (e) { console.warn('\u26a0\ufe0f SDK version fallback require:', e.message);
       return 'unknown';
     }
   }
@@ -3752,6 +4846,25 @@ app.get('/api/test-pricing', async (req, res) => {
 });
 
 /**
+ * Look up real-time Builders.co.za material prices
+ * GET /api/pricing/builders-lookup?q=geyser+150L
+ * Returns: { ok: true, result: { title, url, priceZar, source } }
+ */
+app.get('/api/pricing/builders-lookup', assistantLimiter, async (req, res) => {
+  try {
+    const q = String(req.query.q || req.query.query || '').trim();
+    if (!q) return res.status(400).json({ ok: false, error: 'q parameter required' });
+    const result = await lookupBuildersPriceOne(q);
+    if (!result) return res.json({ ok: true, result: null, message: 'No matching product found on Builders.co.za' });
+    if (result.blocked) return res.json({ ok: true, result: null, message: 'Builders.co.za temporarily blocked this request' });
+    return res.json({ ok: true, result });
+  } catch (e) {
+    console.error('[builders-lookup] Error:', e.message);
+    return res.status(500).json({ ok: false, error: 'Builders lookup failed' });
+  }
+});
+
+/**
  * Start a voice session (recommended for mobile)
  * POST /api/voice/start
  * Body: { roomName?: string, participantName?: string, metadata?: string }
@@ -3838,7 +4951,7 @@ app.post('/api/voice/start', assistantLimiter, async (req, res) => {
           });
         }
       }
-    } catch (_) {
+    } catch (e) { console.warn('\u26a0\ufe0f app-check verification:', e.message);
       // Best-effort only
     }
     const metadata = typeof req.body.metadata === 'string' ? req.body.metadata : '';
@@ -3856,7 +4969,7 @@ app.post('/api/voice/start', assistantLimiter, async (req, res) => {
       parsed.voice_session_id = sessionId;
       parsed.voice_session_nonce = sessionNonce;
       enrichedMetadata = JSON.stringify(parsed);
-    } catch (_) {
+    } catch (e) { console.warn('\u26a0\ufe0f metadata JSON parse:', e.message);
       // If metadata isn't valid JSON, create a fresh object
       enrichedMetadata = JSON.stringify({
         voice_session_id: sessionId,
@@ -4311,7 +5424,7 @@ app.post('/api/action/confirm', assistantLimiter, async (req, res) => {
           request_id: req.requestId || null,
         });
       }
-    } catch (_) {
+    } catch (e) { console.warn('\u26a0\ufe0f idempotency check:', e.message);
       // fall through
     }
   }
@@ -4611,7 +5724,7 @@ app.get('/api/admin/jobs/by-request/:requestId', adminLimiter, async (req, res) 
       .get();
     const items = snap.docs.map((d) => ({ id: d.id, ...(d.data() || {}) }));
     return res.json({ success: true, requestId, items });
-  } catch (_) {
+  } catch (e) { console.warn('\u26a0\ufe0f action jobs query:', e.message);
     return res.json({ success: true, requestId, items: [] });
   }
 });
@@ -4713,7 +5826,7 @@ app.get('/api/admin/debug/reassignment-recipients', async (req, res) => {
     try {
       const direct = await firestore.collection('serviceProvider').doc(providerKey).get();
       if (direct.exists) providerDoc = direct;
-    } catch (_) {
+    } catch (e) { console.warn('\u26a0\ufe0f provider doc direct fetch:', e.message);
       providerDoc = null;
     }
     if (!providerDoc) {
@@ -4725,7 +5838,7 @@ app.get('/api/admin/debug/reassignment-recipients', async (req, res) => {
             providerDoc = qs.docs[0];
             break;
           }
-        } catch (_) {
+        } catch (e) { console.warn('\u26a0\ufe0f provider doc field query:', e.message);
           // ignore
         }
       }
@@ -4815,14 +5928,14 @@ app.post('/api/admin/fix/service-provider-uid-mapping', async (req, res) => {
     try {
       const direct = await firestore.collection('serviceProvider').doc(k).get();
       if (direct.exists) return direct;
-    } catch (_) {
+    } catch (e) { console.warn('\u26a0\ufe0f resolveProviderDoc direct fetch:', e.message);
       // ignore
     }
     for (const f of ['user_id', 'uid', 'userId', 'provider_id']) {
       try {
         const qs = await firestore.collection('serviceProvider').where(f, '==', k).limit(1).get();
         if (!qs.empty) return qs.docs[0];
-      } catch (_) {
+      } catch (e) { console.warn('\u26a0\ufe0f resolveProviderDoc field query:', e.message);
         // ignore
       }
     }
@@ -4895,7 +6008,7 @@ app.post('/api/admin/fix/service-provider-uid-mapping', async (req, res) => {
         prev,
       },
     });
-  } catch (_) {
+  } catch (e) { console.warn('\u26a0\ufe0f admin action audit write:', e.message);
     // best-effort
   }
 
@@ -4911,7 +6024,7 @@ app.post('/api/admin/fix/service-provider-uid-mapping', async (req, res) => {
       const r = String(v || '').trim().toLowerCase();
       userRoleHint = r || null;
     }
-  } catch (_) {
+  } catch (e) { console.warn('\u26a0\ufe0f user role hint lookup:', e.message);
     // ignore
   }
 
@@ -4929,7 +6042,7 @@ app.post('/api/admin/fix/service-provider-uid-mapping', async (req, res) => {
 
 // ── Server-side FCM Notification Endpoint ──
 // Replaces client-side admin SDK usage — clients call this instead of loading firebase-adminsdk.json
-app.post('/api/notifications/send', verifyFirebaseAuth, assistantLimiter, async (req, res) => {
+app.post('/api/notifications/send', authMiddleware, assistantLimiter, async (req, res) => {
   try {
     initFirebaseIfPossible();
     if (firebaseInitError) {
@@ -4994,9 +6107,69 @@ app.post('/api/notifications/send', verifyFirebaseAuth, assistantLimiter, async 
   }
 });
 
+// ── AI Photo Diagnosis — analyzes maintenance issue photos via GPT-4o Vision ──
+app.post('/api/photo/diagnose', assistantLimiter, async (req, res) => {
+  try {
+    const oai = getOpenAI();
+    if (!oai) return res.status(503).json({ error: 'AI service not configured' });
+
+    const { image_base64, image_url, user_description, location_context } = req.body;
+    if (!image_base64 && !image_url) {
+      return res.status(400).json({ error: 'Provide image_base64 or image_url' });
+    }
+
+    const imageContent = image_base64
+      ? { type: 'image_url', image_url: { url: image_base64.startsWith('data:') ? image_base64 : `data:image/jpeg;base64,${image_base64}`, detail: 'high' } }
+      : { type: 'image_url', image_url: { url: image_url, detail: 'high' } };
+
+    const userText = user_description
+      ? `The tenant describes the issue as: "${user_description}"${location_context ? `. Location: ${location_context}` : ''}`
+      : `Please analyze this maintenance issue photo.${location_context ? ` Location: ${location_context}` : ''}`;
+
+    const completion = await oai.chat.completions.create({
+      model: 'gpt-4o',
+      temperature: 0.2,
+      max_tokens: 800,
+      response_format: { type: 'json_object' },
+      messages: [
+        {
+          role: 'system',
+          content: `You are an expert maintenance diagnostics AI for a South African property maintenance company called Square 15 Maintenance.
+
+Analyze the photo of a maintenance issue and return a JSON object with these fields:
+- "issue_type": specific issue (e.g. "burst geyser element", "leaking tap", "cracked wall", "faulty outlet")
+- "service_category": one of: Plumbing, Electrical, Painting, Carpentry, Roofing, Tiling, Locksmith, Appliance Repair, Landscaping, General Maintenance
+- "severity": one of: low, medium, high, emergency
+- "urgency_flag": boolean — true if immediate action required (water damage, electrical hazard, security risk)
+- "description": 2-3 sentence description of what you see and the likely cause
+- "recommended_action": what should be done to fix it
+- "estimated_complexity": 1-5 (1=simple fix, 5=major project)
+- "materials_likely_needed": array of likely materials/parts needed
+- "safety_warnings": array of any safety concerns (empty array if none)
+- "confidence": 0.0-1.0 how confident you are in the diagnosis
+
+If the image is not a maintenance issue, set issue_type to "not_maintenance" and describe what you see.
+Return ONLY valid JSON.`,
+        },
+        {
+          role: 'user',
+          content: [imageContent, { type: 'text', text: userText }],
+        },
+      ],
+    });
+
+    const content = completion.choices[0]?.message?.content || '{}';
+    const diagnosis = JSON.parse(content);
+    res.json({ ok: true, diagnosis });
+  } catch (error) {
+    console.error('❌ Photo diagnosis error:', error.message);
+    res.status(500).json({ error: 'Photo diagnosis failed', details: error.message });
+  }
+});
+
 // ── Server-side PayFast Payment Initiation ──
-// Replaces client-side hardcoded merchant credentials
-app.post('/api/payment/initiate', verifyFirebaseAuth, assistantLimiter, async (req, res) => {
+// Allows WhatsApp bot and app to generate payment URLs
+app.post('/api/payment/initiate', assistantLimiter, async (req, res) => {
   try {
     const merchantId = env('PAYFAST_MERCHANT_ID');
     const merchantKey = env('PAYFAST_MERCHANT_KEY');
@@ -5023,9 +6196,14 @@ app.post('/api/payment/initiate', verifyFirebaseAuth, assistantLimiter, async (r
       ...(custom_str1 ? { custom_str1 } : {}),
     };
 
+    // Build a complete payment URL with query params for WhatsApp bot
+    const qs = new URLSearchParams(paymentData).toString();
+    const fullPaymentUrl = `${payfastUrl}?${qs}`;
+
     res.json({
       ok: true,
       payfast_url: payfastUrl,
+      payment_url: fullPaymentUrl,
       payment_data: paymentData,
     });
   } catch (error) {
@@ -5034,12 +6212,140 @@ app.post('/api/payment/initiate', verifyFirebaseAuth, assistantLimiter, async (r
   }
 });
 
+// ── PayFast ITN (Instant Transaction Notification) Webhook ──
+// Server-side payment verification — PayFast posts here after payment
+app.post('/api/payment/itn', async (req, res) => {
+  try {
+    const data = req.body;
+    console.log('📥 PayFast ITN received:', JSON.stringify(data));
+
+    // 1. Verify signature
+    const merchantKey = env('PAYFAST_MERCHANT_KEY');
+    if (!merchantKey) {
+      console.error('❌ ITN: PAYFAST_MERCHANT_KEY not configured');
+      return res.status(503).send('Server misconfigured');
+    }
+
+    const receivedSignature = data.signature;
+    if (!receivedSignature) {
+      console.error('❌ ITN: No signature in payload');
+      return res.status(400).send('Missing signature');
+    }
+
+    // Build param string for signature verification (exclude signature itself)
+    const paramString = Object.keys(data)
+      .filter(key => key !== 'signature')
+      .sort()
+      .map(key => `${key}=${encodeURIComponent(String(data[key] || '')).replace(/%20/g, '+')}`)
+      .join('&');
+
+    const passphrase = env('PAYFAST_PASSPHRASE') || merchantKey;
+    const expectedSignature = crypto
+      .createHash('md5')
+      .update(paramString + `&passphrase=${encodeURIComponent(passphrase)}`)
+      .digest('hex');
+
+    if (receivedSignature !== expectedSignature) {
+      console.error('❌ ITN: Signature mismatch');
+      return res.status(403).send('Invalid signature');
+    }
+
+    // 2. Extract payment info
+    const paymentStatus = String(data.payment_status || '');
+    const pfPaymentId = String(data.pf_payment_id || '');
+    const amountGross = String(data.amount_gross || '0');
+    const customStr1 = String(data.custom_str1 || ''); // tasksManagement ID
+    const itemName = String(data.item_name || '');
+
+    console.log(`✅ ITN verified: status=${paymentStatus}, pfId=${pfPaymentId}, amount=R${amountGross}, taskId=${customStr1}`);
+
+    // 3. Update Firestore
+    const now = new Date().toISOString();
+
+    if (customStr1) {
+      // Update tasksManagement if we have a task ID
+      const taskRef = admin.firestore().collection('tasksManagement').doc(customStr1);
+      const taskSnap = await taskRef.get();
+
+      if (taskSnap.exists) {
+        const updateData = {
+          payfast_payment_id: pfPaymentId,
+          payfast_itn_status: paymentStatus,
+          payfast_itn_amount: amountGross,
+          payfast_itn_received_at: now,
+          updated_at: now,
+        };
+
+        if (paymentStatus === 'COMPLETE') {
+          updateData.payment_status = 'paid';
+          updateData.payment_verified = true;
+          updateData.payment_verified_at = now;
+          updateData.payment_verified_via = 'payfast_itn';
+        } else if (paymentStatus === 'CANCELLED') {
+          updateData.payment_status = 'cancelled';
+        } else if (paymentStatus === 'FAILED') {
+          updateData.payment_status = 'failed';
+        }
+
+        await taskRef.update(updateData);
+        console.log(`📝 Updated tasksManagement/${customStr1}: payment_status=${updateData.payment_status || paymentStatus}`);
+      }
+
+      // Create/update transaction log
+      const txRef = admin.firestore().collection('transactionLogs');
+      const existingTx = await txRef
+        .where('payfast_payment_id', '==', pfPaymentId)
+        .limit(1)
+        .get();
+
+      if (existingTx.empty) {
+        const taskData = taskSnap.exists ? taskSnap.data() : {};
+        const txId = crypto.randomUUID();
+        await txRef.doc(txId).set({
+          id: txId,
+          amount: amountGross,
+          transaction_at: now,
+          status: paymentStatus === 'COMPLETE' ? 'success' : paymentStatus.toLowerCase(),
+          user_id: taskData.user_id || taskData.userId || '',
+          type: 'payfast',
+          subtype: 'payment',
+          direction: 'in',
+          cash_movement: true,
+          schema_version: 2,
+          tasks_management_id: customStr1,
+          payfast_payment_id: pfPaymentId,
+          payfast_itn_status: paymentStatus,
+          verified_via: 'payfast_itn',
+          item_name: itemName,
+        });
+        console.log(`📝 Created transactionLog for ITN: ${txId}`);
+      } else {
+        // Update existing transaction log
+        const existingDoc = existingTx.docs[0];
+        await existingDoc.ref.update({
+          payfast_itn_status: paymentStatus,
+          payfast_itn_received_at: now,
+          status: paymentStatus === 'COMPLETE' ? 'success' : paymentStatus.toLowerCase(),
+          verified_via: 'payfast_itn',
+        });
+        console.log(`📝 Updated existing transactionLog: ${existingDoc.id}`);
+      }
+    }
+
+    // PayFast expects a 200 OK response
+    res.status(200).send('OK');
+  } catch (error) {
+    console.error('❌ PayFast ITN error:', error);
+    res.status(200).send('OK'); // Always return 200 so PayFast doesn't retry indefinitely
+  }
+});
+
 /**
  * Generate Livekit Access Token (requires auth in production)
  * POST /api/token
  * Body: { roomName: string, participantName: string, metadata?: string }
  */
-app.post('/api/token', verifyFirebaseAuth, async (req, res) => {
+app.post('/api/token', authMiddleware, async (req, res) => {
   try {
     const { roomName, participantName, metadata } = req.body;
 
@@ -5101,7 +6407,7 @@ app.post('/api/token', verifyFirebaseAuth, async (req, res) => {
  * POST /api/create-room
  * Body: { roomName?: string }
  */
-app.post('/api/create-room', verifyFirebaseAuth, async (req, res) => {
+app.post('/api/create-room', authMiddleware, async (req, res) => {
   try {
     const roomName = req.body.roomName || `voice-assistant-${Date.now()}`;
     
@@ -5125,7 +6431,7 @@ app.post('/api/create-room', verifyFirebaseAuth, async (req, res) => {
  * POST /api/dispatch-agent
  * Body: { roomName: string }
  */
-app.post('/api/dispatch-agent', verifyFirebaseAuth, async (req, res) => {
+app.post('/api/dispatch-agent', authMiddleware, async (req, res) => {
   try {
     const { roomName, metadata } = req.body;
 
@@ -5223,6 +6529,583 @@ app.post('/api/admin/bootstrap-claims', async (req, res) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// PHASE 5.2 — Secure Finance Approval Pipeline (Tier C)
+// Money NEVER moves without: auth → fraud check → request doc → admin approval
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── Fraud Detection Engine ──────────────────────────────────────────────────
+async function runFraudChecks({ firestore, type, amount, targetUserId, requestedBy, bookingId }) {
+  const alerts = [];
+  const amountNum = typeof amount === 'number' ? amount : Number.parseFloat(String(amount).replace(/[^0-9.\-]/g, ''));
+
+  // Rule 1: Amount exceeds daily limit per type
+  const DAILY_LIMITS = { refund: 10000, wallet_adjustment: 5000, payout: 50000, fee_override: 2000 };
+  const dailyLimit = DAILY_LIMITS[type] || 5000;
+  if (amountNum > dailyLimit) {
+    alerts.push({ rule: 'amount_exceeds_daily_limit', severity: 'high', detail: `R${amountNum} exceeds R${dailyLimit} limit for ${type}` });
+  }
+
+  // Rule 2: Velocity check — max 5 finance requests per user per hour
+  try {
+    const oneHourAgo = new Date(Date.now() - 3600000).toISOString();
+    const recentSnap = await firestore.collection('finance_requests')
+      .where('requested_by', '==', requestedBy)
+      .where('created_at', '>', oneHourAgo)
+      .limit(10)
+      .get();
+    if (recentSnap.size >= 5) {
+      alerts.push({ rule: 'velocity_exceeded', severity: 'high', detail: `${recentSnap.size} requests in last hour from same admin` });
+    }
+  } catch (e) { console.warn('\u26a0\ufe0f fraud velocity check:', e.message); }
+
+  // Rule 3: Self-dealing — admin requesting funds to themselves
+  if (targetUserId === requestedBy) {
+    alerts.push({ rule: 'self_dealing', severity: 'critical', detail: 'Admin requesting financial action to own account' });
+  }
+
+  // Rule 4: Duplicate refund — same booking refunded within 24 hours
+  if (type === 'refund' && bookingId) {
+    try {
+      const oneDayAgo = new Date(Date.now() - 86400000).toISOString();
+      const dupSnap = await firestore.collection('finance_requests')
+        .where('type', '==', 'refund')
+        .where('booking_id', '==', bookingId)
+        .where('created_at', '>', oneDayAgo)
+        .limit(1)
+        .get();
+      if (!dupSnap.empty) {
+        alerts.push({ rule: 'duplicate_refund', severity: 'high', detail: `Booking ${bookingId} already has a recent refund request` });
+      }
+    } catch (e) { console.warn('\u26a0\ufe0f fraud duplicate refund check:', e.message); }
+  }
+
+  // Rule 5: Flagged user target
+  if (targetUserId) {
+    try {
+      const flagSnap = await firestore.collection('user_flags')
+        .where('user_id', '==', targetUserId)
+        .where('status', '==', 'active')
+        .limit(1)
+        .get();
+      if (!flagSnap.empty) {
+        const flag = flagSnap.docs[0].data() || {};
+        alerts.push({ rule: 'flagged_user', severity: 'medium', detail: `Target user is flagged: ${flag.flag_type} - ${flag.reason || ''}` });
+      }
+    } catch (e) { console.warn('\u26a0\ufe0f fraud flagged user check:', e.message); }
+  }
+
+  // Rule 6: Unusual amount (suspiciously round or very large)
+  if (amountNum > 0 && amountNum === Math.round(amountNum) && amountNum >= 1000 && amountNum % 1000 === 0) {
+    alerts.push({ rule: 'round_amount_pattern', severity: 'low', detail: `Suspiciously round amount: R${amountNum}` });
+  }
+
+  const blocked = alerts.some(a => a.severity === 'critical');
+  const requiresReview = alerts.some(a => a.severity === 'high' || a.severity === 'critical');
+
+  return { alerts, blocked, requiresReview, score: alerts.length };
+}
+
+// ── Create Finance Request (admin-only, creates approval doc) ────────────────
+app.post('/api/finance/request', adminLimiter, async (req, res) => {
+  const firestore = requireFirebase(res);
+  if (!firestore) return;
+  const decoded = await verifyFirebaseAuth(req, res);
+  if (!decoded) return;
+  const role = await resolveRole({ firestore, uid: decoded.uid, decodedToken: decoded });
+  if (role !== 'admin') {
+    return res.status(403).json({ error: 'forbidden', message: 'Admin only' });
+  }
+
+  const type = String(req.body.type || '').trim().toLowerCase();
+  const amountRaw = req.body.amount;
+  const targetUserId = String(req.body.target_user_id || '').trim();
+  const bookingIdParam = String(req.body.booking_id || '').trim();
+  const reason = String(req.body.reason || '').trim();
+  const method = String(req.body.method || '').trim();
+  const notes = String(req.body.notes || '').trim();
+
+  // Validation
+  const validTypes = ['refund', 'wallet_adjustment', 'payout', 'fee_override'];
+  if (!validTypes.includes(type)) {
+    return res.status(400).json({ error: 'invalid_type', message: `Type must be one of: ${validTypes.join(', ')}` });
+  }
+  const amount = Number.parseFloat(String(amountRaw).replace(/[^0-9.\-]/g, ''));
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return res.status(400).json({ error: 'invalid_amount', message: 'Amount must be a positive number' });
+  }
+  if (amount > 100000) {
+    return res.status(400).json({ error: 'amount_too_large', message: 'Maximum single request is R100,000' });
+  }
+  if (!targetUserId) {
+    return res.status(400).json({ error: 'missing_target_user_id' });
+  }
+  if (!reason || reason.length < 5) {
+    return res.status(400).json({ error: 'missing_reason', message: 'Reason must be at least 5 characters' });
+  }
+
+  // Verify target user exists
+  try {
+    const userSnap = await firestore.collection('users').doc(targetUserId).get();
+    if (!userSnap.exists) {
+      return res.status(404).json({ error: 'target_user_not_found' });
+    }
+  } catch (e) { console.warn('\u26a0\ufe0f target user exists check:', e.message); }
+
+  // Run fraud detection
+  const fraud = await runFraudChecks({
+    firestore, type, amount, targetUserId,
+    requestedBy: decoded.uid, bookingId: bookingIdParam,
+  });
+
+  // Block critical fraud alerts immediately
+  if (fraud.blocked) {
+    const alertId = randomId('fraud-');
+    await firestore.collection('fraud_alerts').doc(alertId).set({
+      id: alertId, alert_type: 'blocked_request', severity: 'critical',
+      description: `Blocked ${type} request: ${fraud.alerts.map(a => a.detail).join('; ')}`,
+      user_id: decoded.uid, target_user_id: targetUserId,
+      amount: amount.toFixed(2), booking_id: bookingIdParam,
+      alerts: fraud.alerts, created_at: nowIso(), status: 'open',
+    });
+    return res.status(403).json({
+      error: 'fraud_blocked',
+      message: 'This request was blocked by fraud detection and flagged for review',
+      alerts: fraud.alerts.filter(a => a.severity === 'critical'),
+    });
+  }
+
+  // Create the finance request document
+  const requestId = randomId('fin-');
+  const finReq = {
+    id: requestId,
+    type,
+    amount: Number(amount.toFixed(2)),
+    target_user_id: targetUserId,
+    booking_id: bookingIdParam || null,
+    reason,
+    method: method || null,
+    notes: notes || null,
+    requested_by: decoded.uid,
+    status: fraud.requiresReview ? 'flagged_for_review' : 'pending_approval',
+    fraud_score: fraud.score,
+    fraud_alerts: fraud.alerts,
+    requires_secondary_approval: fraud.requiresReview || amount > 5000,
+    approvals: [],
+    rejections: [],
+    created_at: nowIso(),
+    resolved_at: null,
+    executed_at: null,
+  };
+
+  await firestore.collection('finance_requests').doc(requestId).set(finReq);
+
+  // If flagged, also create a fraud alert
+  if (fraud.requiresReview) {
+    const alertId = randomId('fraud-');
+    await firestore.collection('fraud_alerts').doc(alertId).set({
+      id: alertId, alert_type: 'flagged_request', severity: 'high',
+      description: `Flagged ${type} for R${amount.toFixed(2)}: ${fraud.alerts.map(a => a.detail).join('; ')}`,
+      user_id: decoded.uid, target_user_id: targetUserId,
+      amount: amount.toFixed(2), finance_request_id: requestId,
+      alerts: fraud.alerts, created_at: nowIso(), status: 'open',
+    });
+  }
+
+  // Audit trail
+  await writeAudit({
+    firestore,
+    auditId: randomId('audit-'),
+    audit: {
+      action: `finance_request_${type}`,
+      actor_uid: decoded.uid,
+      actor_role: role,
+      status: 'request_created',
+      payload: { request_id: requestId, type, amount, target_user_id: targetUserId, reason },
+      context: { fraud_score: fraud.score, blocked: fraud.blocked },
+      created_at: nowIso(),
+    },
+  });
+
+  return res.json({
+    success: true,
+    request_id: requestId,
+    status: finReq.status,
+    fraud_score: fraud.score,
+    fraud_alerts: fraud.alerts.length > 0 ? fraud.alerts : undefined,
+    message: fraud.requiresReview
+      ? 'Request created but flagged for additional review due to fraud checks'
+      : 'Request created and pending admin approval',
+  });
+});
+
+// ── Approve Finance Request (admin-only, requires different admin than requester) ──
+app.post('/api/finance/approve', adminLimiter, async (req, res) => {
+  const firestore = requireFirebase(res);
+  if (!firestore) return;
+  const decoded = await verifyFirebaseAuth(req, res);
+  if (!decoded) return;
+  const role = await resolveRole({ firestore, uid: decoded.uid, decodedToken: decoded });
+  if (role !== 'admin') {
+    return res.status(403).json({ error: 'forbidden', message: 'Admin only' });
+  }
+
+  const requestId = String(req.body.request_id || '').trim();
+  if (!requestId) return res.status(400).json({ error: 'missing_request_id' });
+
+  const reqSnap = await firestore.collection('finance_requests').doc(requestId).get();
+  if (!reqSnap.exists) return res.status(404).json({ error: 'request_not_found' });
+
+  const finReq = reqSnap.data() || {};
+
+  // Security: Cannot approve own request (separation of duties)
+  if (finReq.requested_by === decoded.uid) {
+    return res.status(403).json({
+      error: 'self_approval_forbidden',
+      message: 'You cannot approve your own finance request. Another admin must approve it.',
+    });
+  }
+
+  // Check status — only pending or flagged can be approved
+  if (!['pending_approval', 'flagged_for_review'].includes(finReq.status)) {
+    return res.status(409).json({
+      error: 'invalid_status',
+      message: `Request is already ${finReq.status}, cannot approve`,
+    });
+  }
+
+  // Check if secondary approval is needed and hasn't been met
+  const approvals = Array.isArray(finReq.approvals) ? finReq.approvals : [];
+  const alreadyApproved = approvals.some(a => a.uid === decoded.uid);
+  if (alreadyApproved) {
+    return res.status(409).json({ error: 'already_approved', message: 'You have already approved this request' });
+  }
+
+  approvals.push({ uid: decoded.uid, approved_at: nowIso() });
+
+  const needsTwo = finReq.requires_secondary_approval || (finReq.amount > 5000);
+  if (needsTwo && approvals.length < 2) {
+    await reqSnap.ref.update({ approvals, status: 'awaiting_second_approval', updated_at: nowIso() });
+    return res.json({
+      success: true, request_id: requestId,
+      status: 'awaiting_second_approval',
+      message: 'First approval recorded. A second admin must also approve this request.',
+      approvals_count: approvals.length,
+    });
+  }
+
+  // ── Execute the financial operation ──────────────────────────────────
+  const now = nowIso();
+  let executionResult = null;
+  const amount = Number(finReq.amount) || 0;
+  const targetUserId = String(finReq.target_user_id || '').trim();
+
+  try {
+    if (finReq.type === 'refund' || finReq.type === 'wallet_adjustment') {
+      // Credit/debit the user's wallet balance (atomic transaction to prevent race conditions)
+      const userRef = firestore.collection('users').doc(targetUserId);
+      const direction = finReq.type === 'refund' ? 'credit' : (amount >= 0 ? 'credit' : 'debit');
+      const txId = randomId('tx-');
+
+      const { previousBalance, newBalance } = await firestore.runTransaction(async (tx) => {
+        const userSnap = await tx.get(userRef);
+        if (!userSnap.exists) throw new Error('Target user not found');
+
+        const userData = userSnap.data() || {};
+        const currentBalance = Number.parseFloat(String(userData.balance || '0').replace(/[^0-9.\-]/g, '')) || 0;
+        const updatedBalance = direction === 'credit' ? currentBalance + Math.abs(amount) : currentBalance - Math.abs(amount);
+
+        if (updatedBalance < 0 && direction === 'debit') {
+          throw new Error(`Insufficient balance: current R${currentBalance.toFixed(2)}, requested debit R${Math.abs(amount).toFixed(2)}`);
+        }
+
+        tx.update(userRef, { balance: updatedBalance.toFixed(2) });
+
+        // Write transaction log inside the same transaction
+        const txRef = firestore.collection('transactionLogs').doc(txId);
+        tx.set(txRef, {
+          id: txId,
+          transaction_type: finReq.type,
+          amount: amount.toFixed(2),
+          direction: direction === 'credit' ? 'in' : 'out',
+          status: 'success',
+          user_id: targetUserId,
+          booking_id: finReq.booking_id || null,
+          finance_request_id: requestId,
+          previous_balance: currentBalance.toFixed(2),
+          new_balance: updatedBalance.toFixed(2),
+          reason: finReq.reason,
+          executed_by: decoded.uid,
+          approved_by: approvals.map(a => a.uid),
+          transaction_at: now,
+          created_at: now,
+        });
+
+        return { previousBalance: currentBalance, newBalance: updatedBalance };
+      });
+
+      executionResult = {
+        type: finReq.type, amount: amount.toFixed(2),
+        previous_balance: previousBalance.toFixed(2),
+        new_balance: newBalance.toFixed(2),
+        transaction_id: txId,
+      };
+    } else if (finReq.type === 'payout') {
+      // Payouts create a pending payout record (actual transfer handled externally)
+      const payoutId = randomId('payout-');
+      await firestore.collection('payout_records').doc(payoutId).set({
+        id: payoutId,
+        target_user_id: targetUserId,
+        amount: amount.toFixed(2),
+        method: finReq.method || 'eft',
+        status: 'pending_transfer',
+        finance_request_id: requestId,
+        reason: finReq.reason,
+        approved_by: approvals.map(a => a.uid),
+        created_at: now,
+      });
+
+      // Deduct from user balance
+      const userRef = firestore.collection('users').doc(targetUserId);
+      const userSnap = await userRef.get();
+      if (userSnap.exists) {
+        const bal = Number.parseFloat(String((userSnap.data() || {}).balance || '0').replace(/[^0-9.\-]/g, '')) || 0;
+        if (bal < amount) {
+          throw new Error(`Insufficient balance for payout: R${bal.toFixed(2)} < R${amount.toFixed(2)}`);
+        }
+        await userRef.update({ balance: (bal - amount).toFixed(2) });
+      }
+
+      const txId = randomId('tx-');
+      await firestore.collection('transactionLogs').doc(txId).set({
+        id: txId, transaction_type: 'payout', amount: amount.toFixed(2),
+        direction: 'out', status: 'pending_transfer', user_id: targetUserId,
+        finance_request_id: requestId, payout_id: payoutId,
+        reason: finReq.reason, executed_by: decoded.uid,
+        approved_by: approvals.map(a => a.uid), transaction_at: now, created_at: now,
+      });
+
+      executionResult = { type: 'payout', payout_id: payoutId, amount: amount.toFixed(2), status: 'pending_transfer' };
+    } else if (finReq.type === 'fee_override') {
+      // Fee overrides update the booking's fee/commission fields
+      const bId = String(finReq.booking_id || '').trim();
+      if (!bId) throw new Error('Fee override requires a booking_id');
+      const bRef = firestore.collection('futureBookings').doc(bId);
+      const bSnap = await bRef.get();
+      if (!bSnap.exists) throw new Error('Booking not found');
+      await bRef.update({
+        fee_override: amount.toFixed(2),
+        fee_override_reason: finReq.reason,
+        fee_override_by: decoded.uid,
+        fee_override_at: now,
+      });
+      executionResult = { type: 'fee_override', booking_id: bId, new_fee: amount.toFixed(2) };
+    }
+
+    // Mark request as executed
+    await reqSnap.ref.update({
+      status: 'executed',
+      approvals,
+      executed_at: now,
+      executed_by: decoded.uid,
+      execution_result: executionResult,
+      updated_at: now,
+    });
+
+    // Audit trail
+    await writeAudit({
+      firestore, auditId: randomId('audit-'),
+      audit: {
+        action: `finance_executed_${finReq.type}`,
+        actor_uid: decoded.uid, actor_role: role,
+        status: 'executed',
+        payload: { request_id: requestId, type: finReq.type, amount, target_user_id: targetUserId },
+        context: { approvals: approvals.length, execution_result: executionResult },
+        created_at: now,
+      },
+    });
+
+    return res.json({
+      success: true, request_id: requestId,
+      status: 'executed', execution_result: executionResult,
+    });
+  } catch (execErr) {
+    await reqSnap.ref.update({
+      status: 'execution_failed',
+      execution_error: execErr.message,
+      updated_at: nowIso(),
+    });
+    return res.status(500).json({
+      error: 'execution_failed',
+      message: execErr.message,
+      request_id: requestId,
+    });
+  }
+});
+
+// ── Reject Finance Request (admin-only) ──────────────────────────────────────
+app.post('/api/finance/reject', adminLimiter, async (req, res) => {
+  const firestore = requireFirebase(res);
+  if (!firestore) return;
+  const decoded = await verifyFirebaseAuth(req, res);
+  if (!decoded) return;
+  const role = await resolveRole({ firestore, uid: decoded.uid, decodedToken: decoded });
+  if (role !== 'admin') {
+    return res.status(403).json({ error: 'forbidden', message: 'Admin only' });
+  }
+
+  const requestId = String(req.body.request_id || '').trim();
+  const rejectReason = String(req.body.reason || '').trim();
+  if (!requestId) return res.status(400).json({ error: 'missing_request_id' });
+  if (!rejectReason) return res.status(400).json({ error: 'missing_reason' });
+
+  const reqSnap = await firestore.collection('finance_requests').doc(requestId).get();
+  if (!reqSnap.exists) return res.status(404).json({ error: 'request_not_found' });
+
+  const finReq = reqSnap.data() || {};
+  if (['executed', 'rejected'].includes(finReq.status)) {
+    return res.status(409).json({ error: 'invalid_status', message: `Request is already ${finReq.status}` });
+  }
+
+  await reqSnap.ref.update({
+    status: 'rejected',
+    rejected_by: decoded.uid,
+    rejection_reason: rejectReason,
+    resolved_at: nowIso(),
+    updated_at: nowIso(),
+  });
+
+  await writeAudit({
+    firestore, auditId: randomId('audit-'),
+    audit: {
+      action: `finance_rejected_${finReq.type}`,
+      actor_uid: decoded.uid, actor_role: role,
+      status: 'rejected',
+      payload: { request_id: requestId, type: finReq.type, amount: finReq.amount, rejection_reason: rejectReason },
+      created_at: nowIso(),
+    },
+  });
+
+  return res.json({ success: true, request_id: requestId, status: 'rejected' });
+});
+
+// ── List Finance Requests (admin-only) ───────────────────────────────────────
+app.get('/api/finance/requests', adminLimiter, async (req, res) => {
+  const firestore = requireFirebase(res);
+  if (!firestore) return;
+  const decoded = await verifyFirebaseAuth(req, res);
+  if (!decoded) return;
+  const role = await resolveRole({ firestore, uid: decoded.uid, decodedToken: decoded });
+  if (role !== 'admin') {
+    return res.status(403).json({ error: 'forbidden', message: 'Admin only' });
+  }
+
+  const status = String(req.query.status || '').trim();
+  const type = String(req.query.type || '').trim();
+  const limitRaw = Number.parseInt(String(req.query.limit || '50'), 10);
+  const limit = Math.max(1, Math.min(200, limitRaw));
+
+  let q = firestore.collection('finance_requests').orderBy('created_at', 'desc').limit(limit);
+  if (status) q = firestore.collection('finance_requests').where('status', '==', status).orderBy('created_at', 'desc').limit(limit);
+
+  try {
+    let snap;
+    try {
+      snap = await q.get();
+    } catch (indexErr) {
+      // Composite index may not exist yet — fall back to simpler query
+      console.warn('[finance-requests] composite index missing, falling back:', indexErr.message);
+      if (status) {
+        snap = await firestore.collection('finance_requests').where('status', '==', status).limit(limit).get();
+      } else {
+        snap = await firestore.collection('finance_requests').limit(limit).get();
+      }
+    }
+    const items = snap.docs.map(d => {
+      const r = d.data() || {};
+      return {
+        id: d.id, type: r.type, amount: r.amount, status: r.status,
+        target_user_id: r.target_user_id, booking_id: r.booking_id,
+        reason: r.reason, requested_by: r.requested_by, method: r.method,
+        fraud_score: r.fraud_score, fraud_alerts: r.fraud_alerts,
+        requires_secondary_approval: r.requires_secondary_approval,
+        approvals: r.approvals, created_at: r.created_at,
+        executed_at: r.executed_at, resolved_at: r.resolved_at,
+      };
+    });
+    return res.json({ success: true, count: items.length, items });
+  } catch (e) {
+    return res.status(500).json({ error: 'internal_error', message: e.message });
+  }
+});
+
+// ── Fraud Alerts Dashboard (admin-only) ──────────────────────────────────────
+app.get('/api/finance/fraud-alerts', adminLimiter, async (req, res) => {
+  const firestore = requireFirebase(res);
+  if (!firestore) return;
+  const decoded = await verifyFirebaseAuth(req, res);
+  if (!decoded) return;
+  const role = await resolveRole({ firestore, uid: decoded.uid, decodedToken: decoded });
+  if (role !== 'admin') {
+    return res.status(403).json({ error: 'forbidden', message: 'Admin only' });
+  }
+
+  const status = String(req.query.status || 'open').trim();
+  const limitRaw = Number.parseInt(String(req.query.limit || '50'), 10);
+  const limit = Math.max(1, Math.min(200, limitRaw));
+
+  try {
+    let snap;
+    try {
+      snap = await firestore.collection('fraud_alerts')
+        .where('status', '==', status)
+        .orderBy('created_at', 'desc')
+        .limit(limit)
+        .get();
+    } catch (indexErr) {
+      // Composite index may not exist yet — fall back to status-only query
+      console.warn('[fraud-alerts] composite index missing, falling back:', indexErr.message);
+      snap = await firestore.collection('fraud_alerts')
+        .where('status', '==', status)
+        .limit(limit)
+        .get();
+    }
+    const items = snap.docs.map(d => ({ id: d.id, ...(d.data() || {}) }));
+    return res.json({ success: true, count: items.length, items });
+  } catch (e) {
+    return res.status(500).json({ error: 'internal_error', message: e.message });
+  }
+});
+
+// ── Dismiss Fraud Alert (admin-only) ─────────────────────────────────────────
+app.post('/api/finance/fraud-alerts/dismiss', adminLimiter, async (req, res) => {
+  const firestore = requireFirebase(res);
+  if (!firestore) return;
+  const decoded = await verifyFirebaseAuth(req, res);
+  if (!decoded) return;
+  const role = await resolveRole({ firestore, uid: decoded.uid, decodedToken: decoded });
+  if (role !== 'admin') {
+    return res.status(403).json({ error: 'forbidden', message: 'Admin only' });
+  }
+
+  const alertId = String(req.body.alert_id || '').trim();
+  const dismissReason = String(req.body.reason || '').trim();
+  if (!alertId) return res.status(400).json({ error: 'missing_alert_id' });
+  if (!dismissReason) return res.status(400).json({ error: 'missing_reason' });
+
+  try {
+    await firestore.collection('fraud_alerts').doc(alertId).update({
+      status: 'dismissed',
+      dismissed_by: decoded.uid,
+      dismiss_reason: dismissReason,
+      dismissed_at: nowIso(),
+    });
+    return res.json({ success: true, alert_id: alertId, status: 'dismissed' });
+  } catch (e) {
+    return res.status(500).json({ error: 'internal_error', message: e.message });
+  }
+});
+
 // 404 handler
 app.use((req, res) => {
   res.status(404).json({
@@ -5236,6 +7119,14 @@ module.exports = app;
 
 // Start server only when executed directly (node server.js)
 if (require.main === module) {
+  process.on('unhandledRejection', (reason, promise) => {
+    console.error('\u274c Unhandled Rejection:', reason);
+  });
+  process.on('uncaughtException', (error) => {
+    console.error('\u274c Uncaught Exception:', error);
+    process.exit(1);
+  });
+
   app.listen(PORT, () => {
     console.log('🚀 Square 15 Livekit Backend');
     console.log(`📡 Server running on port ${PORT}`);
@@ -5244,5 +7135,220 @@ if (require.main === module) {
     console.log(`🧠 Voice start endpoint: http://localhost:${PORT}/api/voice/start`);
     console.log(`📦 Environment: ${process.env.NODE_ENV}`);
     console.log('✅ Server ready to accept requests\n');
+
+    // ── Retargeting Queue Processor — runs every 15 minutes ──
+    if (firestore) {
+      const RETARGET_INTERVAL = 15 * 60 * 1000; // 15 min
+      async function processRetargetingQueue() {
+        try {
+          const now = new Date();
+          const nowStr = now.toISOString();
+          const dueSnap = await firestore.collection('retargeting_queue')
+            .where('status', '==', 'active')
+            .where('next_send_at', '<=', nowStr)
+            .limit(20)
+            .get();
+
+          if (dueSnap.empty) return;
+          console.log(`🔄 Retargeting: processing ${dueSnap.size} due items`);
+
+          for (const doc of dueSnap.docs) {
+            try {
+              const data = doc.data() || {};
+              const userId = String(data.user_id || '').trim();
+              const category = String(data.category_name || 'maintenance').trim();
+              const step = parseInt(data.next_step) || 1;
+              const amount = parseFloat(data.quoted_amount) || 0;
+
+              if (!userId) { await doc.ref.update({ status: 'expired' }); continue; }
+
+              // Check if user booked since (cancel retargeting)
+              const recentBookings = await firestore.collection('futureBookings')
+                .where('userId', '==', userId)
+                .where('status', 'in', ['pending', 'in_progress', 'completed'])
+                .limit(1)
+                .get();
+              const recentTasks = await firestore.collection('tasksManagement')
+                .where('userId', '==', userId)
+                .where('status', 'in', ['pending', 'in_progress', 'completed'])
+                .limit(1)
+                .get();
+              if (!recentBookings.empty || !recentTasks.empty) {
+                await doc.ref.update({ status: 'converted' });
+                continue;
+              }
+
+              // Get user's push tokens
+              const tokens = await getUserTokens(userId);
+              if (tokens.length === 0) {
+                await doc.ref.update({ status: 'expired', expired_reason: 'no_push_token' });
+                continue;
+              }
+
+              // Get user name
+              const userSnap = await firestore.collection('users').doc(userId).get();
+              const userName = String((userSnap.data() || {}).name || 'there').split(' ')[0];
+
+              const amountStr = amount > 0 ? ` (R${amount.toFixed(0)})` : '';
+
+              switch (step) {
+                case 1: // 1 hour: reminder
+                  await sendPushToTokens({
+                    tokens,
+                    title: `Still need that ${category} done?`,
+                    body: `Hi ${userName}, your quote${amountStr} is waiting! Tap to continue booking.`,
+                    data: { type: 'retarget_reminder', session_id: doc.id },
+                  });
+                  await doc.ref.update({
+                    next_step: 2,
+                    next_send_at: new Date(now.getTime() + 23 * 3600000).toISOString(),
+                    last_sent_at: nowStr,
+                  });
+                  break;
+
+                case 2: { // 24 hours: 5% discount
+                  const code = `BACK5-${doc.id.slice(-6).toUpperCase()}`;
+                  const expires = new Date(now.getTime() + 48 * 3600000);
+                  await firestore.collection('promo_codes').doc(code).set({
+                    code, discount_percent: 5, created_at: now.toISOString(),
+                    expires_at: expires.toISOString(), user_id: userId,
+                    type: 'retargeting', status: 'active', max_uses: 1, uses: 0,
+                  });
+                  await sendPushToTokens({
+                    tokens,
+                    title: `5% off your ${category} booking!`,
+                    body: `Hi ${userName}, use code ${code} for 5% off${amountStr}. Valid 48 hours!`,
+                    data: { type: 'retarget_discount', promo_code: code },
+                  });
+                  await doc.ref.update({
+                    next_step: 3,
+                    next_send_at: new Date(now.getTime() + 48 * 3600000).toISOString(),
+                    last_sent_at: nowStr, promo_code: code,
+                  });
+                  break;
+                }
+
+                case 3: { // 72 hours: 10% discount
+                  const code = `BACK10-${doc.id.slice(-6).toUpperCase()}`;
+                  const expires = new Date(now.getTime() + 96 * 3600000);
+                  await firestore.collection('promo_codes').doc(code).set({
+                    code, discount_percent: 10, created_at: now.toISOString(),
+                    expires_at: expires.toISOString(), user_id: userId,
+                    type: 'retargeting', status: 'active', max_uses: 1, uses: 0,
+                  });
+                  await sendPushToTokens({
+                    tokens,
+                    title: '10% off — limited time!',
+                    body: `Hi ${userName}, your ${category} issue won't fix itself. Use ${code} for 10% off!`,
+                    data: { type: 'retarget_discount', promo_code: code },
+                  });
+                  await doc.ref.update({
+                    next_step: 4,
+                    next_send_at: new Date(now.getTime() + 4 * 24 * 3600000).toISOString(),
+                    last_sent_at: nowStr, promo_code: code,
+                  });
+                  break;
+                }
+
+                case 4: { // 7 days: final 15%
+                  const code = `FINAL15-${doc.id.slice(-6).toUpperCase()}`;
+                  const expires = new Date(now.getTime() + 24 * 3600000);
+                  await firestore.collection('promo_codes').doc(code).set({
+                    code, discount_percent: 15, created_at: now.toISOString(),
+                    expires_at: expires.toISOString(), user_id: userId,
+                    type: 'retargeting', status: 'active', max_uses: 1, uses: 0,
+                  });
+                  await sendPushToTokens({
+                    tokens,
+                    title: 'Last chance: 15% off expires tomorrow!',
+                    body: `${userName}, final offer on your ${category} booking. Code ${code} — 24 hours only.`,
+                    data: { type: 'retarget_final', promo_code: code },
+                  });
+                  await doc.ref.update({
+                    status: 'expired', last_sent_at: nowStr, promo_code: code,
+                  });
+                  break;
+                }
+
+                default:
+                  await doc.ref.update({ status: 'expired' });
+              }
+            } catch (itemErr) {
+              console.warn(`⚠️ Retargeting item ${doc.id} error:`, itemErr.message);
+            }
+          }
+        } catch (e) {
+          console.warn('⚠️ Retargeting queue error:', e.message);
+        }
+      }
+
+      // Also detect stale bookings and queue them for retargeting
+      async function detectStaleBookings() {
+        try {
+          const staleThreshold = new Date(Date.now() - 24 * 3600000); // 24h old
+          const staleStatuses = [
+            'pending', 'pending_payment', 'pending_client_response',
+            'rfq_submitted', 'rfq_pending',
+          ];
+
+          for (const collection of ['futureBookings', 'tasksManagement']) {
+            for (const status of staleStatuses) {
+              const staleSnap = await firestore.collection(collection)
+                .where('status', '==', status)
+                .limit(10)
+                .get();
+
+              for (const doc of staleSnap.docs) {
+                const data = doc.data() || {};
+                const createdAt = data.createdAt?.toDate?.() || data.created_at?.toDate?.();
+                if (!createdAt || createdAt > staleThreshold) continue;
+
+                const uid = String(data.userId || data.user_id || data.clientId || '').trim();
+                if (!uid) continue;
+
+                // Check if already queued
+                const existing = await firestore.collection('retargeting_queue')
+                  .where('session_id', '==', doc.id)
+                  .limit(1)
+                  .get();
+                if (!existing.empty) continue;
+
+                const category = String(data.category || data.serviceCategory || 'maintenance').trim();
+                const amount = parseFloat(data.cost || data.total_cost || data.quoted_price || '0');
+
+                await firestore.collection('retargeting_queue').doc(doc.id).set({
+                  user_id: uid,
+                  session_id: doc.id,
+                  booking_id: doc.id,
+                  category_name: category,
+                  quoted_amount: amount,
+                  stale_status: status,
+                  source: 'stale_detection',
+                  created_at: new Date().toISOString(),
+                  status: 'active',
+                  next_step: 1,
+                  next_send_at: new Date().toISOString(), // Send immediately
+                });
+              }
+            }
+          }
+        } catch (e) {
+          console.warn('⚠️ Stale booking detection error:', e.message);
+        }
+      }
+
+      // Run every 15 minutes
+      setInterval(async () => {
+        await detectStaleBookings();
+        await processRetargetingQueue();
+      }, RETARGET_INTERVAL).unref?.();
+
+      // Also run once on startup (after 30s warm-up)
+      setTimeout(async () => {
+        await detectStaleBookings();
+        await processRetargetingQueue();
+      }, 30_000);
+      console.log('📋 Retargeting queue processor started (every 15 min)');
+    }
   });
 }
