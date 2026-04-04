@@ -1394,6 +1394,41 @@ async function executeWaTool(name, args, session) {
         });
       } catch (e) { console.warn('[wa-tool] booking notification failed:', e.message); }
 
+      // ── Notify available artisans via FCM push ──
+      try {
+        const catSlug = (args.category || '').toLowerCase().replace(/\s+/g, '_');
+        const artisanSnap = await firestore.collection('serviceProvider')
+          .where('status', '==', 'approved')
+          .where('is_suspended', '!=', true)
+          .limit(20)
+          .get();
+        for (const artDoc of artisanSnap.docs) {
+          const ad = artDoc.data() || {};
+          // Check if artisan serves this category
+          const cats = (ad.categories || ad.category || '').toString().toLowerCase();
+          if (cats && !cats.includes(catSlug) && catSlug !== 'general_maintenance') continue;
+          const token = (ad.fcm_token || ad.deviceToken || '').toString().trim();
+          if (!token) continue;
+          try {
+            await admin.messaging().send({
+              token,
+              notification: {
+                title: '🔔 New Booking Request',
+                body: `New ${args.category || 'maintenance'} job available. Tap to view and accept.`,
+              },
+              data: {
+                type: 'new_booking',
+                booking_id: bookingId,
+                order_no: orderNo,
+              },
+              android: { notification: { channelId: 'order_request_channel', sound: 'sound' } },
+            });
+          } catch (fcmErr) {
+            console.warn(`[wa-tool] FCM to artisan ${artDoc.id} failed:`, fcmErr.message);
+          }
+        }
+      } catch (e) { console.warn('[wa-tool] artisan dispatch notification failed:', e.message); }
+
       // Store last booking ID for quick payment follow-up
       session.lastBookingId = bookingId;
       session.lastBookingCost = finalCost;
@@ -2651,6 +2686,36 @@ async function executeWaTool(name, args, session) {
         created_at: admin.firestore.FieldValue.serverTimestamp(),
       });
 
+      // ── Notify available artisans via FCM push ──
+      try {
+        const cat = (data.category || data.category_name || '').toLowerCase().replace(/\s+/g, '_');
+        const artisanSnap = await firestore.collection('serviceProvider')
+          .where('status', '==', 'approved')
+          .where('is_suspended', '!=', true)
+          .limit(20)
+          .get();
+        for (const artDoc of artisanSnap.docs) {
+          const ad = artDoc.data() || {};
+          const cats = (ad.categories || ad.category || '').toString().toLowerCase();
+          if (cats && cat && !cats.includes(cat) && cat !== 'general_maintenance') continue;
+          const token = (ad.fcm_token || ad.deviceToken || '').toString().trim();
+          if (!token) continue;
+          try {
+            await admin.messaging().send({
+              token,
+              notification: {
+                title: '🔔 New RFQ Job Available',
+                body: `RFQ ${data.rfq_no || rfqId} — R${priceNum.toFixed(2)}. Tap to view and accept.`,
+              },
+              data: { type: 'rfq_accepted', booking_id: rfqId },
+              android: { notification: { channelId: 'order_request_channel', sound: 'sound' } },
+            });
+          } catch (fcmErr) {
+            console.warn(`[wa-tool] FCM to artisan ${artDoc.id} failed:`, fcmErr.message);
+          }
+        }
+      } catch (e) { console.warn('[wa-tool] artisan RFQ dispatch failed:', e.message); }
+
       // Store for quick payment follow-up
       session.lastBookingId = rfqId;
       session.lastBookingCost = priceNum;
@@ -3241,6 +3306,159 @@ app.post('/api/send-rfq-response', async (req, res) => {
     res.json({ success: true, to, rfqNo });
   } catch (err) {
     console.error('[send-rfq-response] error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Webhook: Artisan accepted a booking → notify client via WhatsApp ───
+app.post('/api/artisan-accepted', async (req, res) => {
+  try {
+    const { bookingId, artisanName } = req.body || {};
+    if (!bookingId) return res.status(400).json({ error: 'bookingId required' });
+
+    const firestore = admin.firestore();
+
+    // Find booking in tasksManagement
+    const tmDoc = await firestore.collection('tasksManagement').doc(bookingId).get();
+    if (!tmDoc.exists) return res.status(404).json({ error: 'Booking not found' });
+    const tm = tmDoc.data();
+
+    // Find customer phone
+    let phone = (tm.phone || tm.customer_phone || '').toString().trim();
+    if (!phone && tm.user_id) {
+      try {
+        const userDoc = await firestore.collection('users').doc(tm.user_id).get();
+        phone = (userDoc.data()?.phone || userDoc.data()?.phoneNumber || '').toString().trim();
+      } catch (_) {}
+    }
+
+    if (!phone) return res.status(404).json({ error: 'Customer phone not found' });
+
+    // Normalise phone
+    phone = phone.replace(/[^0-9]/g, '');
+    if (phone.startsWith('0')) phone = '27' + phone.slice(1);
+
+    const cost = parseFloat(tm.cost || tm.total_cost || '0');
+    const deposit = (cost * 0.35).toFixed(2);
+    const name = artisanName || tm.service_provider_name || 'An artisan';
+    const orderNo = tm.order_no || tm.booking_id || bookingId;
+
+    await sendWhatsAppMessage(phone,
+      `✅ *Great news!* ${name} has accepted your booking ${orderNo}.\n\n` +
+      `You can now proceed with payment:\n` +
+      `💰 Full amount: R${cost.toFixed(2)}\n` +
+      `💰 Deposit (35%): R${deposit} now, R${(cost - parseFloat(deposit)).toFixed(2)} after completion\n\n` +
+      `🔒 Your payment is held in secure escrow — the artisan only gets paid when you're satisfied.\n\n` +
+      `Reply "pay" or "payment" to get your payment link.`
+    );
+
+    res.json({ success: true, phone });
+  } catch (err) {
+    console.error('[artisan-accepted] error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Webhook: Payment confirmed → update booking + notify client ───
+app.post('/api/payment-confirmed', async (req, res) => {
+  try {
+    const { bookingId, paymentType, amount } = req.body || {};
+    if (!bookingId) return res.status(400).json({ error: 'bookingId required' });
+
+    const firestore = admin.firestore();
+    const tmRef = firestore.collection('tasksManagement').doc(bookingId);
+    const tmDoc = await tmRef.get();
+    if (!tmDoc.exists) return res.status(404).json({ error: 'Booking not found' });
+    const tm = tmDoc.data();
+
+    // Update payment status
+    const isDeposit = paymentType === 'deposit';
+    const updateData = isDeposit
+      ? { deposit_paid: true, deposit_paid_at: new Date().toISOString(), payment_status: 'deposit_paid' }
+      : { deposit_paid: true, balance_paid: true, balance_paid_at: new Date().toISOString(), payment_status: 'paid' };
+    await tmRef.update(updateData);
+
+    // Also update futureBookings if exists
+    const fbId = (tm.future_booking_id || '').toString().trim();
+    if (fbId) {
+      try {
+        await firestore.collection('futureBookings').doc(fbId).update(updateData);
+      } catch (_) {}
+    }
+
+    // Find customer phone and send WhatsApp confirmation
+    let phone = (tm.phone || tm.customer_phone || '').toString().trim();
+    if (!phone && tm.user_id) {
+      try {
+        const userDoc = await firestore.collection('users').doc(tm.user_id).get();
+        phone = (userDoc.data()?.phone || userDoc.data()?.phoneNumber || '').toString().trim();
+      } catch (_) {}
+    }
+
+    if (phone) {
+      phone = phone.replace(/[^0-9]/g, '');
+      if (phone.startsWith('0')) phone = '27' + phone.slice(1);
+
+      const paidAmt = amount || (isDeposit ? tm.deposit_amount : tm.cost);
+      const orderNo = tm.order_no || tm.booking_id || bookingId;
+
+      let msg = `✅ *Payment Received!* R${parseFloat(paidAmt).toFixed(2)} for booking ${orderNo}.\n\n`;
+      if (isDeposit) {
+        const balance = parseFloat(tm.balance_amount || (parseFloat(tm.cost) * 0.65));
+        msg += `💰 Deposit secured. Remaining balance: R${balance.toFixed(2)} (due after job completion).\n\n`;
+      }
+      msg += `🔧 Your artisan will be dispatched according to the scheduled date/time. We'll keep you updated!\n\n`;
+      msg += `🔒 Remember: Your money is in escrow — the artisan only gets paid when you confirm you're satisfied.`;
+
+      await sendWhatsAppMessage(phone, msg);
+    }
+
+    res.json({ success: true, bookingId, paymentStatus: updateData.payment_status });
+  } catch (err) {
+    console.error('[payment-confirmed] error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Webhook: Job status update → notify client via WhatsApp ───
+app.post('/api/job-status-update', async (req, res) => {
+  try {
+    const { bookingId, status, artisanName } = req.body || {};
+    if (!bookingId || !status) return res.status(400).json({ error: 'bookingId and status required' });
+
+    const firestore = admin.firestore();
+    const tmDoc = await firestore.collection('tasksManagement').doc(bookingId).get();
+    if (!tmDoc.exists) return res.status(404).json({ error: 'Booking not found' });
+    const tm = tmDoc.data();
+
+    let phone = (tm.phone || tm.customer_phone || '').toString().trim();
+    if (!phone && tm.user_id) {
+      try {
+        const userDoc = await firestore.collection('users').doc(tm.user_id).get();
+        phone = (userDoc.data()?.phone || userDoc.data()?.phoneNumber || '').toString().trim();
+      } catch (_) {}
+    }
+
+    if (!phone) return res.status(404).json({ error: 'Customer phone not found' });
+    phone = phone.replace(/[^0-9]/g, '');
+    if (phone.startsWith('0')) phone = '27' + phone.slice(1);
+
+    const name = artisanName || tm.service_provider_name || 'Your artisan';
+    const orderNo = tm.order_no || tm.booking_id || bookingId;
+
+    const statusMessages = {
+      'progress': `🚗 *${name} is on the way!* Booking ${orderNo}.\n\nYour artisan has started the job. Sit tight!`,
+      'in_progress': `🚗 *${name} is on the way!* Booking ${orderNo}.\n\nYour artisan has started the job. Sit tight!`,
+      'completed': `✅ *Job completed!* Booking ${orderNo}.\n\n${name} has marked the job as done.\n\n⭐ Please rate the service in your Square 15 app to help us maintain quality standards.\n\n${tm.payment_type === 'deposit' && !tm.balance_paid ? '💰 Reminder: Your remaining balance of R' + parseFloat(tm.balance_amount || 0).toFixed(2) + ' is now due.' : ''}`,
+    };
+
+    const msg = statusMessages[status];
+    if (!msg) return res.status(400).json({ error: `Unknown status: ${status}` });
+
+    await sendWhatsAppMessage(phone, msg);
+    res.json({ success: true, status, orderNo });
+  } catch (err) {
+    console.error('[job-status-update] error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
