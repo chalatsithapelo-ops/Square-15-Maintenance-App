@@ -6268,6 +6268,7 @@ app.post('/api/payment/itn', async (req, res) => {
       const taskSnap = await taskRef.get();
 
       if (taskSnap.exists) {
+        const taskData_itn = taskSnap.data() || {};
         const updateData = {
           payfast_payment_id: pfPaymentId,
           payfast_itn_status: paymentStatus,
@@ -6277,10 +6278,33 @@ app.post('/api/payment/itn', async (req, res) => {
         };
 
         if (paymentStatus === 'COMPLETE') {
-          updateData.payment_status = 'paid';
           updateData.payment_verified = true;
           updateData.payment_verified_at = now;
           updateData.payment_verified_via = 'payfast_itn';
+
+          // Determine if this was a deposit or full/balance payment
+          const paidAmount = parseFloat(amountGross) || 0;
+          const totalCost = parseFloat(taskData_itn.cost || '0') || 0;
+          const depositAmt = parseFloat(taskData_itn.deposit_amount || '0') || (totalCost * 0.35);
+          const wasDepositPaid = taskData_itn.deposit_paid === true;
+
+          if (wasDepositPaid) {
+            // This is a balance payment
+            updateData.balance_paid = true;
+            updateData.balance_paid_at = now;
+            updateData.payment_status = 'paid';
+          } else if (totalCost > 0 && paidAmount < totalCost * 0.7) {
+            // Paid less than 70% of total → treat as deposit
+            updateData.deposit_paid = true;
+            updateData.deposit_paid_at = now;
+            updateData.payment_type = 'deposit';
+            updateData.payment_status = 'deposit_paid';
+          } else {
+            // Full payment
+            updateData.deposit_paid = true;
+            updateData.balance_paid = true;
+            updateData.payment_status = 'paid';
+          }
         } else if (paymentStatus === 'CANCELLED') {
           updateData.payment_status = 'cancelled';
         } else if (paymentStatus === 'FAILED') {
@@ -6289,6 +6313,118 @@ app.post('/api/payment/itn', async (req, res) => {
 
         await taskRef.update(updateData);
         console.log(`📝 Updated tasksManagement/${customStr1}: payment_status=${updateData.payment_status || paymentStatus}`);
+
+        // Also update futureBookings for consistency
+        try {
+          await admin.firestore().collection('futureBookings').doc(customStr1).update({
+            payment_status: updateData.payment_status || paymentStatus.toLowerCase(),
+            payfast_payment_id: pfPaymentId,
+            updated_at: now,
+            ...(paymentStatus === 'COMPLETE' ? {
+              payment_verified: true, payment_verified_at: now,
+              ...(updateData.deposit_paid ? { deposit_paid: true } : {}),
+              ...(updateData.balance_paid ? { balance_paid: true } : {}),
+              ...(updateData.payment_type ? { payment_type: updateData.payment_type } : {}),
+            } : {}),
+          }).catch(() => {});
+        } catch (_) {}
+
+        // Send WhatsApp notification for WhatsApp-originated bookings
+        if (taskData_itn.source === 'whatsapp' && (taskData_itn.customerPhone || taskData_itn.contact)) {
+          try {
+            const waToken = env('WHATSAPP_TOKEN') || env('WA_TOKEN');
+            const waPhoneId = env('WHATSAPP_PHONE_NUMBER_ID') || env('WA_PHONE_ID');
+            if (waToken && waPhoneId) {
+              const customerPhone = String(taskData_itn.customerPhone || taskData_itn.contact || '').replace(/\D/g, '');
+              const orderNo = taskData_itn.order_no || customStr1;
+              let waMessage;
+              if (paymentStatus === 'COMPLETE') {
+                waMessage = `✅ *Payment Confirmed!*\n\nYour payment of R${amountGross} for booking *${orderNo}* has been received and verified.\n\n🔒 Your funds are held in secure escrow until you confirm satisfaction with the completed work.\n\nWe'll notify you when your artisan is on the way!`;
+              } else if (paymentStatus === 'CANCELLED') {
+                waMessage = `⚠️ *Payment Cancelled*\n\nYour payment of R${amountGross} for booking *${orderNo}* was cancelled.\n\nYou can retry by replying "pay" or "payment" to get a new payment link.`;
+              } else if (paymentStatus === 'FAILED') {
+                waMessage = `❌ *Payment Failed*\n\nYour payment of R${amountGross} for booking *${orderNo}* could not be processed.\n\nPlease try again by replying "pay" or "payment", or use a different payment method.`;
+              }
+              if (waMessage) {
+                const waResp = await fetch(`https://graph.facebook.com/v18.0/${waPhoneId}/messages`, {
+                  method: 'POST',
+                  headers: {
+                    'Authorization': `Bearer ${waToken}`,
+                    'Content-Type': 'application/json',
+                  },
+                  body: JSON.stringify({
+                    messaging_product: 'whatsapp',
+                    to: customerPhone,
+                    type: 'text',
+                    text: { body: waMessage },
+                  }),
+                });
+                console.log(`📱 WhatsApp ITN notification sent to ${customerPhone}: ${paymentStatus} (status=${waResp.status})`);
+              }
+            }
+          } catch (waErr) {
+            console.warn('ITN WhatsApp notification failed:', waErr.message);
+          }
+        }
+
+        // Notify customer and create refund request for CANCELLED/FAILED payments
+        if (paymentStatus === 'CANCELLED' || paymentStatus === 'FAILED') {
+          const taskData = taskSnap.data() || {};
+          const userId = taskData.user_id || taskData.userId || '';
+          const statusLabel = paymentStatus === 'CANCELLED' ? 'cancelled' : 'failed';
+
+          // Send notification to customer
+          if (userId) {
+            try {
+              await admin.firestore().collection('notifications').add({
+                title: `Payment ${statusLabel === 'cancelled' ? 'Cancelled' : 'Failed'}`,
+                body: `Your payment of R${amountGross} for booking ${taskData.order_no || customStr1} was ${statusLabel}. You can retry from your bookings page.`,
+                type: 'payment_' + statusLabel,
+                user_id: userId,
+                user_type: 'user',
+                booking_id: customStr1,
+                read: false,
+                created_at: now,
+              });
+            } catch (notifErr) {
+              console.warn('ITN notification failed:', notifErr.message);
+            }
+          }
+
+          // Send FCM push if user has token
+          if (userId) {
+            try {
+              const userSnap = await admin.firestore().collection('users').doc(userId).get();
+              const fcmToken = (userSnap.data() || {}).fcm_token || (userSnap.data() || {}).deviceToken || '';
+              if (fcmToken) {
+                await admin.messaging().send({
+                  token: fcmToken,
+                  notification: {
+                    title: `Payment ${statusLabel === 'cancelled' ? 'Cancelled' : 'Failed'}`,
+                    body: `Your R${amountGross} payment was ${statusLabel}. Tap to retry.`,
+                  },
+                  data: { type: 'payment_' + statusLabel, booking_id: customStr1 },
+                  android: { notification: { channelId: 'payment_channel' } },
+                }).catch(() => {});
+              }
+            } catch (_) {}
+          }
+
+          // Notify admin
+          try {
+            await admin.firestore().collection('notifications').add({
+              title: `PayFast Payment ${paymentStatus}`,
+              body: `Payment of R${amountGross} for task ${customStr1} was ${statusLabel}. PF ID: ${pfPaymentId}`,
+              type: 'payment_' + statusLabel,
+              user_type: 'admin',
+              booking_id: customStr1,
+              read: false,
+              created_at: now,
+            });
+          } catch (_) {}
+
+          console.log(`📨 Sent ${statusLabel} notifications for task ${customStr1}`);
+        }
       }
 
       // Create/update transaction log
@@ -7135,6 +7271,17 @@ if (require.main === module) {
     console.log(`🧠 Voice start endpoint: http://localhost:${PORT}/api/voice/start`);
     console.log(`📦 Environment: ${process.env.NODE_ENV}`);
     console.log('✅ Server ready to accept requests\n');
+
+    // Initialize Firestore for background processors
+    let firestore = null;
+    try {
+      initFirebaseIfPossible();
+      if (!firebaseInitError) {
+        firestore = admin.firestore();
+      }
+    } catch (e) {
+      console.warn('⚠️ Firebase not available for background processors:', e.message);
+    }
 
     // ── Retargeting Queue Processor — runs every 15 minutes ──
     if (firestore) {
