@@ -31,6 +31,8 @@ import 'package:maintenanceapp/services/booking_monitor_service.dart';
 import 'package:maintenanceapp/services/future_booking_service.dart';
 import 'package:maintenanceapp/services/service_area_checker.dart';
 import 'package:maintenanceapp/services/firestore_services/firebase_services.dart';
+import 'package:maintenanceapp/services/rfq_ai_service.dart';
+import 'package:maintenanceapp/services/ai_photo_diagnosis_service.dart';
 
 /// Professional Livekit Voice AI Assistant Integration
 /// Enables voice interactions with AI agent for booking, support, and general queries
@@ -447,7 +449,28 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
         (_) async {
           if (!mounted || !_isConnected) return;
           debugPrint('🔄 Refreshing Firebase token for agent session...');
-          await _sendCredentialsToAgent();
+          try {
+            await _sendCredentialsToAgent();
+          } catch (e) {
+            debugPrint('❌ Token refresh failed: $e');
+            try {
+              await Future.delayed(const Duration(seconds: 3));
+              await _sendCredentialsToAgent();
+            } catch (e2) {
+              debugPrint('❌ Token refresh retry also failed: $e2');
+              // Force-refresh the Firebase ID token and try once more
+              try {
+                final u = FirebaseAuth.instance.currentUser;
+                if (u != null) {
+                  _firebaseIdToken = (await u.getIdToken(true)) ?? '';
+                  await _sendCredentialsToAgent();
+                  debugPrint('✅ Emergency token refresh succeeded');
+                }
+              } catch (e3) {
+                debugPrint('❌ Emergency token refresh failed: $e3');
+              }
+            }
+          }
         },
       );
 
@@ -532,27 +555,24 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
 
     _sentLizzySpokenIntro = true;
 
-    // Give the agent a moment to finish joining + attach metadata listeners.
-    Future.delayed(const Duration(milliseconds: 700), () async {
+    // Reduced from 700ms to 200ms — agent is already listening by this point.
+    Future.delayed(const Duration(milliseconds: 200), () async {
       try {
         // ── CRITICAL: Re-send credentials now that agent has joined ──
         // The initial publishData may have been lost if the agent wasn't
         // listening yet. This guarantees the agent gets our Firebase token.
         await _sendCredentialsToAgent();
 
-        await _sendSpeakToAgent(
-          'I am $_assistantName, how can I help you today?',
-        );
+        // Don't send speak intro — server-side agent sends its own greeting
+        // immediately after session.start(). Sending a duplicate from here
+        // caused the user to hear the greeting twice.
 
-        // Also re-send app context with active bookings for the agent.
+        // Send app context with active bookings for the agent.
         await _sendAppContextToAgent(reason: 'agent_joined');
 
-        // Retry once in case the first metadata update was missed.
+        // Retry credentials once in case the first metadata update was missed.
         await Future.delayed(const Duration(seconds: 3));
         await _sendCredentialsToAgent();
-        await _sendSpeakToAgent(
-          'I am $_assistantName, how can I help you today?',
-        );
       } catch (_) {
         // Best-effort: ignore.
       }
@@ -865,7 +885,9 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
           token = (await u.getIdToken(true)) ?? '';
           _firebaseIdToken = token;
         }
-      } catch (_) {}
+      } catch (e) {
+        debugPrint('[ai_app] ❌ Firebase token refresh failed: $e');
+      }
     }
 
     if (token.trim().isEmpty) {
@@ -1233,7 +1255,8 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
 
       if (resp.statusCode < 200 || resp.statusCode >= 300) return null;
       return jsonDecode(resp.body) as Map<String, dynamic>;
-    } catch (_) {
+    } catch (e) {
+      debugPrint('❌ Action execution error: $e');
       return null;
     }
   }
@@ -1254,10 +1277,11 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
 
     // Use a single callback-based listener (compatible with this SDK version)
     _room!.addListener(() {
-      if (_room == null) return;
+      final room = _room;
+      if (room == null) return;
 
       // Check for remote participants (AI agent)
-      for (final participant in _room!.remoteParticipants.values) {
+      for (final participant in room.remoteParticipants.values) {
         final pid = participant.identity;
         if (!_seenRemoteParticipants.contains(pid)) {
           _seenRemoteParticipants.add(pid);
@@ -1293,14 +1317,14 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
       }
 
       // Update status when remote participants are present
-      if (_room!.remoteParticipants.isNotEmpty && mounted) {
+      if (room.remoteParticipants.isNotEmpty && mounted) {
         setState(() {
           _connectionStatus = '$_assistantName Active';
         });
       }
 
       // Handle connection state changes
-      final state = _room!.connectionState;
+      final state = room.connectionState;
       if (_lastConnectionState != state) {
         _lastConnectionState = state;
         debugPrint('ℹ️ Room state: $state');
@@ -1316,8 +1340,10 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
           _metadataPoller?.cancel();
           _metadataPoller =
               Timer.periodic(const Duration(milliseconds: 600), (_) {
-            if (!mounted || _room == null) return;
-            for (final p in _room!.remoteParticipants.values) {
+            if (!mounted) return;
+            final room = _room; // snapshot to avoid race
+            if (room == null) return;
+            for (final p in room.remoteParticipants.values) {
               final md = p.metadata;
               if (md != null && md.trim().isNotEmpty) {
                 _maybeHandleParticipantMetadata(
@@ -3033,10 +3059,83 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
         // General Maintenance
         'maintenance': 'general maintenance',
         'general maintenance': 'general maintenance',
-        'handyman': 'general maintenance',
         'odd job': 'general maintenance',
         'odd jobs': 'general maintenance',
         'emergency': 'general maintenance',
+
+        // Appliance Repair → under General Maintenance
+        'appliance': 'general maintenance',
+        'appliance repair': 'general maintenance',
+        'washing machine': 'general maintenance',
+        'fridge': 'general maintenance',
+        'freezer': 'general maintenance',
+        'stove': 'general maintenance',
+        'oven': 'general maintenance',
+        'dishwasher': 'general maintenance',
+        'tumble dryer': 'general maintenance',
+        'microwave': 'general maintenance',
+        'geyser repair': 'general maintenance',
+
+        // Locksmith → under General Maintenance
+        'locksmith': 'general maintenance',
+        'locked out': 'general maintenance',
+        'lock repair': 'general maintenance',
+        'gate lock': 'general maintenance',
+        'padlock': 'general maintenance',
+        'lost keys': 'general maintenance',
+
+        // Pest Control → under General Maintenance
+        'pest': 'general maintenance',
+        'pest control': 'general maintenance',
+        'fumigation': 'general maintenance',
+        'cockroach': 'general maintenance',
+        'cockroaches': 'general maintenance',
+        'rodent': 'general maintenance',
+        'rats': 'general maintenance',
+        'termite': 'general maintenance',
+        'bed bugs': 'general maintenance',
+        'fleas': 'general maintenance',
+
+        // Moving & Removal → under General Maintenance
+        'moving': 'general maintenance',
+        'removals': 'general maintenance',
+        'furniture moving': 'general maintenance',
+        'rubble removal': 'general maintenance',
+        'waste removal': 'general maintenance',
+        'garden refuse': 'general maintenance',
+
+        // Handyman → under General Maintenance
+        'handyman': 'general maintenance',
+        'tv mounting': 'general maintenance',
+        'curtain rail': 'general maintenance',
+        'shelf mounting': 'general maintenance',
+        'picture hanging': 'general maintenance',
+        'door adjustment': 'general maintenance',
+        'tap washer': 'general maintenance',
+        'light bulb': 'general maintenance',
+
+        // Property Inspections → under General Maintenance
+        'property inspection': 'general maintenance',
+        'home inspection': 'general maintenance',
+        'snag list': 'general maintenance',
+        'pre-purchase inspection': 'general maintenance',
+        'rental inspection': 'general maintenance',
+        'compliance check': 'general maintenance',
+
+        // COC → maps to relevant trades
+        'electrical coc': 'electrical',
+        'plumbing coc': 'plumbing',
+        'coc': 'general maintenance',
+
+        // Pool Maintenance → under General Maintenance
+        'pool': 'general maintenance',
+        'pool maintenance': 'general maintenance',
+        'swimming pool': 'general maintenance',
+        'pool cleaning': 'general maintenance',
+        'pool pump': 'general maintenance',
+        'pool filter': 'general maintenance',
+        'pool acid wash': 'general maintenance',
+        'pool leak': 'general maintenance',
         // Compound phrases for common service requests
         'blocked toilet': 'plumbing',
         'blocked drain': 'plumbing',
@@ -3630,7 +3729,7 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
         (map['category_name'] ?? map['categoryName'] ?? '').toString().trim();
     final description =
         (map['problem_description'] ?? map['description'] ?? '').toString();
-    final notes = (map['additional_notes'] ?? map['notes'] ?? '').toString();
+    var notes = (map['additional_notes'] ?? map['notes'] ?? '').toString();
     String address =
         (map['service_address'] ?? map['address'] ?? '').toString();
     String lat = (map['service_lat'] ?? map['lat'] ?? '').toString();
@@ -3920,9 +4019,9 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
         // ignore parse errors
       }
 
-      if (parsedScheduled != null && parsedScheduled.isBefore(now)) {
-        // Date is in the past — use smart defaults instead.
-        print('[booking_time] AI provided past date ($scheduledDate $scheduledTime), using smart default');
+      if (parsedScheduled != null && (parsedScheduled.isBefore(now) || parsedScheduled.isAfter(now.add(const Duration(days: 365))))) {
+        // Date is in the past or more than 1 year in the future — use smart defaults.
+        print('[booking_time] AI provided invalid date ($scheduledDate $scheduledTime), using smart default');
         if (isEmergency) {
           final dt = now.add(const Duration(hours: 1));
           effectiveDate = _formatDate(dt);
@@ -4267,7 +4366,7 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
       }
     }
 
-    final effectiveDescription = description.trim().isNotEmpty
+    var effectiveDescription = description.trim().isNotEmpty
         ? description
         : 'Voice request: $categoryName${notes.trim().isNotEmpty ? " - $notes" : ""}';
 
@@ -4433,7 +4532,7 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
 
       List<String>? uploadedUrls;
       try {
-        uploadedUrls = await Get.to<List<String>>(
+        final result = await Get.to<Map<String, dynamic>>(
           () => AiPhotoUploadScreen(
             categoryName: categoryName,
             problemDescription: description,
@@ -4444,11 +4543,14 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
           ),
           transition: Transition.fadeIn,
         );
+        if (result != null) {
+          uploadedUrls = List<String>.from(result['urls'] ?? []);
+        }
       } catch (e) {
         // Fallback: try Navigator.push
         try {
           final ctx2 = Get.context ?? context;
-          uploadedUrls = await Navigator.of(ctx2).push<List<String>>(
+          final result = await Navigator.of(ctx2).push<Map<String, dynamic>>(
             MaterialPageRoute(
               builder: (_) => AiPhotoUploadScreen(
                 categoryName: categoryName,
@@ -4460,6 +4562,9 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
               ),
             ),
           );
+          if (result != null) {
+            uploadedUrls = List<String>.from(result['urls'] ?? []);
+          }
         } catch (_) {}
       }
 
@@ -4475,12 +4580,53 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
 
       finalImageUrls = uploadedUrls;
       setState(() {
-        _aiResponse = 'Photos uploaded! Sending your request to the nearest artisan...';
+        _aiResponse = 'Photos uploaded! Analyzing the issue...';
       });
       _addToTranscript('AI', 'Photos uploaded successfully.');
       await _sendSpeakToAgent(
-        'Photos uploaded successfully. I am now sending the request to the nearest available artisan.',
+        'Photos uploaded successfully. Let me quickly analyze the photos.',
       );
+
+      // ── AI Photo Diagnosis (best-effort, enriches description) ─────
+      try {
+        final diagnosis = await AIPhotoDiagnosisService.instance.diagnoseFromUrl(
+          imageUrl: finalImageUrls.first,
+          userDescription: effectiveDescription,
+        );
+        if (diagnosis.confidence >= 0.4 && !diagnosis.isNotMaintenance) {
+          // Enrich the description with AI vision findings
+          effectiveDescription =
+              '$effectiveDescription\n[AI Photo Analysis: ${diagnosis.description} '
+              'Severity: ${diagnosis.severity}. '
+              'Recommended: ${diagnosis.recommendedAction}]';
+          if (diagnosis.materialsLikelyNeeded.isNotEmpty) {
+            notes = '$notes | Materials from photo: ${diagnosis.materialsLikelyNeeded.join(', ')}';
+          }
+          // Store diagnosis on the booking later (in ai_quote step)
+          debugPrint('📸 [VoiceRFQ] Photo diagnosis: ${diagnosis.issueType} — ${diagnosis.severity}');
+
+          if (diagnosis.isEmergency) {
+            await _sendSpeakToAgent(
+              'I can see this looks urgent — ${diagnosis.description} '
+              'I am prioritizing your request.',
+            );
+          } else {
+            await _sendSpeakToAgent(
+              'I can see the issue. ${diagnosis.description} '
+              'Sending your request now.',
+            );
+          }
+        } else {
+          await _sendSpeakToAgent(
+            'I am now sending the request to the nearest available artisan.',
+          );
+        }
+      } catch (e) {
+        debugPrint('⚠️ [VoiceRFQ] Photo diagnosis failed (non-blocking): $e');
+        await _sendSpeakToAgent(
+          'I am now sending the request to the nearest available artisan.',
+        );
+      }
     }
 
     // ── Geo-fence check ─────────────────────────────────────────────────
@@ -4539,6 +4685,10 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
               '')
           .toString();
 
+      if (bookingId.trim().isEmpty) {
+        throw StateError('Backend returned success but no booking ID');
+      }
+
       print(
           '[dispatch_result] bookingId=$bookingId isRFQ=$isRFQ assigned=$assigned');
 
@@ -4559,7 +4709,7 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
       }
 
       final msg = isRFQ
-          ? 'Request created (RFQ). Admin will assign the best available artisan.'
+          ? 'Your request for quotes has been created. A preliminary AI quote with cost breakdown is being generated now.'
           : (assigned.isNotEmpty
               ? 'Booking created. Request sent to a nearby artisan. Waiting for acceptance.'
               : 'Booking created. Still finding an available artisan to accept.');
@@ -4576,6 +4726,18 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
 
       Get.snackbar(_assistantName, msg,
           backgroundColor: Colors.green, colorText: Colors.white);
+
+      // ── Auto-generate AI quote for voice RFQ bookings ──────────────
+      if (isRFQ && bookingId.trim().isNotEmpty) {
+        _generateAIQuoteForVoiceRFQ(
+          bookingId: bookingId,
+          categoryName: categoryName,
+          description: effectiveDescription,
+          notes: notes,
+          imageUrls: finalImageUrls,
+          materialsResponsibility: materialsResponsibility,
+        );
+      }
     } catch (e) {
       debugPrint('❌ backend create_order_booking failed: $e');
       print(
@@ -4593,6 +4755,66 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
       await _sendSpeakToAgent(
           'Sorry — I encountered an error creating the booking. Please try again.');
     }
+  }
+
+  /// Fire-and-forget: generates an AI quote for a voice-created RFQ booking
+  /// and writes the result back to Firestore so the user (and admin) can see it.
+  void _generateAIQuoteForVoiceRFQ({
+    required String bookingId,
+    required String categoryName,
+    required String description,
+    required String notes,
+    required List<String> imageUrls,
+    required String materialsResponsibility,
+  }) {
+    // Run asynchronously — don't block the voice flow.
+    () async {
+      try {
+        debugPrint('🤖 [VoiceRFQ] Generating AI quote for booking $bookingId …');
+
+        final quotation = await RFQAIService.generateQuotation(
+          categoryName: categoryName,
+          problemDescription: description,
+          additionalNotes: notes,
+          imageUrls: imageUrls,
+          materialsResponsibility: materialsResponsibility,
+        );
+
+        final total = ((quotation['total'] ?? quotation['totalCost'] ?? 0) as num).toDouble();
+
+        // Write AI quote into the futureBookings doc so that:
+        //  • explain_rfq_quote on server.js picks up quoted_price / quote_details
+        //  • admin app can see the AI-generated quote as a baseline
+        await FirebaseFirestore.instance
+            .collection('futureBookings')
+            .doc(bookingId)
+            .update({
+          'ai_quote': quotation,
+          'quoted_price': total,
+          'quote_details': quotation['summary'] ?? quotation['breakdown'] ?? '',
+          'rfq_status': 'ai_quote_ready',
+          'ai_quote_generated_at': FieldValue.serverTimestamp(),
+        });
+
+        debugPrint('✅ [VoiceRFQ] AI quote written — total R${total.toStringAsFixed(2)}');
+
+        if (mounted) {
+          final spokenTotal = total > 0
+              ? 'Your preliminary quote is ready. The estimated total is ${total.toStringAsFixed(0)} rand. You can ask me to explain the breakdown.'
+              : 'Your preliminary quote is ready. Ask me to explain the breakdown for details.';
+          await _sendSpeakToAgent(spokenTotal);
+        }
+      } catch (e, st) {
+        debugPrint('⚠️ [VoiceRFQ] AI quote generation failed: $e\n$st');
+        // Gracefully degrade — the RFQ still exists; admin can quote manually.
+        if (mounted) {
+          await _sendSpeakToAgent(
+            'I was unable to generate a preliminary quote automatically. '
+            'An admin will review your request and send a quote shortly.',
+          );
+        }
+      }
+    }();
   }
 
   Future<void> _openPhotoUploadThenDispatch(dynamic payload) async {
@@ -4702,7 +4924,7 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
         Object? lastError;
         for (int attempt = 0; attempt < 3; attempt++) {
           try {
-            final navFuture = Future.microtask(() => Get.to<List<String>>(
+            final navFuture = Future.microtask(() => Get.to<Map<String, dynamic>>(
                   () => AiPhotoUploadScreen(
                     categoryName: categoryName,
                     problemDescription: description,
@@ -4725,7 +4947,10 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
               'I have opened the photo upload, please upload the photos of the issue.',
             );
 
-            urls = await navFuture;
+            final result = await navFuture;
+            if (result != null) {
+              urls = List<String>.from(result['urls'] ?? []);
+            }
             break;
           } catch (e) {
             lastError = e;
@@ -4737,7 +4962,7 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
         if (urls == null) {
           try {
             final ctx = Get.context ?? context;
-            final navFuture = Navigator.of(ctx).push<List<String>>(
+            final navFuture = Navigator.of(ctx).push<Map<String, dynamic>>(
               MaterialPageRoute(
                 builder: (_) => AiPhotoUploadScreen(
                   categoryName: categoryName,
@@ -4762,7 +4987,10 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
               'Opening the photo upload screen now. Please upload at least 3 photos.',
             );
 
-            urls = await navFuture;
+            final result = await navFuture;
+            if (result != null) {
+              urls = List<String>.from(result['urls'] ?? []);
+            }
           } catch (e) {
             lastError = e;
           }
@@ -4860,14 +5088,45 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
         .doc(bookingId)
         .snapshots()
         .listen((snap) async {
-      if (!mounted) return;
-      if (!snap.exists) return;
+      if (!mounted) {
+        await _bookingStatusSubscription?.cancel();
+        _bookingStatusSubscription = null;
+        return;
+      }
+      if (!snap.exists) {
+        await _bookingStatusSubscription?.cancel();
+        _bookingStatusSubscription = null;
+        return;
+      }
 
       final data = snap.data() ?? <String, dynamic>{};
       final isRfq = (data['is_rfq'] ?? '').toString().trim().toLowerCase();
       if (isRfq == 'yes') return;
 
       final status = (data['status'] ?? '').toString().trim().toLowerCase();
+
+      // Stop watching on terminal states
+      if (status == 'cancelled' || status == 'completed') {
+        if (status == 'cancelled') {
+          final msg = 'This booking has been cancelled.';
+          setState(() { _aiResponse = msg; });
+          _addToTranscript('AI', msg);
+          await _sendSpeakToAgent(msg);
+        }
+        await _bookingStatusSubscription?.cancel();
+        _bookingStatusSubscription = null;
+        return;
+      }
+
+      // Handle rejection by artisan
+      if (status == 'rejected') {
+        final msg = 'The artisan could not accept this booking. I am looking for another available artisan.';
+        setState(() { _aiResponse = msg; });
+        _addToTranscript('AI', msg);
+        await _sendSpeakToAgent(msg);
+        // Don't cancel — keep listening in case admin reassigns
+      }
+
       final artisanConfirmed =
           (data['artisan_confirmed'] ?? '').toString().trim().toLowerCase();
       final artisanId = (data['service_provider_id'] ?? '').toString().trim();
@@ -5339,18 +5598,29 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
     _waveAnimationController.stop();
     _pulseAnimationController.stop();
 
-    await _room!.disconnect();
-    await _room!.dispose();
+    try {
+      await _room!.disconnect();
+      await _room!.dispose();
+    } catch (e) {
+      debugPrint('⚠️ Room disconnect/dispose error: $e');
+    }
 
-    setState(() {
+    if (mounted) {
+      setState(() {
+        _room = null;
+        _localParticipant = null;
+        _isConnected = false;
+        _isMuted = false;
+        _connectionStatus = 'Disconnected';
+        _aiResponse = 'Tap the microphone to start talking...';
+        _transcript.clear();
+      });
+    } else {
       _room = null;
       _localParticipant = null;
       _isConnected = false;
       _isMuted = false;
-      _connectionStatus = 'Disconnected';
-      _aiResponse = 'Tap the microphone to start talking...';
-      _transcript.clear();
-    });
+    }
 
     debugPrint('🔌 Disconnected from Livekit');
     _isDisconnecting = false;
@@ -5399,7 +5669,11 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
     _artisanRequestsWorker = null;
     _waveAnimationController.dispose();
     _pulseAnimationController.dispose();
-    _disconnect();
+    try {
+      _disconnect();
+    } catch (e) {
+      debugPrint('💥 Disconnect error during dispose: $e');
+    }
     super.dispose();
   }
 
