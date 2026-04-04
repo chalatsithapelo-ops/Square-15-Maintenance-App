@@ -8,6 +8,9 @@ const fs = require('fs');
 const OpenAI = require('openai');
 require('dotenv').config();
 
+// Deploy version (used to verify Render deployment)
+const DEPLOY_VERSION = '2026-04-04a';
+
 // ─── Prompt sanitization (prevent injection via user-supplied text) ───
 function sanitizeForPrompt(text, maxLen = 500) {
   if (!text || typeof text !== 'string') return '';
@@ -4695,6 +4698,7 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     message: 'Livekit Token Server is running',
+    version: DEPLOY_VERSION,
     timestamp: new Date().toISOString(),
     sdkVersion: getSdkVersion(),
     firebase: {
