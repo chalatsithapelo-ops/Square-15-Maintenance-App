@@ -14,6 +14,11 @@ yarn-error.log*
 dist/
 build/
 
+# Debug / migration scripts (contain local paths to service account keys)
+check_*.js
+cleanup_images.js
+migrate_images.js
+
 # Python
 __pycache__/
 *.pyc
