@@ -26,13 +26,19 @@ services:
         sync: false
       - key: LIVEKIT_AGENT_NAME
         value: square15-voice-assistant
-      # PayFast credentials (set as Secret in Render dashboard)
-      - key: PAYFAST_MERCHANT_ID
+      # Ozow payment credentials (set as Secret in Render dashboard)
+      - key: OZOW_SITE_CODE
         sync: false
-      - key: PAYFAST_MERCHANT_KEY
+      - key: OZOW_API_KEY
         sync: false
-      - key: PAYFAST_URL
-        value: "https://www.payfast.co.za/eng/process"
+      - key: OZOW_PRIVATE_KEY
+        sync: false
+      - key: OZOW_PAYOUT_API_KEY
+        sync: false
+      - key: OZOW_IS_TEST
+        value: "false"
+      - key: BACKEND_BASE_URL
+        value: "https://square15-livekit-backend.onrender.com"
       # Admin bootstrap key for setting admin custom claims
       - key: ADMIN_BOOTSTRAP_KEY
         sync: false

@@ -802,7 +802,7 @@ const ACTION_TIERS = Object.freeze({
   admin_close_stale_cases: 'B',
   admin_broadcast_notification: 'B',
   admin_flag_user: 'B',
-  // Payment link generation (Tier B — creates PayFast link + notification)
+  // Payment link generation (Tier B — creates Ozow link + notification)
   request_payment_link: 'B',
   // Phase 5.1: Finance read-only (Tier A)
   get_finance_summary: 'A',
@@ -3225,7 +3225,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     }
   }
 
-  // ── Request Payment Link — generates PayFast URL + stores in payment_links + sends notification ──
+  // ── Request Payment Link — generates Ozow URL + stores in payment_links + sends notification ──
   if (action === 'request_payment_link') {
     try {
       const bid = bookingId || String(payload.tasks_management_id || '').trim();
@@ -3258,11 +3258,16 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         payAmount = cost;
       }
 
-      const merchantId = env('PAYFAST_MERCHANT_ID');
-      const merchantKey = env('PAYFAST_MERCHANT_KEY');
-      const payfastUrl = env('PAYFAST_URL') || 'https://www.payfast.co.za/eng/process';
+      const siteCode = env('OZOW_SITE_CODE');
+      const apiKey = env('OZOW_API_KEY');
+      const privateKey = env('OZOW_PRIVATE_KEY');
+      const isTest = (env('OZOW_IS_TEST') || 'false') === 'true';
+      const ozowUrl = isTest
+        ? 'https://stagingapi.ozow.com/PostPaymentRequest'
+        : 'https://api.ozow.com/PostPaymentRequest';
+      const backendBase = env('BACKEND_BASE_URL') || 'https://square15-livekit-backend.onrender.com';
 
-      if (!merchantId || !merchantKey) {
+      if (!siteCode || !privateKey || !apiKey) {
         // Fallback: store request + notify admin
         const payRef = `PAY-${bid}-${Date.now().toString(36)}`;
         await firestore.collection('payment_links').doc(payRef).set({
@@ -3292,23 +3297,60 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
 
       const itemSuffix = paymentType === 'deposit' ? '(35% Deposit)' : (bData.deposit_paid === true ? '(Balance)' : '(Full)');
       const itemName = `Square 15 Booking ${bData.order_no || bData.rfq_no || bid} ${itemSuffix}`;
-      const paymentData = {
-        merchant_id: merchantId,
-        merchant_key: merchantKey,
-        amount: payAmount.toFixed(2),
-        item_name: itemName,
-        custom_str1: bid,
-      };
-      const qs = new (require('url').URLSearchParams)(paymentData).toString();
-      const paymentUrl = `${payfastUrl}?${qs}`;
+      const transactionRef = `PAY-${bid}-${Date.now().toString(36)}`;
+      const bankRef = `SQ15 ${(bData.order_no || bid).slice(0, 20)}`;
 
-      const payRef = `PAY-${bid}-${Date.now().toString(36)}`;
-      await firestore.collection('payment_links').doc(payRef).set({
+      const successUrl = `${backendBase}/api/payment/ozow-result?status=success&ref=${transactionRef}`;
+      const cancelUrl = `${backendBase}/api/payment/ozow-result?status=cancel&ref=${transactionRef}`;
+      const errorUrl = `${backendBase}/api/payment/ozow-result?status=error&ref=${transactionRef}`;
+      const notifyUrl = `${backendBase}/api/payment/ozow-notify`;
+
+      const hashValues = [
+        siteCode, 'ZA', 'ZAR', payAmount.toFixed(2), transactionRef,
+        bankRef, cancelUrl, errorUrl, successUrl, notifyUrl, String(isTest),
+      ];
+      const hashCheck = ozowHashCheck(hashValues, privateKey);
+
+      const ozowPayload = {
+        SiteCode: siteCode,
+        CountryCode: 'ZA',
+        CurrencyCode: 'ZAR',
+        Amount: payAmount.toFixed(2),
+        TransactionReference: transactionRef,
+        BankReference: bankRef,
+        CancelUrl: cancelUrl,
+        ErrorUrl: errorUrl,
+        SuccessUrl: successUrl,
+        NotifyUrl: notifyUrl,
+        IsTest: isTest,
+        HashCheck: hashCheck,
+      };
+
+      let paymentUrl = '';
+      try {
+        const ozowResp = await fetch(ozowUrl, {
+          method: 'POST',
+          headers: {
+            'Accept': 'application/json',
+            'ApiKey': apiKey,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(ozowPayload),
+        });
+        const ozowBody = await ozowResp.json();
+        paymentUrl = ozowBody.url || ozowBody.paymentUrl || ozowBody.redirectUrl || '';
+      } catch (ozErr) {
+        console.warn('Ozow API call failed for payment link:', ozErr.message);
+      }
+
+      await firestore.collection('payment_links').doc(transactionRef).set({
         booking_id: bid,
+        task_id: bid,
         amount: payAmount,
         payment_type: paymentType,
         user_id: actorUid || '',
         payment_url: paymentUrl,
+        provider: 'ozow',
         status: 'pending',
         source: payload.source || 'voice',
         created_at: admin.firestore.FieldValue.serverTimestamp(),
@@ -3332,7 +3374,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
 
       return { ok: true, status: 200, data: {
         message: `Payment link generated for R${payAmount.toFixed(2)} ${itemSuffix}. A notification with the link has been sent to your phone.`,
-        paymentUrl, reference: payRef, bookingId: bid, amount: payAmount, payment_type: paymentType,
+        paymentUrl, reference: transactionRef, bookingId: bid, amount: payAmount, payment_type: paymentType,
       }};
     } catch (err) {
       return { ok: false, status: 500, error: `payment_link_error: ${err.message}` };
@@ -6171,160 +6213,266 @@ Return ONLY valid JSON.`,
   }
 });
 
-// ── Server-side PayFast Payment Initiation ──
-// Allows WhatsApp bot and app to generate payment URLs
+// ── Ozow Payment Helpers ──
+function ozowHashCheck(values, privateKey) {
+  // Concatenate all values, append private key, lowercase, SHA512
+  const input = values.join('') + privateKey;
+  return crypto.createHash('sha512').update(input.toLowerCase()).digest('hex');
+}
+
+// ── Server-side Ozow Payment Initiation ──
+// Generates Ozow payment URL for apps and WhatsApp bot
 app.post('/api/payment/initiate', assistantLimiter, async (req, res) => {
   try {
-    const merchantId = env('PAYFAST_MERCHANT_ID');
-    const merchantKey = env('PAYFAST_MERCHANT_KEY');
-    const payfastUrl = env('PAYFAST_URL') || 'https://www.payfast.co.za/eng/process';
+    const siteCode = env('OZOW_SITE_CODE');
+    const apiKey = env('OZOW_API_KEY');
+    const privateKey = env('OZOW_PRIVATE_KEY');
+    const isTest = (env('OZOW_IS_TEST') || 'false') === 'true';
+    const ozowUrl = isTest
+      ? 'https://stagingapi.ozow.com/PostPaymentRequest'
+      : 'https://api.ozow.com/PostPaymentRequest';
+    const backendBase = env('BACKEND_BASE_URL') || 'https://square15-livekit-backend.onrender.com';
 
-    if (!merchantId || !merchantKey) {
-      return res.status(503).json({ error: 'Payment credentials not configured on server' });
+    if (!siteCode || !privateKey || !apiKey) {
+      return res.status(503).json({ error: 'Ozow payment credentials not configured on server' });
     }
 
-    const { amount, item_name, return_url, cancel_url, notify_url, custom_str1 } = req.body;
-
+    const { amount, item_name, custom_str1 } = req.body;
     if (!amount || !item_name) {
       return res.status(400).json({ error: 'Missing required fields: amount, item_name' });
     }
 
+    const transactionRef = `SQ15-${(custom_str1 || '').slice(0, 10)}-${Date.now().toString(36)}`;
+    const bankRef = `Square15 ${(item_name || '').slice(0, 20)}`;
+
+    const successUrl = `${backendBase}/api/payment/ozow-result?status=success&ref=${transactionRef}`;
+    const cancelUrl = `${backendBase}/api/payment/ozow-result?status=cancel&ref=${transactionRef}`;
+    const errorUrl = `${backendBase}/api/payment/ozow-result?status=error&ref=${transactionRef}`;
+    const notifyUrl = `${backendBase}/api/payment/ozow-notify`;
+
+    // HashCheck = SHA512(SiteCode + CountryCode + CurrencyCode + Amount + TransactionReference
+    //   + BankReference + CancelUrl + ErrorUrl + SuccessUrl + NotifyUrl + IsTest + PrivateKey) lowercase
+    const hashValues = [
+      siteCode, 'ZA', 'ZAR', parseFloat(amount).toFixed(2), transactionRef,
+      bankRef, cancelUrl, errorUrl, successUrl, notifyUrl, String(isTest),
+    ];
+    const hashCheck = ozowHashCheck(hashValues, privateKey);
+
     const paymentData = {
-      merchant_id: merchantId,
-      merchant_key: merchantKey,
-      amount: String(amount),
-      item_name: String(item_name),
-      ...(return_url ? { return_url } : {}),
-      ...(cancel_url ? { cancel_url } : {}),
-      ...(notify_url ? { notify_url } : {}),
-      ...(custom_str1 ? { custom_str1 } : {}),
+      SiteCode: siteCode,
+      CountryCode: 'ZA',
+      CurrencyCode: 'ZAR',
+      Amount: parseFloat(amount).toFixed(2),
+      TransactionReference: transactionRef,
+      BankReference: bankRef,
+      CancelUrl: cancelUrl,
+      ErrorUrl: errorUrl,
+      SuccessUrl: successUrl,
+      NotifyUrl: notifyUrl,
+      IsTest: isTest,
+      HashCheck: hashCheck,
     };
 
-    // Build a complete payment URL with query params for WhatsApp bot
-    const qs = new URLSearchParams(paymentData).toString();
-    const fullPaymentUrl = `${payfastUrl}?${qs}`;
-
-    res.json({
-      ok: true,
-      payfast_url: payfastUrl,
-      payment_url: fullPaymentUrl,
-      payment_data: paymentData,
+    // POST to Ozow API to get payment URL
+    const ozowResp = await fetch(ozowUrl, {
+      method: 'POST',
+      headers: {
+        'Accept': 'application/json',
+        'ApiKey': apiKey,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(paymentData),
     });
+
+    const ozowBody = await ozowResp.json();
+    console.log('Ozow PostPaymentRequest response:', JSON.stringify(ozowBody));
+
+    if (ozowBody.url || ozowBody.paymentUrl || ozowBody.redirectUrl) {
+      const paymentUrl = ozowBody.url || ozowBody.paymentUrl || ozowBody.redirectUrl;
+
+      // Store payment reference for tracking
+      try {
+        await admin.firestore().collection('payment_links').doc(transactionRef).set({
+          transaction_ref: transactionRef,
+          amount: parseFloat(amount).toFixed(2),
+          item_name: String(item_name),
+          task_id: custom_str1 || '',
+          payment_url: paymentUrl,
+          provider: 'ozow',
+          status: 'pending',
+          created_at: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      } catch (dbErr) {
+        console.warn('Could not store payment link:', dbErr.message);
+      }
+
+      res.json({
+        ok: true,
+        payment_url: paymentUrl,
+        transaction_ref: transactionRef,
+      });
+    } else {
+      console.error('Ozow did not return payment URL:', ozowBody);
+      res.status(502).json({
+        error: 'Ozow did not return a payment URL',
+        details: ozowBody.errorMessage || ozowBody.message || JSON.stringify(ozowBody),
+      });
+    }
   } catch (error) {
     console.error('❌ Payment initiation error:', error);
     res.status(500).json({ error: 'Payment initiation failed' });
   }
 });
 
-// ── PayFast ITN (Instant Transaction Notification) Webhook ──
-// Server-side payment verification — PayFast posts here after payment
-app.post('/api/payment/itn', async (req, res) => {
+// ── Ozow Payment Result Page (SuccessUrl / CancelUrl / ErrorUrl) ──
+// Simple HTML page that apps' WebView can detect via URL
+app.get('/api/payment/ozow-result', (req, res) => {
+  const status = String(req.query.status || 'unknown');
+  const ref = String(req.query.ref || '');
+  const titles = { success: 'Payment Successful', cancel: 'Payment Cancelled', error: 'Payment Error' };
+  const colors = { success: '#4CAF50', cancel: '#FF9800', error: '#f44336' };
+  const icons = { success: '✅', cancel: '⚠️', error: '❌' };
+  res.send(`<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>${titles[status] || 'Payment'}</title></head>
+    <body style="font-family:sans-serif;text-align:center;padding:40px;background:#f5f5f5">
+    <div style="background:white;border-radius:12px;padding:30px;max-width:400px;margin:auto;box-shadow:0 2px 8px rgba(0,0,0,0.1)">
+    <div style="font-size:48px">${icons[status] || '❓'}</div>
+    <h2 style="color:${colors[status] || '#333'}">${titles[status] || 'Unknown Status'}</h2>
+    <p style="color:#666">Reference: ${ref}</p>
+    <p style="color:#999;font-size:12px">You can close this page and return to the app.</p>
+    </div></body></html>`);
+});
+
+// ── Ozow Payment Notification Webhook ──
+// Ozow POSTs here after payment completion
+app.post('/api/payment/ozow-notify', async (req, res) => {
   try {
     const data = req.body;
-    console.log('📥 PayFast ITN received:', JSON.stringify(data));
+    console.log('📥 Ozow notification received:', JSON.stringify(data));
 
-    // 1. Verify signature
-    const merchantKey = env('PAYFAST_MERCHANT_KEY');
-    if (!merchantKey) {
-      console.error('❌ ITN: PAYFAST_MERCHANT_KEY not configured');
+    const privateKey = env('OZOW_PRIVATE_KEY');
+    if (!privateKey) {
+      console.error('❌ Ozow notify: OZOW_PRIVATE_KEY not configured');
       return res.status(503).send('Server misconfigured');
     }
 
-    const receivedSignature = data.signature;
-    if (!receivedSignature) {
-      console.error('❌ ITN: No signature in payload');
-      return res.status(400).send('Missing signature');
+    // Verify hash check
+    const receivedHash = String(data.HashCheck || data.hashCheck || '').toLowerCase();
+    if (!receivedHash) {
+      console.error('❌ Ozow notify: No HashCheck in payload');
+      return res.status(400).send('Missing HashCheck');
     }
 
-    // Build param string for signature verification (exclude signature itself)
-    const paramString = Object.keys(data)
-      .filter(key => key !== 'signature')
-      .sort()
-      .map(key => `${key}=${encodeURIComponent(String(data[key] || '')).replace(/%20/g, '+')}`)
-      .join('&');
+    // Ozow notification hash: SiteCode + TransactionId + TransactionReference + Amount
+    //   + Status + Optional1-5 + CurrencyCode + IsTest + StatusMessage + PrivateKey (lowercase SHA512)
+    const hashValues = [
+      String(data.SiteCode || data.siteCode || ''),
+      String(data.TransactionId || data.transactionId || ''),
+      String(data.TransactionReference || data.transactionReference || ''),
+      String(data.Amount || data.amount || ''),
+      String(data.Status || data.status || ''),
+      String(data.Optional1 || ''),
+      String(data.Optional2 || ''),
+      String(data.Optional3 || ''),
+      String(data.Optional4 || ''),
+      String(data.Optional5 || ''),
+      String(data.CurrencyCode || data.currencyCode || ''),
+      String(data.IsTest || data.isTest || ''),
+      String(data.StatusMessage || data.statusMessage || ''),
+    ];
+    const expectedHash = ozowHashCheck(hashValues, privateKey);
 
-    const passphrase = env('PAYFAST_PASSPHRASE') || merchantKey;
-    const expectedSignature = crypto
-      .createHash('md5')
-      .update(paramString + `&passphrase=${encodeURIComponent(passphrase)}`)
-      .digest('hex');
-
-    if (receivedSignature !== expectedSignature) {
-      console.error('❌ ITN: Signature mismatch');
-      return res.status(403).send('Invalid signature');
+    if (receivedHash !== expectedHash) {
+      console.error('❌ Ozow notify: Hash mismatch');
+      console.error('  received:', receivedHash);
+      console.error('  expected:', expectedHash);
+      return res.status(403).send('Invalid HashCheck');
     }
 
-    // 2. Extract payment info
-    const paymentStatus = String(data.payment_status || '');
-    const pfPaymentId = String(data.pf_payment_id || '');
-    const amountGross = String(data.amount_gross || '0');
-    const customStr1 = String(data.custom_str1 || ''); // tasksManagement ID
-    const itemName = String(data.item_name || '');
+    // Extract payment info
+    const ozowStatus = String(data.Status || data.status || '').toLowerCase();
+    const transactionId = String(data.TransactionId || data.transactionId || '');
+    const transactionRef = String(data.TransactionReference || data.transactionReference || '');
+    const amountGross = String(data.Amount || data.amount || '0');
 
-    console.log(`✅ ITN verified: status=${paymentStatus}, pfId=${pfPaymentId}, amount=R${amountGross}, taskId=${customStr1}`);
+    console.log(`✅ Ozow verified: status=${ozowStatus}, txId=${transactionId}, amount=R${amountGross}, ref=${transactionRef}`);
 
-    // 3. Update Firestore
+    // Look up associated task from payment_links collection
     const now = new Date().toISOString();
+    let taskId = '';
 
-    if (customStr1) {
-      // Update tasksManagement if we have a task ID
-      const taskRef = admin.firestore().collection('tasksManagement').doc(customStr1);
+    try {
+      const plSnap = await admin.firestore().collection('payment_links').doc(transactionRef).get();
+      if (plSnap.exists) {
+        taskId = plSnap.data().task_id || '';
+        await plSnap.ref.update({
+          ozow_transaction_id: transactionId,
+          ozow_status: ozowStatus,
+          status: ozowStatus === 'complete' ? 'paid' : ozowStatus,
+          updated_at: now,
+        });
+      }
+    } catch (plErr) {
+      console.warn('Could not update payment_links:', plErr.message);
+    }
+
+    // Update tasksManagement if we have a task ID
+    if (taskId) {
+      const taskRef = admin.firestore().collection('tasksManagement').doc(taskId);
       const taskSnap = await taskRef.get();
 
       if (taskSnap.exists) {
-        const taskData_itn = taskSnap.data() || {};
+        const taskData_notify = taskSnap.data() || {};
         const updateData = {
-          payfast_payment_id: pfPaymentId,
-          payfast_itn_status: paymentStatus,
-          payfast_itn_amount: amountGross,
-          payfast_itn_received_at: now,
+          ozow_transaction_id: transactionId,
+          ozow_status: ozowStatus,
+          ozow_amount: amountGross,
+          ozow_notify_received_at: now,
           updated_at: now,
         };
 
-        if (paymentStatus === 'COMPLETE') {
+        if (ozowStatus === 'complete') {
           updateData.payment_verified = true;
           updateData.payment_verified_at = now;
-          updateData.payment_verified_via = 'payfast_itn';
+          updateData.payment_verified_via = 'ozow_notify';
 
-          // Determine if this was a deposit or full/balance payment
+          // Determine deposit vs full vs balance payment
           const paidAmount = parseFloat(amountGross) || 0;
-          const totalCost = parseFloat(taskData_itn.cost || '0') || 0;
-          const depositAmt = parseFloat(taskData_itn.deposit_amount || '0') || (totalCost * 0.35);
-          const wasDepositPaid = taskData_itn.deposit_paid === true;
+          const totalCost = parseFloat(taskData_notify.cost || '0') || 0;
+          const wasDepositPaid = taskData_notify.deposit_paid === true;
 
           if (wasDepositPaid) {
-            // This is a balance payment
             updateData.balance_paid = true;
             updateData.balance_paid_at = now;
             updateData.payment_status = 'paid';
           } else if (totalCost > 0 && paidAmount < totalCost * 0.7) {
-            // Paid less than 70% of total → treat as deposit
             updateData.deposit_paid = true;
             updateData.deposit_paid_at = now;
             updateData.payment_type = 'deposit';
             updateData.payment_status = 'deposit_paid';
           } else {
-            // Full payment
             updateData.deposit_paid = true;
             updateData.balance_paid = true;
             updateData.payment_status = 'paid';
           }
-        } else if (paymentStatus === 'CANCELLED') {
+        } else if (ozowStatus === 'cancelled' || ozowStatus === 'abandoned') {
           updateData.payment_status = 'cancelled';
-        } else if (paymentStatus === 'FAILED') {
+        } else if (ozowStatus === 'error') {
           updateData.payment_status = 'failed';
+        } else if (ozowStatus === 'pendinginvestigation') {
+          updateData.payment_status = 'pending_investigation';
         }
 
         await taskRef.update(updateData);
-        console.log(`📝 Updated tasksManagement/${customStr1}: payment_status=${updateData.payment_status || paymentStatus}`);
+        console.log(`📝 Updated tasksManagement/${taskId}: payment_status=${updateData.payment_status || ozowStatus}`);
 
         // Also update futureBookings for consistency
         try {
-          await admin.firestore().collection('futureBookings').doc(customStr1).update({
-            payment_status: updateData.payment_status || paymentStatus.toLowerCase(),
-            payfast_payment_id: pfPaymentId,
+          await admin.firestore().collection('futureBookings').doc(taskId).update({
+            payment_status: updateData.payment_status || ozowStatus,
+            ozow_transaction_id: transactionId,
             updated_at: now,
-            ...(paymentStatus === 'COMPLETE' ? {
+            ...(ozowStatus === 'complete' ? {
               payment_verified: true, payment_verified_at: now,
               ...(updateData.deposit_paid ? { deposit_paid: true } : {}),
               ...(updateData.balance_paid ? { balance_paid: true } : {}),
@@ -6334,19 +6482,19 @@ app.post('/api/payment/itn', async (req, res) => {
         } catch (_) {}
 
         // Send WhatsApp notification for WhatsApp-originated bookings
-        if (taskData_itn.source === 'whatsapp' && (taskData_itn.customerPhone || taskData_itn.contact)) {
+        if (taskData_notify.source === 'whatsapp' && (taskData_notify.customerPhone || taskData_notify.contact)) {
           try {
             const waToken = env('WHATSAPP_TOKEN') || env('WA_TOKEN');
             const waPhoneId = env('WHATSAPP_PHONE_NUMBER_ID') || env('WA_PHONE_ID');
             if (waToken && waPhoneId) {
-              const customerPhone = String(taskData_itn.customerPhone || taskData_itn.contact || '').replace(/\D/g, '');
-              const orderNo = taskData_itn.order_no || customStr1;
+              const customerPhone = String(taskData_notify.customerPhone || taskData_notify.contact || '').replace(/\D/g, '');
+              const orderNo = taskData_notify.order_no || taskId;
               let waMessage;
-              if (paymentStatus === 'COMPLETE') {
+              if (ozowStatus === 'complete') {
                 waMessage = `✅ *Payment Confirmed!*\n\nYour payment of R${amountGross} for booking *${orderNo}* has been received and verified.\n\n🔒 Your funds are held in secure escrow until you confirm satisfaction with the completed work.\n\nWe'll notify you when your artisan is on the way!`;
-              } else if (paymentStatus === 'CANCELLED') {
+              } else if (ozowStatus === 'cancelled' || ozowStatus === 'abandoned') {
                 waMessage = `⚠️ *Payment Cancelled*\n\nYour payment of R${amountGross} for booking *${orderNo}* was cancelled.\n\nYou can retry by replying "pay" or "payment" to get a new payment link.`;
-              } else if (paymentStatus === 'FAILED') {
+              } else if (ozowStatus === 'error') {
                 waMessage = `❌ *Payment Failed*\n\nYour payment of R${amountGross} for booking *${orderNo}* could not be processed.\n\nPlease try again by replying "pay" or "payment", or use a different payment method.`;
               }
               if (waMessage) {
@@ -6363,40 +6511,37 @@ app.post('/api/payment/itn', async (req, res) => {
                     text: { body: waMessage },
                   }),
                 });
-                console.log(`📱 WhatsApp ITN notification sent to ${customerPhone}: ${paymentStatus} (status=${waResp.status})`);
+                console.log(`📱 WhatsApp Ozow notification sent to ${customerPhone}: ${ozowStatus} (status=${waResp.status})`);
               }
             }
           } catch (waErr) {
-            console.warn('ITN WhatsApp notification failed:', waErr.message);
+            console.warn('Ozow WhatsApp notification failed:', waErr.message);
           }
         }
 
-        // Notify customer and create refund request for CANCELLED/FAILED payments
-        if (paymentStatus === 'CANCELLED' || paymentStatus === 'FAILED') {
+        // Notify customer for cancelled/failed payments
+        if (ozowStatus === 'cancelled' || ozowStatus === 'abandoned' || ozowStatus === 'error') {
           const taskData = taskSnap.data() || {};
           const userId = taskData.user_id || taskData.userId || '';
-          const statusLabel = paymentStatus === 'CANCELLED' ? 'cancelled' : 'failed';
+          const statusLabel = ozowStatus === 'error' ? 'failed' : 'cancelled';
 
-          // Send notification to customer
           if (userId) {
             try {
               await admin.firestore().collection('notifications').add({
                 title: `Payment ${statusLabel === 'cancelled' ? 'Cancelled' : 'Failed'}`,
-                body: `Your payment of R${amountGross} for booking ${taskData.order_no || customStr1} was ${statusLabel}. You can retry from your bookings page.`,
+                body: `Your payment of R${amountGross} for booking ${taskData.order_no || taskId} was ${statusLabel}. You can retry from your bookings page.`,
                 type: 'payment_' + statusLabel,
                 user_id: userId,
                 user_type: 'user',
-                booking_id: customStr1,
+                booking_id: taskId,
                 read: false,
                 created_at: now,
               });
             } catch (notifErr) {
-              console.warn('ITN notification failed:', notifErr.message);
+              console.warn('Ozow notification save failed:', notifErr.message);
             }
-          }
 
-          // Send FCM push if user has token
-          if (userId) {
+            // Send FCM push
             try {
               const userSnap = await admin.firestore().collection('users').doc(userId).get();
               const fcmToken = (userSnap.data() || {}).fcm_token || (userSnap.data() || {}).deviceToken || '';
@@ -6407,7 +6552,7 @@ app.post('/api/payment/itn', async (req, res) => {
                     title: `Payment ${statusLabel === 'cancelled' ? 'Cancelled' : 'Failed'}`,
                     body: `Your R${amountGross} payment was ${statusLabel}. Tap to retry.`,
                   },
-                  data: { type: 'payment_' + statusLabel, booking_id: customStr1 },
+                  data: { type: 'payment_' + statusLabel, booking_id: taskId },
                   android: { notification: { channelId: 'payment_channel' } },
                 }).catch(() => {});
               }
@@ -6417,66 +6562,62 @@ app.post('/api/payment/itn', async (req, res) => {
           // Notify admin
           try {
             await admin.firestore().collection('notifications').add({
-              title: `PayFast Payment ${paymentStatus}`,
-              body: `Payment of R${amountGross} for task ${customStr1} was ${statusLabel}. PF ID: ${pfPaymentId}`,
+              title: `Ozow Payment ${ozowStatus}`,
+              body: `Payment of R${amountGross} for task ${taskId} was ${statusLabel}. Ozow ID: ${transactionId}`,
               type: 'payment_' + statusLabel,
               user_type: 'admin',
-              booking_id: customStr1,
+              booking_id: taskId,
               read: false,
               created_at: now,
             });
           } catch (_) {}
-
-          console.log(`📨 Sent ${statusLabel} notifications for task ${customStr1}`);
         }
-      }
-
-      // Create/update transaction log
-      const txRef = admin.firestore().collection('transactionLogs');
-      const existingTx = await txRef
-        .where('payfast_payment_id', '==', pfPaymentId)
-        .limit(1)
-        .get();
-
-      if (existingTx.empty) {
-        const taskData = taskSnap.exists ? taskSnap.data() : {};
-        const txId = crypto.randomUUID();
-        await txRef.doc(txId).set({
-          id: txId,
-          amount: amountGross,
-          transaction_at: now,
-          status: paymentStatus === 'COMPLETE' ? 'success' : paymentStatus.toLowerCase(),
-          user_id: taskData.user_id || taskData.userId || '',
-          type: 'payfast',
-          subtype: 'payment',
-          direction: 'in',
-          cash_movement: true,
-          schema_version: 2,
-          tasks_management_id: customStr1,
-          payfast_payment_id: pfPaymentId,
-          payfast_itn_status: paymentStatus,
-          verified_via: 'payfast_itn',
-          item_name: itemName,
-        });
-        console.log(`📝 Created transactionLog for ITN: ${txId}`);
-      } else {
-        // Update existing transaction log
-        const existingDoc = existingTx.docs[0];
-        await existingDoc.ref.update({
-          payfast_itn_status: paymentStatus,
-          payfast_itn_received_at: now,
-          status: paymentStatus === 'COMPLETE' ? 'success' : paymentStatus.toLowerCase(),
-          verified_via: 'payfast_itn',
-        });
-        console.log(`📝 Updated existing transactionLog: ${existingDoc.id}`);
       }
     }
 
-    // PayFast expects a 200 OK response
+    // Create/update transaction log
+    const txRef = admin.firestore().collection('transactionLogs');
+    const existingTx = await txRef
+      .where('ozow_transaction_id', '==', transactionId)
+      .limit(1)
+      .get();
+
+    if (existingTx.empty) {
+      const txId = crypto.randomUUID();
+      await txRef.doc(txId).set({
+        id: txId,
+        amount: amountGross,
+        transaction_at: now,
+        status: ozowStatus === 'complete' ? 'success' : ozowStatus,
+        user_id: '',
+        type: 'ozow',
+        subtype: 'payment',
+        direction: 'in',
+        cash_movement: true,
+        schema_version: 2,
+        tasks_management_id: taskId,
+        ozow_transaction_id: transactionId,
+        transaction_reference: transactionRef,
+        ozow_status: ozowStatus,
+        verified_via: 'ozow_notify',
+      });
+      console.log(`📝 Created transactionLog for Ozow: ${txId}`);
+    } else {
+      const existingDoc = existingTx.docs[0];
+      await existingDoc.ref.update({
+        ozow_status: ozowStatus,
+        ozow_notify_received_at: now,
+        status: ozowStatus === 'complete' ? 'success' : ozowStatus,
+        verified_via: 'ozow_notify',
+      });
+      console.log(`📝 Updated existing transactionLog: ${existingDoc.id}`);
+    }
+
+    // Ozow expects a 200 OK response
     res.status(200).send('OK');
   } catch (error) {
-    console.error('❌ PayFast ITN error:', error);
-    res.status(200).send('OK'); // Always return 200 so PayFast doesn't retry indefinitely
+    console.error('❌ Ozow notification error:', error);
+    res.status(200).send('OK'); // Always return 200 so Ozow doesn't retry indefinitely
   }
 });
 
