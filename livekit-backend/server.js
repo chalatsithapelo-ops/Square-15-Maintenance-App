@@ -1729,16 +1729,20 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
 
   async function createTasksManagementRequestForFutureBooking({ bookingIdLocal, bookingDataLocal, artisanIdLocal }) {
     const userIdLocal = String(bookingDataLocal.user_id || '').trim();
-    if (!userIdLocal || !String(artisanIdLocal || '').trim()) return null;
+    if (!userIdLocal) return null;
+    const hasArtisan = !!String(artisanIdLocal || '').trim();
 
     let effectiveTaskId = String(bookingDataLocal.task_id || '').trim();
     let jobIds = stringList(bookingDataLocal.job_ids ?? bookingDataLocal.jobIds);
     if (jobIds.length === 0 && effectiveTaskId) jobIds = [effectiveTaskId];
     if (!effectiveTaskId && jobIds.length > 0) effectiveTaskId = String(jobIds[0] || '').trim();
 
-    const providerDoc = await getServiceProviderDocByAnyId(artisanIdLocal);
-    const providerListenerId = providerDoc && providerDoc.exists ? String(providerDoc.id).trim() : String(artisanIdLocal).trim();
-    if (!providerListenerId) return null;
+    let providerListenerId = '';
+    if (hasArtisan) {
+      const providerDoc = await getServiceProviderDocByAnyId(artisanIdLocal);
+      providerListenerId = providerDoc && providerDoc.exists ? String(providerDoc.id).trim() : String(artisanIdLocal).trim();
+      if (!providerListenerId) return null;
+    }
 
     const workImages = stringList(bookingDataLocal.work_images ?? bookingDataLocal.workImages);
     const firstImage = workImages.length > 0 ? workImages[0] : '';
@@ -2246,12 +2250,25 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     await bookingRefLocal.set(bookingDoc);
 
     let tasksManagementId = null;
-    if (!isRFQFlag && assignedSuccessfully) {
-      tasksManagementId = await createTasksManagementRequestForFutureBooking({
-        bookingIdLocal: bookingIdLocal,
-        bookingDataLocal: bookingDoc,
-        artisanIdLocal: assignedArtisanId.trim(),
-      });
+    if (!isRFQFlag) {
+      if (assignedSuccessfully) {
+        tasksManagementId = await createTasksManagementRequestForFutureBooking({
+          bookingIdLocal: bookingIdLocal,
+          bookingDataLocal: bookingDoc,
+          artisanIdLocal: assignedArtisanId.trim(),
+        });
+      } else {
+        // Create tasksManagement even without artisan so payment/cancel flows work
+        try {
+          tasksManagementId = await createTasksManagementRequestForFutureBooking({
+            bookingIdLocal: bookingIdLocal,
+            bookingDataLocal: bookingDoc,
+            artisanIdLocal: '',
+          });
+        } catch (e) {
+          console.warn('[booking] tasksManagement creation without artisan failed:', e.message);
+        }
+      }
     }
 
     if (isRFQFlag) {

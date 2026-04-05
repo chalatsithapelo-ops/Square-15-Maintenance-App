@@ -1877,7 +1877,7 @@ async function executeWaTool(name, args, session) {
     }
 
     // ═══════════════════════════════════════════
-    // 7) REQUEST PAYMENT LINK (PayFast)
+    // 7) REQUEST PAYMENT LINK (Ozow)
     // ═══════════════════════════════════════════
     case 'request_payment_link': {
       if (!firestore) return { error: 'Database unavailable' };
@@ -1907,7 +1907,6 @@ async function executeWaTool(name, args, session) {
       if (d.deposit_paid === true && d.balance_paid !== true) {
         const bal = parseFloat(d.balance_amount || '0');
         if (bal <= 0) return { message: 'Deposit already paid. No balance due yet.', bookingId: bid };
-        // For balance payment, force full remaining amount
         args.payment_type = 'full';
       }
 
@@ -1923,39 +1922,22 @@ async function executeWaTool(name, args, session) {
         itemSuffix = d.deposit_paid === true ? '(Balance Payment)' : '(Full Payment)';
       }
 
-      // Try to generate a real PayFast payment URL via the backend
+      // Try to generate an Ozow payment URL via the backend
       try {
         const backendUrl = process.env.BACKEND_URL || 'https://square15-livekit-backend.onrender.com';
         const fetch = (await import('node-fetch')).default;
-        const pfResp = await fetch(`${backendUrl}/api/payment/initiate`, {
+        const ozowResp = await fetch(`${backendUrl}/api/payment/initiate`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             amount: payAmount.toFixed(2),
             item_name: `Square 15 Booking ${d.order_no || d.rfq_no || bid} ${itemSuffix}`,
-            booking_id: bid,
-            email: d.customer_email || d.email || '',
-            phone: session.phone,
-            payment_type: paymentType,
+            custom_str1: bid,
           }),
         });
-        const pfBody = await pfResp.json();
+        const ozowBody = await ozowResp.json();
 
-        if (pfBody.ok && pfBody.payment_url) {
-          // Store payment link record
-          const payRef = `PAY-${bid}-${Date.now().toString(36)}`;
-          await firestore.collection('payment_links').doc(payRef).set({
-            booking_id: bid,
-            amount: payAmount,
-            payment_type: paymentType,
-            phone: session.phone,
-            user_id: session.linkedUserId || '',
-            payment_url: pfBody.payment_url,
-            status: 'pending',
-            source: 'whatsapp',
-            created_at: admin.firestore.FieldValue.serverTimestamp(),
-          });
-
+        if (ozowBody.ok && ozowBody.payment_url) {
           // Update booking with payment_type
           try {
             await firestore.collection('tasksManagement').doc(bid).update({ payment_type: paymentType }).catch(() => {});
@@ -1968,15 +1950,15 @@ async function executeWaTool(name, args, session) {
 
           return {
             success: true,
-            message: `Here's your ${itemSuffix} link for R${payAmount.toFixed(2)}:\n\n${pfBody.payment_url}\n\nClick to pay securely via PayFast.${escrowMsg}\n\n✅ 100% Money-Back Guarantee — not satisfied? Full refund, no questions asked within 24 hours.\n🚫 Free cancellation before artisan dispatch.`,
+            message: `Here's your ${itemSuffix} link for R${payAmount.toFixed(2)}:\n\n${ozowBody.payment_url}\n\nClick to pay securely via Ozow (instant EFT).${escrowMsg}\n\n✅ 100% Money-Back Guarantee — not satisfied? Full refund, no questions asked within 24 hours.\n🚫 Free cancellation before artisan dispatch.`,
             amount: `R${payAmount.toFixed(2)}`,
-            paymentUrl: pfBody.payment_url,
-            reference: payRef,
+            paymentUrl: ozowBody.payment_url,
+            reference: ozowBody.transaction_ref || '',
             bookingId: bid,
           };
         }
       } catch (e) {
-        console.warn('[request_payment_link] PayFast API call failed:', e.message);
+        console.warn('[request_payment_link] Ozow API call failed:', e.message);
       }
 
       // Fallback: store request and notify admin
@@ -2235,6 +2217,7 @@ async function executeWaTool(name, args, session) {
           await firestore.collection('futureBookings').doc(rfqId).update({
             ai_quote: quote,
             quoted_price: quote.grand_total.toString(),
+            admin_quote_total: quote.grand_total,
             quote_details: quote.scope_of_work,
             rfq_status: 'pending_client_response',
             total_price: quote.grand_total.toString(),
@@ -3125,7 +3108,7 @@ YOUR FULL CAPABILITIES:
 💰 PAYMENTS:
 - Check wallet balance
 - Pay for bookings using wallet balance
-- Generate secure PayFast payment links for card payment
+- Generate secure Ozow payment links for instant EFT payment
 - Apply promo/discount codes before booking
 
 PAYMENT FLOW (CRITICAL — Artisan must accept BEFORE payment):
