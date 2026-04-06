@@ -6483,6 +6483,62 @@ app.post('/api/payment/ozow-notify', async (req, res) => {
         await taskRef.update(updateData);
         console.log(`📝 Updated tasksManagement/${taskId}: payment_status=${updateData.payment_status || ozowStatus}`);
 
+        // ── Record partner commission on successful payment ──
+        if (ozowStatus === 'complete') {
+          try {
+            const userId = (taskData_notify.user_id || taskData_notify.userId || '').toString().trim();
+            if (userId) {
+              const userDoc = await admin.firestore().collection('users').doc(userId).get();
+              if (userDoc.exists) {
+                const partnerId = (userDoc.data().referred_by_partner_id || '').toString().trim();
+                if (partnerId) {
+                  // Check for duplicate commission
+                  const existingComm = await admin.firestore().collection('commissions')
+                    .where('task_management_id', isEqualTo: taskId)
+                    .where('partner_id', isEqualTo: partnerId)
+                    .limit(1).get();
+                  if (existingComm.empty) {
+                    const partnerDoc = await admin.firestore().collection('corporate_partners').doc(partnerId).get();
+                    if (partnerDoc.exists && (partnerDoc.data().status || 'active') === 'active') {
+                      const pData = partnerDoc.data();
+                      const rate = parseFloat(pData.commission_rate || 5) / 100;
+                      const paidAmount = parseFloat(amountGross) || 0;
+                      const commAmt = paidAmount * rate;
+                      if (commAmt > 0) {
+                        const commId = `COMM-${Date.now().toString(36).toUpperCase()}`;
+                        await admin.firestore().collection('commissions').doc(commId).set({
+                          id: commId,
+                          partner_id: partnerId,
+                          user_id: userId,
+                          task_management_id: taskId,
+                          booking_id: taskId,
+                          job_amount: paidAmount,
+                          commission_rate: parseFloat(pData.commission_rate || 5),
+                          commission_amount: commAmt,
+                          status: 'pending_payout',
+                          source: 'ozow_webhook',
+                          partner_name: pData.company_name || '',
+                          client_name: userDoc.data().name || userDoc.data().userName || '',
+                          job_description: taskData_notify.description || taskData_notify.category_name || '',
+                          created_at: now,
+                        });
+                        await admin.firestore().collection('corporate_partners').doc(partnerId).update({
+                          pending_payout: admin.firestore.FieldValue.increment(commAmt),
+                          total_earned: admin.firestore.FieldValue.increment(commAmt),
+                          updated_at: now,
+                        });
+                        console.log(`💰 Commission R${commAmt.toFixed(2)} recorded for partner ${partnerId} (booking ${taskId})`);
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          } catch (commErr) {
+            console.warn('[ozow-notify] Commission recording failed:', commErr.message);
+          }
+        }
+
         // Also update futureBookings for consistency
         try {
           await admin.firestore().collection('futureBookings').doc(taskId).update({
