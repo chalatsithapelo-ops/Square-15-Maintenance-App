@@ -1667,68 +1667,72 @@ async function executeWaTool(name, args, session) {
           }
         } catch (e) { console.warn('[wa-tool] tasks lookup failed:', e.message); }
 
-        // 3) If subcategory provided, try to find an exact or fuzzy match
-        //    Uses word-level matching: split both search and service name into words,
-        //    match if ANY word (≥3 chars) from one side appears in the other.
+        // 3) Find BEST match using word-overlap scoring.
+        //    Score = number of overlapping words between search and service name.
+        //    Exact substring match gets a large bonus.
         let matchedService = null;
         let matchedPrice = null;
+        let bestScore = 0;
 
-        const _wordMatch = (a, b) => {
+        const _matchScore = (a, b) => {
           const al = a.toLowerCase(), bl = b.toLowerCase();
-          if (al.includes(bl) || bl.includes(al)) return true;
+          if (al === bl) return 1000; // exact match
+          if (al.includes(bl) || bl.includes(al)) return 100; // full substring
           const aw = al.split(/\s+/).filter(w => w.length >= 3);
           const bw = bl.split(/\s+/).filter(w => w.length >= 3);
-          return aw.some(w => bl.includes(w)) || bw.some(w => al.includes(w));
+          let score = 0;
+          for (const w of aw) { if (bl.includes(w)) score++; }
+          for (const w of bw) { if (al.includes(w)) score++; }
+          return score;
         };
 
         // Also build a combined query from category + subcategory for broader matching
         const combinedQuery = [args.category || '', args.subcategory || ''].join(' ').toLowerCase().trim();
+        const searchQ = subQuery || combinedQuery;
 
-        if (subQuery || catSlug) {
-          // Check service_prices map first
+        if (searchQ) {
+          // Check service_prices map — pick highest-scoring match
           for (const [svcName, price] of Object.entries(servicePrices)) {
-            if (_wordMatch(svcName, subQuery || combinedQuery)) {
+            const score = _matchScore(svcName, searchQ);
+            if (score > bestScore) {
+              bestScore = score;
               matchedService = svcName;
               matchedPrice = typeof price === 'number' ? price : parseFloat(price);
-              break;
             }
           }
-          // Then check tasks collection
-          if (!matchedService) {
-            for (const t of taskResults) {
-              if (_wordMatch(t.name, subQuery || combinedQuery)) {
-                matchedService = t.name;
-                matchedPrice = t.cost;
-                break;
-              }
+          // Also check tasks collection
+          for (const t of taskResults) {
+            const score = _matchScore(t.name, searchQ);
+            if (score > bestScore) {
+              bestScore = score;
+              matchedService = t.name;
+              matchedPrice = t.cost;
             }
           }
         }
 
-        // 3b) If no match found yet and we only checked one pricingGuidance doc, scan all docs
-        if (!matchedService) {
-          try {
-            const allGuidance = await firestore.collection('pricingGuidance').limit(20).get();
-            for (const gDoc of allGuidance.docs) {
-              if (gDoc.id === catSlug) continue; // already checked
-              const gd = gDoc.data();
-              const sp = gd.service_prices || gd.servicePrices || {};
-              for (const [svcName, price] of Object.entries(sp)) {
-                if (_wordMatch(svcName, combinedQuery)) {
-                  matchedService = svcName;
-                  matchedPrice = typeof price === 'number' ? price : parseFloat(price);
-                  servicePrices = sp;
-                  categoryName = gd.category_name || gd.categoryName || gDoc.id;
-                  laborCostPerHour = parseFloat(gd.labor_cost_per_hour || gd.laborCostPerHour || 0) || null;
-                  outsourcedLaborRate = parseFloat(gd.outsourced_labor_rate || 0) || null;
-                  materialMultiplier = parseFloat(gd.material_multiplier || 0) || null;
-                  break;
-                }
+        // 3b) If no match or weak match, also scan ALL pricingGuidance docs
+        try {
+          const allGuidance = await firestore.collection('pricingGuidance').limit(20).get();
+          for (const gDoc of allGuidance.docs) {
+            if (gDoc.id === catSlug && bestScore > 0) continue; // already checked
+            const gd = gDoc.data();
+            const sp = gd.service_prices || gd.servicePrices || {};
+            for (const [svcName, price] of Object.entries(sp)) {
+              const score = _matchScore(svcName, combinedQuery);
+              if (score > bestScore) {
+                bestScore = score;
+                matchedService = svcName;
+                matchedPrice = typeof price === 'number' ? price : parseFloat(price);
+                servicePrices = sp;
+                categoryName = gd.category_name || gd.categoryName || gDoc.id;
+                laborCostPerHour = parseFloat(gd.labor_cost_per_hour || gd.laborCostPerHour || 0) || null;
+                outsourcedLaborRate = parseFloat(gd.outsourced_labor_rate || 0) || null;
+                materialMultiplier = parseFloat(gd.material_multiplier || 0) || null;
               }
-              if (matchedService) break;
             }
-          } catch (e) { console.warn('[wa-tool] pricingGuidance scan failed:', e.message); }
-        }
+          }
+        } catch (e) { console.warn('[wa-tool] pricingGuidance scan failed:', e.message); }
 
         // Build response
         const allFixedPrices = Object.entries(servicePrices).map(([name, price]) => ({
@@ -1740,7 +1744,9 @@ async function executeWaTool(name, args, session) {
         const existingNames = new Set(Object.keys(servicePrices).map(n => n.toLowerCase()));
         for (const t of taskResults) {
           const catId = t.category_id.toLowerCase();
-          if ((_wordMatch(catId, catSlug) || _wordMatch(t.name, combinedQuery)) && !existingNames.has(t.name.toLowerCase())) {
+          const catScore = _matchScore(catId, catSlug);
+          const nameScore = _matchScore(t.name, combinedQuery);
+          if ((catScore > 0 || nameScore > 0) && !existingNames.has(t.name.toLowerCase())) {
             allFixedPrices.push({ service: t.name, fixedPrice: `R${t.cost.toFixed(2)}` });
           }
         }
