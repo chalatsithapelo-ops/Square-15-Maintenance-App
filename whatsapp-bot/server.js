@@ -3236,46 +3236,124 @@ async function executeWaTool(name, args, session) {
         accepted_via: 'whatsapp',
       }, { merge: true });
 
-      // Notify admin to assign an artisan
-      await firestore.collection('notifications').add({
-        title: 'RFQ Quote Accepted — Assign Artisan',
-        body: `Customer accepted quote for RFQ ${data.rfq_no || rfqId} (R${priceNum.toFixed(2)}). Please assign an artisan.`,
-        type: 'rfq_accepted',
-        user_type: 'admin',
-        booking_id: rfqId,
-        read: false,
-        created_at: admin.firestore.FieldValue.serverTimestamp(),
-      });
+      // ── Auto-dispatch: route directly to artisans when conditions are met ──
+      const materialsResp = (data.materials_responsibility || '').toString().trim().toLowerCase();
+      const clientBuysMaterials = materialsResp === 'client';
+      const underThreshold = priceNum > 0 && priceNum < 12000;
+      let autoDispatched = false;
 
-      // ── Notify available artisans via FCM push ──
-      try {
+      if (clientBuysMaterials || underThreshold) {
+        const autoReason = clientBuysMaterials ? 'client_buys_materials' : 'under_12k';
         const cat = (data.category || data.category_name || '').toLowerCase().replace(/\s+/g, '_');
-        const artisanSnap = await firestore.collection('serviceProvider')
-          .where('status', '==', 'approved')
-          .where('is_suspended', '!=', true)
-          .limit(20)
-          .get();
-        for (const artDoc of artisanSnap.docs) {
-          const ad = artDoc.data() || {};
-          const cats = (ad.categories || ad.category || '').toString().toLowerCase();
-          if (cats && cat && !cats.includes(cat) && cat !== 'general_maintenance') continue;
-          const token = (ad.fcm_token || ad.deviceToken || '').toString().trim();
-          if (!token) continue;
-          try {
-            await admin.messaging().send({
-              token,
-              notification: {
-                title: '🔔 New RFQ Job Available',
-                body: `RFQ ${data.rfq_no || rfqId} — R${priceNum.toFixed(2)}. Tap to view and accept.`,
-              },
-              data: { type: 'rfq_accepted', booking_id: rfqId },
-              android: { notification: { channelId: 'order_request_channel', sound: 'sound' } },
-            });
-          } catch (fcmErr) {
-            console.warn(`[wa-tool] FCM to artisan ${artDoc.id} failed:`, fcmErr.message);
+        try {
+          // Find matching artisans by category
+          const artisanSnap = await firestore.collection('serviceProvider')
+            .where('status', '==', 'approved')
+            .where('is_suspended', '!=', true)
+            .limit(20)
+            .get();
+          const matchedArtisans = [];
+          for (const artDoc of artisanSnap.docs) {
+            const ad = artDoc.data() || {};
+            const cats = (ad.categories || ad.category || '').toString().toLowerCase();
+            if (cats && cat && !cats.includes(cat) && cat !== 'general_maintenance') continue;
+            const aName = ad.name || ad.userName || ad.full_name || artDoc.id;
+            matchedArtisans.push({ id: artDoc.id, name: aName, token: (ad.fcm_token || ad.deviceToken || '').toString().trim() });
+            if (matchedArtisans.length >= 3) break;
           }
-        }
-      } catch (e) { console.warn('[wa-tool] artisan RFQ dispatch failed:', e.message); }
+
+          if (matchedArtisans.length > 0) {
+            const artisanIds = matchedArtisans.map(a => a.id);
+            const artisanNames = {};
+            matchedArtisans.forEach(a => { artisanNames[a.id] = a.name; });
+
+            // Update futureBooking with assigned artisans
+            await firestore.collection('futureBookings').doc(rfqId).update({
+              rfq_status: 'pending_artisan_acceptance',
+              status: 'pending_artisan_acceptance',
+              rfq_submitted_to: 'artisan',
+              rfq_assigned_artisan_ids: artisanIds,
+              rfq_assigned_artisan_names: artisanNames,
+              rfq_auto_assigned: true,
+              rfq_auto_assign_reason: autoReason,
+              rfq_artisan_rejection_count: 0,
+              rfq_artisan_rejections: [],
+              artisan_name: matchedArtisans[0].name,
+            });
+
+            // Update tasksManagement bridge
+            await firestore.collection('tasksManagement').doc(rfqId).update({
+              status: 'pending_artisan_acceptance',
+              rfq_assigned_artisan_ids: artisanIds,
+              rfq_auto_assigned: true,
+              rfq_auto_assign_reason: autoReason,
+            });
+
+            // Send targeted FCM to matched artisans
+            for (const art of matchedArtisans) {
+              if (!art.token) continue;
+              try {
+                await admin.messaging().send({
+                  token: art.token,
+                  notification: {
+                    title: '🔔 New RFQ Job Available',
+                    body: `RFQ ${data.rfq_no || rfqId} — R${priceNum.toFixed(2)}. Tap to view and accept.`,
+                  },
+                  data: { type: 'rfq_accepted', booking_id: rfqId },
+                  android: { notification: { channelId: 'order_request_channel', sound: 'sound' } },
+                });
+              } catch (fcmErr) {
+                console.warn(`[wa-tool] FCM to artisan ${art.id} failed:`, fcmErr.message);
+              }
+            }
+            autoDispatched = true;
+            console.log(`[wa-tool] Auto-dispatched RFQ ${rfqId} to ${artisanIds.length} artisans (${autoReason})`);
+          }
+        } catch (e) { console.warn('[wa-tool] auto-dispatch failed, falling back to admin:', e.message); }
+      }
+
+      if (!autoDispatched) {
+        // Notify admin to assign an artisan
+        await firestore.collection('notifications').add({
+          title: 'RFQ Quote Accepted — Assign Artisan',
+          body: `Customer accepted quote for RFQ ${data.rfq_no || rfqId} (R${priceNum.toFixed(2)}). Please assign an artisan.`,
+          type: 'rfq_accepted',
+          user_type: 'admin',
+          booking_id: rfqId,
+          read: false,
+          created_at: admin.firestore.FieldValue.serverTimestamp(),
+        });
+
+        // Broad FCM blast to available artisans
+        try {
+          const cat = (data.category || data.category_name || '').toLowerCase().replace(/\s+/g, '_');
+          const artisanSnap = await firestore.collection('serviceProvider')
+            .where('status', '==', 'approved')
+            .where('is_suspended', '!=', true)
+            .limit(20)
+            .get();
+          for (const artDoc of artisanSnap.docs) {
+            const ad = artDoc.data() || {};
+            const cats = (ad.categories || ad.category || '').toString().toLowerCase();
+            if (cats && cat && !cats.includes(cat) && cat !== 'general_maintenance') continue;
+            const token = (ad.fcm_token || ad.deviceToken || '').toString().trim();
+            if (!token) continue;
+            try {
+              await admin.messaging().send({
+                token,
+                notification: {
+                  title: '🔔 New RFQ Job Available',
+                  body: `RFQ ${data.rfq_no || rfqId} — R${priceNum.toFixed(2)}. Tap to view and accept.`,
+                },
+                data: { type: 'rfq_accepted', booking_id: rfqId },
+                android: { notification: { channelId: 'order_request_channel', sound: 'sound' } },
+              });
+            } catch (fcmErr) {
+              console.warn(`[wa-tool] FCM to artisan ${artDoc.id} failed:`, fcmErr.message);
+            }
+          }
+        } catch (e) { console.warn('[wa-tool] artisan RFQ dispatch failed:', e.message); }
+      }
 
       // Store for quick payment follow-up
       session.lastBookingId = rfqId;
