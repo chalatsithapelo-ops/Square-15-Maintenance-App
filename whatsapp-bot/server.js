@@ -1013,6 +1013,53 @@ async function getLearningFactor(firestore, category) {
   } catch (e) { console.error('[wa-learning] error:', e.message); return 1.0; }
 }
 
+// ─── Fixed-price lookup helper (shared by generateAIQuote & submit_rfq) ───
+
+async function lookupFixedPrice(category, description) {
+  const firestore = db();
+  if (!firestore) return null;
+  try {
+    const catSlug = (category || '').toLowerCase().replace(/\s+/g, '_');
+    const searchQ = [category || '', description || ''].join(' ').toLowerCase().trim();
+
+    const _matchScore = (a, b) => {
+      const al = a.toLowerCase(), bl = b.toLowerCase();
+      if (al === bl) return 1000;
+      if (al.includes(bl) || bl.includes(al)) return 100;
+      const aw = al.split(/\s+/).filter(w => w.length >= 3);
+      const bw = bl.split(/\s+/).filter(w => w.length >= 3);
+      let score = 0;
+      for (const w of aw) { if (bl.includes(w)) score++; }
+      for (const w of bw) { if (al.includes(w)) score++; }
+      return score;
+    };
+
+    const taskSnap = await firestore.collection('tasks').limit(200).get();
+    let bestScore = 0, matchedService = null, matchedPrice = null;
+    for (const td of taskSnap.docs) {
+      const d = td.data();
+      const name = (d.name || d.title || d.task_name || '').toString();
+      const cost = parseFloat(d.cost || d.price || d.amount || 0);
+      if (name && cost > 0) {
+        const score = _matchScore(name, searchQ);
+        if (score > bestScore) {
+          bestScore = score;
+          matchedService = name;
+          matchedPrice = cost;
+        }
+      }
+    }
+    if (matchedService && matchedPrice && bestScore >= 2) {
+      console.log(`[fixed-price] Matched "${matchedService}" @ R${matchedPrice} (score ${bestScore}) for "${searchQ}"`);
+      return { service: matchedService, price: matchedPrice, score: bestScore };
+    }
+    return null;
+  } catch (e) {
+    console.error('[fixed-price] lookup error:', e.message);
+    return null;
+  }
+}
+
 // ─── AI Quote Generation for RFQ (with Builders.co.za real-time pricing) ───
 
 async function generateAIQuote(category, description, materialsResponsibility, additionalContext) {
@@ -1023,6 +1070,43 @@ async function generateAIQuote(category, description, materialsResponsibility, a
   additionalContext = sanitizeForPrompt(additionalContext, 500);
 
   const firestore = db();
+
+  // 0. Check tasks collection for a fixed price FIRST — if found, return it directly
+  try {
+    const fixedMatch = await lookupFixedPrice(category, description);
+    if (fixedMatch) {
+      console.log(`[ai-quote] Using fixed price R${fixedMatch.price} for "${fixedMatch.service}" instead of AI generation`);
+      const r2 = (v) => Math.round(v * 100) / 100;
+      return {
+        laborHours: 0,
+        laborCostPerHour: 0,
+        laborCost: 0,
+        complexity: 2,
+        materialsBOM: [],
+        materialsMultiplier: 1,
+        materials_subtotal: 0,
+        materials_with_markup: 0,
+        materials_responsibility: materialsResponsibility || 'artisan',
+        equipmentCost: 0,
+        subtotal: r2(fixedMatch.price),
+        contingency: 0,
+        grand_total: r2(fixedMatch.price),
+        scope_of_work: description || fixedMatch.service,
+        estimated_duration: 'To be determined on-site',
+        learning_factor: 1,
+        pricing_sources: { fixed_price: 1, builders: 0, catalog: 0, ai_estimate: 0 },
+        breakdown: [
+          { description: `Fixed price: ${fixedMatch.service}`, cost: fixedMatch.price.toFixed(2) },
+        ],
+        disclaimer: 'This is a fixed price set by admin for this service.',
+        generated_at: new Date().toISOString(),
+        source: 'tasks_fixed_price',
+        fixed_price_match: fixedMatch.service,
+      };
+    }
+  } catch (e) {
+    console.warn('[ai-quote] fixed price check failed, continuing with AI:', e.message);
+  }
 
   // 1. Look up pricing guidance from Firestore
   let laborRate = 150;
