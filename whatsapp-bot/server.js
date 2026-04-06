@@ -438,6 +438,28 @@ const waTools = [
   {
     type: 'function',
     function: {
+      name: 'check_auto_discounts',
+      description: 'Check if the customer qualifies for any automatic discounts (first-job discount, off-peak discount, loyalty points). Call this BEFORE creating a booking to inform the customer of available savings.',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_upsell_addons',
+      description: 'Get recommended add-on services for a booking category. These are discounted extra services the customer might want to add. Call this after the customer picks a category and BEFORE creating the booking.',
+      parameters: {
+        type: 'object',
+        properties: {
+          categoryId: { type: 'string', description: 'The service category slug (e.g. plumbing, electrical, painting)' },
+        },
+        required: ['categoryId'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'request_payment_link',
       description: 'Generate a payment link for an unpaid booking so the customer can pay via card. Customer must choose deposit (35%) or full payment. Artisan must have accepted the job first.',
       parameters: {
@@ -1435,6 +1457,55 @@ async function executeWaTool(name, args, session) {
         estimatedCost = '0';
       }
 
+      // Auto-check for first-job / off-peak discounts if no promo applied yet
+      if (!session.promoCode) {
+        try {
+          const uid = session.linkedUserId;
+          // First-job check
+          let isFirstJob = false;
+          if (uid) {
+            const co = await firestore.collection('tasksManagement')
+              .where('user_id', '==', uid).where('status', 'in', ['completed', 'closed']).limit(1).get();
+            isFirstJob = co.empty;
+          }
+          if (!isFirstJob) {
+            const wao = await firestore.collection('tasksManagement')
+              .where('customerPhone', '==', session.phone).where('status', 'in', ['completed', 'closed']).limit(1).get();
+            isFirstJob = wao.empty;
+          }
+          if (isFirstJob) {
+            const fjSnap = await firestore.collection('promo_codes')
+              .where('promo_type', '==', 'first_job').where('status', '==', 'active').limit(1).get();
+            if (!fjSnap.empty) {
+              const fj = fjSnap.docs[0].data();
+              session.promoCode = fj.code || 'FIRSTJOB';
+              session.promoId = fjSnap.docs[0].id;
+              session.promoDiscountType = fj.discount_type || fj.discountType || 'percentage';
+              session.promoDiscount = fj.discount_value || fj.discountValue || 0;
+              session.autoDiscount = 'first_job';
+            }
+          }
+          // Off-peak check (only if no first-job)
+          if (!session.promoCode) {
+            const sast = new Date(new Date().toLocaleString('en-US', { timeZone: 'Africa/Johannesburg' }));
+            const day = sast.getDay();
+            const hour = sast.getHours();
+            if (day >= 1 && day <= 5 && hour < 10) {
+              const opSnap = await firestore.collection('promo_codes')
+                .where('promo_type', '==', 'off_peak').where('status', '==', 'active').limit(1).get();
+              if (!opSnap.empty) {
+                const op = opSnap.docs[0].data();
+                session.promoCode = op.code || 'OFFPEAK';
+                session.promoId = opSnap.docs[0].id;
+                session.promoDiscountType = op.discount_type || op.discountType || 'percentage';
+                session.promoDiscount = op.discount_value || op.discountValue || 0;
+                session.autoDiscount = 'off_peak';
+              }
+            }
+          }
+        } catch (e) { console.warn('[create_booking] auto-discount check error:', e.message); }
+      }
+
       // Apply promo discount if active
       let finalCost = parseFloat(estimatedCost);
       let promoApplied = null;
@@ -1447,7 +1518,7 @@ async function executeWaTool(name, args, session) {
         }
         discount = Math.min(discount, finalCost);
         finalCost = Math.max(0, finalCost - discount);
-        promoApplied = { code: session.promoCode, discount, type: session.promoDiscountType || 'fixed' };
+        promoApplied = { code: session.promoCode, discount, type: session.promoDiscountType || 'fixed', autoApplied: session.autoDiscount || null };
       }
 
       // Calculate deposit amount (35% of total, matching app's deposit_service.dart)
@@ -1933,6 +2004,213 @@ async function executeWaTool(name, args, session) {
     // ═══════════════════════════════════════════
     // 6) APPLY PROMO CODE
     // ═══════════════════════════════════════════
+    // ═══════════════════════════════════════════
+    // 6a) CHECK AUTO-DISCOUNTS
+    // ═══════════════════════════════════════════
+    case 'check_auto_discounts': {
+      if (!firestore) return { error: 'Database unavailable' };
+      const discounts = [];
+      const userId = session.linkedUserId;
+
+      // 1) First-job discount — check if user has zero completed orders
+      if (userId) {
+        try {
+          const completedOrders = await firestore.collection('tasksManagement')
+            .where('user_id', '==', userId)
+            .where('status', 'in', ['completed', 'closed'])
+            .limit(1).get();
+          if (completedOrders.empty) {
+            // Also check WhatsApp bookings by phone
+            const waOrders = await firestore.collection('tasksManagement')
+              .where('customerPhone', '==', session.phone)
+              .where('status', 'in', ['completed', 'closed'])
+              .limit(1).get();
+            if (waOrders.empty) {
+              const fjSnap = await firestore.collection('promo_codes')
+                .where('promo_type', '==', 'first_job')
+                .where('status', '==', 'active').limit(1).get();
+              if (!fjSnap.empty) {
+                const fj = fjSnap.docs[0].data();
+                const discType = fj.discount_type || fj.discountType || 'percentage';
+                const discVal = fj.discount_value || fj.discountValue || 0;
+                discounts.push({
+                  type: 'first_job',
+                  label: 'First Job Discount',
+                  discountType: discType,
+                  discountValue: discVal,
+                  description: discType === 'percentage' ? `${discVal}% off your first booking!` : `R${discVal} off your first booking!`,
+                  promoId: fjSnap.docs[0].id,
+                  code: fj.code || 'FIRSTJOB',
+                });
+              }
+            }
+          }
+        } catch (e) { console.warn('[auto-discount] first-job check error:', e.message); }
+      } else {
+        // No linked account — check by phone only
+        try {
+          const waOrders = await firestore.collection('tasksManagement')
+            .where('customerPhone', '==', session.phone)
+            .where('status', 'in', ['completed', 'closed'])
+            .limit(1).get();
+          if (waOrders.empty) {
+            const fjSnap = await firestore.collection('promo_codes')
+              .where('promo_type', '==', 'first_job')
+              .where('status', '==', 'active').limit(1).get();
+            if (!fjSnap.empty) {
+              const fj = fjSnap.docs[0].data();
+              const discType = fj.discount_type || fj.discountType || 'percentage';
+              const discVal = fj.discount_value || fj.discountValue || 0;
+              discounts.push({
+                type: 'first_job',
+                label: 'First Job Discount',
+                discountType: discType,
+                discountValue: discVal,
+                description: discType === 'percentage' ? `${discVal}% off your first booking!` : `R${discVal} off your first booking!`,
+                promoId: fjSnap.docs[0].id,
+                code: fj.code || 'FIRSTJOB',
+              });
+            }
+          }
+        } catch (e) { console.warn('[auto-discount] first-job phone check error:', e.message); }
+      }
+
+      // 2) Off-peak discount — weekdays before 10am SAST
+      try {
+        const sast = new Date(new Date().toLocaleString('en-US', { timeZone: 'Africa/Johannesburg' }));
+        const day = sast.getDay(); // 0=Sun, 6=Sat
+        const hour = sast.getHours();
+        if (day >= 1 && day <= 5 && hour < 10) {
+          const opSnap = await firestore.collection('promo_codes')
+            .where('promo_type', '==', 'off_peak')
+            .where('status', '==', 'active').limit(1).get();
+          if (!opSnap.empty) {
+            const op = opSnap.docs[0].data();
+            const discType = op.discount_type || op.discountType || 'percentage';
+            const discVal = op.discount_value || op.discountValue || 0;
+            discounts.push({
+              type: 'off_peak',
+              label: 'Off-Peak Discount',
+              discountType: discType,
+              discountValue: discVal,
+              description: discType === 'percentage' ? `${discVal}% off for booking during off-peak hours!` : `R${discVal} off for booking during off-peak hours!`,
+              promoId: opSnap.docs[0].id,
+              code: op.code || 'OFFPEAK',
+            });
+          }
+        }
+      } catch (e) { console.warn('[auto-discount] off-peak check error:', e.message); }
+
+      // 3) Loyalty points balance
+      if (userId) {
+        try {
+          const lpDoc = await firestore.collection('loyalty_points').doc(userId).get();
+          if (lpDoc.exists) {
+            const pts = lpDoc.data().totalPoints || 0;
+            if (pts >= 100) {
+              const randValue = Math.floor(pts / 10); // 100pts = R10
+              discounts.push({
+                type: 'loyalty_points',
+                label: 'Loyalty Points',
+                points: pts,
+                randValue,
+                description: `You have ${pts} loyalty points (worth R${randValue})! You can redeem up to 10% of your booking total.`,
+              });
+            }
+          }
+        } catch (e) { console.warn('[auto-discount] loyalty check error:', e.message); }
+      }
+
+      // Auto-apply the best promo if no manual promo is active
+      if (!session.promoCode && discounts.length > 0) {
+        const bestPromo = discounts.find(d => d.type === 'first_job') || discounts.find(d => d.type === 'off_peak');
+        if (bestPromo && bestPromo.promoId) {
+          session.promoCode = bestPromo.code;
+          session.promoId = bestPromo.promoId;
+          session.promoDiscountType = bestPromo.discountType;
+          session.promoDiscount = bestPromo.discountValue;
+          session.autoDiscount = bestPromo.type;
+        }
+      }
+
+      if (discounts.length === 0) {
+        return { discounts: [], message: 'No automatic discounts available right now, but you can still enter a promo code if you have one!' };
+      }
+
+      return {
+        discounts,
+        autoApplied: session.autoDiscount || null,
+        message: `Great news! You qualify for: ${discounts.map(d => d.description).join(' | ')}`,
+      };
+    }
+
+    // ═══════════════════════════════════════════
+    // 6b) GET UPSELL ADD-ONS
+    // ═══════════════════════════════════════════
+    case 'get_upsell_addons': {
+      if (!firestore) return { error: 'Database unavailable' };
+      const catId = (args.categoryId || '').toLowerCase().replace(/\s+/g, '_');
+      if (!catId) return { addons: [], message: 'No category provided.' };
+
+      try {
+        let addonDocs;
+        try {
+          const snap = await firestore.collection('upsell_addons')
+            .where('trigger_category_id', '==', catId)
+            .where('status', '==', 'active')
+            .orderBy('sort_order').get();
+          addonDocs = snap.docs;
+        } catch (indexErr) {
+          // Fallback without orderBy if composite index doesn't exist
+          const snap = await firestore.collection('upsell_addons')
+            .where('trigger_category_id', '==', catId)
+            .where('status', '==', 'active').get();
+          addonDocs = snap.docs;
+        }
+
+        if (addonDocs.length === 0) {
+          return { addons: [], message: 'No add-on services available for this category.' };
+        }
+
+        const addons = addonDocs.map(d => {
+          const a = d.data();
+          const base = parseFloat(a.base_price || a.basePrice || 0);
+          const disc = parseFloat(a.discount_percent || a.discountPercent || 0);
+          const discounted = Math.round(base * (1 - disc / 100));
+          return {
+            id: d.id,
+            name: a.name || a.title || '',
+            description: a.description || '',
+            originalPrice: base,
+            discountPercent: disc,
+            discountedPrice: discounted,
+            savings: Math.round(base - discounted),
+          };
+        });
+
+        // Log that upsells were shown
+        for (const addon of addons) {
+          firestore.collection('upsell_logs').add({
+            user_id: session.linkedUserId || session.phone,
+            addon_id: addon.id,
+            event_type: 'shown',
+            addon_name: addon.name,
+            addon_price: addon.discountedPrice,
+            source: 'whatsapp',
+            created_at: new Date().toISOString(),
+          }).catch(() => {});
+        }
+
+        return {
+          addons,
+          message: `Recommended add-ons for your ${args.categoryId} booking (special bundle prices when added to your booking):\n${addons.map((a, i) => `${i+1}. ${a.name} — R${a.discountedPrice}${a.discountPercent > 0 ? ` (was R${a.originalPrice}, save ${a.discountPercent}%)` : ''}`).join('\n')}\n\nWould you like to add any of these to your booking?`,
+        };
+      } catch (e) {
+        console.error('[get_upsell_addons] Error:', e.message);
+        return { addons: [], message: 'Could not load add-ons right now.' };
+      }
+    }
+
     case 'apply_promo_code': {
       if (!firestore) return { error: 'Cannot validate promo codes right now. Please try again later.' };
       const code = (args.code || '').trim().toUpperCase();
@@ -3341,6 +3619,28 @@ PHOTO ANALYSIS FOR RFQ:
 - When a customer sends photos, analyse them with vision to identify the issue
 - Use the photo analysis to build a detailed description for the RFQ
 - The AI quote generator uses the conversation context including your photo analysis
+
+🎁 AUTO-DISCOUNTS (IMPORTANT — check and mention these proactively):
+- FIRST-JOB DISCOUNT: New customers who have never completed a booking get an automatic discount. Call check_auto_discounts to verify eligibility and tell them about their savings BEFORE creating the booking.
+- OFF-PEAK DISCOUNT: Bookings made on weekdays before 10am SAST qualify for an automatic off-peak discount.
+- LOYALTY POINTS: Returning customers earn loyalty points (10 pts per R100 spent). 100+ points can be redeemed for up to 10% off (100pts = R10).
+- Auto-discounts are applied automatically at booking time even if you don't call check_auto_discounts — but ALWAYS mention the discount to make the customer feel valued.
+- If a customer already has a manual promo code applied, auto-discounts won't override it.
+
+🛒 UPSELL ADD-ONS (use these to offer more value):
+- After the customer picks a service category, call get_upsell_addons(categoryId) to check for recommended add-on services.
+- Add-ons come with special bundle discounts (e.g. "Add a geyser inspection to your plumbing booking — 30% off!").
+- Present add-ons BEFORE creating the booking. Let the customer choose which (if any) they want.
+- Example flow: Customer wants plumbing → you call get_upsell_addons('plumbing') → present options → customer picks → include them in the booking description and add their costs.
+- NEVER pressure the customer — frame it as "Here are some recommended services that pair well with your booking".
+
+DISCOUNT & UPSELL FLOW (follow this for every booking):
+1. Customer describes their need → you identify the category
+2. Call check_auto_discounts — mention any available discounts enthusiastically
+3. Call get_upsell_addons(categoryId) — present relevant add-ons with bundle pricing
+4. Call lookup_pricing → get the service price
+5. Let customer confirm what they want
+6. Call create_booking — discounts are auto-applied to the final price
 
 ⭐ RATINGS & REVIEWS:
 - Rate completed jobs (1-5 stars with optional comment)
