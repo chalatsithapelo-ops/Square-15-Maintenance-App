@@ -1668,13 +1668,26 @@ async function executeWaTool(name, args, session) {
         } catch (e) { console.warn('[wa-tool] tasks lookup failed:', e.message); }
 
         // 3) If subcategory provided, try to find an exact or fuzzy match
+        //    Uses word-level matching: split both search and service name into words,
+        //    match if ANY word (≥3 chars) from one side appears in the other.
         let matchedService = null;
         let matchedPrice = null;
 
-        if (subQuery) {
+        const _wordMatch = (a, b) => {
+          const al = a.toLowerCase(), bl = b.toLowerCase();
+          if (al.includes(bl) || bl.includes(al)) return true;
+          const aw = al.split(/\s+/).filter(w => w.length >= 3);
+          const bw = bl.split(/\s+/).filter(w => w.length >= 3);
+          return aw.some(w => bl.includes(w)) || bw.some(w => al.includes(w));
+        };
+
+        // Also build a combined query from category + subcategory for broader matching
+        const combinedQuery = [args.category || '', args.subcategory || ''].join(' ').toLowerCase().trim();
+
+        if (subQuery || catSlug) {
           // Check service_prices map first
           for (const [svcName, price] of Object.entries(servicePrices)) {
-            if (svcName.toLowerCase().includes(subQuery) || subQuery.includes(svcName.toLowerCase())) {
+            if (_wordMatch(svcName, subQuery || combinedQuery)) {
               matchedService = svcName;
               matchedPrice = typeof price === 'number' ? price : parseFloat(price);
               break;
@@ -1683,13 +1696,38 @@ async function executeWaTool(name, args, session) {
           // Then check tasks collection
           if (!matchedService) {
             for (const t of taskResults) {
-              if (t.name.toLowerCase().includes(subQuery) || subQuery.includes(t.name.toLowerCase())) {
+              if (_wordMatch(t.name, subQuery || combinedQuery)) {
                 matchedService = t.name;
                 matchedPrice = t.cost;
                 break;
               }
             }
           }
+        }
+
+        // 3b) If no match found yet and we only checked one pricingGuidance doc, scan all docs
+        if (!matchedService) {
+          try {
+            const allGuidance = await firestore.collection('pricingGuidance').limit(20).get();
+            for (const gDoc of allGuidance.docs) {
+              if (gDoc.id === catSlug) continue; // already checked
+              const gd = gDoc.data();
+              const sp = gd.service_prices || gd.servicePrices || {};
+              for (const [svcName, price] of Object.entries(sp)) {
+                if (_wordMatch(svcName, combinedQuery)) {
+                  matchedService = svcName;
+                  matchedPrice = typeof price === 'number' ? price : parseFloat(price);
+                  servicePrices = sp;
+                  categoryName = gd.category_name || gd.categoryName || gDoc.id;
+                  laborCostPerHour = parseFloat(gd.labor_cost_per_hour || gd.laborCostPerHour || 0) || null;
+                  outsourcedLaborRate = parseFloat(gd.outsourced_labor_rate || 0) || null;
+                  materialMultiplier = parseFloat(gd.material_multiplier || 0) || null;
+                  break;
+                }
+              }
+              if (matchedService) break;
+            }
+          } catch (e) { console.warn('[wa-tool] pricingGuidance scan failed:', e.message); }
         }
 
         // Build response
@@ -1702,7 +1740,7 @@ async function executeWaTool(name, args, session) {
         const existingNames = new Set(Object.keys(servicePrices).map(n => n.toLowerCase()));
         for (const t of taskResults) {
           const catId = t.category_id.toLowerCase();
-          if ((catId === catSlug || catId.includes(catSlug) || catSlug.includes(catId)) && !existingNames.has(t.name.toLowerCase())) {
+          if ((_wordMatch(catId, catSlug) || _wordMatch(t.name, combinedQuery)) && !existingNames.has(t.name.toLowerCase())) {
             allFixedPrices.push({ service: t.name, fixedPrice: `R${t.cost.toFixed(2)}` });
           }
         }
