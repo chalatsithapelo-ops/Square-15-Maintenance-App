@@ -1637,23 +1637,26 @@ async function executeWaTool(name, args, session) {
         const catSlug = (args.category || '').toLowerCase().replace(/\s+/g, '_');
         const subQuery = (args.subcategory || '').toLowerCase();
 
-        // 1) Look up from pricingGuidance by doc ID (e.g. 'plumbing')
-        let servicePrices = {};
-        let categoryName = args.category || '';
-        let laborCostPerHour = null;
-        let outsourcedLaborRate = null;
-        let materialMultiplier = null;
-        const guidanceDoc = await firestore.collection('pricingGuidance').doc(catSlug).get();
-        if (guidanceDoc.exists) {
-          const gd = guidanceDoc.data();
-          servicePrices = gd.service_prices || gd.servicePrices || {};
-          categoryName = gd.category_name || gd.categoryName || categoryName;
-          laborCostPerHour = parseFloat(gd.labor_cost_per_hour || gd.laborCostPerHour || 0) || null;
-          outsourcedLaborRate = parseFloat(gd.outsourced_labor_rate || 0) || null;
-          materialMultiplier = parseFloat(gd.material_multiplier || 0) || null;
-        }
+        // Scoring helper: exact > substring > word overlap count
+        const _matchScore = (a, b) => {
+          const al = a.toLowerCase(), bl = b.toLowerCase();
+          if (al === bl) return 1000;
+          if (al.includes(bl) || bl.includes(al)) return 100;
+          const aw = al.split(/\s+/).filter(w => w.length >= 3);
+          const bw = bl.split(/\s+/).filter(w => w.length >= 3);
+          let score = 0;
+          for (const w of aw) { if (bl.includes(w)) score++; }
+          for (const w of bw) { if (al.includes(w)) score++; }
+          return score;
+        };
 
-        // 2) Also search the tasks collection for matching service entries
+        const combinedQuery = [args.category || '', args.subcategory || ''].join(' ').toLowerCase().trim();
+        const searchQ = subQuery || combinedQuery;
+
+        // 1) AUTHORITATIVE SOURCE: tasks collection (admin-managed fixed prices)
+        let matchedService = null;
+        let matchedPrice = null;
+        let bestScore = 0;
         const taskResults = [];
         try {
           const taskSnap = await firestore.collection('tasks').limit(200).get();
@@ -1663,91 +1666,49 @@ async function executeWaTool(name, args, session) {
             const cost = parseFloat(d.cost || d.price || d.amount || 0);
             if (name && cost > 0) {
               taskResults.push({ name, cost, category_id: d.categoryId || d.category_id || '' });
+              if (searchQ) {
+                const score = _matchScore(name, searchQ);
+                if (score > bestScore) {
+                  bestScore = score;
+                  matchedService = name;
+                  matchedPrice = cost;
+                }
+              }
             }
           }
         } catch (e) { console.warn('[wa-tool] tasks lookup failed:', e.message); }
 
-        // 3) Find BEST match using word-overlap scoring.
-        //    Score = number of overlapping words between search and service name.
-        //    Exact substring match gets a large bonus.
-        let matchedService = null;
-        let matchedPrice = null;
-        let bestScore = 0;
-
-        const _matchScore = (a, b) => {
-          const al = a.toLowerCase(), bl = b.toLowerCase();
-          if (al === bl) return 1000; // exact match
-          if (al.includes(bl) || bl.includes(al)) return 100; // full substring
-          const aw = al.split(/\s+/).filter(w => w.length >= 3);
-          const bw = bl.split(/\s+/).filter(w => w.length >= 3);
-          let score = 0;
-          for (const w of aw) { if (bl.includes(w)) score++; }
-          for (const w of bw) { if (al.includes(w)) score++; }
-          return score;
-        };
-
-        // Also build a combined query from category + subcategory for broader matching
-        const combinedQuery = [args.category || '', args.subcategory || ''].join(' ').toLowerCase().trim();
-        const searchQ = subQuery || combinedQuery;
-
-        if (searchQ) {
-          // Check service_prices map — pick highest-scoring match
-          for (const [svcName, price] of Object.entries(servicePrices)) {
-            const score = _matchScore(svcName, searchQ);
-            if (score > bestScore) {
-              bestScore = score;
-              matchedService = svcName;
-              matchedPrice = typeof price === 'number' ? price : parseFloat(price);
-            }
-          }
-          // Also check tasks collection
-          for (const t of taskResults) {
-            const score = _matchScore(t.name, searchQ);
-            if (score > bestScore) {
-              bestScore = score;
-              matchedService = t.name;
-              matchedPrice = t.cost;
-            }
-          }
-        }
-
-        // 3b) If no match or weak match, also scan ALL pricingGuidance docs
+        // 2) pricingGuidance — for AI context only (labor rates, material multipliers)
+        //    Does NOT override task-matched price.
+        let categoryName = args.category || '';
+        let laborCostPerHour = null;
+        let outsourcedLaborRate = null;
+        let materialMultiplier = null;
+        let guidanceServicePrices = {};
         try {
-          const allGuidance = await firestore.collection('pricingGuidance').limit(20).get();
-          for (const gDoc of allGuidance.docs) {
-            if (gDoc.id === catSlug && bestScore > 0) continue; // already checked
-            const gd = gDoc.data();
-            const sp = gd.service_prices || gd.servicePrices || {};
-            for (const [svcName, price] of Object.entries(sp)) {
-              const score = _matchScore(svcName, combinedQuery);
-              if (score > bestScore) {
-                bestScore = score;
-                matchedService = svcName;
-                matchedPrice = typeof price === 'number' ? price : parseFloat(price);
-                servicePrices = sp;
-                categoryName = gd.category_name || gd.categoryName || gDoc.id;
-                laborCostPerHour = parseFloat(gd.labor_cost_per_hour || gd.laborCostPerHour || 0) || null;
-                outsourcedLaborRate = parseFloat(gd.outsourced_labor_rate || 0) || null;
-                materialMultiplier = parseFloat(gd.material_multiplier || 0) || null;
-              }
-            }
+          const guidanceDoc = await firestore.collection('pricingGuidance').doc(catSlug).get();
+          if (guidanceDoc.exists) {
+            const gd = guidanceDoc.data();
+            guidanceServicePrices = gd.service_prices || gd.servicePrices || {};
+            categoryName = gd.category_name || gd.categoryName || categoryName;
+            laborCostPerHour = parseFloat(gd.labor_cost_per_hour || gd.laborCostPerHour || 0) || null;
+            outsourcedLaborRate = parseFloat(gd.outsourced_labor_rate || 0) || null;
+            materialMultiplier = parseFloat(gd.material_multiplier || 0) || null;
           }
-        } catch (e) { console.warn('[wa-tool] pricingGuidance scan failed:', e.message); }
+        } catch (e) { /* ignore guidance errors */ }
 
-        // Build response
-        const allFixedPrices = Object.entries(servicePrices).map(([name, price]) => ({
-          service: name,
-          fixedPrice: `R${typeof price === 'number' ? price.toFixed(2) : price}`,
-        }));
-
-        // Add task-collection prices not already in servicePrices
-        const existingNames = new Set(Object.keys(servicePrices).map(n => n.toLowerCase()));
+        // Build the available fixed prices list from tasks
+        const allFixedPrices = [];
+        const addedNames = new Set();
         for (const t of taskResults) {
-          const catId = t.category_id.toLowerCase();
+          const catId = (t.category_id || '').toLowerCase();
           const catScore = _matchScore(catId, catSlug);
           const nameScore = _matchScore(t.name, combinedQuery);
-          if ((catScore > 0 || nameScore > 0) && !existingNames.has(t.name.toLowerCase())) {
-            allFixedPrices.push({ service: t.name, fixedPrice: `R${t.cost.toFixed(2)}` });
+          if (catScore > 0 || nameScore > 0) {
+            if (!addedNames.has(t.name.toLowerCase())) {
+              allFixedPrices.push({ service: t.name, fixedPrice: `R${t.cost.toFixed(2)}` });
+              addedNames.add(t.name.toLowerCase());
+            }
           }
         }
 
