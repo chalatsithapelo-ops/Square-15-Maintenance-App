@@ -578,6 +578,23 @@ const waTools = [
   {
     type: 'function',
     function: {
+      name: 'register_account',
+      description: 'Register a new Square 15 account directly via WhatsApp. Use this for customers who don\'t have the app. Collect their full name first, then optionally ask for email, address, and referral/partner code.',
+      parameters: {
+        type: 'object',
+        properties: {
+          name:         { type: 'string', description: 'Customer full name' },
+          email:        { type: 'string', description: 'Email address (optional but recommended)' },
+          address:      { type: 'string', description: 'Home/service address (optional)' },
+          referralCode: { type: 'string', description: 'Partner or referral code if the customer has one (optional)' },
+        },
+        required: ['name'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'check_rfq_status',
       description: 'Check the status of an RFQ (Request for Quote). Returns quote details, breakdown, and acceptance status. Can look up by RFQ ID or list all RFQs for the customer.',
       parameters: {
@@ -2648,7 +2665,7 @@ async function executeWaTool(name, args, session) {
       if (!session.linkedUserId) {
         const user = await findUserByPhone(session.phone);
         if (user) session.linkedUserId = user.id;
-        else return { error: 'Your WhatsApp number is not linked to a Square 15 account. Please sign up in the app first to use referral codes.' };
+        else return { error: 'You don\'t have a Square 15 account yet. Please register first by telling me your name, and I\'ll set you up — then we can link the referral code.' };
       }
 
       // Check if already linked
@@ -2691,7 +2708,91 @@ async function executeWaTool(name, args, session) {
 
       return {
         linked: false,
-        message: 'No Square 15 account found for this phone number. Please download the Square 15 app and register, or book directly here — we\'ll create your booking with your phone number.',
+        message: 'No Square 15 account found for this phone number. I can register you right here on WhatsApp — just tell me your full name and I\'ll create your account. Or if you already have the app, make sure you registered with this same phone number.',
+      };
+    }
+
+    // ═══════════════════════════════════════════
+    // 16b) REGISTER ACCOUNT (WhatsApp)
+    // ═══════════════════════════════════════════
+    case 'register_account': {
+      if (!firestore) return { error: 'Database unavailable' };
+
+      const customerName = (args.name || '').trim();
+      if (!customerName) return { error: 'Please provide your full name to register.' };
+
+      // Check if already registered
+      if (session.linkedUserId) {
+        return { registered: true, message: 'You already have a Square 15 account linked to this WhatsApp number.' };
+      }
+
+      const existingUser = await findUserByPhone(session.phone);
+      if (existingUser) {
+        session.linkedUserId = existingUser.id;
+        return { registered: true, message: `You already have an account (${existingUser.name || customerName}). I\'ve linked it to this WhatsApp chat.` };
+      }
+
+      // Create a new user document (compatible with Flutter app UserModel)
+      const userId = `wa_${session.phone}`;
+      const now = new Date().toISOString();
+      const userData = {
+        uid: userId,
+        name: customerName,
+        email: (args.email || '').trim() || null,
+        contact: parseInt(session.phone) || session.phone,
+        phone: session.phone,
+        isAdmin: false,
+        isServiceProvider: false,
+        isUser: true,
+        isVerified: false,
+        lat: '0.0',
+        lng: '0.0',
+        deviceToken: '',
+        fcm_token: '',
+        image: '',
+        balance: '0',
+        source: 'whatsapp',
+        created_at: now,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      };
+
+      if (args.address) userData.address = args.address.trim();
+
+      await firestore.collection('users').doc(userId).set(userData);
+      session.linkedUserId = userId;
+
+      // Handle referral code if provided
+      let referralMessage = '';
+      const code = (args.referralCode || '').trim().toUpperCase();
+      if (code) {
+        try {
+          const partnerSnap = await firestore.collection('corporate_partners')
+            .where('referral_code', '==', code).where('status', '==', 'active').limit(1).get();
+          if (!partnerSnap.empty) {
+            const partner = partnerSnap.docs[0];
+            const partnerData = partner.data();
+            await firestore.collection('users').doc(userId).update({
+              referred_by_partner_id: partner.id,
+              referral_code_used: code,
+              referral_linked_at: now,
+            });
+            await firestore.collection('corporate_partners').doc(partner.id).update({
+              total_referrals: admin.firestore.FieldValue.increment(1),
+            });
+            referralMessage = ` Partner code "${code}" linked — you're under ${partnerData.company_name || 'our corporate partner'}'s program.`;
+          } else {
+            referralMessage = ` (Referral code "${code}" was not found or is inactive — you can try again later.)`;
+          }
+        } catch (e) {
+          console.error('[register_account] Referral link error:', e.message);
+          referralMessage = ' (Could not link referral code right now — you can try again later.)';
+        }
+      }
+
+      return {
+        registered: true,
+        userId,
+        message: `Welcome to Square 15, ${customerName}! 🎉 Your account has been created and linked to this WhatsApp number.${referralMessage} You can now book services, track jobs, earn wallet credits, and more — all right here on WhatsApp.`,
       };
     }
 
@@ -3252,10 +3353,22 @@ PHOTO ANALYSIS FOR RFQ:
 🤝 PARTNER CODES:
 - Link corporate partner / referral codes for commission tracking
 - Validate referral codes
+- Referral codes can be provided during registration or linked afterwards
 
-🔗 ACCOUNT:
-- Auto-link WhatsApp number to existing Square 15 app account
-- Inform customers about app features when relevant
+📝 REGISTRATION & ACCOUNT:
+- Register new customers directly on WhatsApp (register_account) — NO app download needed
+- During registration, ALWAYS ask: "Do you have a referral or partner code?" (but make it clear it's optional)
+- Collect: full name (required), email (optional but recommended), address (optional), referral code (optional)
+- Auto-link WhatsApp number to existing Square 15 app account (link_account) for customers who already have the app
+- If a new user tries to book or use a referral code without an account, suggest registering first
+
+FIRST-TIME USER FLOW (IMPORTANT):
+1. When you detect a new/unregistered user (no linked account), warmly welcome them and offer to register them
+2. Ask for their full name
+3. Ask "Do you have a referral or partner code? (No worries if you don't!)"
+4. Call register_account with the collected info
+5. Then proceed with whatever they originally wanted (booking, RFQ, etc.)
+6. For returning users who already have the app, use link_account to sync their WhatsApp
 
 💬 MESSAGING:
 - Get messages/chat history for a booking (get_messages)
