@@ -1634,10 +1634,15 @@ async function executeWaTool(name, args, session) {
         let matchedService = null;
         let matchedPrice = null;
 
+        // Normalize: replace underscores/hyphens with spaces for comparison
+        const normalize = (s) => s.toLowerCase().replace(/[_\-]+/g, ' ').trim();
+        const subNorm = normalize(subQuery);
+
         if (subQuery) {
           // Check service_prices map first
           for (const [svcName, price] of Object.entries(servicePrices)) {
-            if (svcName.toLowerCase().includes(subQuery) || subQuery.includes(svcName.toLowerCase())) {
+            const svcNorm = normalize(svcName);
+            if (svcNorm.includes(subNorm) || subNorm.includes(svcNorm)) {
               matchedService = svcName;
               matchedPrice = typeof price === 'number' ? price : parseFloat(price);
               break;
@@ -1646,7 +1651,8 @@ async function executeWaTool(name, args, session) {
           // Then check tasks collection
           if (!matchedService) {
             for (const t of taskResults) {
-              if (t.name.toLowerCase().includes(subQuery) || subQuery.includes(t.name.toLowerCase())) {
+              const tNorm = normalize(t.name);
+              if (tNorm.includes(subNorm) || subNorm.includes(tNorm)) {
                 matchedService = t.name;
                 matchedPrice = t.cost;
                 break;
@@ -1662,10 +1668,11 @@ async function executeWaTool(name, args, session) {
         }));
 
         // Add task-collection prices not already in servicePrices
-        const existingNames = new Set(Object.keys(servicePrices).map(n => n.toLowerCase()));
+        const existingNames = new Set(Object.keys(servicePrices).map(n => normalize(n)));
         for (const t of taskResults) {
-          const catId = t.category_id.toLowerCase();
-          if ((catId === catSlug || catId.includes(catSlug) || catSlug.includes(catId)) && !existingNames.has(t.name.toLowerCase())) {
+          const catId = normalize(t.category_id);
+          const catSlugNorm = normalize(catSlug);
+          if ((catId === catSlugNorm || catId.includes(catSlugNorm) || catSlugNorm.includes(catId)) && !existingNames.has(normalize(t.name))) {
             allFixedPrices.push({ service: t.name, fixedPrice: `R${t.cost.toFixed(2)}` });
           }
         }
