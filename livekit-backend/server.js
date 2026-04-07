@@ -1425,7 +1425,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       const doc = await firestore.collection('tasks').doc(t).get();
       if (!doc.exists) return null;
       const data = doc.data() || {};
-      const amount = toNumber(data.cost ?? data.price ?? data.amount ?? data.unit_price);
+      const amount = toNumber(data.client_rate ?? data.clientRate ?? data.cost ?? data.price ?? data.amount ?? data.unit_price);
       return amount && amount > 0 ? amount : null;
     } catch (e) { console.warn('\u26a0\ufe0f resolveTaskCost:', e.message);
       return null;
@@ -1829,6 +1829,19 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     const bookingRefLocal = firestore.collection('futureBookings').doc(bookingIdLocal);
 
     const batch = firestore.batch();
+    // Resolve task names for artisan display
+    const resolvedJobNames = [];
+    for (const jid of jobIds) {
+      const sid = String(jid || '').trim();
+      if (!sid) continue;
+      try {
+        const tDoc = await firestore.collection('tasks').doc(sid).get();
+        const tName = String((tDoc.exists ? (tDoc.data() || {}).name : '') || '').trim();
+        if (tName) resolvedJobNames.push(tName);
+      } catch (_) {}
+    }
+    const effectiveDescription = description || (resolvedJobNames.length > 0 ? resolvedJobNames.join(', ') : '');
+
     batch.set(tmRef, {
       id: tmId,
       order_no: resolvedOrderNo,
@@ -1853,7 +1866,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       creation_date: now,
       updated_at: now,
       updated_by: userIdLocal,
-      description,
+      description: effectiveDescription,
       service_on_location: isCurrent ? 'yes' : 'no',
       provided_address: effectiveAddress,
       other_lat: effectiveLat,
@@ -1872,14 +1885,21 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       if (!id) continue;
       const jobDocId = crypto.randomUUID();
       const jobCost = resolvedTaskCosts[id] ?? 0.0;
+      // Resolve task name for artisan display
+      let jobName = '';
+      try {
+        const tDoc = await firestore.collection('tasks').doc(id).get();
+        jobName = String((tDoc.exists ? (tDoc.data() || {}).name : '') || '').trim();
+      } catch (_) {}
       batch.set(tmRef.collection('jobs').doc(jobDocId), {
         id: jobDocId,
         task_id: id,
+        name: jobName,
         height: '',
         width: '',
         area: '',
         cost: jobCost > 0 ? Number(jobCost).toFixed(2) : '0',
-        description,
+        description: effectiveDescription,
         image: firstImage || '',
       });
     }
@@ -2945,7 +2965,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         const name = String(d.name || d.title || d.task_name || d.taskName || '').trim();
         if (!name) continue;
 
-        const cost = toNumber(d.cost ?? d.price ?? d.amount ?? d.unit_price);
+        const cost = toNumber(d.client_rate ?? d.clientRate ?? d.cost ?? d.price ?? d.amount ?? d.unit_price);
         const catId = String(d.categoryId || d.category_id || d.subCategoryId || d.sub_category_id || d.subcategoryId || d.subcategory_id || '').trim();
         const catName = categoryMap[catId] || '';
         const taskId = String(d.id || doc.id).trim();
