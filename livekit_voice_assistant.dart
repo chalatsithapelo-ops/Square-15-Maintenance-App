@@ -3680,7 +3680,9 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
         final name = (data['name'] ?? '').toString();
         final s = scoreTask(name, hint, hintTokens);
         final c = _toAmount(
-              data['cost'] ??
+              data['client_rate'] ??
+                  data['clientRate'] ??
+                  data['cost'] ??
                   data['price'] ??
                   data['amount'] ??
                   data['unit_price'],
@@ -4075,7 +4077,9 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
 
     double extractTaskCost(Map<String, dynamic> taskData) {
       return _toAmount(
-            taskData['cost'] ??
+            taskData['client_rate'] ??
+                taskData['clientRate'] ??
+                taskData['cost'] ??
                 taskData['price'] ??
                 taskData['amount'] ??
                 taskData['unit_price'],
