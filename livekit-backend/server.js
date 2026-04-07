@@ -311,8 +311,11 @@ async function lookupMaterialsCatalog(firestore, name) {
     // Try by name_lower field
     let snap = await firestore.collection('materialsCatalog').where('name_lower', '==', normalized).limit(1).get();
     if (!snap.empty) { const d = snap.docs[0].data(); const p = parseFloat(d.unit_price || d.price_incl_vat || d.price || 0); if (p > 0) return { price: p, source: 'catalog_name_lower' }; }
-    // Try by aliases
+    // Try by aliases (both space and underscore variants)
     snap = await firestore.collection('materialsCatalog').where('aliases', 'array-contains', name.toLowerCase()).limit(1).get();
+    if (snap.empty) {
+      snap = await firestore.collection('materialsCatalog').where('aliases', 'array-contains', normalized).limit(1).get();
+    }
     if (!snap.empty) { const d = snap.docs[0].data(); const p = parseFloat(d.unit_price || d.price_incl_vat || d.price || 0); if (p > 0) return { price: p, source: 'catalog_alias' }; }
   } catch (e) { console.error('[catalog] lookup error:', e.message); }
   return null;
@@ -3014,7 +3017,8 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       // ── Also load pricingGuidance for the matched category ──
       let pricingGuidance = null;
       try {
-        const guidanceSlug = categoryName || (finalServices[0] && finalServices[0].category_name ? finalServices[0].category_name.toLowerCase() : '');
+        const guidanceRaw = categoryName || (finalServices[0] && finalServices[0].category_name ? finalServices[0].category_name.toLowerCase() : '');
+        const guidanceSlug = guidanceRaw.toLowerCase().replace(/[\s-]+/g, '_');
         if (guidanceSlug) {
           const gDoc = await firestore.collection('pricingGuidance').doc(guidanceSlug).get();
           if (gDoc.exists) {
