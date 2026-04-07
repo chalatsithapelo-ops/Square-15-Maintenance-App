@@ -3820,7 +3820,102 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       updated_at: now,
     });
 
-    return { ok: true, status: 200, data: { accepted: true, price, rfq_no: String(data.rfq_no || '').trim() } };
+    // Mirror to tasksManagement
+    try {
+      await firestore.collection('tasksManagement').doc(bookingId).set({
+        id: bookingId,
+        order_no: data.order_no || data.rfq_no || bookingId,
+        user_id: data.user_id || '',
+        category_name: data.category_name || '',
+        description: data.description || data.problem_description || '',
+        status: 'pending_artisan_acceptance',
+        artisan_confirmed: 'pending',
+        cost: priceNum.toFixed(2),
+        deposit_amount: depositAmount.toFixed(2),
+        balance_amount: balanceAmount.toFixed(2),
+        source: 'voice_rfq',
+        is_rfq: 'yes',
+        rfq_status: 'accepted_converted',
+        accepted_at: now,
+        accepted_via: 'voice',
+      }, { merge: true });
+    } catch (e) { console.warn('[voice] tasksManagement mirror failed:', e.message); }
+
+    // Auto-dispatch: route directly to artisans when conditions met
+    const materialsResp = (data.materials_responsibility || '').toString().trim().toLowerCase();
+    const clientBuysMaterials = materialsResp === 'client';
+    const underThreshold = priceNum > 0 && priceNum < 12000;
+    let autoDispatched = false;
+
+    if (clientBuysMaterials || underThreshold) {
+      const autoReason = clientBuysMaterials ? 'client_buys_materials' : 'under_12k';
+      const cat = (data.category || data.category_name || '').toLowerCase().replace(/\s+/g, '_');
+      try {
+        const artisanSnap = await firestore.collection('serviceProvider')
+          .where('status', '==', 'approved')
+          .where('is_suspended', '!=', true)
+          .limit(20)
+          .get();
+        const matchedArtisans = [];
+        for (const artDoc of artisanSnap.docs) {
+          const ad = artDoc.data() || {};
+          const cats = (ad.categories || ad.category || '').toString().toLowerCase();
+          if (cats && cat && !cats.includes(cat) && cat !== 'general_maintenance') continue;
+          const aName = ad.name || ad.userName || ad.full_name || artDoc.id;
+          matchedArtisans.push({ id: artDoc.id, name: aName, token: (ad.fcm_token || ad.deviceToken || '').toString().trim() });
+          if (matchedArtisans.length >= 3) break;
+        }
+        if (matchedArtisans.length > 0) {
+          const artisanIds = matchedArtisans.map(a => a.id);
+          const artisanNames = {};
+          matchedArtisans.forEach(a => { artisanNames[a.id] = a.name; });
+
+          await bookingRef.update({
+            rfq_status: 'pending_artisan_acceptance',
+            status: 'pending_artisan_acceptance',
+            rfq_submitted_to: 'artisan',
+            rfq_assigned_artisan_ids: artisanIds,
+            rfq_assigned_artisan_names: artisanNames,
+            rfq_auto_assigned: true,
+            rfq_auto_assign_reason: autoReason,
+            rfq_artisan_rejection_count: 0,
+            rfq_artisan_rejections: [],
+            artisan_name: matchedArtisans[0].name,
+          });
+
+          await firestore.collection('tasksManagement').doc(bookingId).update({
+            status: 'pending_artisan_acceptance',
+            rfq_assigned_artisan_ids: artisanIds,
+            rfq_auto_assigned: true,
+            rfq_auto_assign_reason: autoReason,
+          });
+
+          for (const art of matchedArtisans) {
+            if (!art.token) continue;
+            try {
+              await admin.messaging().send({
+                token: art.token,
+                notification: { title: '🔔 New RFQ Job Available', body: `RFQ ${data.rfq_no || bookingId} — R${priceNum.toFixed(2)}. Tap to view and accept.` },
+                data: { type: 'rfq_accepted', booking_id: bookingId },
+                android: { notification: { channelId: 'order_request_channel', sound: 'sound' } },
+              });
+            } catch (fcmErr) { console.warn(`[voice] FCM to artisan ${art.id} failed:`, fcmErr.message); }
+          }
+          autoDispatched = true;
+          console.log(`[voice] Auto-dispatched RFQ ${bookingId} to ${artisanIds.length} artisans (${autoReason})`);
+        }
+      } catch (e) { console.warn('[voice] auto-dispatch failed:', e.message); }
+    }
+
+    if (!autoDispatched) {
+      await writeAdminNotification({
+        title: 'RFQ Quote Accepted — Assign Artisan',
+        message: `Customer accepted RFQ ${data.rfq_no || bookingId} (R${priceNum.toFixed(2)}) via voice. Please assign an artisan.`,
+        data: { type: 'rfq_accepted', bookingId },
+      });
+    }
+
+    return { ok: true, status: 200, data: { accepted: true, price, rfq_no: String(data.rfq_no || '').trim(), auto_dispatched: autoDispatched } };
   }
 
   // ── Reject / Negotiate RFQ Quote ──
@@ -6494,8 +6589,8 @@ app.post('/api/payment/ozow-notify', async (req, res) => {
                 if (partnerId) {
                   // Check for duplicate commission
                   const existingComm = await admin.firestore().collection('commissions')
-                    .where('task_management_id', isEqualTo: taskId)
-                    .where('partner_id', isEqualTo: partnerId)
+                    .where('task_management_id', '==', taskId)
+                    .where('partner_id', '==', partnerId)
                     .limit(1).get();
                   if (existingComm.empty) {
                     const partnerDoc = await admin.firestore().collection('corporate_partners').doc(partnerId).get();
