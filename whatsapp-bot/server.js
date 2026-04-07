@@ -94,6 +94,7 @@ async function sendWhatsAppMessage(to, text) {
       type: 'text',
       text: { body: text },
     }),
+    signal: AbortSignal.timeout(15000),
   });
   if (!res.ok) console.error('[wa] send failed:', await res.text());
 }
@@ -110,6 +111,7 @@ async function sendWhatsAppInteractive(to, header, body, buttons) {
         'Authorization': `Bearer ${token}`,
         'Content-Type': 'application/json',
       },
+      signal: AbortSignal.timeout(15000),
       body: JSON.stringify({
         messaging_product: 'whatsapp',
         to,
@@ -144,6 +146,7 @@ async function sendWhatsAppList(to, header, body, buttonText, sections) {
       'Authorization': `Bearer ${token}`,
       'Content-Type': 'application/json',
     },
+    signal: AbortSignal.timeout(15000),
     body: JSON.stringify({
       messaging_product: 'whatsapp',
       to,
@@ -177,6 +180,7 @@ async function downloadWhatsAppMedia(mediaId) {
     // Step 1: Get the media URL
     const metaRes = await fetch(`${WA_API}/${mediaId}`, {
       headers: { 'Authorization': `Bearer ${token}` },
+      signal: AbortSignal.timeout(15000),
     });
     if (!metaRes.ok) { console.error('[wa-media] metadata fetch failed:', metaRes.status); return null; }
     const meta = await metaRes.json();
@@ -186,6 +190,7 @@ async function downloadWhatsAppMedia(mediaId) {
     // Step 2: Download the media binary
     const dlRes = await fetch(mediaUrl, {
       headers: { 'Authorization': `Bearer ${token}` },
+      signal: AbortSignal.timeout(30000),
     });
     if (!dlRes.ok) { console.error('[wa-media] download failed:', dlRes.status); return null; }
     const buffer = Buffer.from(await dlRes.arrayBuffer());
@@ -1596,7 +1601,7 @@ async function executeWaTool(name, args, session) {
     // 5) LOOKUP PRICING
     // ═══════════════════════════════════════════
     case 'lookup_pricing': {
-      if (!firestore) return { estimate: 'R350 – R1,200 (typical range for most services)' };
+      if (!firestore) return { matched: false, estimate: 'Pricing service temporarily unavailable. Please try again.', note: 'Suggest the customer try again or submit an RFQ.' };
       try {
         const catSlug = (args.category || '').toLowerCase().replace(/\s+/g, '_');
         const subQuery = (args.subcategory || '').toLowerCase();
@@ -1688,7 +1693,7 @@ async function executeWaTool(name, args, session) {
         return { matched: false, estimate: 'No fixed pricing found for this category.', note: 'Suggest the customer submit an RFQ for a detailed quote.' };
       } catch (e) {
         console.error('[lookup_pricing] Error:', e.message);
-        return { estimate: 'R350 – R1,200 (typical range)' };
+        return { matched: false, estimate: 'Pricing lookup failed. Please try again.', note: 'Suggest the customer submit an RFQ for a detailed quote.' };
       }
     }
 

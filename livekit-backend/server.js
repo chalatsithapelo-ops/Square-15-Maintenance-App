@@ -404,11 +404,15 @@ function createInMemoryRateLimiter({ windowMs, max, keyFn, name }) {
   const safeMax = Math.max(1, Number(max) || 60);
 
   setInterval(() => {
-    const now = Date.now();
-    for (const [k, v] of hits.entries()) {
-      if (!v || (now - v.windowStart) > safeWindowMs) {
-        hits.delete(k);
+    try {
+      const now = Date.now();
+      for (const [k, v] of hits.entries()) {
+        if (!v || (now - v.windowStart) > safeWindowMs) {
+          hits.delete(k);
+        }
       }
+    } catch (e) {
+      console.error(`[rate-limiter:${name || 'anon'}] cleanup error:`, e.message);
     }
   }, Math.min(safeWindowMs, 60_000)).unref?.();
 
