@@ -5333,6 +5333,8 @@ class _LivekitVoiceAssistantState extends State<LivekitVoiceAssistant>
           'Request sent. Waiting for the artisan to confirm.',
         );
       }
+    }, onError: (e) {
+      debugPrint('[booking-status-watcher] stream error: $e');
     });
   }
 
