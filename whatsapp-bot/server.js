@@ -1329,11 +1329,19 @@ async function executeWaTool(name, args, session) {
         const _normalize = (s) => s.toLowerCase().replace(/[_\-]+/g, ' ').trim();
         const _stem = (w) => w.replace(/(ing|ed|tion|ment|ness|able|ible|er|est|ly|s)$/i, '');
         const _synonyms = {
-          toilet: ['drain', 'sewer', 'pipe'], drain: ['toilet', 'sewer', 'pipe'],
-          unblock: ['block', 'clog', 'clear', 'unclog'], block: ['unblock', 'clog', 'clear', 'unclog'],
-          fix: ['repair', 'replace', 'mend'], repair: ['fix', 'replace', 'mend'],
-          leak: ['burst', 'drip', 'seep'], burst: ['leak', 'broken', 'crack'],
-          install: ['fit', 'mount', 'setup'], geyser: ['boiler', 'water heater', 'hot water'],
+          plumbing:    ['toilet', 'cistern', 'basin', 'bath', 'tap', 'pipe', 'drain', 'geyser', 'shower', 'sink', 'plumb', 'blocked', 'leak', 'water', 'bathroom', 'kitchen'],
+          electrical:  ['light', 'switch', 'socket', 'wire', 'wiring', 'breaker', 'db board', 'plug', 'circuit', 'electric', 'power', 'volt'],
+          painting:    ['paint', 'wall', 'ceiling', 'enamel', 'pva', 'varnish', 'roof', 'garage', 'door'],
+          cleaning:    ['clean', 'wash', 'deep clean', 'carpet', 'window', 'scrub'],
+          tiling:      ['tile', 'floor', 'grout', 'ceramic'],
+          carpentry:   ['wood', 'cabinet', 'shelf', 'cupboard', 'door', 'frame', 'carpenter'],
+          solar:       ['panel', 'pv', 'inverter', 'battery', 'geyser', 'energy'],
+          maintenance: ['repair', 'fix', 'maintain', 'service', 'general'],
+          bathroom:    ['toilet', 'cistern', 'basin', 'bath', 'shower', 'tap', 'plumb', 'blocked', 'drain'],
+          kitchen:     ['tap', 'mixer', 'sink', 'faucet', 'cupboard'],
+          door:        ['lock', 'handle', 'hinge', 'frame', 'door'],
+          window:      ['glass', 'pane', 'frame', 'window'],
+          installation:['install', 'setup', 'mount', 'fit'],
         };
         const _fuzzyMatch = (qNorm, sNorm) => {
           if (sNorm.includes(qNorm) || qNorm.includes(sNorm)) return true;
@@ -1343,7 +1351,16 @@ async function executeWaTool(name, args, session) {
           const qS = qW.map(_stem), sS = sW.map(_stem);
           if (qS.some(qs => sS.some(ss => qs === ss || qs.includes(ss) || ss.includes(qs)))) return true;
           const expanded = new Set(qW.concat(qS));
-          for (const w of qW.concat(qS)) { if (_synonyms[w]) _synonyms[w].forEach(s => expanded.add(s)); }
+          for (const w of qW.concat(qS)) {
+            if (_synonyms[w]) _synonyms[w].forEach(s => expanded.add(s));
+            // Bidirectional: if word appears in a category's synonyms, add the category key + all siblings
+            for (const [key, syns] of Object.entries(_synonyms)) {
+              if (syns.includes(w)) {
+                expanded.add(key);
+                syns.forEach(s => expanded.add(s));
+              }
+            }
+          }
           const exp = [...expanded];
           if (exp.some(qe => sW.some(sw => sw.includes(qe) || qe.includes(sw)))
               || exp.some(qe => sS.some(ss => ss.includes(qe) || qe.includes(ss)))) return true;
@@ -1737,25 +1754,37 @@ async function executeWaTool(name, args, session) {
         // Fuzzy matching helpers
         const normalize = (s) => s.toLowerCase().replace(/[_\-]+/g, ' ').trim();
         const stem = (w) => w.replace(/(ing|ed|tion|ment|ness|able|ible|er|est|ly|s)$/i, '');
-        const synonyms = {
-          toilet: ['drain', 'sewer', 'pipe', 'plunger', 'sewage'],
-          drain: ['toilet', 'sewer', 'pipe', 'sewage'],
-          unblock: ['block', 'clog', 'clear', 'unclog', 'jam'],
-          block: ['unblock', 'clog', 'clear', 'unclog', 'jam'],
-          fix: ['repair', 'replace', 'mend'],
-          repair: ['fix', 'replace', 'mend'],
-          leak: ['burst', 'drip', 'seep'],
-          burst: ['leak', 'broken', 'crack'],
-          install: ['fit', 'mount', 'setup'],
-          geyser: ['boiler', 'water heater', 'hot water'],
+        // Comprehensive 14-category synonym map (matches livekit-backend)
+        const SYNONYMS = {
+          plumbing:    ['toilet', 'cistern', 'basin', 'bath', 'tap', 'pipe', 'drain', 'geyser', 'shower', 'sink', 'plumb', 'blocked', 'leak', 'water', 'bathroom', 'kitchen'],
+          electrical:  ['light', 'switch', 'socket', 'wire', 'wiring', 'breaker', 'db board', 'plug', 'circuit', 'electric', 'power', 'volt'],
+          painting:    ['paint', 'wall', 'ceiling', 'enamel', 'pva', 'varnish', 'roof', 'garage', 'door'],
+          cleaning:    ['clean', 'wash', 'deep clean', 'carpet', 'window', 'scrub'],
+          tiling:      ['tile', 'floor', 'grout', 'ceramic'],
+          carpentry:   ['wood', 'cabinet', 'shelf', 'cupboard', 'door', 'frame', 'carpenter'],
+          solar:       ['panel', 'pv', 'inverter', 'battery', 'geyser', 'energy'],
+          maintenance: ['repair', 'fix', 'maintain', 'service', 'general'],
+          bathroom:    ['toilet', 'cistern', 'basin', 'bath', 'shower', 'tap', 'plumb', 'blocked', 'drain'],
+          kitchen:     ['tap', 'mixer', 'sink', 'faucet', 'cupboard'],
+          door:        ['lock', 'handle', 'hinge', 'frame', 'door'],
+          window:      ['glass', 'pane', 'frame', 'window'],
+          installation:['install', 'setup', 'mount', 'fit'],
         };
         const expandWithSynonyms = (words) => {
           const expanded = new Set(words);
           for (const w of words) {
             const stemmed = stem(w);
             expanded.add(stemmed);
-            if (synonyms[stemmed]) synonyms[stemmed].forEach(s => expanded.add(s));
-            if (synonyms[w]) synonyms[w].forEach(s => expanded.add(s));
+            // Bidirectional: if word matches a category key, add all its synonyms
+            if (SYNONYMS[w]) SYNONYMS[w].forEach(s => expanded.add(s));
+            if (SYNONYMS[stemmed]) SYNONYMS[stemmed].forEach(s => expanded.add(s));
+            // Reverse: if word appears in a category's synonyms, add the category key + all siblings
+            for (const [key, syns] of Object.entries(SYNONYMS)) {
+              if (syns.includes(w) || syns.includes(stemmed)) {
+                expanded.add(key);
+                syns.forEach(s => expanded.add(s));
+              }
+            }
           }
           return [...expanded];
         };

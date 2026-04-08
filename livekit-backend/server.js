@@ -8,9 +8,6 @@ const fs = require('fs');
 const OpenAI = require('openai');
 require('dotenv').config();
 
-// Deploy version (used to verify Render deployment)
-const DEPLOY_VERSION = '2026-04-04a';
-
 // ─── Prompt sanitization (prevent injection via user-supplied text) ───
 function sanitizeForPrompt(text, maxLen = 500) {
   if (!text || typeof text !== 'string') return '';
@@ -311,11 +308,8 @@ async function lookupMaterialsCatalog(firestore, name) {
     // Try by name_lower field
     let snap = await firestore.collection('materialsCatalog').where('name_lower', '==', normalized).limit(1).get();
     if (!snap.empty) { const d = snap.docs[0].data(); const p = parseFloat(d.unit_price || d.price_incl_vat || d.price || 0); if (p > 0) return { price: p, source: 'catalog_name_lower' }; }
-    // Try by aliases (both space and underscore variants)
+    // Try by aliases
     snap = await firestore.collection('materialsCatalog').where('aliases', 'array-contains', name.toLowerCase()).limit(1).get();
-    if (snap.empty) {
-      snap = await firestore.collection('materialsCatalog').where('aliases', 'array-contains', normalized).limit(1).get();
-    }
     if (!snap.empty) { const d = snap.docs[0].data(); const p = parseFloat(d.unit_price || d.price_incl_vat || d.price || 0); if (p > 0) return { price: p, source: 'catalog_alias' }; }
   } catch (e) { console.error('[catalog] lookup error:', e.message); }
   return null;
@@ -407,15 +401,11 @@ function createInMemoryRateLimiter({ windowMs, max, keyFn, name }) {
   const safeMax = Math.max(1, Number(max) || 60);
 
   setInterval(() => {
-    try {
-      const now = Date.now();
-      for (const [k, v] of hits.entries()) {
-        if (!v || (now - v.windowStart) > safeWindowMs) {
-          hits.delete(k);
-        }
+    const now = Date.now();
+    for (const [k, v] of hits.entries()) {
+      if (!v || (now - v.windowStart) > safeWindowMs) {
+        hits.delete(k);
       }
-    } catch (e) {
-      console.error(`[rate-limiter:${name || 'anon'}] cleanup error:`, e.message);
     }
   }, Math.min(safeWindowMs, 60_000)).unref?.();
 
@@ -809,8 +799,6 @@ const ACTION_TIERS = Object.freeze({
   admin_close_stale_cases: 'B',
   admin_broadcast_notification: 'B',
   admin_flag_user: 'B',
-  // Payment link generation (Tier B — creates Ozow link + notification)
-  request_payment_link: 'B',
   // Phase 5.1: Finance read-only (Tier A)
   get_finance_summary: 'A',
   get_daily_revenue: 'A',
@@ -1432,7 +1420,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       const doc = await firestore.collection('tasks').doc(t).get();
       if (!doc.exists) return null;
       const data = doc.data() || {};
-      const amount = toNumber(data.client_rate ?? data.clientRate ?? data.cost ?? data.price ?? data.amount ?? data.unit_price);
+      const amount = toNumber(data.cost ?? data.price ?? data.amount ?? data.unit_price);
       return amount && amount > 0 ? amount : null;
     } catch (e) { console.warn('\u26a0\ufe0f resolveTaskCost:', e.message);
       return null;
@@ -1736,20 +1724,16 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
 
   async function createTasksManagementRequestForFutureBooking({ bookingIdLocal, bookingDataLocal, artisanIdLocal }) {
     const userIdLocal = String(bookingDataLocal.user_id || '').trim();
-    if (!userIdLocal) return null;
-    const hasArtisan = !!String(artisanIdLocal || '').trim();
+    if (!userIdLocal || !String(artisanIdLocal || '').trim()) return null;
 
     let effectiveTaskId = String(bookingDataLocal.task_id || '').trim();
     let jobIds = stringList(bookingDataLocal.job_ids ?? bookingDataLocal.jobIds);
     if (jobIds.length === 0 && effectiveTaskId) jobIds = [effectiveTaskId];
     if (!effectiveTaskId && jobIds.length > 0) effectiveTaskId = String(jobIds[0] || '').trim();
 
-    let providerListenerId = '';
-    if (hasArtisan) {
-      const providerDoc = await getServiceProviderDocByAnyId(artisanIdLocal);
-      providerListenerId = providerDoc && providerDoc.exists ? String(providerDoc.id).trim() : String(artisanIdLocal).trim();
-      if (!providerListenerId) return null;
-    }
+    const providerDoc = await getServiceProviderDocByAnyId(artisanIdLocal);
+    const providerListenerId = providerDoc && providerDoc.exists ? String(providerDoc.id).trim() : String(artisanIdLocal).trim();
+    if (!providerListenerId) return null;
 
     const workImages = stringList(bookingDataLocal.work_images ?? bookingDataLocal.workImages);
     const firstImage = workImages.length > 0 ? workImages[0] : '';
@@ -1836,19 +1820,6 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     const bookingRefLocal = firestore.collection('futureBookings').doc(bookingIdLocal);
 
     const batch = firestore.batch();
-    // Resolve task names for artisan display
-    const resolvedJobNames = [];
-    for (const jid of jobIds) {
-      const sid = String(jid || '').trim();
-      if (!sid) continue;
-      try {
-        const tDoc = await firestore.collection('tasks').doc(sid).get();
-        const tName = String((tDoc.exists ? (tDoc.data() || {}).name : '') || '').trim();
-        if (tName) resolvedJobNames.push(tName);
-      } catch (_) {}
-    }
-    const effectiveDescription = description || (resolvedJobNames.length > 0 ? resolvedJobNames.join(', ') : '');
-
     batch.set(tmRef, {
       id: tmId,
       order_no: resolvedOrderNo,
@@ -1873,7 +1844,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       creation_date: now,
       updated_at: now,
       updated_by: userIdLocal,
-      description: effectiveDescription,
+      description,
       service_on_location: isCurrent ? 'yes' : 'no',
       provided_address: effectiveAddress,
       other_lat: effectiveLat,
@@ -1892,21 +1863,14 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       if (!id) continue;
       const jobDocId = crypto.randomUUID();
       const jobCost = resolvedTaskCosts[id] ?? 0.0;
-      // Resolve task name for artisan display
-      let jobName = '';
-      try {
-        const tDoc = await firestore.collection('tasks').doc(id).get();
-        jobName = String((tDoc.exists ? (tDoc.data() || {}).name : '') || '').trim();
-      } catch (_) {}
       batch.set(tmRef.collection('jobs').doc(jobDocId), {
         id: jobDocId,
         task_id: id,
-        name: jobName,
         height: '',
         width: '',
         area: '',
         cost: jobCost > 0 ? Number(jobCost).toFixed(2) : '0',
-        description: effectiveDescription,
+        description,
         image: firstImage || '',
       });
     }
@@ -2277,25 +2241,12 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     await bookingRefLocal.set(bookingDoc);
 
     let tasksManagementId = null;
-    if (!isRFQFlag) {
-      if (assignedSuccessfully) {
-        tasksManagementId = await createTasksManagementRequestForFutureBooking({
-          bookingIdLocal: bookingIdLocal,
-          bookingDataLocal: bookingDoc,
-          artisanIdLocal: assignedArtisanId.trim(),
-        });
-      } else {
-        // Create tasksManagement even without artisan so payment/cancel flows work
-        try {
-          tasksManagementId = await createTasksManagementRequestForFutureBooking({
-            bookingIdLocal: bookingIdLocal,
-            bookingDataLocal: bookingDoc,
-            artisanIdLocal: '',
-          });
-        } catch (e) {
-          console.warn('[booking] tasksManagement creation without artisan failed:', e.message);
-        }
-      }
+    if (!isRFQFlag && assignedSuccessfully) {
+      tasksManagementId = await createTasksManagementRequestForFutureBooking({
+        bookingIdLocal: bookingIdLocal,
+        bookingDataLocal: bookingDoc,
+        artisanIdLocal: assignedArtisanId.trim(),
+      });
     }
 
     if (isRFQFlag) {
@@ -2972,7 +2923,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         const name = String(d.name || d.title || d.task_name || d.taskName || '').trim();
         if (!name) continue;
 
-        const cost = toNumber(d.client_rate ?? d.clientRate ?? d.cost ?? d.price ?? d.amount ?? d.unit_price);
+        const cost = toNumber(d.cost ?? d.price ?? d.amount ?? d.unit_price);
         const catId = String(d.categoryId || d.category_id || d.subCategoryId || d.sub_category_id || d.subcategoryId || d.subcategory_id || '').trim();
         const catName = categoryMap[catId] || '';
         const taskId = String(d.id || doc.id).trim();
@@ -3014,27 +2965,6 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         return (a.name || '').localeCompare(b.name || '');
       });
 
-      // ── Also load pricingGuidance for the matched category ──
-      let pricingGuidance = null;
-      try {
-        const guidanceRaw = categoryName || (finalServices[0] && finalServices[0].category_name ? finalServices[0].category_name.toLowerCase() : '');
-        const guidanceSlug = guidanceRaw.toLowerCase().replace(/[\s-]+/g, '_');
-        if (guidanceSlug) {
-          const gDoc = await firestore.collection('pricingGuidance').doc(guidanceSlug).get();
-          if (gDoc.exists) {
-            const gd = gDoc.data() || {};
-            pricingGuidance = {
-              category: guidanceSlug,
-              laborCostPerHour: gd.laborCostPerHour ?? gd.labor_cost_per_hour ?? null,
-              outsourcedLaborRate: gd.outsourcedLaborRate ?? gd.outsourced_labor_rate ?? null,
-              materialMultiplier: gd.materialMultiplier ?? gd.material_multiplier ?? null,
-              service_prices: gd.service_prices || gd.servicePrices || null,
-              updated_at: gd.updatedAt || gd.updated_at || null,
-            };
-          }
-        }
-      } catch (ge) { console.warn('⚠️ pricingGuidance lookup:', ge.message); }
-
       return {
         ok: true,
         success: true,
@@ -3044,7 +2974,6 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
           filtered: services.length > 0,
           search_terms: searchTerms || 'all',
           expanded_terms: expandedTerms !== searchTerms ? expandedTerms.trim() : undefined,
-          pricingGuidance: pricingGuidance,
           message: services.length > 0
             ? `Found ${services.length} service(s) matching "${searchTerms}".`
             : allServices.length > 0
@@ -3054,70 +2983,6 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       };
     } catch (e) {
       return { ok: false, success: false, error: 'pricing_lookup_failed', message: String(e) };
-    }
-  }
-
-  // ── Builders Product Lookup ──
-  if (action === 'lookup_builders_product') {
-    try {
-      const query = String(payload.query || payload.search || payload.product || '').trim();
-      if (!query) return { ok: false, error: 'query parameter required' };
-
-      const bffCfg = await getBuildersBffConfig();
-      if (!bffCfg || !bffCfg.searchHash) {
-        return { ok: true, data: { products: [], message: 'Builders search temporarily unavailable.' } };
-      }
-
-      const searchBody = JSON.stringify({
-        persistedQuery: { version: 1, sha256Hash: bffCfg.searchHash },
-        variables: {
-          ...(bffCfg.defaultSearchVars || {}),
-          query: query,
-          pageSize: 8,
-          storeId: bffCfg.storeId || '42',
-          paginationInput: { cursor: '', pageSize: 8 },
-        },
-      });
-
-      const searchResp = await fetchWithTimeout(bffCfg.gqlUrl, {
-        method: 'POST',
-        headers: { ...buildersBffHeaders({ operationName: 'Search', operationHash: bffCfg.searchHash }), 'Content-Type': 'application/json' },
-        body: searchBody,
-        timeoutMs: 15000,
-      });
-
-      if (!searchResp || !searchResp.ok) {
-        return { ok: true, data: { products: [], message: 'Builders search returned no results.' } };
-      }
-
-      const searchJson = await searchResp.json();
-      const items = searchJson?.data?.search?.searchResult?.itemStacks?.[0]?.itemsV2 || [];
-
-      const products = items.slice(0, 8).map(it => {
-        const priceInfo = it.priceInfo?.currentPrice || it.priceInfo?.linePrice;
-        const price = priceInfo?.priceString || priceInfo?.price || null;
-        const name = it.name || it.title || 'Unknown Product';
-        const brand = it.brand || '';
-        const url = it.canonicalUrl
-          ? (it.canonicalUrl.startsWith('http') ? it.canonicalUrl : `https://www.builders.co.za${it.canonicalUrl}`)
-          : null;
-        return { name, brand, price: price ? `R${String(price).replace(/[^0-9.]/g, '')}` : 'Price on request', url };
-      }).filter(p => p.name !== 'Unknown Product');
-
-      return {
-        ok: true,
-        data: {
-          products,
-          query,
-          count: products.length,
-          message: products.length > 0
-            ? `Found ${products.length} product(s) on Builders for "${query}".`
-            : `No products found on Builders for "${query}".`,
-        },
-      };
-    } catch (e) {
-      console.error('[lookup_builders_product]', e.message);
-      return { ok: false, error: 'builders_lookup_failed', message: String(e.message || e) };
     }
   }
 
@@ -3267,162 +3132,6 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       };
     } catch (err) {
       return { ok: false, status: 500, error: `wallet_error: ${err.message}` };
-    }
-  }
-
-  // ── Request Payment Link — generates Ozow URL + stores in payment_links + sends notification ──
-  if (action === 'request_payment_link') {
-    try {
-      const bid = bookingId || String(payload.tasks_management_id || '').trim();
-      if (!bid) return { ok: false, status: 400, error: 'missing_booking_id' };
-
-      const bData = await loadBooking();
-      if (!bData) return { ok: false, status: 404, error: 'booking_not_found' };
-
-      // Enforce artisan acceptance before payment
-      const artisanAccepted = bData.accept === '1' || bData.accept === 1 || bData.artisan_confirmed === 'yes';
-      if (!artisanAccepted) {
-        return { ok: false, status: 400, error: 'An artisan hasn\'t accepted this job yet. Payment is only available after an artisan accepts.' };
-      }
-
-      const cost = parseFloat(bData.cost || bData.total_cost || bData.quoted_price || '0');
-      if (cost <= 0) return { ok: false, status: 400, error: 'no_confirmed_price' };
-
-      if ((bData.payment_status || bData.paymentStatus) === 'paid') {
-        return { ok: true, status: 200, data: { message: 'This booking is already paid.', bookingId: bid } };
-      }
-
-      // Support deposit vs full payment
-      const paymentType = payload.payment_type || 'full';
-      let payAmount;
-      if (bData.deposit_paid === true && bData.balance_paid !== true) {
-        payAmount = parseFloat(bData.balance_amount || cost);
-      } else if (paymentType === 'deposit') {
-        payAmount = Math.round(cost * 0.35 * 100) / 100;
-      } else {
-        payAmount = cost;
-      }
-
-      const siteCode = env('OZOW_SITE_CODE');
-      const apiKey = env('OZOW_API_KEY');
-      const privateKey = env('OZOW_PRIVATE_KEY');
-      const isTest = (env('OZOW_IS_TEST') || 'false') === 'true';
-      const ozowUrl = isTest
-        ? 'https://stagingapi.ozow.com/PostPaymentRequest'
-        : 'https://api.ozow.com/PostPaymentRequest';
-      const backendBase = env('BACKEND_BASE_URL') || 'https://square15-livekit-backend.onrender.com';
-
-      if (!siteCode || !privateKey || !apiKey) {
-        // Fallback: store request + notify admin
-        const payRef = `PAY-${bid}-${Date.now().toString(36)}`;
-        await firestore.collection('payment_links').doc(payRef).set({
-          booking_id: bid,
-          amount: payAmount,
-          payment_type: paymentType,
-          user_id: actorUid || '',
-          status: 'pending',
-          source: payload.source || 'voice',
-          created_at: admin.firestore.FieldValue.serverTimestamp(),
-        });
-        await firestore.collection('notifications').add({
-          title: 'Payment Link Request',
-          body: `Payment link requested for booking ${bid} (R${payAmount.toFixed(2)}, ${paymentType})`,
-          type: 'payment_request',
-          booking_id: bid,
-          amount: payAmount,
-          for_role: 'admin',
-          status: 'unread',
-          created_at: admin.firestore.FieldValue.serverTimestamp(),
-        });
-        return { ok: true, status: 200, data: {
-          message: `Payment of R${payAmount.toFixed(2)} is being processed. You'll receive a payment link shortly.`,
-          reference: payRef, bookingId: bid, amount: payAmount,
-        }};
-      }
-
-      const itemSuffix = paymentType === 'deposit' ? '(35% Deposit)' : (bData.deposit_paid === true ? '(Balance)' : '(Full)');
-      const itemName = `Square 15 Booking ${bData.order_no || bData.rfq_no || bid} ${itemSuffix}`;
-      const transactionRef = `PAY-${bid}-${Date.now().toString(36)}`;
-      const bankRef = `SQ15 ${(bData.order_no || bid).slice(0, 20)}`;
-
-      const successUrl = `${backendBase}/api/payment/ozow-result?status=success&ref=${transactionRef}`;
-      const cancelUrl = `${backendBase}/api/payment/ozow-result?status=cancel&ref=${transactionRef}`;
-      const errorUrl = `${backendBase}/api/payment/ozow-result?status=error&ref=${transactionRef}`;
-      const notifyUrl = `${backendBase}/api/payment/ozow-notify`;
-
-      const hashValues = [
-        siteCode, 'ZA', 'ZAR', payAmount.toFixed(2), transactionRef,
-        bankRef, cancelUrl, errorUrl, successUrl, notifyUrl, String(isTest),
-      ];
-      const hashCheck = ozowHashCheck(hashValues, privateKey);
-
-      const ozowPayload = {
-        SiteCode: siteCode,
-        CountryCode: 'ZA',
-        CurrencyCode: 'ZAR',
-        Amount: payAmount.toFixed(2),
-        TransactionReference: transactionRef,
-        BankReference: bankRef,
-        CancelUrl: cancelUrl,
-        ErrorUrl: errorUrl,
-        SuccessUrl: successUrl,
-        NotifyUrl: notifyUrl,
-        IsTest: isTest,
-        HashCheck: hashCheck,
-      };
-
-      let paymentUrl = '';
-      try {
-        const ozowResp = await fetch(ozowUrl, {
-          method: 'POST',
-          headers: {
-            'Accept': 'application/json',
-            'ApiKey': apiKey,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify(ozowPayload),
-        });
-        const ozowBody = await ozowResp.json();
-        paymentUrl = ozowBody.url || ozowBody.paymentUrl || ozowBody.redirectUrl || '';
-      } catch (ozErr) {
-        console.warn('Ozow API call failed for payment link:', ozErr.message);
-      }
-
-      await firestore.collection('payment_links').doc(transactionRef).set({
-        booking_id: bid,
-        task_id: bid,
-        amount: payAmount,
-        payment_type: paymentType,
-        user_id: actorUid || '',
-        payment_url: paymentUrl,
-        provider: 'ozow',
-        status: 'pending',
-        source: payload.source || 'voice',
-        created_at: admin.firestore.FieldValue.serverTimestamp(),
-      });
-
-      // Send notification to the customer so they receive the link
-      if (actorUid) {
-        await firestore.collection('notifications').add({
-          title: 'Payment Link Ready',
-          body: `Tap to pay R${payAmount.toFixed(2)} ${itemSuffix} for booking ${bData.order_no || bData.rfq_no || bid}`,
-          type: 'payment_link',
-          booking_id: bid,
-          amount: payAmount,
-          payment_type: paymentType,
-          payment_url: paymentUrl,
-          userId: actorUid,
-          status: 'unread',
-          created_at: admin.firestore.FieldValue.serverTimestamp(),
-        });
-      }
-
-      return { ok: true, status: 200, data: {
-        message: `Payment link generated for R${payAmount.toFixed(2)} ${itemSuffix}. A notification with the link has been sent to your phone.`,
-        paymentUrl, reference: transactionRef, bookingId: bid, amount: payAmount, payment_type: paymentType,
-      }};
-    } catch (err) {
-      return { ok: false, status: 500, error: `payment_link_error: ${err.message}` };
     }
   }
 
@@ -3830,19 +3539,11 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     if (!data.ai_quote && !data.quoted_price) return { ok: false, status: 400, error: 'no_quote_available' };
 
     const price = data.quoted_price || (data.ai_quote ? String(data.ai_quote.grand_total) : '0');
-    const priceNum = parseFloat(price);
-    const depositAmount = Math.round(priceNum * 0.35 * 100) / 100;
-    const balanceAmount = Math.round((priceNum - depositAmount) * 100) / 100;
+    const priceNum = parseFloat(price) || 0;
 
     await bookingRef.update({
       rfq_status: 'accepted_converted',
       status: 'pending_artisan_acceptance',
-      artisan_confirmed: 'pending',
-      deposit_amount: depositAmount.toFixed(2),
-      balance_amount: balanceAmount.toFixed(2),
-      payment_type: '',
-      deposit_paid: false,
-      balance_paid: false,
       accepted_at: now,
       accepted_via: payload.source || 'voice',
       updated_at: now,
@@ -3859,8 +3560,6 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         status: 'pending_artisan_acceptance',
         artisan_confirmed: 'pending',
         cost: priceNum.toFixed(2),
-        deposit_amount: depositAmount.toFixed(2),
-        balance_amount: balanceAmount.toFixed(2),
         source: 'voice_rfq',
         is_rfq: 'yes',
         rfq_status: 'accepted_converted',
@@ -4880,7 +4579,6 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     message: 'Livekit Token Server is running',
-    version: DEPLOY_VERSION,
     timestamp: new Date().toISOString(),
     sdkVersion: getSdkVersion(),
     firebase: {
@@ -5028,25 +4726,6 @@ app.get('/api/test-pricing', async (req, res) => {
     });
   } catch (e) {
     res.status(500).json({ error: String(e) });
-  }
-});
-
-/**
- * Look up real-time Builders.co.za material prices
- * GET /api/pricing/builders-lookup?q=geyser+150L
- * Returns: { ok: true, result: { title, url, priceZar, source } }
- */
-app.get('/api/pricing/builders-lookup', assistantLimiter, async (req, res) => {
-  try {
-    const q = String(req.query.q || req.query.query || '').trim();
-    if (!q) return res.status(400).json({ ok: false, error: 'q parameter required' });
-    const result = await lookupBuildersPriceOne(q);
-    if (!result) return res.json({ ok: true, result: null, message: 'No matching product found on Builders.co.za' });
-    if (result.blocked) return res.json({ ok: true, result: null, message: 'Builders.co.za temporarily blocked this request' });
-    return res.json({ ok: true, result });
-  } catch (e) {
-    console.error('[builders-lookup] Error:', e.message);
-    return res.status(500).json({ ok: false, error: 'Builders lookup failed' });
   }
 });
 
@@ -6293,527 +5972,171 @@ app.post('/api/notifications/send', authMiddleware, assistantLimiter, async (req
   }
 });
 
-// ── AI Photo Diagnosis — analyzes maintenance issue photos via GPT-4o Vision ──
-app.post('/api/photo/diagnose', assistantLimiter, async (req, res) => {
+// ── Server-side PayFast Payment Initiation ──
+// Replaces client-side hardcoded merchant credentials
+app.post('/api/payment/initiate', authMiddleware, assistantLimiter, async (req, res) => {
   try {
-    const oai = getOpenAI();
-    if (!oai) return res.status(503).json({ error: 'AI service not configured' });
+    const merchantId = env('PAYFAST_MERCHANT_ID');
+    const merchantKey = env('PAYFAST_MERCHANT_KEY');
+    const payfastUrl = env('PAYFAST_URL') || 'https://www.payfast.co.za/eng/process';
 
-    const { image_base64, image_url, user_description, location_context } = req.body;
-    if (!image_base64 && !image_url) {
-      return res.status(400).json({ error: 'Provide image_base64 or image_url' });
+    if (!merchantId || !merchantKey) {
+      return res.status(503).json({ error: 'Payment credentials not configured on server' });
     }
 
-    const imageContent = image_base64
-      ? { type: 'image_url', image_url: { url: image_base64.startsWith('data:') ? image_base64 : `data:image/jpeg;base64,${image_base64}`, detail: 'high' } }
-      : { type: 'image_url', image_url: { url: image_url, detail: 'high' } };
+    const { amount, item_name, return_url, cancel_url, notify_url, custom_str1 } = req.body;
 
-    const userText = user_description
-      ? `The tenant describes the issue as: "${user_description}"${location_context ? `. Location: ${location_context}` : ''}`
-      : `Please analyze this maintenance issue photo.${location_context ? ` Location: ${location_context}` : ''}`;
-
-    const completion = await oai.chat.completions.create({
-      model: 'gpt-4o',
-      temperature: 0.2,
-      max_tokens: 800,
-      response_format: { type: 'json_object' },
-      messages: [
-        {
-          role: 'system',
-          content: `You are an expert maintenance diagnostics AI for a South African property maintenance company called Square 15 Maintenance.
-
-Analyze the photo of a maintenance issue and return a JSON object with these fields:
-- "issue_type": specific issue (e.g. "burst geyser element", "leaking tap", "cracked wall", "faulty outlet")
-- "service_category": one of: Plumbing, Electrical, Painting, Carpentry, Roofing, Tiling, Locksmith, Appliance Repair, Landscaping, General Maintenance
-- "severity": one of: low, medium, high, emergency
-- "urgency_flag": boolean — true if immediate action required (water damage, electrical hazard, security risk)
-- "description": 2-3 sentence description of what you see and the likely cause
-- "recommended_action": what should be done to fix it
-- "estimated_complexity": 1-5 (1=simple fix, 5=major project)
-- "materials_likely_needed": array of likely materials/parts needed
-- "safety_warnings": array of any safety concerns (empty array if none)
-- "confidence": 0.0-1.0 how confident you are in the diagnosis
-
-If the image is not a maintenance issue, set issue_type to "not_maintenance" and describe what you see.
-Return ONLY valid JSON.`,
-        },
-        {
-          role: 'user',
-          content: [imageContent, { type: 'text', text: userText }],
-        },
-      ],
-    });
-
-    const content = completion.choices[0]?.message?.content || '{}';
-    const diagnosis = JSON.parse(content);
-    res.json({ ok: true, diagnosis });
-  } catch (error) {
-    console.error('❌ Photo diagnosis error:', error.message);
-    res.status(500).json({ error: 'Photo diagnosis failed', details: error.message });
-  }
-});
-
-// ── Ozow Payment Helpers ──
-function ozowHashCheck(values, privateKey) {
-  // Concatenate all values, append private key, lowercase, SHA512
-  const input = values.join('') + privateKey;
-  return crypto.createHash('sha512').update(input.toLowerCase()).digest('hex');
-}
-
-// ── Server-side Ozow Payment Initiation ──
-// Generates Ozow payment URL for apps and WhatsApp bot
-app.post('/api/payment/initiate', assistantLimiter, async (req, res) => {
-  try {
-    const siteCode = env('OZOW_SITE_CODE');
-    const apiKey = env('OZOW_API_KEY');
-    const privateKey = env('OZOW_PRIVATE_KEY');
-    const isTest = (env('OZOW_IS_TEST') || 'false') === 'true';
-    const ozowUrl = isTest
-      ? 'https://stagingapi.ozow.com/PostPaymentRequest'
-      : 'https://api.ozow.com/PostPaymentRequest';
-    const backendBase = env('BACKEND_BASE_URL') || 'https://square15-livekit-backend.onrender.com';
-
-    if (!siteCode || !privateKey || !apiKey) {
-      return res.status(503).json({ error: 'Ozow payment credentials not configured on server' });
-    }
-
-    const { amount, item_name, custom_str1 } = req.body;
     if (!amount || !item_name) {
       return res.status(400).json({ error: 'Missing required fields: amount, item_name' });
     }
 
-    const transactionRef = `SQ15-${(custom_str1 || '').slice(0, 10)}-${Date.now().toString(36)}`;
-    const bankRef = `Square15 ${(item_name || '').slice(0, 20)}`;
-
-    const successUrl = `${backendBase}/api/payment/ozow-result?status=success&ref=${transactionRef}`;
-    const cancelUrl = `${backendBase}/api/payment/ozow-result?status=cancel&ref=${transactionRef}`;
-    const errorUrl = `${backendBase}/api/payment/ozow-result?status=error&ref=${transactionRef}`;
-    const notifyUrl = `${backendBase}/api/payment/ozow-notify`;
-
-    // HashCheck = SHA512(SiteCode + CountryCode + CurrencyCode + Amount + TransactionReference
-    //   + BankReference + CancelUrl + ErrorUrl + SuccessUrl + NotifyUrl + IsTest + PrivateKey) lowercase
-    const hashValues = [
-      siteCode, 'ZA', 'ZAR', parseFloat(amount).toFixed(2), transactionRef,
-      bankRef, cancelUrl, errorUrl, successUrl, notifyUrl, String(isTest),
-    ];
-    const hashCheck = ozowHashCheck(hashValues, privateKey);
-
     const paymentData = {
-      SiteCode: siteCode,
-      CountryCode: 'ZA',
-      CurrencyCode: 'ZAR',
-      Amount: parseFloat(amount).toFixed(2),
-      TransactionReference: transactionRef,
-      BankReference: bankRef,
-      CancelUrl: cancelUrl,
-      ErrorUrl: errorUrl,
-      SuccessUrl: successUrl,
-      NotifyUrl: notifyUrl,
-      IsTest: isTest,
-      HashCheck: hashCheck,
+      merchant_id: merchantId,
+      merchant_key: merchantKey,
+      amount: String(amount),
+      item_name: String(item_name),
+      ...(return_url ? { return_url } : {}),
+      ...(cancel_url ? { cancel_url } : {}),
+      ...(notify_url ? { notify_url } : {}),
+      ...(custom_str1 ? { custom_str1 } : {}),
     };
 
-    // POST to Ozow API to get payment URL
-    const ozowResp = await fetch(ozowUrl, {
-      method: 'POST',
-      headers: {
-        'Accept': 'application/json',
-        'ApiKey': apiKey,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(paymentData),
+    res.json({
+      ok: true,
+      payfast_url: payfastUrl,
+      payment_data: paymentData,
     });
-
-    const ozowBody = await ozowResp.json();
-    console.log('Ozow PostPaymentRequest response:', JSON.stringify(ozowBody));
-
-    if (ozowBody.url || ozowBody.paymentUrl || ozowBody.redirectUrl) {
-      const paymentUrl = ozowBody.url || ozowBody.paymentUrl || ozowBody.redirectUrl;
-
-      // Store payment reference for tracking
-      try {
-        await admin.firestore().collection('payment_links').doc(transactionRef).set({
-          transaction_ref: transactionRef,
-          amount: parseFloat(amount).toFixed(2),
-          item_name: String(item_name),
-          task_id: custom_str1 || '',
-          payment_url: paymentUrl,
-          provider: 'ozow',
-          status: 'pending',
-          created_at: admin.firestore.FieldValue.serverTimestamp(),
-        });
-      } catch (dbErr) {
-        console.warn('Could not store payment link:', dbErr.message);
-      }
-
-      res.json({
-        ok: true,
-        payment_url: paymentUrl,
-        transaction_ref: transactionRef,
-      });
-    } else {
-      console.error('Ozow did not return payment URL:', ozowBody);
-      res.status(502).json({
-        error: 'Ozow did not return a payment URL',
-        details: ozowBody.errorMessage || ozowBody.message || JSON.stringify(ozowBody),
-      });
-    }
   } catch (error) {
     console.error('❌ Payment initiation error:', error);
     res.status(500).json({ error: 'Payment initiation failed' });
   }
 });
 
-// ── Ozow Payment Result Page (SuccessUrl / CancelUrl / ErrorUrl) ──
-// Simple HTML page that apps' WebView can detect via URL
-app.get('/api/payment/ozow-result', (req, res) => {
-  const status = String(req.query.status || 'unknown');
-  const ref = String(req.query.ref || '');
-  const titles = { success: 'Payment Successful', cancel: 'Payment Cancelled', error: 'Payment Error' };
-  const colors = { success: '#4CAF50', cancel: '#FF9800', error: '#f44336' };
-  const icons = { success: '✅', cancel: '⚠️', error: '❌' };
-  res.send(`<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-    <title>${titles[status] || 'Payment'}</title></head>
-    <body style="font-family:sans-serif;text-align:center;padding:40px;background:#f5f5f5">
-    <div style="background:white;border-radius:12px;padding:30px;max-width:400px;margin:auto;box-shadow:0 2px 8px rgba(0,0,0,0.1)">
-    <div style="font-size:48px">${icons[status] || '❓'}</div>
-    <h2 style="color:${colors[status] || '#333'}">${titles[status] || 'Unknown Status'}</h2>
-    <p style="color:#666">Reference: ${ref}</p>
-    <p style="color:#999;font-size:12px">You can close this page and return to the app.</p>
-    </div></body></html>`);
-});
-
-// ── Ozow Payment Notification Webhook ──
-// Ozow POSTs here after payment completion
-app.post('/api/payment/ozow-notify', async (req, res) => {
+// ── PayFast ITN (Instant Transaction Notification) Webhook ──
+// Server-side payment verification — PayFast posts here after payment
+app.post('/api/payment/itn', async (req, res) => {
   try {
     const data = req.body;
-    console.log('📥 Ozow notification received:', JSON.stringify(data));
+    console.log('📥 PayFast ITN received:', JSON.stringify(data));
 
-    const privateKey = env('OZOW_PRIVATE_KEY');
-    if (!privateKey) {
-      console.error('❌ Ozow notify: OZOW_PRIVATE_KEY not configured');
+    // 1. Verify signature
+    const merchantKey = env('PAYFAST_MERCHANT_KEY');
+    if (!merchantKey) {
+      console.error('❌ ITN: PAYFAST_MERCHANT_KEY not configured');
       return res.status(503).send('Server misconfigured');
     }
 
-    // Verify hash check
-    const receivedHash = String(data.HashCheck || data.hashCheck || '').toLowerCase();
-    if (!receivedHash) {
-      console.error('❌ Ozow notify: No HashCheck in payload');
-      return res.status(400).send('Missing HashCheck');
+    const receivedSignature = data.signature;
+    if (!receivedSignature) {
+      console.error('❌ ITN: No signature in payload');
+      return res.status(400).send('Missing signature');
     }
 
-    // Ozow notification hash: SiteCode + TransactionId + TransactionReference + Amount
-    //   + Status + Optional1-5 + CurrencyCode + IsTest + StatusMessage + PrivateKey (lowercase SHA512)
-    const hashValues = [
-      String(data.SiteCode || data.siteCode || ''),
-      String(data.TransactionId || data.transactionId || ''),
-      String(data.TransactionReference || data.transactionReference || ''),
-      String(data.Amount || data.amount || ''),
-      String(data.Status || data.status || ''),
-      String(data.Optional1 || ''),
-      String(data.Optional2 || ''),
-      String(data.Optional3 || ''),
-      String(data.Optional4 || ''),
-      String(data.Optional5 || ''),
-      String(data.CurrencyCode || data.currencyCode || ''),
-      String(data.IsTest || data.isTest || ''),
-      String(data.StatusMessage || data.statusMessage || ''),
-    ];
-    const expectedHash = ozowHashCheck(hashValues, privateKey);
+    // Build param string for signature verification (exclude signature itself)
+    const paramString = Object.keys(data)
+      .filter(key => key !== 'signature')
+      .sort()
+      .map(key => `${key}=${encodeURIComponent(String(data[key] || '')).replace(/%20/g, '+')}`)
+      .join('&');
 
-    if (receivedHash !== expectedHash) {
-      console.error('❌ Ozow notify: Hash mismatch');
-      console.error('  received:', receivedHash);
-      console.error('  expected:', expectedHash);
-      return res.status(403).send('Invalid HashCheck');
+    const passphrase = env('PAYFAST_PASSPHRASE') || merchantKey;
+    const expectedSignature = crypto
+      .createHash('md5')
+      .update(paramString + `&passphrase=${encodeURIComponent(passphrase)}`)
+      .digest('hex');
+
+    if (receivedSignature !== expectedSignature) {
+      console.error('❌ ITN: Signature mismatch');
+      return res.status(403).send('Invalid signature');
     }
 
-    // Extract payment info
-    const ozowStatus = String(data.Status || data.status || '').toLowerCase();
-    const transactionId = String(data.TransactionId || data.transactionId || '');
-    const transactionRef = String(data.TransactionReference || data.transactionReference || '');
-    const amountGross = String(data.Amount || data.amount || '0');
+    // 2. Extract payment info
+    const paymentStatus = String(data.payment_status || '');
+    const pfPaymentId = String(data.pf_payment_id || '');
+    const amountGross = String(data.amount_gross || '0');
+    const customStr1 = String(data.custom_str1 || ''); // tasksManagement ID
+    const itemName = String(data.item_name || '');
 
-    console.log(`✅ Ozow verified: status=${ozowStatus}, txId=${transactionId}, amount=R${amountGross}, ref=${transactionRef}`);
+    console.log(`✅ ITN verified: status=${paymentStatus}, pfId=${pfPaymentId}, amount=R${amountGross}, taskId=${customStr1}`);
 
-    // Look up associated task from payment_links collection
+    // 3. Update Firestore
     const now = new Date().toISOString();
-    let taskId = '';
 
-    try {
-      const plSnap = await admin.firestore().collection('payment_links').doc(transactionRef).get();
-      if (plSnap.exists) {
-        taskId = plSnap.data().task_id || '';
-        await plSnap.ref.update({
-          ozow_transaction_id: transactionId,
-          ozow_status: ozowStatus,
-          status: ozowStatus === 'complete' ? 'paid' : ozowStatus,
-          updated_at: now,
-        });
-      }
-    } catch (plErr) {
-      console.warn('Could not update payment_links:', plErr.message);
-    }
-
-    // Update tasksManagement if we have a task ID
-    if (taskId) {
-      const taskRef = admin.firestore().collection('tasksManagement').doc(taskId);
+    if (customStr1) {
+      // Update tasksManagement if we have a task ID
+      const taskRef = admin.firestore().collection('tasksManagement').doc(customStr1);
       const taskSnap = await taskRef.get();
 
       if (taskSnap.exists) {
-        const taskData_notify = taskSnap.data() || {};
         const updateData = {
-          ozow_transaction_id: transactionId,
-          ozow_status: ozowStatus,
-          ozow_amount: amountGross,
-          ozow_notify_received_at: now,
+          payfast_payment_id: pfPaymentId,
+          payfast_itn_status: paymentStatus,
+          payfast_itn_amount: amountGross,
+          payfast_itn_received_at: now,
           updated_at: now,
         };
 
-        if (ozowStatus === 'complete') {
+        if (paymentStatus === 'COMPLETE') {
+          updateData.payment_status = 'paid';
           updateData.payment_verified = true;
           updateData.payment_verified_at = now;
-          updateData.payment_verified_via = 'ozow_notify';
-
-          // Determine deposit vs full vs balance payment
-          const paidAmount = parseFloat(amountGross) || 0;
-          const totalCost = parseFloat(taskData_notify.cost || '0') || 0;
-          const wasDepositPaid = taskData_notify.deposit_paid === true;
-
-          if (wasDepositPaid) {
-            updateData.balance_paid = true;
-            updateData.balance_paid_at = now;
-            updateData.payment_status = 'paid';
-          } else if (totalCost > 0 && paidAmount < totalCost * 0.7) {
-            updateData.deposit_paid = true;
-            updateData.deposit_paid_at = now;
-            updateData.payment_type = 'deposit';
-            updateData.payment_status = 'deposit_paid';
-          } else {
-            updateData.deposit_paid = true;
-            updateData.balance_paid = true;
-            updateData.payment_status = 'paid';
-          }
-        } else if (ozowStatus === 'cancelled' || ozowStatus === 'abandoned') {
+          updateData.payment_verified_via = 'payfast_itn';
+        } else if (paymentStatus === 'CANCELLED') {
           updateData.payment_status = 'cancelled';
-        } else if (ozowStatus === 'error') {
+        } else if (paymentStatus === 'FAILED') {
           updateData.payment_status = 'failed';
-        } else if (ozowStatus === 'pendinginvestigation') {
-          updateData.payment_status = 'pending_investigation';
         }
 
         await taskRef.update(updateData);
-        console.log(`📝 Updated tasksManagement/${taskId}: payment_status=${updateData.payment_status || ozowStatus}`);
+        console.log(`📝 Updated tasksManagement/${customStr1}: payment_status=${updateData.payment_status || paymentStatus}`);
+      }
 
-        // ── Record partner commission on successful payment ──
-        if (ozowStatus === 'complete') {
-          try {
-            const userId = (taskData_notify.user_id || taskData_notify.userId || '').toString().trim();
-            if (userId) {
-              const userDoc = await admin.firestore().collection('users').doc(userId).get();
-              if (userDoc.exists) {
-                const partnerId = (userDoc.data().referred_by_partner_id || '').toString().trim();
-                if (partnerId) {
-                  // Check for duplicate commission
-                  const existingComm = await admin.firestore().collection('commissions')
-                    .where('task_management_id', '==', taskId)
-                    .where('partner_id', '==', partnerId)
-                    .limit(1).get();
-                  if (existingComm.empty) {
-                    const partnerDoc = await admin.firestore().collection('corporate_partners').doc(partnerId).get();
-                    if (partnerDoc.exists && (partnerDoc.data().status || 'active') === 'active') {
-                      const pData = partnerDoc.data();
-                      const rate = parseFloat(pData.commission_rate || 5) / 100;
-                      const paidAmount = parseFloat(amountGross) || 0;
-                      const commAmt = paidAmount * rate;
-                      if (commAmt > 0) {
-                        const commId = `COMM-${Date.now().toString(36).toUpperCase()}`;
-                        await admin.firestore().collection('commissions').doc(commId).set({
-                          id: commId,
-                          partner_id: partnerId,
-                          user_id: userId,
-                          task_management_id: taskId,
-                          booking_id: taskId,
-                          job_amount: paidAmount,
-                          commission_rate: parseFloat(pData.commission_rate || 5),
-                          commission_amount: commAmt,
-                          status: 'pending_payout',
-                          source: 'ozow_webhook',
-                          partner_name: pData.company_name || '',
-                          client_name: userDoc.data().name || userDoc.data().userName || '',
-                          job_description: taskData_notify.description || taskData_notify.category_name || '',
-                          created_at: now,
-                        });
-                        await admin.firestore().collection('corporate_partners').doc(partnerId).update({
-                          pending_payout: admin.firestore.FieldValue.increment(commAmt),
-                          total_earned: admin.firestore.FieldValue.increment(commAmt),
-                          updated_at: now,
-                        });
-                        console.log(`💰 Commission R${commAmt.toFixed(2)} recorded for partner ${partnerId} (booking ${taskId})`);
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          } catch (commErr) {
-            console.warn('[ozow-notify] Commission recording failed:', commErr.message);
-          }
-        }
+      // Create/update transaction log
+      const txRef = admin.firestore().collection('transactionLogs');
+      const existingTx = await txRef
+        .where('payfast_payment_id', '==', pfPaymentId)
+        .limit(1)
+        .get();
 
-        // Also update futureBookings for consistency
-        try {
-          await admin.firestore().collection('futureBookings').doc(taskId).update({
-            payment_status: updateData.payment_status || ozowStatus,
-            ozow_transaction_id: transactionId,
-            updated_at: now,
-            ...(ozowStatus === 'complete' ? {
-              payment_verified: true, payment_verified_at: now,
-              ...(updateData.deposit_paid ? { deposit_paid: true } : {}),
-              ...(updateData.balance_paid ? { balance_paid: true } : {}),
-              ...(updateData.payment_type ? { payment_type: updateData.payment_type } : {}),
-            } : {}),
-          }).catch(() => {});
-        } catch (_) {}
-
-        // Send WhatsApp notification for WhatsApp-originated bookings
-        if (taskData_notify.source === 'whatsapp' && (taskData_notify.customerPhone || taskData_notify.contact)) {
-          try {
-            const waToken = env('WHATSAPP_TOKEN') || env('WA_TOKEN');
-            const waPhoneId = env('WHATSAPP_PHONE_NUMBER_ID') || env('WA_PHONE_ID');
-            if (waToken && waPhoneId) {
-              const customerPhone = String(taskData_notify.customerPhone || taskData_notify.contact || '').replace(/\D/g, '');
-              const orderNo = taskData_notify.order_no || taskId;
-              let waMessage;
-              if (ozowStatus === 'complete') {
-                waMessage = `✅ *Payment Confirmed!*\n\nYour payment of R${amountGross} for booking *${orderNo}* has been received and verified.\n\n🔒 Your funds are held in secure escrow until you confirm satisfaction with the completed work.\n\nWe'll notify you when your artisan is on the way!`;
-              } else if (ozowStatus === 'cancelled' || ozowStatus === 'abandoned') {
-                waMessage = `⚠️ *Payment Cancelled*\n\nYour payment of R${amountGross} for booking *${orderNo}* was cancelled.\n\nYou can retry by replying "pay" or "payment" to get a new payment link.`;
-              } else if (ozowStatus === 'error') {
-                waMessage = `❌ *Payment Failed*\n\nYour payment of R${amountGross} for booking *${orderNo}* could not be processed.\n\nPlease try again by replying "pay" or "payment", or use a different payment method.`;
-              }
-              if (waMessage) {
-                const waResp = await fetch(`https://graph.facebook.com/v18.0/${waPhoneId}/messages`, {
-                  method: 'POST',
-                  headers: {
-                    'Authorization': `Bearer ${waToken}`,
-                    'Content-Type': 'application/json',
-                  },
-                  body: JSON.stringify({
-                    messaging_product: 'whatsapp',
-                    to: customerPhone,
-                    type: 'text',
-                    text: { body: waMessage },
-                  }),
-                });
-                console.log(`📱 WhatsApp Ozow notification sent to ${customerPhone}: ${ozowStatus} (status=${waResp.status})`);
-              }
-            }
-          } catch (waErr) {
-            console.warn('Ozow WhatsApp notification failed:', waErr.message);
-          }
-        }
-
-        // Notify customer for cancelled/failed payments
-        if (ozowStatus === 'cancelled' || ozowStatus === 'abandoned' || ozowStatus === 'error') {
-          const taskData = taskSnap.data() || {};
-          const userId = taskData.user_id || taskData.userId || '';
-          const statusLabel = ozowStatus === 'error' ? 'failed' : 'cancelled';
-
-          if (userId) {
-            try {
-              await admin.firestore().collection('notifications').add({
-                title: `Payment ${statusLabel === 'cancelled' ? 'Cancelled' : 'Failed'}`,
-                body: `Your payment of R${amountGross} for booking ${taskData.order_no || taskId} was ${statusLabel}. You can retry from your bookings page.`,
-                type: 'payment_' + statusLabel,
-                user_id: userId,
-                user_type: 'user',
-                booking_id: taskId,
-                read: false,
-                created_at: now,
-              });
-            } catch (notifErr) {
-              console.warn('Ozow notification save failed:', notifErr.message);
-            }
-
-            // Send FCM push
-            try {
-              const userSnap = await admin.firestore().collection('users').doc(userId).get();
-              const fcmToken = (userSnap.data() || {}).fcm_token || (userSnap.data() || {}).deviceToken || '';
-              if (fcmToken) {
-                await admin.messaging().send({
-                  token: fcmToken,
-                  notification: {
-                    title: `Payment ${statusLabel === 'cancelled' ? 'Cancelled' : 'Failed'}`,
-                    body: `Your R${amountGross} payment was ${statusLabel}. Tap to retry.`,
-                  },
-                  data: { type: 'payment_' + statusLabel, booking_id: taskId },
-                  android: { notification: { channelId: 'payment_channel' } },
-                }).catch(() => {});
-              }
-            } catch (_) {}
-          }
-
-          // Notify admin
-          try {
-            await admin.firestore().collection('notifications').add({
-              title: `Ozow Payment ${ozowStatus}`,
-              body: `Payment of R${amountGross} for task ${taskId} was ${statusLabel}. Ozow ID: ${transactionId}`,
-              type: 'payment_' + statusLabel,
-              user_type: 'admin',
-              booking_id: taskId,
-              read: false,
-              created_at: now,
-            });
-          } catch (_) {}
-        }
+      if (existingTx.empty) {
+        const taskData = taskSnap.exists ? taskSnap.data() : {};
+        const txId = crypto.randomUUID();
+        await txRef.doc(txId).set({
+          id: txId,
+          amount: amountGross,
+          transaction_at: now,
+          status: paymentStatus === 'COMPLETE' ? 'success' : paymentStatus.toLowerCase(),
+          user_id: taskData.user_id || taskData.userId || '',
+          type: 'payfast',
+          subtype: 'payment',
+          direction: 'in',
+          cash_movement: true,
+          schema_version: 2,
+          tasks_management_id: customStr1,
+          payfast_payment_id: pfPaymentId,
+          payfast_itn_status: paymentStatus,
+          verified_via: 'payfast_itn',
+          item_name: itemName,
+        });
+        console.log(`📝 Created transactionLog for ITN: ${txId}`);
+      } else {
+        // Update existing transaction log
+        const existingDoc = existingTx.docs[0];
+        await existingDoc.ref.update({
+          payfast_itn_status: paymentStatus,
+          payfast_itn_received_at: now,
+          status: paymentStatus === 'COMPLETE' ? 'success' : paymentStatus.toLowerCase(),
+          verified_via: 'payfast_itn',
+        });
+        console.log(`📝 Updated existing transactionLog: ${existingDoc.id}`);
       }
     }
 
-    // Create/update transaction log
-    const txRef = admin.firestore().collection('transactionLogs');
-    const existingTx = await txRef
-      .where('ozow_transaction_id', '==', transactionId)
-      .limit(1)
-      .get();
-
-    if (existingTx.empty) {
-      const txId = crypto.randomUUID();
-      await txRef.doc(txId).set({
-        id: txId,
-        amount: amountGross,
-        transaction_at: now,
-        status: ozowStatus === 'complete' ? 'success' : ozowStatus,
-        user_id: '',
-        type: 'ozow',
-        subtype: 'payment',
-        direction: 'in',
-        cash_movement: true,
-        schema_version: 2,
-        tasks_management_id: taskId,
-        ozow_transaction_id: transactionId,
-        transaction_reference: transactionRef,
-        ozow_status: ozowStatus,
-        verified_via: 'ozow_notify',
-      });
-      console.log(`📝 Created transactionLog for Ozow: ${txId}`);
-    } else {
-      const existingDoc = existingTx.docs[0];
-      await existingDoc.ref.update({
-        ozow_status: ozowStatus,
-        ozow_notify_received_at: now,
-        status: ozowStatus === 'complete' ? 'success' : ozowStatus,
-        verified_via: 'ozow_notify',
-      });
-      console.log(`📝 Updated existing transactionLog: ${existingDoc.id}`);
-    }
-
-    // Ozow expects a 200 OK response
+    // PayFast expects a 200 OK response
     res.status(200).send('OK');
   } catch (error) {
-    console.error('❌ Ozow notification error:', error);
-    res.status(200).send('OK'); // Always return 200 so Ozow doesn't retry indefinitely
+    console.error('❌ PayFast ITN error:', error);
+    res.status(200).send('OK'); // Always return 200 so PayFast doesn't retry indefinitely
   }
 });
 
@@ -7486,18 +6809,7 @@ app.get('/api/finance/requests', adminLimiter, async (req, res) => {
   if (status) q = firestore.collection('finance_requests').where('status', '==', status).orderBy('created_at', 'desc').limit(limit);
 
   try {
-    let snap;
-    try {
-      snap = await q.get();
-    } catch (indexErr) {
-      // Composite index may not exist yet — fall back to simpler query
-      console.warn('[finance-requests] composite index missing, falling back:', indexErr.message);
-      if (status) {
-        snap = await firestore.collection('finance_requests').where('status', '==', status).limit(limit).get();
-      } else {
-        snap = await firestore.collection('finance_requests').limit(limit).get();
-      }
-    }
+    const snap = await q.get();
     const items = snap.docs.map(d => {
       const r = d.data() || {};
       return {
@@ -7541,13 +6853,13 @@ app.get('/api/finance/fraud-alerts', adminLimiter, async (req, res) => {
         .get();
     } catch (indexErr) {
       // Composite index may not exist yet — fall back to status-only query
-      console.warn('[fraud-alerts] composite index missing, falling back:', indexErr.message);
+      console.warn('[fraud-alerts] Index query failed, falling back:', indexErr.message);
       snap = await firestore.collection('fraud_alerts')
         .where('status', '==', status)
         .limit(limit)
         .get();
     }
-    const items = snap.docs.map(d => ({ id: d.id, ...(d.data() || {}) }));
+    const items = snap.docs.map(d => ({ id: d.id, ...d.data() }));
     return res.json({ success: true, count: items.length, items });
   } catch (e) {
     return res.status(500).json({ error: 'internal_error', message: e.message });
@@ -7612,231 +6924,5 @@ if (require.main === module) {
     console.log(`🧠 Voice start endpoint: http://localhost:${PORT}/api/voice/start`);
     console.log(`📦 Environment: ${process.env.NODE_ENV}`);
     console.log('✅ Server ready to accept requests\n');
-
-    // Initialize Firestore for background processors
-    let firestore = null;
-    try {
-      initFirebaseIfPossible();
-      if (!firebaseInitError) {
-        firestore = admin.firestore();
-      }
-    } catch (e) {
-      console.warn('⚠️ Firebase not available for background processors:', e.message);
-    }
-
-    // ── Retargeting Queue Processor — runs every 15 minutes ──
-    if (firestore) {
-      const RETARGET_INTERVAL = 15 * 60 * 1000; // 15 min
-      async function processRetargetingQueue() {
-        try {
-          const now = new Date();
-          const nowStr = now.toISOString();
-          const dueSnap = await firestore.collection('retargeting_queue')
-            .where('status', '==', 'active')
-            .where('next_send_at', '<=', nowStr)
-            .limit(20)
-            .get();
-
-          if (dueSnap.empty) return;
-          console.log(`🔄 Retargeting: processing ${dueSnap.size} due items`);
-
-          for (const doc of dueSnap.docs) {
-            try {
-              const data = doc.data() || {};
-              const userId = String(data.user_id || '').trim();
-              const category = String(data.category_name || 'maintenance').trim();
-              const step = parseInt(data.next_step) || 1;
-              const amount = parseFloat(data.quoted_amount) || 0;
-
-              if (!userId) { await doc.ref.update({ status: 'expired' }); continue; }
-
-              // Check if user booked since (cancel retargeting)
-              const recentBookings = await firestore.collection('futureBookings')
-                .where('userId', '==', userId)
-                .where('status', 'in', ['pending', 'in_progress', 'completed'])
-                .limit(1)
-                .get();
-              const recentTasks = await firestore.collection('tasksManagement')
-                .where('userId', '==', userId)
-                .where('status', 'in', ['pending', 'in_progress', 'completed'])
-                .limit(1)
-                .get();
-              if (!recentBookings.empty || !recentTasks.empty) {
-                await doc.ref.update({ status: 'converted' });
-                continue;
-              }
-
-              // Get user's push tokens
-              const tokens = await getUserTokens(userId);
-              if (tokens.length === 0) {
-                await doc.ref.update({ status: 'expired', expired_reason: 'no_push_token' });
-                continue;
-              }
-
-              // Get user name
-              const userSnap = await firestore.collection('users').doc(userId).get();
-              const userName = String((userSnap.data() || {}).name || 'there').split(' ')[0];
-
-              const amountStr = amount > 0 ? ` (R${amount.toFixed(0)})` : '';
-
-              switch (step) {
-                case 1: // 1 hour: reminder
-                  await sendPushToTokens({
-                    tokens,
-                    title: `Still need that ${category} done?`,
-                    body: `Hi ${userName}, your quote${amountStr} is waiting! Tap to continue booking.`,
-                    data: { type: 'retarget_reminder', session_id: doc.id },
-                  });
-                  await doc.ref.update({
-                    next_step: 2,
-                    next_send_at: new Date(now.getTime() + 23 * 3600000).toISOString(),
-                    last_sent_at: nowStr,
-                  });
-                  break;
-
-                case 2: { // 24 hours: 5% discount
-                  const code = `BACK5-${doc.id.slice(-6).toUpperCase()}`;
-                  const expires = new Date(now.getTime() + 48 * 3600000);
-                  await firestore.collection('promo_codes').doc(code).set({
-                    code, discount_percent: 5, created_at: now.toISOString(),
-                    expires_at: expires.toISOString(), user_id: userId,
-                    type: 'retargeting', status: 'active', max_uses: 1, uses: 0,
-                  });
-                  await sendPushToTokens({
-                    tokens,
-                    title: `5% off your ${category} booking!`,
-                    body: `Hi ${userName}, use code ${code} for 5% off${amountStr}. Valid 48 hours!`,
-                    data: { type: 'retarget_discount', promo_code: code },
-                  });
-                  await doc.ref.update({
-                    next_step: 3,
-                    next_send_at: new Date(now.getTime() + 48 * 3600000).toISOString(),
-                    last_sent_at: nowStr, promo_code: code,
-                  });
-                  break;
-                }
-
-                case 3: { // 72 hours: 10% discount
-                  const code = `BACK10-${doc.id.slice(-6).toUpperCase()}`;
-                  const expires = new Date(now.getTime() + 96 * 3600000);
-                  await firestore.collection('promo_codes').doc(code).set({
-                    code, discount_percent: 10, created_at: now.toISOString(),
-                    expires_at: expires.toISOString(), user_id: userId,
-                    type: 'retargeting', status: 'active', max_uses: 1, uses: 0,
-                  });
-                  await sendPushToTokens({
-                    tokens,
-                    title: '10% off — limited time!',
-                    body: `Hi ${userName}, your ${category} issue won't fix itself. Use ${code} for 10% off!`,
-                    data: { type: 'retarget_discount', promo_code: code },
-                  });
-                  await doc.ref.update({
-                    next_step: 4,
-                    next_send_at: new Date(now.getTime() + 4 * 24 * 3600000).toISOString(),
-                    last_sent_at: nowStr, promo_code: code,
-                  });
-                  break;
-                }
-
-                case 4: { // 7 days: final 15%
-                  const code = `FINAL15-${doc.id.slice(-6).toUpperCase()}`;
-                  const expires = new Date(now.getTime() + 24 * 3600000);
-                  await firestore.collection('promo_codes').doc(code).set({
-                    code, discount_percent: 15, created_at: now.toISOString(),
-                    expires_at: expires.toISOString(), user_id: userId,
-                    type: 'retargeting', status: 'active', max_uses: 1, uses: 0,
-                  });
-                  await sendPushToTokens({
-                    tokens,
-                    title: 'Last chance: 15% off expires tomorrow!',
-                    body: `${userName}, final offer on your ${category} booking. Code ${code} — 24 hours only.`,
-                    data: { type: 'retarget_final', promo_code: code },
-                  });
-                  await doc.ref.update({
-                    status: 'expired', last_sent_at: nowStr, promo_code: code,
-                  });
-                  break;
-                }
-
-                default:
-                  await doc.ref.update({ status: 'expired' });
-              }
-            } catch (itemErr) {
-              console.warn(`⚠️ Retargeting item ${doc.id} error:`, itemErr.message);
-            }
-          }
-        } catch (e) {
-          console.warn('⚠️ Retargeting queue error:', e.message);
-        }
-      }
-
-      // Also detect stale bookings and queue them for retargeting
-      async function detectStaleBookings() {
-        try {
-          const staleThreshold = new Date(Date.now() - 24 * 3600000); // 24h old
-          const staleStatuses = [
-            'pending', 'pending_payment', 'pending_client_response',
-            'rfq_submitted', 'rfq_pending',
-          ];
-
-          for (const collection of ['futureBookings', 'tasksManagement']) {
-            for (const status of staleStatuses) {
-              const staleSnap = await firestore.collection(collection)
-                .where('status', '==', status)
-                .limit(10)
-                .get();
-
-              for (const doc of staleSnap.docs) {
-                const data = doc.data() || {};
-                const createdAt = data.createdAt?.toDate?.() || data.created_at?.toDate?.();
-                if (!createdAt || createdAt > staleThreshold) continue;
-
-                const uid = String(data.userId || data.user_id || data.clientId || '').trim();
-                if (!uid) continue;
-
-                // Check if already queued
-                const existing = await firestore.collection('retargeting_queue')
-                  .where('session_id', '==', doc.id)
-                  .limit(1)
-                  .get();
-                if (!existing.empty) continue;
-
-                const category = String(data.category || data.serviceCategory || 'maintenance').trim();
-                const amount = parseFloat(data.cost || data.total_cost || data.quoted_price || '0');
-
-                await firestore.collection('retargeting_queue').doc(doc.id).set({
-                  user_id: uid,
-                  session_id: doc.id,
-                  booking_id: doc.id,
-                  category_name: category,
-                  quoted_amount: amount,
-                  stale_status: status,
-                  source: 'stale_detection',
-                  created_at: new Date().toISOString(),
-                  status: 'active',
-                  next_step: 1,
-                  next_send_at: new Date().toISOString(), // Send immediately
-                });
-              }
-            }
-          }
-        } catch (e) {
-          console.warn('⚠️ Stale booking detection error:', e.message);
-        }
-      }
-
-      // Run every 15 minutes
-      setInterval(async () => {
-        await detectStaleBookings();
-        await processRetargetingQueue();
-      }, RETARGET_INTERVAL).unref?.();
-
-      // Also run once on startup (after 30s warm-up)
-      setTimeout(async () => {
-        await detectStaleBookings();
-        await processRetargetingQueue();
-      }, 30_000);
-      console.log('📋 Retargeting queue processor started (every 15 min)');
-    }
   });
 }
