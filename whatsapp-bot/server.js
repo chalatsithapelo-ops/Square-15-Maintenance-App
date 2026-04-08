@@ -1325,6 +1325,32 @@ async function executeWaTool(name, args, session) {
         const catSlug = (args.category || '').toLowerCase().replace(/\s+/g, '_');
         const subQuery = (args.subcategory || args.description || '').toLowerCase();
 
+        // Reuse fuzzy matching helpers (stem, synonyms, fuzzyMatch)
+        const _normalize = (s) => s.toLowerCase().replace(/[_\-]+/g, ' ').trim();
+        const _stem = (w) => w.replace(/(ing|ed|tion|ment|ness|able|ible|er|est|ly|s)$/i, '');
+        const _synonyms = {
+          toilet: ['drain', 'sewer', 'pipe'], drain: ['toilet', 'sewer', 'pipe'],
+          unblock: ['block', 'clog', 'clear', 'unclog'], block: ['unblock', 'clog', 'clear', 'unclog'],
+          fix: ['repair', 'replace', 'mend'], repair: ['fix', 'replace', 'mend'],
+          leak: ['burst', 'drip', 'seep'], burst: ['leak', 'broken', 'crack'],
+          install: ['fit', 'mount', 'setup'], geyser: ['boiler', 'water heater', 'hot water'],
+        };
+        const _fuzzyMatch = (qNorm, sNorm) => {
+          if (sNorm.includes(qNorm) || qNorm.includes(sNorm)) return true;
+          const qW = qNorm.split(/\s+/).filter(w => w.length >= 3);
+          const sW = sNorm.split(/\s+/).filter(w => w.length >= 3);
+          if (qW.some(w => sNorm.includes(w)) || sW.some(w => qNorm.includes(w))) return true;
+          const qS = qW.map(_stem), sS = sW.map(_stem);
+          if (qS.some(qs => sS.some(ss => qs === ss || qs.includes(ss) || ss.includes(qs)))) return true;
+          const expanded = new Set(qW.concat(qS));
+          for (const w of qW.concat(qS)) { if (_synonyms[w]) _synonyms[w].forEach(s => expanded.add(s)); }
+          const exp = [...expanded];
+          if (exp.some(qe => sW.some(sw => sw.includes(qe) || qe.includes(sw)))
+              || exp.some(qe => sS.some(ss => ss.includes(qe) || qe.includes(ss)))) return true;
+          return false;
+        };
+        const subNorm = _normalize(subQuery);
+
         // 1) Check pricingGuidance doc's service_prices map
         const guidanceDoc = await firestore.collection('pricingGuidance').doc(catSlug).get();
         if (guidanceDoc.exists) {
@@ -1332,9 +1358,8 @@ async function executeWaTool(name, args, session) {
           const servicePrices = gd.service_prices || gd.servicePrices || {};
           // Try to match subcategory/description against service_prices keys
           for (const [svcName, price] of Object.entries(servicePrices)) {
-            const svcLower = svcName.toLowerCase();
-            if (subQuery.includes(svcLower) || svcLower.includes(subQuery) ||
-                subQuery.split(/\s+/).some(w => w.length >= 3 && svcLower.includes(w))) {
+            const svcNorm = _normalize(svcName);
+            if (_fuzzyMatch(subNorm, svcNorm)) {
               estimatedCost = (typeof price === 'number' ? price : parseFloat(price)).toString();
               pricingSource = 'fixed';
               break;
@@ -1357,8 +1382,7 @@ async function executeWaTool(name, args, session) {
             const d = td.data();
             const name = (d.name || d.title || d.task_name || '').toString().toLowerCase();
             const cost = parseFloat(d.client_rate || d.clientRate || d.cost || d.price || d.amount || 0);
-            if (name && cost > 0 && (subQuery.includes(name) || name.includes(subQuery) ||
-                subQuery.split(/\s+/).some(w => w.length >= 3 && name.includes(w)))) {
+            if (name && cost > 0 && _fuzzyMatch(subNorm, _normalize(name))) {
               estimatedCost = cost.toString();
               pricingSource = 'fixed';
               break;
@@ -1706,13 +1730,56 @@ async function executeWaTool(name, args, session) {
 
         // Normalize: replace underscores/hyphens with spaces for comparison
         const normalize = (s) => s.toLowerCase().replace(/[_\-]+/g, ' ').trim();
+        // Simple stemming: strip common suffixes so "unblocking" matches "unblock"
+        const stem = (w) => w.replace(/(ing|ed|tion|ment|ness|able|ible|er|est|ly|s)$/i, '');
+        // Synonym map for common maintenance terms
+        const synonyms = {
+          toilet: ['drain', 'sewer', 'pipe', 'plunger', 'sewage'],
+          drain: ['toilet', 'sewer', 'pipe', 'sewage'],
+          unblock: ['block', 'clog', 'clear', 'unclog', 'jam'],
+          block: ['unblock', 'clog', 'clear', 'unclog', 'jam'],
+          fix: ['repair', 'replace', 'mend'],
+          repair: ['fix', 'replace', 'mend'],
+          leak: ['burst', 'drip', 'seep'],
+          burst: ['leak', 'broken', 'crack'],
+          install: ['fit', 'mount', 'setup'],
+          geyser: ['boiler', 'water heater', 'hot water'],
+        };
+        const expandWithSynonyms = (words) => {
+          const expanded = new Set(words);
+          for (const w of words) {
+            const stemmed = stem(w);
+            expanded.add(stemmed);
+            if (synonyms[stemmed]) synonyms[stemmed].forEach(s => expanded.add(s));
+            if (synonyms[w]) synonyms[w].forEach(s => expanded.add(s));
+          }
+          return [...expanded];
+        };
+        // Match helper: substring, word-level, stem, and synonym matching
+        const fuzzyMatch = (queryNorm, svcNorm) => {
+          // 1) Full substring match
+          if (svcNorm.includes(queryNorm) || queryNorm.includes(svcNorm)) return true;
+          const qWords = queryNorm.split(/\s+/).filter(w => w.length >= 3);
+          const sWords = svcNorm.split(/\s+/).filter(w => w.length >= 3);
+          // 2) Word-level match (any query word found in service name or vice versa)
+          if (qWords.some(w => svcNorm.includes(w)) || sWords.some(w => queryNorm.includes(w))) return true;
+          // 3) Stem-based match (e.g. "unblocking" → "unblock" matches "unblock drain")
+          const qStems = qWords.map(stem);
+          const sStems = sWords.map(stem);
+          if (qStems.some(qs => sStems.some(ss => qs === ss || qs.includes(ss) || ss.includes(qs)))) return true;
+          // 4) Synonym match (e.g. "toilet" → "drain" matches "unblock drain")
+          const qExpanded = expandWithSynonyms(qWords.concat(qStems));
+          if (qExpanded.some(qe => sWords.some(sw => sw.includes(qe) || qe.includes(sw)))
+              || qExpanded.some(qe => sStems.some(ss => ss.includes(qe) || qe.includes(ss)))) return true;
+          return false;
+        };
         const subNorm = normalize(subQuery);
 
         if (subQuery) {
           // Check service_prices map first
           for (const [svcName, price] of Object.entries(servicePrices)) {
             const svcNorm = normalize(svcName);
-            if (svcNorm.includes(subNorm) || subNorm.includes(svcNorm)) {
+            if (fuzzyMatch(subNorm, svcNorm)) {
               matchedService = svcName;
               matchedPrice = typeof price === 'number' ? price : parseFloat(price);
               break;
@@ -1722,7 +1789,7 @@ async function executeWaTool(name, args, session) {
           if (!matchedService) {
             for (const t of taskResults) {
               const tNorm = normalize(t.name);
-              if (tNorm.includes(subNorm) || subNorm.includes(tNorm)) {
+              if (fuzzyMatch(subNorm, tNorm)) {
                 matchedService = t.name;
                 matchedPrice = t.cost;
                 break;
