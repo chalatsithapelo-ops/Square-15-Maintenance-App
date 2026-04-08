@@ -1532,7 +1532,11 @@ async function executeWaTool(name, args, session) {
         });
       } catch (e) { console.warn('[wa-tool] booking notification failed:', e.message); }
 
-      // ── Notify available artisans via FCM push ──
+      // ── Dispatch: create tasksManagement bridge per artisan + FCM push ──
+      // Artisan app queries tasksManagement WHERE service_provider_id == artisanId.
+      // We create a separate bridge record for each matching artisan so the booking
+      // appears in their "New Requests" screen. When one accepts, others get cancelled.
+      let dispatchedCount = 0;
       try {
         const catSlug = (args.category || '').toLowerCase().replace(/\s+/g, '_');
         const artisanSnap = await firestore.collection('serviceProvider')
@@ -1540,31 +1544,82 @@ async function executeWaTool(name, args, session) {
           .where('is_suspended', '!=', true)
           .limit(20)
           .get();
+
+        const photoUrls = booking.work_images || [];
+
         for (const artDoc of artisanSnap.docs) {
           const ad = artDoc.data() || {};
           const cats = (ad.categories || ad.category || '').toString().toLowerCase();
           if (cats && !cats.includes(catSlug) && catSlug !== 'general_maintenance') continue;
-          const token = (ad.fcm_token || ad.deviceToken || '').toString().trim();
-          if (!token) continue;
+
+          const artisanId = artDoc.id;
+          const bridgeId = `${bookingId}_${artisanId}`;
+
+          // Create tasksManagement bridge record for this artisan
           try {
-            await admin.messaging().send({
-              token,
-              notification: {
-                title: '🔔 New Booking Request',
-                body: `New ${args.category || 'maintenance'} job available. Tap to view and accept.`,
-              },
-              data: {
-                type: 'new_booking',
-                booking_id: bookingId,
-                order_no: orderNo,
-              },
-              android: { notification: { channelId: 'order_request_channel', sound: 'sound' } },
+            await firestore.collection('tasksManagement').doc(bridgeId).set({
+              id: bridgeId,
+              bookingId: bridgeId,
+              order_no: orderNo,
+              future_booking_id: bookingId,
+              category_name: args.category || '',
+              category: args.category || '',
+              subcategory: args.subcategory || '',
+              description: args.description || '',
+              address: args.address || '',
+              urgency: args.urgency || 'normal',
+              name: args.customerName || '',
+              customerName: args.customerName || '',
+              customerPhone: session.phone,
+              contact: session.phone,
+              user_id: session.linkedUserId || '',
+              source: 'whatsapp',
+              status: 'pending',
+              accept: '',
+              cost: finalCost.toFixed(2),
+              payment_status: 'unpaid',
+              paymentStatus: 'pending',
+              service_provider_id: artisanId,
+              service_provider_name: ad.name || ad.fullName || '',
+              work_images: photoUrls,
+              image_urls: photoUrls,
+              imageUrls: photoUrls,
+              has_photos: photoUrls.length > 0 ? 'yes' : 'no',
+              created_at: now,
+              createdAt: admin.firestore.FieldValue.serverTimestamp(),
+              updated_at: now,
             });
-          } catch (fcmErr) {
-            console.warn(`[wa-tool] FCM to artisan ${artDoc.id} failed:`, fcmErr.message);
+            dispatchedCount++;
+          } catch (bridgeErr) {
+            console.warn(`[wa-tool] Bridge record for artisan ${artisanId} failed:`, bridgeErr.message);
+          }
+
+          // Send FCM push notification
+          const token = (ad.fcm_token || ad.deviceToken || '').toString().trim();
+          if (token) {
+            try {
+              await admin.messaging().send({
+                token,
+                notification: {
+                  title: '🔔 New Booking Request',
+                  body: `New ${args.category || 'maintenance'} job: ${args.description || args.subcategory || 'maintenance work'}. Tap to view and accept.`,
+                },
+                data: {
+                  type: 'new_booking',
+                  booking_id: bridgeId,
+                  order_no: orderNo,
+                  future_booking_id: bookingId,
+                  has_photos: photoUrls.length > 0 ? 'true' : 'false',
+                },
+                android: { notification: { channelId: 'order_request_channel', sound: 'sound' } },
+              });
+            } catch (fcmErr) {
+              console.warn(`[wa-tool] FCM to artisan ${artDoc.id} failed:`, fcmErr.message);
+            }
           }
         }
-      } catch (e) { console.warn('[wa-tool] artisan dispatch notification failed:', e.message); }
+        console.log(`[wa-tool] Dispatched booking ${bookingId} to ${dispatchedCount} artisans`);
+      } catch (e) { console.warn('[wa-tool] artisan dispatch failed:', e.message); }
 
       // Store last booking ID for quick payment follow-up
       session.lastBookingId = bookingId;
@@ -3151,13 +3206,21 @@ CRITICAL PRICING RULES:
 - NEVER guess or make up a price. Only use prices returned by lookup_pricing.
 - If create_booking returns an estimated cost of R0.00, it means no fixed price was found — inform the customer and suggest an RFQ.
 
+PHOTO REQUIREMENT (CRITICAL):
+- ALWAYS ask the customer to send a photo of the issue BEFORE creating a booking or RFQ.
+- Say something like: "Could you please send me a photo of the issue? This helps our artisans understand the problem and come prepared."
+- If the customer has already sent a photo during this conversation, you do NOT need to ask again.
+- If the customer says they cannot send a photo (e.g. "I can't right now"), proceed without one — don't block the booking.
+- Photos are automatically attached to the booking and sent to artisans when they receive the job request.
+- The artisan will see the photos alongside the job description, address, and pricing.
+
 GUIDELINES:
 - Be warm, professional, and concise (WhatsApp messages should be short)
-- Always collect: category, description, address, customer name BEFORE creating a booking
+- Always collect: category, description, address, customer name, AND photos BEFORE creating a booking
 - For complex jobs (renovations, full installations), suggest submitting an RFQ instead of a regular booking
 - Use South African Rands (R) for all pricing
 - When a customer sends a photo, ANALYSE the image using your vision capabilities. Identify the maintenance issue (e.g. leaking pipe, broken socket, cracked wall), suggest the correct service category, and offer to create a booking or RFQ
-- For emergencies, emphasise urgency and prioritise booking creation
+- For emergencies, emphasise urgency and prioritise booking creation (still ask for photo but don't delay)
 - When a booking is created, always mention the estimated cost and payment options
 - After job completion, encourage rating
 - If payment is discussed, explain: "Payment is held securely in escrow and only released to the artisan once you confirm the job is done"
