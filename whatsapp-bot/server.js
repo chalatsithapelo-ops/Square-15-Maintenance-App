@@ -1318,7 +1318,7 @@ async function executeWaTool(name, args, session) {
       const orderNo = `SQ15-${bookingId}`;
       const now = new Date().toISOString();
 
-      // Look up pricing estimate from pricingGuidance service_prices map and tasks collection
+      // Look up pricing estimate — tasks collection is AUTHORITATIVE (admin-managed)
       let estimatedCost = '0';
       let pricingSource = 'none';
       try {
@@ -1351,37 +1351,41 @@ async function executeWaTool(name, args, session) {
         };
         const subNorm = _normalize(subQuery);
 
-        // 1) Check pricingGuidance doc's service_prices map
-        const guidanceDoc = await firestore.collection('pricingGuidance').doc(catSlug).get();
-        if (guidanceDoc.exists) {
-          const gd = guidanceDoc.data();
-          const servicePrices = gd.service_prices || gd.servicePrices || {};
-          // Try to match subcategory/description against service_prices keys
-          for (const [svcName, price] of Object.entries(servicePrices)) {
-            const svcNorm = _normalize(svcName);
-            if (_fuzzyMatch(subNorm, svcNorm)) {
-              estimatedCost = (typeof price === 'number' ? price : parseFloat(price)).toString();
-              pricingSource = 'fixed';
-              break;
+        // 1) AUTHORITATIVE: Check pricingGuidance FIRST (admin-configured category prices)
+        // Seeded by admin app ConfigurationHelper and updated via pricing_guide_service.dart
+        {
+          const guidanceDoc = await firestore.collection('pricingGuidance').doc(catSlug).get();
+          if (guidanceDoc.exists) {
+            const gd = guidanceDoc.data();
+            const servicePrices = gd.service_prices || gd.servicePrices || {};
+            for (const [svcName, price] of Object.entries(servicePrices)) {
+              const svcNorm = _normalize(svcName);
+              if (subQuery && _fuzzyMatch(subNorm, svcNorm)) {
+                estimatedCost = (typeof price === 'number' ? price : parseFloat(price)).toString();
+                pricingSource = 'fixed';
+                break;
+              }
             }
-          }
-          // If no service match, use labor_cost_per_hour as rough baseline (not fallback R500)
-          if (pricingSource === 'none') {
-            const laborRate = gd.labor_cost_per_hour || gd.laborCostPerHour;
-            if (laborRate) {
-              estimatedCost = (parseFloat(laborRate) * 2).toString(); // 2-hour minimum estimate
-              pricingSource = 'labor_estimate';
+            // If still no match, use labor_cost_per_hour as rough baseline
+            if (pricingSource === 'none') {
+              const laborRate = gd.labor_cost_per_hour || gd.laborCostPerHour;
+              if (laborRate) {
+                estimatedCost = (parseFloat(laborRate) * 2).toString();
+                pricingSource = 'labor_estimate';
+              }
             }
           }
         }
 
-        // 2) Also check tasks collection for exact service pricing
+        // 2) FALLBACK: Check tasks collection only if no pricingGuidance match
         if (pricingSource !== 'fixed' && subQuery) {
           const taskSnap = await firestore.collection('tasks').limit(200).get();
           for (const td of taskSnap.docs) {
             const d = td.data();
-            const name = (d.name || d.title || d.task_name || '').toString().toLowerCase();
-            const cost = parseFloat(d.client_rate || d.clientRate || d.cost || d.price || d.amount || 0);
+            const status = (d.status || '').toLowerCase();
+            if (status && status !== 'publish' && status !== 'active') continue;
+            const name = (d.name || d.title || d.task_name || '').toString();
+            const cost = parseFloat(d.cost || d.client_rate || d.clientRate || d.price || d.amount || 0);
             if (name && cost > 0 && _fuzzyMatch(subNorm, _normalize(name))) {
               estimatedCost = cost.toString();
               pricingSource = 'fixed';
@@ -1700,39 +1704,9 @@ async function executeWaTool(name, args, session) {
         const catSlug = (args.category || '').toLowerCase().replace(/\s+/g, '_');
         const subQuery = (args.subcategory || '').toLowerCase();
 
-        // 1) Look up from pricingGuidance by doc ID (e.g. 'plumbing')
-        let servicePrices = {};
-        let categoryName = args.category || '';
-        const guidanceDoc = await firestore.collection('pricingGuidance').doc(catSlug).get();
-        if (guidanceDoc.exists) {
-          const gd = guidanceDoc.data();
-          servicePrices = gd.service_prices || gd.servicePrices || {};
-          categoryName = gd.category_name || gd.categoryName || categoryName;
-        }
-
-        // 2) Also search the tasks collection for matching service entries
-        const taskResults = [];
-        try {
-          const taskSnap = await firestore.collection('tasks').limit(200).get();
-          for (const td of taskSnap.docs) {
-            const d = td.data();
-            const name = (d.name || d.title || d.task_name || '').toString();
-            const cost = parseFloat(d.client_rate || d.clientRate || d.cost || d.price || d.amount || 0);
-            if (name && cost > 0) {
-              taskResults.push({ name, cost, category_id: d.categoryId || d.category_id || '' });
-            }
-          }
-        } catch (e) { console.warn('[wa-tool] tasks lookup failed:', e.message); }
-
-        // 3) If subcategory provided, try to find an exact or fuzzy match
-        let matchedService = null;
-        let matchedPrice = null;
-
-        // Normalize: replace underscores/hyphens with spaces for comparison
+        // Fuzzy matching helpers
         const normalize = (s) => s.toLowerCase().replace(/[_\-]+/g, ' ').trim();
-        // Simple stemming: strip common suffixes so "unblocking" matches "unblock"
         const stem = (w) => w.replace(/(ing|ed|tion|ment|ness|able|ible|er|est|ly|s)$/i, '');
-        // Synonym map for common maintenance terms
         const synonyms = {
           toilet: ['drain', 'sewer', 'pipe', 'plunger', 'sewage'],
           drain: ['toilet', 'sewer', 'pipe', 'sewage'],
@@ -1755,19 +1729,14 @@ async function executeWaTool(name, args, session) {
           }
           return [...expanded];
         };
-        // Match helper: substring, word-level, stem, and synonym matching
         const fuzzyMatch = (queryNorm, svcNorm) => {
-          // 1) Full substring match
           if (svcNorm.includes(queryNorm) || queryNorm.includes(svcNorm)) return true;
           const qWords = queryNorm.split(/\s+/).filter(w => w.length >= 3);
           const sWords = svcNorm.split(/\s+/).filter(w => w.length >= 3);
-          // 2) Word-level match (any query word found in service name or vice versa)
           if (qWords.some(w => svcNorm.includes(w)) || sWords.some(w => queryNorm.includes(w))) return true;
-          // 3) Stem-based match (e.g. "unblocking" → "unblock" matches "unblock drain")
           const qStems = qWords.map(stem);
           const sStems = sWords.map(stem);
           if (qStems.some(qs => sStems.some(ss => qs === ss || qs.includes(ss) || ss.includes(qs)))) return true;
-          // 4) Synonym match (e.g. "toilet" → "drain" matches "unblock drain")
           const qExpanded = expandWithSynonyms(qWords.concat(qStems));
           if (qExpanded.some(qe => sWords.some(sw => sw.includes(qe) || qe.includes(sw)))
               || qExpanded.some(qe => sStems.some(ss => ss.includes(qe) || qe.includes(ss)))) return true;
@@ -1775,8 +1744,23 @@ async function executeWaTool(name, args, session) {
         };
         const subNorm = normalize(subQuery);
 
+        let matchedService = null;
+        let matchedPrice = null;
+        let categoryName = args.category || '';
+
+        // ── 1) AUTHORITATIVE SOURCE: pricingGuidance collection (admin-configured category prices) ──
+        // Seeded by admin app ConfigurationHelper.initializeDefaultPricingGuides()
+        // and updated via pricing_guide_service.dart updateServicePrice()
+        let servicePrices = {};
+        const guidanceDoc = await firestore.collection('pricingGuidance').doc(catSlug).get();
+        if (guidanceDoc.exists) {
+          const gd = guidanceDoc.data();
+          servicePrices = gd.service_prices || gd.servicePrices || {};
+          categoryName = gd.category_name || gd.categoryName || categoryName;
+        }
+
+        // Try to match subcategory against pricingGuidance (authoritative prices)
         if (subQuery) {
-          // Check service_prices map first
           for (const [svcName, price] of Object.entries(servicePrices)) {
             const svcNorm = normalize(svcName);
             if (fuzzyMatch(subNorm, svcNorm)) {
@@ -1785,31 +1769,48 @@ async function executeWaTool(name, args, session) {
               break;
             }
           }
-          // Then check tasks collection
-          if (!matchedService) {
-            for (const t of taskResults) {
-              const tNorm = normalize(t.name);
-              if (fuzzyMatch(subNorm, tNorm)) {
-                matchedService = t.name;
-                matchedPrice = t.cost;
-                break;
-              }
+        }
+
+        // ── 2) FALLBACK: tasks collection (only if no pricingGuidance match) ──
+        const taskResults = [];
+        try {
+          const taskSnap = await firestore.collection('tasks').limit(200).get();
+          for (const td of taskSnap.docs) {
+            const d = td.data();
+            const status = (d.status || '').toLowerCase();
+            if (status && status !== 'publish' && status !== 'active') continue;
+            const name = (d.name || d.title || d.task_name || '').toString();
+            const cost = parseFloat(d.cost || d.client_rate || d.clientRate || d.price || d.amount || 0);
+            if (name && cost > 0) {
+              taskResults.push({ name, cost, category_id: d.categoryId || d.category_id || '' });
+            }
+          }
+        } catch (e) { console.warn('[wa-tool] tasks lookup failed:', e.message); }
+
+        if (!matchedService && subQuery) {
+          for (const t of taskResults) {
+            const tNorm = normalize(t.name);
+            if (fuzzyMatch(subNorm, tNorm)) {
+              matchedService = t.name;
+              matchedPrice = t.cost;
+              break;
             }
           }
         }
 
-        // Build response
-        const allFixedPrices = Object.entries(servicePrices).map(([name, price]) => ({
-          service: name,
-          fixedPrice: `R${typeof price === 'number' ? price.toFixed(2) : price}`,
-        }));
-
-        // Add task-collection prices not already in servicePrices
-        const existingNames = new Set(Object.keys(servicePrices).map(n => normalize(n)));
+        // Build list of all available fixed prices for context
+        const allFixedPrices = [];
+        // Add pricingGuidance entries first (authoritative)
+        const addedNames = new Set();
+        for (const [name, price] of Object.entries(servicePrices)) {
+          allFixedPrices.push({ service: name, fixedPrice: `R${typeof price === 'number' ? price.toFixed(2) : price}` });
+          addedNames.add(normalize(name));
+        }
+        // Then add tasks entries not already covered
         for (const t of taskResults) {
           const catId = normalize(t.category_id);
           const catSlugNorm = normalize(catSlug);
-          if ((catId === catSlugNorm || catId.includes(catSlugNorm) || catSlugNorm.includes(catId)) && !existingNames.has(normalize(t.name))) {
+          if (!addedNames.has(normalize(t.name)) && (!catSlug || catId === catSlugNorm || catId.includes(catSlugNorm) || catSlugNorm.includes(catId))) {
             allFixedPrices.push({ service: t.name, fixedPrice: `R${t.cost.toFixed(2)}` });
           }
         }
