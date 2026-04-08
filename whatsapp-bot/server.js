@@ -3474,19 +3474,32 @@ app.listen(PORT, () => {
   console.log(`[whatsapp-bot] listening on :${PORT}`);
   initFirebase();
 
-  // One-time cleanup: delete all pricingGuidance documents (stale default prices)
-  // The correct prices are in the tasks collection, managed by the admin app.
+  // One-time cleanup: remove stale service_prices from pricingGuidance documents.
+  // Keep labor_cost_per_hour, material_multiplier, outsourced_labor_rate (used by RFQ).
+  // Fixed pricing now comes solely from the tasks collection (admin-managed categories).
   try {
     const firestore = db();
     if (firestore) {
+      const FieldValue = admin.firestore.FieldValue;
       firestore.collection('pricingGuidance').get().then(snap => {
-        if (snap.empty) { console.log('[cleanup] pricingGuidance already empty'); return; }
+        if (snap.empty) { console.log('[cleanup] pricingGuidance empty, nothing to clean'); return; }
         const batch = firestore.batch();
-        snap.docs.forEach(doc => batch.delete(doc.ref));
-        return batch.commit();
-      }).then(() => {
-        console.log('[cleanup] pricingGuidance collection deleted successfully');
-      }).catch(e => console.warn('[cleanup] pricingGuidance deletion failed:', e.message));
+        let cleaned = 0;
+        snap.docs.forEach(doc => {
+          const d = doc.data();
+          if (d.service_prices || d.servicePrices) {
+            batch.update(doc.ref, {
+              service_prices: FieldValue.delete(),
+              servicePrices: FieldValue.delete(),
+            });
+            cleaned++;
+          }
+        });
+        if (cleaned === 0) { console.log('[cleanup] pricingGuidance service_prices already removed'); return; }
+        return batch.commit().then(() => {
+          console.log(`[cleanup] Removed service_prices from ${cleaned} pricingGuidance docs (labor rates preserved for RFQ)`);
+        });
+      }).catch(e => console.warn('[cleanup] pricingGuidance cleanup failed:', e.message));
     }
   } catch (e) { console.warn('[cleanup] error:', e.message); }
 });
