@@ -205,6 +205,28 @@ async function downloadWhatsAppMedia(mediaId) {
   }
 }
 
+// ─── Upload image buffer to Firebase Storage and return download URL ───
+
+async function uploadImageToStorage(buffer, mimeType) {
+  try {
+    const bucket = admin.storage().bucket('promaintapp-b618a.firebasestorage.app');
+    const ext = (mimeType || 'image/jpeg').includes('png') ? 'png' : 'jpg';
+    const fileName = `booking_images/${Date.now()}_${Math.random().toString(36).substring(2, 10)}.${ext}`;
+    const file = bucket.file(fileName);
+    await file.save(buffer, {
+      metadata: { contentType: mimeType || 'image/jpeg' },
+      public: true,
+    });
+    // Get public download URL
+    const url = `https://storage.googleapis.com/${bucket.name}/${fileName}`;
+    console.log(`[wa-media] Uploaded image to Storage: ${fileName}`);
+    return url;
+  } catch (e) {
+    console.error('[wa-media] Storage upload failed:', e.message);
+    return null;
+  }
+}
+
 // ─── Transcribe audio via Whisper ───
 
 async function transcribeAudio(mediaId) {
@@ -304,6 +326,7 @@ function getSession(phone) {
       linkedUserId: null,   // app account link
       promoCode: null,      // active promo for current booking
       promoDiscount: 0,
+      photoUrls: [],        // Firebase Storage URLs for photos sent during this session
       lastActivity: Date.now(),
       _restored: false,     // whether Firestore restore was attempted
     };
@@ -349,12 +372,29 @@ async function findUserByPhone(phone) {
   if (phone.startsWith('+27')) variants.push('0' + phone.slice(3), phone.slice(1));
   if (phone.startsWith('0')) variants.push('27' + phone.slice(1), '+27' + phone.slice(1));
 
+  // Also build numeric (int) variants — Flutter app stores `contact` as int
+  const numericVariants = new Set();
+  for (const v of variants) {
+    const n = parseInt(v, 10);
+    if (!isNaN(n)) numericVariants.add(n);
+  }
+
   for (const v of variants) {
     for (const field of ['contact', 'phone', 'mobile', 'phoneNumber', 'phone_number']) {
+      // Search with string value
       const snap = await firestore.collection('users').where(field, '==', v).limit(1).get();
       if (!snap.empty) return { id: snap.docs[0].id, ...snap.docs[0].data() };
     }
   }
+
+  // Search with numeric (int) values for fields that might be stored as numbers
+  for (const n of numericVariants) {
+    for (const field of ['contact', 'phone', 'mobile', 'phoneNumber', 'phone_number']) {
+      const snap = await firestore.collection('users').where(field, '==', n).limit(1).get();
+      if (!snap.empty) return { id: snap.docs[0].id, ...snap.docs[0].data() };
+    }
+  }
+
   return null;
 }
 
@@ -576,6 +616,23 @@ const waTools = [
       name: 'link_account',
       description: 'Link the WhatsApp number to an existing Square 15 app account. Call this when a customer wants to connect their app account.',
       parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'register_account',
+      description: 'Register a new Square 15 account directly via WhatsApp. Use this for customers who don\'t have the app. Collect their full name first, then optionally ask for email, address, and referral/partner code.',
+      parameters: {
+        type: 'object',
+        properties: {
+          name:         { type: 'string', description: 'Customer full name' },
+          email:        { type: 'string', description: 'Email address (optional but recommended)' },
+          address:      { type: 'string', description: 'Home/service address (optional)' },
+          referralCode: { type: 'string', description: 'Partner or referral code if the customer has one (optional)' },
+        },
+        required: ['name'],
+      },
     },
   },
   {
@@ -1356,6 +1413,11 @@ async function executeWaTool(name, args, session) {
         paymentStatus: 'pending',
         promo_code: promoApplied ? promoApplied.code : null,
         promo_discount: promoApplied ? promoApplied.discount : 0,
+        // Photo URLs from customer images sent during this session
+        work_images: session.photoUrls.length ? session.photoUrls : [],
+        image_urls: session.photoUrls.length ? session.photoUrls : [],
+        imageUrls: session.photoUrls.length ? session.photoUrls : [],
+        has_photos: session.photoUrls.length ? 'yes' : 'no',
         created_at: now,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
         updated_at: now,
@@ -1387,11 +1449,19 @@ async function executeWaTool(name, args, session) {
         promo_code: promoApplied ? promoApplied.code : null,
         promo_discount: promoApplied ? promoApplied.discount : 0,
         tasks_management_id: bookingId,
+        // Photo URLs from customer images sent during this session
+        work_images: session.photoUrls.length ? session.photoUrls : [],
+        image_urls: session.photoUrls.length ? session.photoUrls : [],
+        imageUrls: session.photoUrls.length ? session.photoUrls : [],
+        has_photos: session.photoUrls.length ? 'yes' : 'no',
         created_at: now,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
       };
 
       await firestore.collection('futureBookings').doc(bookingId).set(futureBooking);
+
+      // Clear photo URLs after storing them in the booking
+      session.photoUrls = [];
 
       // Record promo redemption if used
       if (promoApplied && session.promoId) {
@@ -1929,11 +1999,19 @@ async function executeWaTool(name, args, session) {
         service_provider_name: '',
         scheduled_date: '',
         scheduled_time: '',
+        // Photo URLs from customer images sent during this session
+        work_images: session.photoUrls.length ? session.photoUrls : [],
+        image_urls: session.photoUrls.length ? session.photoUrls : [],
+        imageUrls: session.photoUrls.length ? session.photoUrls : [],
+        has_photos: session.photoUrls.length ? 'yes' : 'no',
         created_at: now,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
       };
 
       await firestore.collection('futureBookings').doc(rfqId).set(rfqDoc);
+
+      // Clear photo URLs after storing them in the RFQ
+      session.photoUrls = [];
 
       // Track in session for follow-up
       session.lastRfqId = rfqId;
@@ -2358,7 +2436,91 @@ async function executeWaTool(name, args, session) {
 
       return {
         linked: false,
-        message: 'No Square 15 account found for this phone number. Please download the Square 15 app and register, or book directly here — we\'ll create your booking with your phone number.',
+        message: 'No Square 15 account found for this phone number. Would you like me to register a new account for you right here on WhatsApp? Just provide your full name to get started.',
+      };
+    }
+
+    // ═══════════════════════════════════════════
+    // 16b) REGISTER ACCOUNT (WhatsApp)
+    // ═══════════════════════════════════════════
+    case 'register_account': {
+      if (!firestore) return { error: 'Database unavailable' };
+
+      const customerName = (args.name || '').trim();
+      if (!customerName) return { error: 'Please provide your full name to register.' };
+
+      // Check if already registered
+      if (session.linkedUserId) {
+        return { registered: true, message: 'You already have a Square 15 account linked to this WhatsApp number.' };
+      }
+
+      const existingUser = await findUserByPhone(session.phone);
+      if (existingUser) {
+        session.linkedUserId = existingUser.id;
+        return { registered: true, message: `You already have an account (${existingUser.name || customerName}). I've linked it to this WhatsApp chat.` };
+      }
+
+      // Create a new user document (compatible with Flutter app UserModel)
+      const userId = `wa_${session.phone}`;
+      const now = new Date().toISOString();
+      const userData = {
+        uid: userId,
+        name: customerName,
+        email: (args.email || '').trim() || null,
+        contact: parseInt(session.phone) || session.phone,
+        phone: session.phone,
+        isAdmin: false,
+        isServiceProvider: false,
+        isUser: true,
+        isVerified: false,
+        lat: '0.0',
+        lng: '0.0',
+        deviceToken: '',
+        fcm_token: '',
+        image: '',
+        balance: '0',
+        source: 'whatsapp',
+        created_at: now,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      };
+
+      if (args.address) userData.address = args.address.trim();
+
+      await firestore.collection('users').doc(userId).set(userData);
+      session.linkedUserId = userId;
+
+      // Handle referral code if provided
+      let referralMessage = '';
+      const code = (args.referralCode || '').trim().toUpperCase();
+      if (code) {
+        try {
+          const partnerSnap = await firestore.collection('corporate_partners')
+            .where('referral_code', '==', code).where('status', '==', 'active').limit(1).get();
+          if (!partnerSnap.empty) {
+            const partner = partnerSnap.docs[0];
+            const partnerData = partner.data();
+            await firestore.collection('users').doc(userId).update({
+              referred_by_partner_id: partner.id,
+              referral_code_used: code,
+              referral_linked_at: now,
+            });
+            await firestore.collection('corporate_partners').doc(partner.id).update({
+              total_referrals: admin.firestore.FieldValue.increment(1),
+            });
+            referralMessage = ` Partner code "${code}" linked — you're under ${partnerData.company_name || 'our corporate partner'}'s program.`;
+          } else {
+            referralMessage = ` (Referral code "${code}" was not found or is inactive — you can try again later.)`;
+          }
+        } catch (e) {
+          console.error('[register_account] Referral link error:', e.message);
+          referralMessage = ' (Could not link referral code right now — you can try again later.)';
+        }
+      }
+
+      return {
+        registered: true,
+        userId,
+        message: `Welcome to Square 15, ${customerName}! 🎉 Your account has been created and linked to this WhatsApp number.${referralMessage} You can now book services, track jobs, earn wallet credits, and more — all right here on WhatsApp.`,
       };
     }
 
@@ -2535,35 +2697,75 @@ async function executeWaTool(name, args, session) {
         created_at: admin.firestore.FieldValue.serverTimestamp(),
       });
 
-      // ── Notify available artisans via FCM push ──
-      try {
+      // ── Auto-dispatch: route directly to artisans when conditions met ──
+      const materialsResp = (data.materials_responsibility || '').toString().trim().toLowerCase();
+      const clientBuysMaterials = materialsResp === 'client';
+      const underThreshold = priceNum > 0 && priceNum < 12000;
+      let autoDispatched = false;
+
+      if (clientBuysMaterials || underThreshold) {
+        const autoReason = clientBuysMaterials ? 'client_buys_materials' : 'under_12k';
         const cat = (data.category || data.category_name || '').toLowerCase().replace(/\s+/g, '_');
-        const artisanSnap = await firestore.collection('serviceProvider')
-          .where('status', '==', 'approved')
-          .where('is_suspended', '!=', true)
-          .limit(20)
-          .get();
-        for (const artDoc of artisanSnap.docs) {
-          const ad = artDoc.data() || {};
-          const cats = (ad.categories || ad.category || '').toString().toLowerCase();
-          if (cats && cat && !cats.includes(cat) && cat !== 'general_maintenance') continue;
-          const token = (ad.fcm_token || ad.deviceToken || '').toString().trim();
-          if (!token) continue;
-          try {
-            await admin.messaging().send({
-              token,
-              notification: {
-                title: '🔔 New RFQ Job Available',
-                body: `RFQ ${data.rfq_no || rfqId} — R${priceNum.toFixed(2)}. Tap to view and accept.`,
-              },
-              data: { type: 'rfq_accepted', booking_id: rfqId },
-              android: { notification: { channelId: 'order_request_channel', sound: 'sound' } },
-            });
-          } catch (fcmErr) {
-            console.warn(`[wa-tool] FCM to artisan ${artDoc.id} failed:`, fcmErr.message);
+        try {
+          const artisanSnap = await firestore.collection('serviceProvider')
+            .where('status', '==', 'approved')
+            .where('is_suspended', '!=', true)
+            .limit(20)
+            .get();
+          const matchedArtisans = [];
+          for (const artDoc of artisanSnap.docs) {
+            const ad = artDoc.data() || {};
+            const cats = (ad.categories || ad.category || '').toString().toLowerCase();
+            if (cats && cat && !cats.includes(cat) && cat !== 'general_maintenance') continue;
+            const aName = ad.name || ad.userName || ad.full_name || artDoc.id;
+            matchedArtisans.push({ id: artDoc.id, name: aName, token: (ad.fcm_token || ad.deviceToken || '').toString().trim() });
+            if (matchedArtisans.length >= 3) break;
           }
-        }
-      } catch (e) { console.warn('[wa-tool] artisan RFQ dispatch failed:', e.message); }
+          if (matchedArtisans.length > 0) {
+            const artisanIds = matchedArtisans.map(a => a.id);
+            const artisanNames = {};
+            matchedArtisans.forEach(a => { artisanNames[a.id] = a.name; });
+
+            await firestore.collection('futureBookings').doc(rfqId).update({
+              rfq_status: 'pending_artisan_acceptance',
+              status: 'pending_artisan_acceptance',
+              rfq_submitted_to: 'artisan',
+              rfq_assigned_artisan_ids: artisanIds,
+              rfq_assigned_artisan_names: artisanNames,
+              rfq_auto_assigned: true,
+              rfq_auto_assign_reason: autoReason,
+              rfq_artisan_rejection_count: 0,
+              rfq_artisan_rejections: [],
+              artisan_name: matchedArtisans[0].name,
+            });
+
+            await firestore.collection('tasksManagement').doc(rfqId).update({
+              status: 'pending_artisan_acceptance',
+              rfq_assigned_artisan_ids: artisanIds,
+              rfq_auto_assigned: true,
+              rfq_auto_assign_reason: autoReason,
+            });
+
+            for (const art of matchedArtisans) {
+              if (!art.token) continue;
+              try {
+                await admin.messaging().send({
+                  token: art.token,
+                  notification: { title: '🔔 New RFQ Job Available', body: `RFQ ${data.rfq_no || rfqId} — R${priceNum.toFixed(2)}. Tap to view and accept.` },
+                  data: { type: 'rfq_accepted', booking_id: rfqId },
+                  android: { notification: { channelId: 'order_request_channel', sound: 'sound' } },
+                });
+              } catch (fcmErr) { console.warn(`[wa-tool] FCM to artisan ${art.id} failed:`, fcmErr.message); }
+            }
+            autoDispatched = true;
+            console.log(`[wa-tool] Auto-dispatched RFQ ${rfqId} to ${artisanIds.length} artisans (${autoReason})`);
+          }
+        } catch (e) { console.warn('[wa-tool] auto-dispatch failed, falling back to admin:', e.message); }
+      }
+
+      if (autoDispatched) {
+        console.log(`[wa-tool] RFQ ${rfqId} auto-dispatched to artisans (under R12K or client buys materials)`);
+      }
 
       // Store for quick payment follow-up
       session.lastBookingId = rfqId;
@@ -2905,6 +3107,8 @@ PHOTO ANALYSIS FOR RFQ:
 
 🔗 ACCOUNT:
 - Auto-link WhatsApp number to existing Square 15 app account
+- Register new accounts directly via WhatsApp (register_account) — collect customer's full name, optionally email, address, and referral/partner code
+- When link_account fails (no existing account found), offer to register a new account right here on WhatsApp
 - Inform customers about app features when relevant
 
 💬 MESSAGING:
@@ -3105,6 +3309,19 @@ app.post('/webhook', async (req, res) => {
       // Restore session from Firestore if this is a fresh in-memory session
       await restoreSessionFromFirestore(session);
 
+      // Auto-link: if no linked account yet, try to find existing app user by phone number
+      if (!session.linkedUserId) {
+        try {
+          const appUser = await findUserByPhone(session.phone);
+          if (appUser) {
+            session.linkedUserId = appUser.id;
+            console.log(`[auto-link] Matched WhatsApp ${session.phone} to app user ${appUser.id} (${appUser.name || 'unknown'})`);
+          }
+        } catch (e) {
+          console.warn('[auto-link] Phone lookup failed:', e.message);
+        }
+      }
+
       let userText = '';
 
       switch (msg.type) {
@@ -3126,6 +3343,12 @@ app.post('/webhook', async (req, res) => {
           const imageMedia = await downloadWhatsAppMedia(msg.image?.id);
           const caption = msg.image?.caption || '';
           if (imageMedia) {
+            // Upload photo to Firebase Storage so artisans can see it
+            const storageUrl = await uploadImageToStorage(imageMedia.buffer, imageMedia.mimeType);
+            if (storageUrl) {
+              session.photoUrls.push(storageUrl);
+              console.log(`[msg] ${from}: [IMAGE uploaded to Storage, ${session.photoUrls.length} total]`);
+            }
             userText = caption
               ? `[Customer sent a photo with caption: "${caption}"] Analyse this image of a maintenance/repair issue. Identify the problem, suggest the service category, and offer to create a booking or RFQ.`
               : '[Customer sent a photo of a maintenance issue] Analyse this image. Identify what repair or maintenance is needed, suggest the service category (plumbing, electrical, painting, etc.), estimate the scope, and offer to create a booking or submit an RFQ.';
