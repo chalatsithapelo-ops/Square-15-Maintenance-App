@@ -1351,41 +1351,16 @@ async function executeWaTool(name, args, session) {
         };
         const subNorm = _normalize(subQuery);
 
-        // 1) AUTHORITATIVE: Check pricingGuidance FIRST (admin-configured category prices)
-        // Seeded by admin app ConfigurationHelper and updated via pricing_guide_service.dart
-        {
-          const guidanceDoc = await firestore.collection('pricingGuidance').doc(catSlug).get();
-          if (guidanceDoc.exists) {
-            const gd = guidanceDoc.data();
-            const servicePrices = gd.service_prices || gd.servicePrices || {};
-            for (const [svcName, price] of Object.entries(servicePrices)) {
-              const svcNorm = _normalize(svcName);
-              if (subQuery && _fuzzyMatch(subNorm, svcNorm)) {
-                estimatedCost = (typeof price === 'number' ? price : parseFloat(price)).toString();
-                pricingSource = 'fixed';
-                break;
-              }
-            }
-            // If still no match, use labor_cost_per_hour as rough baseline
-            if (pricingSource === 'none') {
-              const laborRate = gd.labor_cost_per_hour || gd.laborCostPerHour;
-              if (laborRate) {
-                estimatedCost = (parseFloat(laborRate) * 2).toString();
-                pricingSource = 'labor_estimate';
-              }
-            }
-          }
-        }
-
-        // 2) FALLBACK: Check tasks collection only if no pricingGuidance match
-        if (pricingSource !== 'fixed' && subQuery) {
+        // SOLE SOURCE: tasks collection (admin-managed fixed prices)
+        // pricingGuidance is NOT used (stale default data, deleted).
+        if (subQuery) {
           const taskSnap = await firestore.collection('tasks').limit(200).get();
           for (const td of taskSnap.docs) {
             const d = td.data();
             const status = (d.status || '').toLowerCase();
             if (status && status !== 'publish' && status !== 'active') continue;
             const name = (d.name || d.title || d.task_name || '').toString();
-            const cost = parseFloat(d.cost || d.client_rate || d.clientRate || d.price || d.amount || 0);
+            const cost = parseFloat(d.client_rate || d.cost || d.clientRate || d.price || d.amount || 0);
             if (name && cost > 0 && _fuzzyMatch(subNorm, _normalize(name))) {
               estimatedCost = cost.toString();
               pricingSource = 'fixed';
@@ -1748,30 +1723,9 @@ async function executeWaTool(name, args, session) {
         let matchedPrice = null;
         let categoryName = args.category || '';
 
-        // ── 1) AUTHORITATIVE SOURCE: pricingGuidance collection (admin-configured category prices) ──
-        // Seeded by admin app ConfigurationHelper.initializeDefaultPricingGuides()
-        // and updated via pricing_guide_service.dart updateServicePrice()
-        let servicePrices = {};
-        const guidanceDoc = await firestore.collection('pricingGuidance').doc(catSlug).get();
-        if (guidanceDoc.exists) {
-          const gd = guidanceDoc.data();
-          servicePrices = gd.service_prices || gd.servicePrices || {};
-          categoryName = gd.category_name || gd.categoryName || categoryName;
-        }
-
-        // Try to match subcategory against pricingGuidance (authoritative prices)
-        if (subQuery) {
-          for (const [svcName, price] of Object.entries(servicePrices)) {
-            const svcNorm = normalize(svcName);
-            if (fuzzyMatch(subNorm, svcNorm)) {
-              matchedService = svcName;
-              matchedPrice = typeof price === 'number' ? price : parseFloat(price);
-              break;
-            }
-          }
-        }
-
-        // ── 2) FALLBACK: tasks collection (only if no pricingGuidance match) ──
+        // ── SOLE SOURCE: tasks collection (admin-managed fixed prices) ──
+        // These are the prices set by the admin via the admin app categories.
+        // pricingGuidance collection is NOT used (stale default data, deleted).
         const taskResults = [];
         try {
           const taskSnap = await firestore.collection('tasks').limit(200).get();
@@ -1780,19 +1734,21 @@ async function executeWaTool(name, args, session) {
             const status = (d.status || '').toLowerCase();
             if (status && status !== 'publish' && status !== 'active') continue;
             const name = (d.name || d.title || d.task_name || '').toString();
-            const cost = parseFloat(d.cost || d.client_rate || d.clientRate || d.price || d.amount || 0);
+            const cost = parseFloat(d.client_rate || d.cost || d.clientRate || d.price || d.amount || 0);
             if (name && cost > 0) {
-              taskResults.push({ name, cost, category_id: d.categoryId || d.category_id || '' });
+              taskResults.push({ name, cost, category_id: d.categoryId || d.category_id || '', category_name: d.category_name || d.categoryName || '' });
             }
           }
         } catch (e) { console.warn('[wa-tool] tasks lookup failed:', e.message); }
 
-        if (!matchedService && subQuery) {
+        // Try to match subcategory against tasks
+        if (subQuery) {
           for (const t of taskResults) {
             const tNorm = normalize(t.name);
             if (fuzzyMatch(subNorm, tNorm)) {
               matchedService = t.name;
               matchedPrice = t.cost;
+              categoryName = t.category_name || categoryName;
               break;
             }
           }
@@ -1800,17 +1756,12 @@ async function executeWaTool(name, args, session) {
 
         // Build list of all available fixed prices for context
         const allFixedPrices = [];
-        // Add pricingGuidance entries first (authoritative)
-        const addedNames = new Set();
-        for (const [name, price] of Object.entries(servicePrices)) {
-          allFixedPrices.push({ service: name, fixedPrice: `R${typeof price === 'number' ? price.toFixed(2) : price}` });
-          addedNames.add(normalize(name));
-        }
-        // Then add tasks entries not already covered
         for (const t of taskResults) {
           const catId = normalize(t.category_id);
+          const catNameNorm = normalize(t.category_name);
           const catSlugNorm = normalize(catSlug);
-          if (!addedNames.has(normalize(t.name)) && (!catSlug || catId === catSlugNorm || catId.includes(catSlugNorm) || catSlugNorm.includes(catId))) {
+          if (!catSlug || catId === catSlugNorm || catId.includes(catSlugNorm) || catSlugNorm.includes(catId)
+              || catNameNorm === catSlugNorm || catNameNorm.includes(catSlugNorm) || catSlugNorm.includes(catNameNorm)) {
             allFixedPrices.push({ service: t.name, fixedPrice: `R${t.cost.toFixed(2)}` });
           }
         }
@@ -3522,4 +3473,20 @@ app.get('/terms', (req, res) => {
 app.listen(PORT, () => {
   console.log(`[whatsapp-bot] listening on :${PORT}`);
   initFirebase();
+
+  // One-time cleanup: delete all pricingGuidance documents (stale default prices)
+  // The correct prices are in the tasks collection, managed by the admin app.
+  try {
+    const firestore = db();
+    if (firestore) {
+      firestore.collection('pricingGuidance').get().then(snap => {
+        if (snap.empty) { console.log('[cleanup] pricingGuidance already empty'); return; }
+        const batch = firestore.batch();
+        snap.docs.forEach(doc => batch.delete(doc.ref));
+        return batch.commit();
+      }).then(() => {
+        console.log('[cleanup] pricingGuidance collection deleted successfully');
+      }).catch(e => console.warn('[cleanup] pricingGuidance deletion failed:', e.message));
+    }
+  } catch (e) { console.warn('[cleanup] error:', e.message); }
 });
