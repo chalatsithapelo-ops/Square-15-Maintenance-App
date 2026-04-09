@@ -3652,6 +3652,128 @@ app.get('/debug/firebase-test', async (req, res) => {
   res.json(results);
 });
 
+// ─── Artisan App → WhatsApp: Notify client when artisan accepts/rejects ───
+app.post('/api/artisan-accepted', async (req, res) => {
+  try {
+    const { bookingId, artisanName } = req.body || {};
+    if (!bookingId) return res.status(400).json({ error: 'bookingId required' });
+
+    const firestore = db();
+    if (!firestore) return res.status(503).json({ error: 'Database unavailable' });
+
+    // Look up booking to find customer phone + details
+    // bookingId may be the bridge ID (WA-XXX_artisanId) or the main booking ID (WA-XXX)
+    const mainBookingId = bookingId.includes('_') ? bookingId.split('_')[0] : bookingId;
+
+    let customerPhone = '';
+    let bookingCost = '';
+    let bookingDescription = '';
+    let orderNo = '';
+
+    // Try futureBookings first (has the canonical data)
+    const fbDoc = await firestore.collection('futureBookings').doc(mainBookingId).get();
+    if (fbDoc.exists) {
+      const d = fbDoc.data();
+      customerPhone = d.user_phone || d.customerPhone || d.contact || '';
+      bookingCost = d.cost || '';
+      bookingDescription = d.description || d.subcategory || d.category_name || '';
+      orderNo = d.order_no || '';
+    }
+
+    // Fallback to tasksManagement
+    if (!customerPhone) {
+      const tmDoc = await firestore.collection('tasksManagement').doc(mainBookingId).get();
+      if (tmDoc.exists) {
+        const d = tmDoc.data();
+        customerPhone = d.customerPhone || d.contact || '';
+        bookingCost = d.cost || '';
+        bookingDescription = d.description || d.subcategory || d.category_name || '';
+        orderNo = d.order_no || '';
+      }
+    }
+
+    if (!customerPhone) {
+      return res.status(404).json({ error: 'No customer phone found for booking' });
+    }
+
+    // Normalise phone to international format (27...)
+    let to = customerPhone.replace(/[^0-9]/g, '');
+    if (to.startsWith('0')) to = '27' + to.slice(1);
+
+    // Send artisan acceptance message
+    const name = artisanName || 'Your artisan';
+    const costStr = bookingCost ? `R${parseFloat(bookingCost).toFixed(2)}` : '';
+    const descStr = bookingDescription || 'your maintenance request';
+
+    let msg = `✅ *Great news!* ${name} has accepted your booking`;
+    if (orderNo) msg += ` (#${orderNo})`;
+    msg += `!\n\n`;
+    msg += `📋 *Job:* ${descStr}\n`;
+    if (costStr) msg += `💰 *Cost:* ${costStr}\n`;
+    msg += `\n${name} will contact you to confirm the schedule and arrive at your location.\n`;
+    msg += `\n💳 *Payment:* Please make payment via the Square 15 app or contact us to arrange payment. Your funds are held in escrow until you confirm satisfaction with the work.\n`;
+    msg += `\nIf you have any questions, just reply here! 😊`;
+
+    await sendWhatsAppMessage(to, msg);
+    console.log(`[api/artisan-accepted] Sent acceptance notification to ${to} for booking ${mainBookingId}`);
+
+    res.json({ success: true, to, bookingId: mainBookingId });
+  } catch (err) {
+    console.error('[api/artisan-accepted] error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Artisan App → WhatsApp: Notify client of booking status changes ───
+app.post('/api/booking-status-update', async (req, res) => {
+  try {
+    const { bookingId, status, message: customMsg } = req.body || {};
+    if (!bookingId || !status) return res.status(400).json({ error: 'bookingId and status required' });
+
+    const firestore = db();
+    if (!firestore) return res.status(503).json({ error: 'Database unavailable' });
+
+    const mainBookingId = bookingId.includes('_') ? bookingId.split('_')[0] : bookingId;
+
+    let customerPhone = '';
+    const fbDoc = await firestore.collection('futureBookings').doc(mainBookingId).get();
+    if (fbDoc.exists) {
+      const d = fbDoc.data();
+      customerPhone = d.user_phone || d.customerPhone || d.contact || '';
+    }
+    if (!customerPhone) {
+      const tmDoc = await firestore.collection('tasksManagement').doc(mainBookingId).get();
+      if (tmDoc.exists) {
+        const d = tmDoc.data();
+        customerPhone = d.customerPhone || d.contact || '';
+      }
+    }
+    if (!customerPhone) return res.status(404).json({ error: 'No customer phone found' });
+
+    let to = customerPhone.replace(/[^0-9]/g, '');
+    if (to.startsWith('0')) to = '27' + to.slice(1);
+
+    // Default status messages
+    const statusMessages = {
+      'in_progress': '🔧 Your artisan has started working on your job. We\'ll update you when they\'re done!',
+      'progress': '🔧 Your artisan has started working on your job. We\'ll update you when they\'re done!',
+      'completed': '✅ Your job has been completed! Please review the work and confirm satisfaction in the app.',
+      'closed': '✅ Your job has been completed and closed. Thank you for using Square 15!',
+      'cancelled': '❌ Your booking has been cancelled. If you need help, reply here.',
+      'payment_received': '💳 Payment received! Thank you. Your booking is confirmed.',
+    };
+
+    const msg = customMsg || statusMessages[status] || `📋 Your booking status has been updated to: *${status}*`;
+    await sendWhatsAppMessage(to, msg);
+    console.log(`[api/booking-status-update] Status "${status}" sent to ${to} for ${mainBookingId}`);
+
+    res.json({ success: true, to, status });
+  } catch (err) {
+    console.error('[api/booking-status-update] error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ─── Admin → WhatsApp: Send RFQ response back to client ───
 app.post('/api/send-rfq-response', async (req, res) => {
   try {
