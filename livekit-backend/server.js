@@ -3578,14 +3578,21 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       const autoReason = clientBuysMaterials ? 'client_buys_materials' : 'under_12k';
       const cat = (data.category || data.category_name || '').toLowerCase().replace(/\s+/g, '_');
       try {
-        const artisanSnap = await firestore.collection('serviceProvider')
-          .where('status', '==', 'approved')
-          .where('is_suspended', '!=', true)
-          .limit(20)
-          .get();
+        let artisanSnap;
+        try {
+          artisanSnap = await firestore.collection('serviceProvider').where('status', '==', 'publish').limit(200).get();
+          if (artisanSnap.empty) artisanSnap = await firestore.collection('serviceProvider').where('status', '==', 'approved').limit(200).get();
+          if (artisanSnap.empty) artisanSnap = await firestore.collection('serviceProvider').limit(200).get();
+        } catch (qErr) {
+          console.warn('[lk] artisan query fallback:', qErr.message);
+          artisanSnap = await firestore.collection('serviceProvider').limit(200).get();
+        }
         const matchedArtisans = [];
         for (const artDoc of artisanSnap.docs) {
           const ad = artDoc.data() || {};
+          const st = (ad.status || '').toString().toLowerCase();
+          if (st && st !== 'publish' && st !== 'published' && st !== 'approved' && st !== 'approve') continue;
+          if (ad.is_suspended === true) continue;
           const cats = (ad.categories || ad.category || '').toString().toLowerCase();
           if (cats && cat && !cats.includes(cat) && cat !== 'general_maintenance') continue;
           const aName = ad.name || ad.userName || ad.full_name || artDoc.id;

@@ -1556,16 +1556,29 @@ async function executeWaTool(name, args, session) {
       let dispatchedCount = 0;
       try {
         const catSlug = (args.category || '').toLowerCase().replace(/\s+/g, '_');
-        const artisanSnap = await firestore.collection('serviceProvider')
-          .where('status', '==', 'approved')
-          .where('is_suspended', '!=', true)
-          .limit(20)
-          .get();
+        // Fetch all service providers and filter in-code to avoid Firestore
+        // compound-inequality index issues and the != gotcha (docs without
+        // the is_suspended field are excluded by Firestore != queries).
+        let artisanSnap;
+        try {
+          artisanSnap = await firestore.collection('serviceProvider').where('status', '==', 'publish').limit(200).get();
+          if (artisanSnap.empty) artisanSnap = await firestore.collection('serviceProvider').where('status', '==', 'approved').limit(200).get();
+          if (artisanSnap.empty) artisanSnap = await firestore.collection('serviceProvider').limit(200).get();
+        } catch (qErr) {
+          console.warn('[wa-tool] artisan query fallback:', qErr.message);
+          artisanSnap = await firestore.collection('serviceProvider').limit(200).get();
+        }
+
+        console.log(`[wa-tool] Found ${artisanSnap.docs.length} serviceProvider docs, catSlug=${catSlug}`);
 
         const photoUrls = booking.work_images || [];
 
         for (const artDoc of artisanSnap.docs) {
           const ad = artDoc.data() || {};
+          // Filter: status must be publish/approved, not suspended
+          const st = (ad.status || '').toString().toLowerCase();
+          if (st && st !== 'publish' && st !== 'published' && st !== 'approved' && st !== 'approve') continue;
+          if (ad.is_suspended === true) continue;
           const cats = (ad.categories || ad.category || '').toString().toLowerCase();
           if (cats && !cats.includes(catSlug) && catSlug !== 'general_maintenance') continue;
 
