@@ -1548,6 +1548,9 @@ async function executeWaTool(name, args, session) {
       const depositAmount = Math.round(finalCost * 0.35 * 100) / 100;
       const balanceAmount = Math.round((finalCost - depositAmount) * 100) / 100;
 
+      // Collect any photos stored in session (uploaded via WhatsApp image messages)
+      const photoUrls = session.uploadedPhotos || [];
+
       // Core booking doc (compatible with Flutter app tasksManagement queries)
       const booking = {
         id: bookingId,
@@ -1579,6 +1582,10 @@ async function executeWaTool(name, args, session) {
         balance_paid: false,
         payment_status: 'unpaid',
         paymentStatus: 'pending',
+        work_images: photoUrls,
+        image_urls: photoUrls,
+        imageUrls: photoUrls,
+        has_photos: photoUrls.length > 0 ? 'yes' : 'no',
         promo_code: promoApplied ? promoApplied.code : null,
         promo_discount: promoApplied ? promoApplied.discount : 0,
         created_at: now,
@@ -1730,8 +1737,6 @@ async function executeWaTool(name, args, session) {
             .get();
         }
         console.log(`[wa-tool] Found ${artisanSnap.docs.length} artisans to dispatch to`);
-
-        const photoUrls = futureBooking.work_images || [];
 
         for (const artDoc of artisanSnap.docs) {
           const ad = artDoc.data() || {};
