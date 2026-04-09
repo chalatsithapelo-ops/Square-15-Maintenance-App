@@ -349,9 +349,15 @@ async function restoreSessionFromFirestore(session) {
     // Only restore if Firestore data is recent (within TTL)
     const lastTs = data.lastActivity?.toMillis?.() || data.lastActivity || 0;
     if (Date.now() - lastTs > SESSION_TTL_MS) return;
-    // Restore conversation history
+    // Restore conversation history — strip tool_calls/tool messages to avoid
+    // OpenAI errors if tools changed between deploys.
     if (Array.isArray(data.messages) && data.messages.length > 0) {
-      session.messages = data.messages;
+      const validToolNames = new Set(waTools.map(t => t.function?.name));
+      session.messages = data.messages.filter(m => {
+        if (m.role === 'tool') return false;
+        if (m.role === 'assistant' && m.tool_calls) return false;
+        return true;
+      });
     }
     // Restore linked account
     if (data.linkedUserId) session.linkedUserId = data.linkedUserId;
@@ -4108,7 +4114,12 @@ async function handleMessage(session, userMessage, imageDataUrl) {
 
     return reply;
   } catch (err) {
-    console.error('[handleMessage] Error:', err.message);
+    console.error('[handleMessage] Error:', err.message, err.stack?.substring(0, 300));
+    // If the error is from corrupt session messages, clear them for next attempt
+    if (err.message?.includes('tool_call') || err.message?.includes('tool_calls') || err.status === 400) {
+      session.messages = [];
+      console.warn('[handleMessage] Cleared session messages due to likely corrupt tool state');
+    }
     return "I'm having trouble right now. Please try again in a moment, or send 'Hi' to restart our conversation.";
   }
 }
