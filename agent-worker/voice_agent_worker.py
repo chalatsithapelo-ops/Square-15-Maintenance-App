@@ -498,6 +498,9 @@ async def entrypoint(ctx: JobContext):
             "- NEVER say 'I cannot access', 'I am unable to', 'I don't have access to', or 'I need you to be authenticated'. ALWAYS try calling the relevant tool.\n"
             "- BACKEND tools for data: get_booking_status, list_my_bookings, explain_quote, check_payment, get_wallet_balance, get_messages, get_case_status.\n"
             "- BACKEND tools for ACTIONS: cancel_booking, reschedule_booking, send_message_to_artisan, send_message_to_client, send_message_to_admin, mark_booking_in_progress, artisan_cancel_and_reassign, submit_rating, submit_complaint. These tools EXECUTE real actions on the backend — use them, NOT ui_navigate.\n"
+            "- PAYMENT tools: request_payment_link (generates a PayFast payment link and sends it to the customer's phone). IMPORTANT: Only offer payment AFTER an artisan has accepted the job. NEVER offer payment immediately after booking creation. When customer wants to pay, ALWAYS ask 'Would you like to pay the full amount or a 35 percent deposit?' before calling request_payment_link.\n"
+            "- If customer says 'deposit' or '35 percent' → call request_payment_link with payment_type='deposit'\n"
+            "- If customer says 'full' or 'pay everything' → call request_payment_link with payment_type='full'\n"
             "- RFQ QUOTE tools: generate_rfq_quote (trigger AI quote), accept_rfq (accept quote → payment), reject_rfq (negotiate quote). Use when handling RFQ requests.\n"
             "- PAYMENT tools: request_payment_link (generates a PayFast payment link and sends it to the customer's phone). IMPORTANT: Only offer payment AFTER an artisan has accepted the job. NEVER offer payment immediately after booking creation. When customer wants to pay, ALWAYS ask 'Would you like to pay the full amount or a 35 percent deposit?' before calling request_payment_link.\n"
             "- lookup_service_pricing for pricing: when user asks 'how much is...', 'what's the price for...', call lookup_service_pricing.\n"
@@ -1314,12 +1317,13 @@ async def entrypoint(ctx: JobContext):
 
     @llm.function_tool(
         description=(
-            "Request a payment link for a booking. Generates a secure PayFast payment link "
-            "and sends it to the customer's phone as a notification. "
-            "IMPORTANT: Only use this AFTER an artisan has accepted the job. "
-            "ALWAYS ask the customer to choose payment_type: 'deposit' (35%) or 'full' before calling. "
-            "Use when the customer says 'I want to pay', 'send me a payment link', "
-            "'how do I pay', or after an artisan has accepted."
+            "Request a payment link for a booking. This generates a PayFast card payment link "
+            "and sends it to the customer's phone via notification. IMPORTANT: Only call this "
+            "AFTER an artisan has accepted the job. NEVER offer payment immediately after booking "
+            "creation. Always ask the customer 'Would you like to pay the full amount or a 35 percent deposit?' "
+            "before calling this. Use payment_type='deposit' for 35% deposit, or payment_type='full' for "
+            "full payment."
+
         )
     )
     async def request_payment_link(booking_id: str, payment_type: str = "full") -> str:
