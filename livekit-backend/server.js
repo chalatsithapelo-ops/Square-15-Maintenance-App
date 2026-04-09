@@ -5992,7 +5992,7 @@ app.post('/api/payment/whatsapp-initiate', assistantLimiter, async (req, res) =>
       return res.status(503).json({ error: 'Payment credentials not configured' });
     }
 
-    const { amount, booking_id, customer_name, customer_phone, description } = req.body;
+    const { amount, booking_id, customer_name, customer_phone, description, payment_method } = req.body;
     if (!amount || !booking_id) {
       return res.status(400).json({ error: 'Missing required: amount, booking_id' });
     }
@@ -6013,6 +6013,8 @@ app.post('/api/payment/whatsapp-initiate', assistantLimiter, async (req, res) =>
       custom_str1: booking_id,
       ...(customer_name ? { name_first: customer_name } : {}),
       ...(customer_phone ? { cell_number: customer_phone } : {}),
+      // Force card-only checkout when requested (Visa, Mastercard, etc.)
+      ...(payment_method === 'cc' ? { payment_method: 'cc' } : {}),
     };
 
     const queryString = Object.entries(paymentData)

@@ -2335,22 +2335,24 @@ async function executeWaTool(name, args, session) {
         itemSuffix = d.deposit_paid === true ? '(Balance Payment)' : '(Full Payment)';
       }
 
-      // Try to generate an Ozow payment URL via the backend
+      // Try to generate a payment URL via the backend (card payment link)
       try {
-        const backendUrl = process.env.BACKEND_URL || 'https://square15-livekit-backend.onrender.com';
-        const fetch = (await import('node-fetch')).default;
-        const ozowResp = await fetch(`${backendUrl}/api/payment/initiate`, {
+        const backendUrl = process.env.BACKEND_URL || process.env.LIVEKIT_BACKEND_URL || 'https://square15-livekit-backend.onrender.com';
+        const payResp = await fetch(`${backendUrl}/api/payment/whatsapp-initiate`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             amount: payAmount.toFixed(2),
-            item_name: `Square 15 Booking ${d.order_no || d.rfq_no || bid} ${itemSuffix}`,
-            custom_str1: bid,
+            booking_id: bid,
+            description: `Square 15 Booking ${d.order_no || d.rfq_no || bid} ${itemSuffix}`,
+            customer_name: d.customerName || d.customer_name || session.customerName || '',
+            customer_phone: d.customerPhone || d.customer_phone || session.phone || '',
+            payment_method: 'cc',
           }),
         });
-        const ozowBody = await ozowResp.json();
+        const payBody = await payResp.json();
 
-        if (ozowBody.ok && ozowBody.payment_url) {
+        if (payBody.ok && payBody.payment_url) {
           // Update booking with payment_type
           try {
             await firestore.collection('tasksManagement').doc(bid).update({ payment_type: paymentType }).catch(() => {});
@@ -2363,15 +2365,15 @@ async function executeWaTool(name, args, session) {
 
           return {
             success: true,
-            message: `Here's your ${itemSuffix} link for R${payAmount.toFixed(2)}:\n\n${ozowBody.payment_url}\n\nClick to pay securely via Ozow (instant EFT).${escrowMsg}\n\n✅ 100% Money-Back Guarantee — not satisfied? Full refund, no questions asked within 24 hours.\n🚫 Free cancellation before artisan dispatch.`,
+            message: `Here's your ${itemSuffix} payment link for R${payAmount.toFixed(2)}:\n\n${payBody.payment_url}\n\nClick to pay securely via card (Visa, Mastercard, etc).${escrowMsg}\n\n✅ 100% Money-Back Guarantee — not satisfied? Full refund, no questions asked within 24 hours.\n🚫 Free cancellation before artisan dispatch.`,
             amount: `R${payAmount.toFixed(2)}`,
-            paymentUrl: ozowBody.payment_url,
-            reference: ozowBody.transaction_ref || '',
+            paymentUrl: payBody.payment_url,
+            reference: payBody.transaction_ref || '',
             bookingId: bid,
           };
         }
       } catch (e) {
-        console.warn('[request_payment_link] Ozow API call failed:', e.message);
+        console.warn('[request_payment_link] Payment link generation failed:', e.message);
       }
 
       // Fallback: store request and notify admin
