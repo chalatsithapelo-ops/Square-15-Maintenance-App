@@ -1444,6 +1444,11 @@ async function executeWaTool(name, args, session) {
       };
 
       await firestore.collection('tasksManagement').doc(bookingId).set(booking);
+      console.log(`[create_booking] ✅ Written tasksManagement/${bookingId} cost=${finalCost} source=whatsapp`);
+
+      // Verify write
+      const verifyDoc = await firestore.collection('tasksManagement').doc(bookingId).get();
+      console.log(`[create_booking] Verify: exists=${verifyDoc.exists}`);
 
       // Also create futureBookings entry (modern flow)
       const futureBooking = {
@@ -3322,7 +3327,13 @@ async function handleMessage(session, userMessage, imageDataUrl) {
         try { toolArgs = JSON.parse(tc.function.arguments); } catch (_) {}
         console.log(`[tool] ${tc.function.name}(${JSON.stringify(toolArgs).substring(0, 100)})`);
 
-        const result = await executeWaTool(tc.function.name, toolArgs, session);
+        let result;
+        try {
+          result = await executeWaTool(tc.function.name, toolArgs, session);
+        } catch (toolErr) {
+          console.error(`[tool] ${tc.function.name} THREW:`, toolErr.message, toolErr.stack);
+          result = { error: `Tool ${tc.function.name} failed: ${toolErr.message}` };
+        }
         session.messages.push({
           role: 'tool',
           tool_call_id: tc.id,
@@ -3531,6 +3542,50 @@ app.post('/webhook', async (req, res) => {
 
 // Health check
 app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot' }));
+
+// ─── Diagnostic: test Firebase read/write ───
+app.get('/debug/firebase-test', async (req, res) => {
+  const results = { firebase_init: false, read_ok: false, write_ok: false, delete_ok: false, sp_count: 0, tm_count: 0, wa_bookings: 0, errors: [] };
+  try {
+    const firestore = db();
+    if (!firestore) { results.errors.push('db() returned null — Firebase not initialized'); return res.json(results); }
+    results.firebase_init = true;
+
+    // Test read
+    try {
+      const tmCount = await firestore.collection('tasksManagement').select().limit(1).get();
+      results.read_ok = true;
+      const tmAll = await firestore.collection('tasksManagement').select().get();
+      results.tm_count = tmAll.docs.length;
+    } catch (e) { results.errors.push('read failed: ' + e.message); }
+
+    // Count WA bookings
+    try {
+      const allTm = await firestore.collection('tasksManagement').get();
+      results.wa_bookings = allTm.docs.filter(d => d.id.startsWith('WA-') || (d.data().source === 'whatsapp')).length;
+    } catch (e) { results.errors.push('wa count failed: ' + e.message); }
+
+    // Test write + delete
+    const testDocId = `_diag_test_${Date.now()}`;
+    try {
+      await firestore.collection('tasksManagement').doc(testDocId).set({ _test: true, created_at: new Date().toISOString() });
+      results.write_ok = true;
+    } catch (e) { results.errors.push('write failed: ' + e.message); }
+    try {
+      await firestore.collection('tasksManagement').doc(testDocId).delete();
+      results.delete_ok = true;
+    } catch (e) { results.errors.push('delete failed: ' + e.message); }
+
+    // Service providers
+    try {
+      const spSnap = await firestore.collection('serviceProvider').get();
+      results.sp_count = spSnap.docs.length;
+      results.sp_sample_fields = spSnap.docs.length > 0 ? Object.keys(spSnap.docs[0].data()) : [];
+      results.sp_first = spSnap.docs.length > 0 ? { id: spSnap.docs[0].id, name: spSnap.docs[0].data().name, active: spSnap.docs[0].data().active, status: spSnap.docs[0].data().status } : null;
+    } catch (e) { results.errors.push('sp read failed: ' + e.message); }
+  } catch (e) { results.errors.push('outer error: ' + e.message); }
+  res.json(results);
+});
 
 // ─── Admin → WhatsApp: Send RFQ response back to client ───
 app.post('/api/send-rfq-response', async (req, res) => {
