@@ -8,6 +8,9 @@ const fs = require('fs');
 const OpenAI = require('openai');
 require('dotenv').config();
 
+// Deploy version (used to verify Render deployment)
+const DEPLOY_VERSION = '2026-04-04a';
+
 // ─── Prompt sanitization (prevent injection via user-supplied text) ───
 function sanitizeForPrompt(text, maxLen = 500) {
   if (!text || typeof text !== 'string') return '';
@@ -308,8 +311,11 @@ async function lookupMaterialsCatalog(firestore, name) {
     // Try by name_lower field
     let snap = await firestore.collection('materialsCatalog').where('name_lower', '==', normalized).limit(1).get();
     if (!snap.empty) { const d = snap.docs[0].data(); const p = parseFloat(d.unit_price || d.price_incl_vat || d.price || 0); if (p > 0) return { price: p, source: 'catalog_name_lower' }; }
-    // Try by aliases
+    // Try by aliases (both space and underscore variants)
     snap = await firestore.collection('materialsCatalog').where('aliases', 'array-contains', name.toLowerCase()).limit(1).get();
+    if (snap.empty) {
+      snap = await firestore.collection('materialsCatalog').where('aliases', 'array-contains', normalized).limit(1).get();
+    }
     if (!snap.empty) { const d = snap.docs[0].data(); const p = parseFloat(d.unit_price || d.price_incl_vat || d.price || 0); if (p > 0) return { price: p, source: 'catalog_alias' }; }
   } catch (e) { console.error('[catalog] lookup error:', e.message); }
   return null;
@@ -401,11 +407,15 @@ function createInMemoryRateLimiter({ windowMs, max, keyFn, name }) {
   const safeMax = Math.max(1, Number(max) || 60);
 
   setInterval(() => {
-    const now = Date.now();
-    for (const [k, v] of hits.entries()) {
-      if (!v || (now - v.windowStart) > safeWindowMs) {
-        hits.delete(k);
+    try {
+      const now = Date.now();
+      for (const [k, v] of hits.entries()) {
+        if (!v || (now - v.windowStart) > safeWindowMs) {
+          hits.delete(k);
+        }
       }
+    } catch (e) {
+      console.error(`[rate-limiter:${name || 'anon'}] cleanup error:`, e.message);
     }
   }, Math.min(safeWindowMs, 60_000)).unref?.();
 
@@ -780,6 +790,8 @@ const ACTION_TIERS = Object.freeze({
   cancel_booking: 'B',
   reschedule_booking: 'B',
   mark_booking_in_progress: 'B',
+  mark_buying_material: 'B',
+  mark_job_completed: 'B',
   request_reassignment: 'B',
   artisan_cancel_and_reassign: 'B',
   reassign_booking: 'B',
@@ -799,6 +811,8 @@ const ACTION_TIERS = Object.freeze({
   admin_close_stale_cases: 'B',
   admin_broadcast_notification: 'B',
   admin_flag_user: 'B',
+  // Payment link generation (Tier B — creates Ozow link + notification)
+  request_payment_link: 'B',
   // Phase 5.1: Finance read-only (Tier A)
   get_finance_summary: 'A',
   get_daily_revenue: 'A',
@@ -1420,7 +1434,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       const doc = await firestore.collection('tasks').doc(t).get();
       if (!doc.exists) return null;
       const data = doc.data() || {};
-      const amount = toNumber(data.cost ?? data.price ?? data.amount ?? data.unit_price);
+      const amount = toNumber(data.client_rate ?? data.clientRate ?? data.cost ?? data.price ?? data.amount ?? data.unit_price);
       return amount && amount > 0 ? amount : null;
     } catch (e) { console.warn('\u26a0\ufe0f resolveTaskCost:', e.message);
       return null;
@@ -1724,16 +1738,20 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
 
   async function createTasksManagementRequestForFutureBooking({ bookingIdLocal, bookingDataLocal, artisanIdLocal }) {
     const userIdLocal = String(bookingDataLocal.user_id || '').trim();
-    if (!userIdLocal || !String(artisanIdLocal || '').trim()) return null;
+    if (!userIdLocal) return null;
+    const hasArtisan = !!String(artisanIdLocal || '').trim();
 
     let effectiveTaskId = String(bookingDataLocal.task_id || '').trim();
     let jobIds = stringList(bookingDataLocal.job_ids ?? bookingDataLocal.jobIds);
     if (jobIds.length === 0 && effectiveTaskId) jobIds = [effectiveTaskId];
     if (!effectiveTaskId && jobIds.length > 0) effectiveTaskId = String(jobIds[0] || '').trim();
 
-    const providerDoc = await getServiceProviderDocByAnyId(artisanIdLocal);
-    const providerListenerId = providerDoc && providerDoc.exists ? String(providerDoc.id).trim() : String(artisanIdLocal).trim();
-    if (!providerListenerId) return null;
+    let providerListenerId = '';
+    if (hasArtisan) {
+      const providerDoc = await getServiceProviderDocByAnyId(artisanIdLocal);
+      providerListenerId = providerDoc && providerDoc.exists ? String(providerDoc.id).trim() : String(artisanIdLocal).trim();
+      if (!providerListenerId) return null;
+    }
 
     const workImages = stringList(bookingDataLocal.work_images ?? bookingDataLocal.workImages);
     const firstImage = workImages.length > 0 ? workImages[0] : '';
@@ -1820,6 +1838,19 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     const bookingRefLocal = firestore.collection('futureBookings').doc(bookingIdLocal);
 
     const batch = firestore.batch();
+    // Resolve task names for artisan display
+    const resolvedJobNames = [];
+    for (const jid of jobIds) {
+      const sid = String(jid || '').trim();
+      if (!sid) continue;
+      try {
+        const tDoc = await firestore.collection('tasks').doc(sid).get();
+        const tName = String((tDoc.exists ? (tDoc.data() || {}).name : '') || '').trim();
+        if (tName) resolvedJobNames.push(tName);
+      } catch (_) {}
+    }
+    const effectiveDescription = description || (resolvedJobNames.length > 0 ? resolvedJobNames.join(', ') : '');
+
     batch.set(tmRef, {
       id: tmId,
       order_no: resolvedOrderNo,
@@ -1844,7 +1875,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       creation_date: now,
       updated_at: now,
       updated_by: userIdLocal,
-      description,
+      description: effectiveDescription,
       service_on_location: isCurrent ? 'yes' : 'no',
       provided_address: effectiveAddress,
       other_lat: effectiveLat,
@@ -1863,14 +1894,21 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       if (!id) continue;
       const jobDocId = crypto.randomUUID();
       const jobCost = resolvedTaskCosts[id] ?? 0.0;
+      // Resolve task name for artisan display
+      let jobName = '';
+      try {
+        const tDoc = await firestore.collection('tasks').doc(id).get();
+        jobName = String((tDoc.exists ? (tDoc.data() || {}).name : '') || '').trim();
+      } catch (_) {}
       batch.set(tmRef.collection('jobs').doc(jobDocId), {
         id: jobDocId,
         task_id: id,
+        name: jobName,
         height: '',
         width: '',
         area: '',
         cost: jobCost > 0 ? Number(jobCost).toFixed(2) : '0',
-        description,
+        description: effectiveDescription,
         image: firstImage || '',
       });
     }
@@ -2241,12 +2279,25 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     await bookingRefLocal.set(bookingDoc);
 
     let tasksManagementId = null;
-    if (!isRFQFlag && assignedSuccessfully) {
-      tasksManagementId = await createTasksManagementRequestForFutureBooking({
-        bookingIdLocal: bookingIdLocal,
-        bookingDataLocal: bookingDoc,
-        artisanIdLocal: assignedArtisanId.trim(),
-      });
+    if (!isRFQFlag) {
+      if (assignedSuccessfully) {
+        tasksManagementId = await createTasksManagementRequestForFutureBooking({
+          bookingIdLocal: bookingIdLocal,
+          bookingDataLocal: bookingDoc,
+          artisanIdLocal: assignedArtisanId.trim(),
+        });
+      } else {
+        // Create tasksManagement even without artisan so payment/cancel flows work
+        try {
+          tasksManagementId = await createTasksManagementRequestForFutureBooking({
+            bookingIdLocal: bookingIdLocal,
+            bookingDataLocal: bookingDoc,
+            artisanIdLocal: '',
+          });
+        } catch (e) {
+          console.warn('[booking] tasksManagement creation without artisan failed:', e.message);
+        }
+      }
     }
 
     if (isRFQFlag) {
@@ -2923,7 +2974,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         const name = String(d.name || d.title || d.task_name || d.taskName || '').trim();
         if (!name) continue;
 
-        const cost = toNumber(d.cost ?? d.price ?? d.amount ?? d.unit_price);
+        const cost = toNumber(d.client_rate ?? d.clientRate ?? d.cost ?? d.price ?? d.amount ?? d.unit_price);
         const catId = String(d.categoryId || d.category_id || d.subCategoryId || d.sub_category_id || d.subcategoryId || d.subcategory_id || '').trim();
         const catName = categoryMap[catId] || '';
         const taskId = String(d.id || doc.id).trim();
@@ -2965,6 +3016,27 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         return (a.name || '').localeCompare(b.name || '');
       });
 
+      // ── Also load pricingGuidance for the matched category ──
+      let pricingGuidance = null;
+      try {
+        const guidanceRaw = categoryName || (finalServices[0] && finalServices[0].category_name ? finalServices[0].category_name.toLowerCase() : '');
+        const guidanceSlug = guidanceRaw.toLowerCase().replace(/[\s-]+/g, '_');
+        if (guidanceSlug) {
+          const gDoc = await firestore.collection('pricingGuidance').doc(guidanceSlug).get();
+          if (gDoc.exists) {
+            const gd = gDoc.data() || {};
+            pricingGuidance = {
+              category: guidanceSlug,
+              laborCostPerHour: gd.laborCostPerHour ?? gd.labor_cost_per_hour ?? null,
+              outsourcedLaborRate: gd.outsourcedLaborRate ?? gd.outsourced_labor_rate ?? null,
+              materialMultiplier: gd.materialMultiplier ?? gd.material_multiplier ?? null,
+              service_prices: gd.service_prices || gd.servicePrices || null,
+              updated_at: gd.updatedAt || gd.updated_at || null,
+            };
+          }
+        }
+      } catch (ge) { console.warn('⚠️ pricingGuidance lookup:', ge.message); }
+
       return {
         ok: true,
         success: true,
@@ -2974,6 +3046,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
           filtered: services.length > 0,
           search_terms: searchTerms || 'all',
           expanded_terms: expandedTerms !== searchTerms ? expandedTerms.trim() : undefined,
+          pricingGuidance: pricingGuidance,
           message: services.length > 0
             ? `Found ${services.length} service(s) matching "${searchTerms}".`
             : allServices.length > 0
@@ -2983,6 +3056,70 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       };
     } catch (e) {
       return { ok: false, success: false, error: 'pricing_lookup_failed', message: String(e) };
+    }
+  }
+
+  // ── Builders Product Lookup ──
+  if (action === 'lookup_builders_product') {
+    try {
+      const query = String(payload.query || payload.search || payload.product || '').trim();
+      if (!query) return { ok: false, error: 'query parameter required' };
+
+      const bffCfg = await getBuildersBffConfig();
+      if (!bffCfg || !bffCfg.searchHash) {
+        return { ok: true, data: { products: [], message: 'Builders search temporarily unavailable.' } };
+      }
+
+      const searchBody = JSON.stringify({
+        persistedQuery: { version: 1, sha256Hash: bffCfg.searchHash },
+        variables: {
+          ...(bffCfg.defaultSearchVars || {}),
+          query: query,
+          pageSize: 8,
+          storeId: bffCfg.storeId || '42',
+          paginationInput: { cursor: '', pageSize: 8 },
+        },
+      });
+
+      const searchResp = await fetchWithTimeout(bffCfg.gqlUrl, {
+        method: 'POST',
+        headers: { ...buildersBffHeaders({ operationName: 'Search', operationHash: bffCfg.searchHash }), 'Content-Type': 'application/json' },
+        body: searchBody,
+        timeoutMs: 15000,
+      });
+
+      if (!searchResp || !searchResp.ok) {
+        return { ok: true, data: { products: [], message: 'Builders search returned no results.' } };
+      }
+
+      const searchJson = await searchResp.json();
+      const items = searchJson?.data?.search?.searchResult?.itemStacks?.[0]?.itemsV2 || [];
+
+      const products = items.slice(0, 8).map(it => {
+        const priceInfo = it.priceInfo?.currentPrice || it.priceInfo?.linePrice;
+        const price = priceInfo?.priceString || priceInfo?.price || null;
+        const name = it.name || it.title || 'Unknown Product';
+        const brand = it.brand || '';
+        const url = it.canonicalUrl
+          ? (it.canonicalUrl.startsWith('http') ? it.canonicalUrl : `https://www.builders.co.za${it.canonicalUrl}`)
+          : null;
+        return { name, brand, price: price ? `R${String(price).replace(/[^0-9.]/g, '')}` : 'Price on request', url };
+      }).filter(p => p.name !== 'Unknown Product');
+
+      return {
+        ok: true,
+        data: {
+          products,
+          query,
+          count: products.length,
+          message: products.length > 0
+            ? `Found ${products.length} product(s) on Builders for "${query}".`
+            : `No products found on Builders for "${query}".`,
+        },
+      };
+    } catch (e) {
+      console.error('[lookup_builders_product]', e.message);
+      return { ok: false, error: 'builders_lookup_failed', message: String(e.message || e) };
     }
   }
 
@@ -3132,6 +3269,162 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       };
     } catch (err) {
       return { ok: false, status: 500, error: `wallet_error: ${err.message}` };
+    }
+  }
+
+  // ── Request Payment Link — generates Ozow URL + stores in payment_links + sends notification ──
+  if (action === 'request_payment_link') {
+    try {
+      const bid = bookingId || String(payload.tasks_management_id || '').trim();
+      if (!bid) return { ok: false, status: 400, error: 'missing_booking_id' };
+
+      const bData = await loadBooking();
+      if (!bData) return { ok: false, status: 404, error: 'booking_not_found' };
+
+      // Enforce artisan acceptance before payment
+      const artisanAccepted = bData.accept === '1' || bData.accept === 1 || bData.artisan_confirmed === 'yes';
+      if (!artisanAccepted) {
+        return { ok: false, status: 400, error: 'An artisan hasn\'t accepted this job yet. Payment is only available after an artisan accepts.' };
+      }
+
+      const cost = parseFloat(bData.cost || bData.total_cost || bData.quoted_price || '0');
+      if (cost <= 0) return { ok: false, status: 400, error: 'no_confirmed_price' };
+
+      if ((bData.payment_status || bData.paymentStatus) === 'paid') {
+        return { ok: true, status: 200, data: { message: 'This booking is already paid.', bookingId: bid } };
+      }
+
+      // Support deposit vs full payment
+      const paymentType = payload.payment_type || 'full';
+      let payAmount;
+      if (bData.deposit_paid === true && bData.balance_paid !== true) {
+        payAmount = parseFloat(bData.balance_amount || cost);
+      } else if (paymentType === 'deposit') {
+        payAmount = Math.round(cost * 0.35 * 100) / 100;
+      } else {
+        payAmount = cost;
+      }
+
+      const siteCode = env('OZOW_SITE_CODE');
+      const apiKey = env('OZOW_API_KEY');
+      const privateKey = env('OZOW_PRIVATE_KEY');
+      const isTest = (env('OZOW_IS_TEST') || 'false') === 'true';
+      const ozowUrl = isTest
+        ? 'https://stagingapi.ozow.com/PostPaymentRequest'
+        : 'https://api.ozow.com/PostPaymentRequest';
+      const backendBase = env('BACKEND_BASE_URL') || 'https://square15-livekit-backend.onrender.com';
+
+      if (!siteCode || !privateKey || !apiKey) {
+        // Fallback: store request + notify admin
+        const payRef = `PAY-${bid}-${Date.now().toString(36)}`;
+        await firestore.collection('payment_links').doc(payRef).set({
+          booking_id: bid,
+          amount: payAmount,
+          payment_type: paymentType,
+          user_id: actorUid || '',
+          status: 'pending',
+          source: payload.source || 'voice',
+          created_at: admin.firestore.FieldValue.serverTimestamp(),
+        });
+        await firestore.collection('notifications').add({
+          title: 'Payment Link Request',
+          body: `Payment link requested for booking ${bid} (R${payAmount.toFixed(2)}, ${paymentType})`,
+          type: 'payment_request',
+          booking_id: bid,
+          amount: payAmount,
+          for_role: 'admin',
+          status: 'unread',
+          created_at: admin.firestore.FieldValue.serverTimestamp(),
+        });
+        return { ok: true, status: 200, data: {
+          message: `Payment of R${payAmount.toFixed(2)} is being processed. You'll receive a payment link shortly.`,
+          reference: payRef, bookingId: bid, amount: payAmount,
+        }};
+      }
+
+      const itemSuffix = paymentType === 'deposit' ? '(35% Deposit)' : (bData.deposit_paid === true ? '(Balance)' : '(Full)');
+      const itemName = `Square 15 Booking ${bData.order_no || bData.rfq_no || bid} ${itemSuffix}`;
+      const transactionRef = `PAY-${bid}-${Date.now().toString(36)}`;
+      const bankRef = `SQ15 ${(bData.order_no || bid).slice(0, 20)}`;
+
+      const successUrl = `${backendBase}/api/payment/ozow-result?status=success&ref=${transactionRef}`;
+      const cancelUrl = `${backendBase}/api/payment/ozow-result?status=cancel&ref=${transactionRef}`;
+      const errorUrl = `${backendBase}/api/payment/ozow-result?status=error&ref=${transactionRef}`;
+      const notifyUrl = `${backendBase}/api/payment/ozow-notify`;
+
+      const hashValues = [
+        siteCode, 'ZA', 'ZAR', payAmount.toFixed(2), transactionRef,
+        bankRef, cancelUrl, errorUrl, successUrl, notifyUrl, String(isTest),
+      ];
+      const hashCheck = ozowHashCheck(hashValues, privateKey);
+
+      const ozowPayload = {
+        SiteCode: siteCode,
+        CountryCode: 'ZA',
+        CurrencyCode: 'ZAR',
+        Amount: payAmount.toFixed(2),
+        TransactionReference: transactionRef,
+        BankReference: bankRef,
+        CancelUrl: cancelUrl,
+        ErrorUrl: errorUrl,
+        SuccessUrl: successUrl,
+        NotifyUrl: notifyUrl,
+        IsTest: isTest,
+        HashCheck: hashCheck,
+      };
+
+      let paymentUrl = '';
+      try {
+        const ozowResp = await fetch(ozowUrl, {
+          method: 'POST',
+          headers: {
+            'Accept': 'application/json',
+            'ApiKey': apiKey,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(ozowPayload),
+        });
+        const ozowBody = await ozowResp.json();
+        paymentUrl = ozowBody.url || ozowBody.paymentUrl || ozowBody.redirectUrl || '';
+      } catch (ozErr) {
+        console.warn('Ozow API call failed for payment link:', ozErr.message);
+      }
+
+      await firestore.collection('payment_links').doc(transactionRef).set({
+        booking_id: bid,
+        task_id: bid,
+        amount: payAmount,
+        payment_type: paymentType,
+        user_id: actorUid || '',
+        payment_url: paymentUrl,
+        provider: 'ozow',
+        status: 'pending',
+        source: payload.source || 'voice',
+        created_at: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      // Send notification to the customer so they receive the link
+      if (actorUid) {
+        await firestore.collection('notifications').add({
+          title: 'Payment Link Ready',
+          body: `Tap to pay R${payAmount.toFixed(2)} ${itemSuffix} for booking ${bData.order_no || bData.rfq_no || bid}`,
+          type: 'payment_link',
+          booking_id: bid,
+          amount: payAmount,
+          payment_type: paymentType,
+          payment_url: paymentUrl,
+          userId: actorUid,
+          status: 'unread',
+          created_at: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      }
+
+      return { ok: true, status: 200, data: {
+        message: `Payment link generated for R${payAmount.toFixed(2)} ${itemSuffix}. A notification with the link has been sent to your phone.`,
+        paymentUrl, reference: transactionRef, bookingId: bid, amount: payAmount, payment_type: paymentType,
+      }};
+    } catch (err) {
+      return { ok: false, status: 500, error: `payment_link_error: ${err.message}` };
     }
   }
 
@@ -3539,11 +3832,19 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     if (!data.ai_quote && !data.quoted_price) return { ok: false, status: 400, error: 'no_quote_available' };
 
     const price = data.quoted_price || (data.ai_quote ? String(data.ai_quote.grand_total) : '0');
-    const priceNum = parseFloat(price) || 0;
+    const priceNum = parseFloat(price);
+    const depositAmount = Math.round(priceNum * 0.35 * 100) / 100;
+    const balanceAmount = Math.round((priceNum - depositAmount) * 100) / 100;
 
     await bookingRef.update({
       rfq_status: 'accepted_converted',
       status: 'pending_artisan_acceptance',
+      artisan_confirmed: 'pending',
+      deposit_amount: depositAmount.toFixed(2),
+      balance_amount: balanceAmount.toFixed(2),
+      payment_type: '',
+      deposit_paid: false,
+      balance_paid: false,
       accepted_at: now,
       accepted_via: payload.source || 'voice',
       updated_at: now,
@@ -3560,6 +3861,8 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         status: 'pending_artisan_acceptance',
         artisan_confirmed: 'pending',
         cost: priceNum.toFixed(2),
+        deposit_amount: depositAmount.toFixed(2),
+        balance_amount: balanceAmount.toFixed(2),
         source: 'voice_rfq',
         is_rfq: 'yes',
         rfq_status: 'accepted_converted',
@@ -3578,21 +3881,14 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       const autoReason = clientBuysMaterials ? 'client_buys_materials' : 'under_12k';
       const cat = (data.category || data.category_name || '').toLowerCase().replace(/\s+/g, '_');
       try {
-        let artisanSnap;
-        try {
-          artisanSnap = await firestore.collection('serviceProvider').where('status', '==', 'publish').limit(200).get();
-          if (artisanSnap.empty) artisanSnap = await firestore.collection('serviceProvider').where('status', '==', 'approved').limit(200).get();
-          if (artisanSnap.empty) artisanSnap = await firestore.collection('serviceProvider').limit(200).get();
-        } catch (qErr) {
-          console.warn('[lk] artisan query fallback:', qErr.message);
-          artisanSnap = await firestore.collection('serviceProvider').limit(200).get();
-        }
+        const artisanSnap = await firestore.collection('serviceProvider')
+          .where('status', '==', 'approved')
+          .where('is_suspended', '!=', true)
+          .limit(20)
+          .get();
         const matchedArtisans = [];
         for (const artDoc of artisanSnap.docs) {
           const ad = artDoc.data() || {};
-          const st = (ad.status || '').toString().toLowerCase();
-          if (st && st !== 'publish' && st !== 'published' && st !== 'approved' && st !== 'approve') continue;
-          if (ad.is_suspended === true) continue;
           const cats = (ad.categories || ad.category || '').toString().toLowerCase();
           if (cats && cat && !cats.includes(cat) && cat !== 'general_maintenance') continue;
           const aName = ad.name || ad.userName || ad.full_name || artDoc.id;
@@ -3793,6 +4089,71 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     }
 
     return { ok: true, status: 200, data: { in_progress: true } };
+  }
+
+  // ── Mark Buying Material ──
+  if (action === 'mark_buying_material') {
+    if (!(actorRole === 'artisan' && artisanId === actorUid)) {
+      return { ok: false, status: 403, error: 'forbidden' };
+    }
+
+    if (tmId) {
+      await firestore.collection('tasksManagement').doc(tmId).set(
+        { buying_material: 'true', updated_at: now },
+        { merge: true }
+      );
+    }
+
+    // Notify WhatsApp client
+    try {
+      const waUrl = process.env.WHATSAPP_BOT_URL || 'https://square15-whatsapp-bot.onrender.com';
+      await fetch(`${waUrl}/api/job-status-update`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          bookingId: tmId || bookingId,
+          status: 'buying_material',
+          artisanName: bookingData.service_provider_name || 'Your artisan',
+        }),
+      });
+    } catch (e) { console.warn('[mark_buying_material] WA notify error:', e.message); }
+
+    return { ok: true, status: 200, data: { buying_material: true } };
+  }
+
+  // ── Mark Job Completed ──
+  if (action === 'mark_job_completed') {
+    if (!(actorRole === 'artisan' && artisanId === actorUid)) {
+      return { ok: false, status: 403, error: 'forbidden' };
+    }
+
+    if (tmId) {
+      await firestore.collection('tasksManagement').doc(tmId).set(
+        { status: 'completed', completed_at: now, updated_at: now },
+        { merge: true }
+      );
+    }
+
+    await bookingRef.set(
+      { status: 'completed', completed_at: now, updated_at: now },
+      { merge: true }
+    );
+
+    // Notify WhatsApp client
+    try {
+      const waUrl = process.env.WHATSAPP_BOT_URL || 'https://square15-whatsapp-bot.onrender.com';
+      await fetch(`${waUrl}/api/job-status-update`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          bookingId: tmId || bookingId,
+          status: 'completed',
+          artisanName: bookingData.service_provider_name || 'Your artisan',
+        }),
+      });
+    } catch (e) { console.warn('[mark_job_completed] WA notify error:', e.message); }
+
+    return { ok: true, status: 200, data: { completed: true } };
   }
 
   if (action === 'request_reassignment' || action === 'artisan_cancel_and_reassign' || action === 'reassign_booking') {
@@ -4586,6 +4947,7 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     message: 'Livekit Token Server is running',
+    version: DEPLOY_VERSION,
     timestamp: new Date().toISOString(),
     sdkVersion: getSdkVersion(),
     firebase: {
@@ -4733,6 +5095,25 @@ app.get('/api/test-pricing', async (req, res) => {
     });
   } catch (e) {
     res.status(500).json({ error: String(e) });
+  }
+});
+
+/**
+ * Look up real-time Builders.co.za material prices
+ * GET /api/pricing/builders-lookup?q=geyser+150L
+ * Returns: { ok: true, result: { title, url, priceZar, source } }
+ */
+app.get('/api/pricing/builders-lookup', assistantLimiter, async (req, res) => {
+  try {
+    const q = String(req.query.q || req.query.query || '').trim();
+    if (!q) return res.status(400).json({ ok: false, error: 'q parameter required' });
+    const result = await lookupBuildersPriceOne(q);
+    if (!result) return res.json({ ok: true, result: null, message: 'No matching product found on Builders.co.za' });
+    if (result.blocked) return res.json({ ok: true, result: null, message: 'Builders.co.za temporarily blocked this request' });
+    return res.json({ ok: true, result });
+  } catch (e) {
+    console.error('[builders-lookup] Error:', e.message);
+    return res.status(500).json({ ok: false, error: 'Builders lookup failed' });
   }
 });
 
@@ -5979,853 +6360,527 @@ app.post('/api/notifications/send', authMiddleware, assistantLimiter, async (req
   }
 });
 
-// ── WhatsApp Payment Link Generation (no Firebase auth required) ──
-// Called by WhatsApp bot to generate a payment link for customers who may not have the app.
-app.post('/api/payment/whatsapp-initiate', assistantLimiter, async (req, res) => {
+// ── AI Photo Diagnosis — analyzes maintenance issue photos via GPT-4o Vision ──
+app.post('/api/photo/diagnose', assistantLimiter, async (req, res) => {
   try {
-    const merchantId = env('PAYFAST_MERCHANT_ID');
-    const merchantKey = env('PAYFAST_MERCHANT_KEY');
-    const payfastUrl = env('PAYFAST_URL') || 'https://www.payfast.co.za/eng/process';
-    const backendUrl = env('RENDER_EXTERNAL_URL') || 'https://square15-livekit-backend.onrender.com';
+    const oai = getOpenAI();
+    if (!oai) return res.status(503).json({ error: 'AI service not configured' });
 
-    if (!merchantId || !merchantKey) {
-      return res.status(503).json({ error: 'Payment credentials not configured' });
+    const { image_base64, image_url, user_description, location_context } = req.body;
+    if (!image_base64 && !image_url) {
+      return res.status(400).json({ error: 'Provide image_base64 or image_url' });
     }
 
-    const { amount, booking_id, customer_name, customer_phone, description } = req.body;
-    if (!amount || !booking_id) {
-      return res.status(400).json({ error: 'Missing required: amount, booking_id' });
-    }
+    const imageContent = image_base64
+      ? { type: 'image_url', image_url: { url: image_base64.startsWith('data:') ? image_base64 : `data:image/jpeg;base64,${image_base64}`, detail: 'high' } }
+      : { type: 'image_url', image_url: { url: image_url, detail: 'high' } };
 
-    const itemName = description || `Square 15 Booking ${booking_id}`;
-    const returnUrl = `${backendUrl}/api/payment/ozow-result?status=success&booking_id=${encodeURIComponent(booking_id)}`;
-    const cancelUrl = `${backendUrl}/api/payment/ozow-result?status=cancel&booking_id=${encodeURIComponent(booking_id)}`;
-    const notifyUrl = `${backendUrl}/api/payment/itn`;
+    const userText = user_description
+      ? `The tenant describes the issue as: "${user_description}"${location_context ? `. Location: ${location_context}` : ''}`
+      : `Please analyze this maintenance issue photo.${location_context ? ` Location: ${location_context}` : ''}`;
 
-    const paymentData = {
-      merchant_id: merchantId,
-      merchant_key: merchantKey,
-      amount: String(parseFloat(amount).toFixed(2)),
-      item_name: itemName,
-      return_url: returnUrl,
-      cancel_url: cancelUrl,
-      notify_url: notifyUrl,
-      custom_str1: booking_id,
-      ...(customer_name ? { name_first: customer_name } : {}),
-      ...(customer_phone ? { cell_number: customer_phone } : {}),
-    };
+    const completion = await oai.chat.completions.create({
+      model: 'gpt-4o',
+      temperature: 0.2,
+      max_tokens: 800,
+      response_format: { type: 'json_object' },
+      messages: [
+        {
+          role: 'system',
+          content: `You are an expert maintenance diagnostics AI for a South African property maintenance company called Square 15 Maintenance.
 
-    const queryString = Object.entries(paymentData)
-      .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
-      .join('&');
-    const fullPaymentUrl = `${payfastUrl}?${queryString}`;
+Analyze the photo of a maintenance issue and return a JSON object with these fields:
+- "issue_type": specific issue (e.g. "burst geyser element", "leaking tap", "cracked wall", "faulty outlet")
+- "service_category": one of: Plumbing, Electrical, Painting, Carpentry, Roofing, Tiling, Locksmith, Appliance Repair, Landscaping, General Maintenance
+- "severity": one of: low, medium, high, emergency
+- "urgency_flag": boolean — true if immediate action required (water damage, electrical hazard, security risk)
+- "description": 2-3 sentence description of what you see and the likely cause
+- "recommended_action": what should be done to fix it
+- "estimated_complexity": 1-5 (1=simple fix, 5=major project)
+- "materials_likely_needed": array of likely materials/parts needed
+- "safety_warnings": array of any safety concerns (empty array if none)
+- "confidence": 0.0-1.0 how confident you are in the diagnosis
 
-    console.log(`[wa-payment] Generated payment link for booking ${booking_id}, R${amount}`);
-
-    res.json({
-      ok: true,
-      payment_url: fullPaymentUrl,
-      booking_id,
-      amount: parseFloat(amount).toFixed(2),
+If the image is not a maintenance issue, set issue_type to "not_maintenance" and describe what you see.
+Return ONLY valid JSON.`,
+        },
+        {
+          role: 'user',
+          content: [imageContent, { type: 'text', text: userText }],
+        },
+      ],
     });
+
+    const content = completion.choices[0]?.message?.content || '{}';
+    const diagnosis = JSON.parse(content);
+    res.json({ ok: true, diagnosis });
   } catch (error) {
-    console.error('❌ WhatsApp payment link error:', error);
-    res.status(500).json({ error: 'Payment link generation failed' });
+    console.error('❌ Photo diagnosis error:', error.message);
+    res.status(500).json({ error: 'Photo diagnosis failed', details: error.message });
   }
 });
 
-// ── Server-side PayFast Payment Initiation ──
-// Replaces client-side hardcoded merchant credentials
-// Supports: payment_method='eft' (default/Ozow), 'cc' (card-only)
-// Supports: subscription_type=2 for ad-hoc tokenization (save card for future use)
-app.post('/api/payment/initiate', authMiddleware, assistantLimiter, async (req, res) => {
-  try {
-    const merchantId = env('PAYFAST_MERCHANT_ID');
-    const merchantKey = env('PAYFAST_MERCHANT_KEY');
-    const payfastUrl = env('PAYFAST_URL') || 'https://www.payfast.co.za/eng/process';
-    const backendUrl = env('RENDER_EXTERNAL_URL') || 'https://square15-livekit-backend.onrender.com';
+// ── Ozow Payment Helpers ──
+function ozowHashCheck(values, privateKey) {
+  // Concatenate all values, append private key, lowercase, SHA512
+  const input = values.join('') + privateKey;
+  return crypto.createHash('sha512').update(input.toLowerCase()).digest('hex');
+}
 
-    if (!merchantId || !merchantKey) {
-      return res.status(503).json({ error: 'Payment credentials not configured on server' });
+// ── Server-side Ozow Payment Initiation ──
+// Generates Ozow payment URL for apps and WhatsApp bot
+app.post('/api/payment/initiate', assistantLimiter, async (req, res) => {
+  try {
+    const siteCode = env('OZOW_SITE_CODE');
+    const apiKey = env('OZOW_API_KEY');
+    const privateKey = env('OZOW_PRIVATE_KEY');
+    const isTest = (env('OZOW_IS_TEST') || 'false') === 'true';
+    const ozowUrl = isTest
+      ? 'https://stagingapi.ozow.com/PostPaymentRequest'
+      : 'https://api.ozow.com/PostPaymentRequest';
+    const backendBase = env('BACKEND_BASE_URL') || 'https://square15-livekit-backend.onrender.com';
+
+    if (!siteCode || !privateKey || !apiKey) {
+      return res.status(503).json({ error: 'Ozow payment credentials not configured on server' });
     }
 
-    const { amount, item_name, return_url, cancel_url, notify_url, custom_str1, payment_method, save_card } = req.body;
-
+    const { amount, item_name, custom_str1 } = req.body;
     if (!amount || !item_name) {
       return res.status(400).json({ error: 'Missing required fields: amount, item_name' });
     }
 
-    // Default return/cancel URLs point to our result page
-    const taskId = custom_str1 || '';
-    const defaultReturn = `${backendUrl}/api/payment/ozow-result?status=success&booking_id=${encodeURIComponent(taskId)}`;
-    const defaultCancel = `${backendUrl}/api/payment/ozow-result?status=cancel&booking_id=${encodeURIComponent(taskId)}`;
-    const defaultNotify = `${backendUrl}/api/payment/itn`;
+    const transactionRef = `SQ15-${(custom_str1 || '').slice(0, 10)}-${Date.now().toString(36)}`;
+    const bankRef = `Square15 ${(item_name || '').slice(0, 20)}`;
+
+    const successUrl = `${backendBase}/api/payment/ozow-result?status=success&ref=${transactionRef}`;
+    const cancelUrl = `${backendBase}/api/payment/ozow-result?status=cancel&ref=${transactionRef}`;
+    const errorUrl = `${backendBase}/api/payment/ozow-result?status=error&ref=${transactionRef}`;
+    const notifyUrl = `${backendBase}/api/payment/ozow-notify`;
+
+    // HashCheck = SHA512(SiteCode + CountryCode + CurrencyCode + Amount + TransactionReference
+    //   + BankReference + CancelUrl + ErrorUrl + SuccessUrl + NotifyUrl + IsTest + PrivateKey) lowercase
+    const hashValues = [
+      siteCode, 'ZA', 'ZAR', parseFloat(amount).toFixed(2), transactionRef,
+      bankRef, cancelUrl, errorUrl, successUrl, notifyUrl, String(isTest),
+    ];
+    const hashCheck = ozowHashCheck(hashValues, privateKey);
 
     const paymentData = {
-      merchant_id: merchantId,
-      merchant_key: merchantKey,
-      amount: String(amount),
-      item_name: String(item_name),
-      return_url: return_url || defaultReturn,
-      cancel_url: cancel_url || defaultCancel,
-      notify_url: notify_url || defaultNotify,
-      ...(custom_str1 ? { custom_str1 } : {}),
+      SiteCode: siteCode,
+      CountryCode: 'ZA',
+      CurrencyCode: 'ZAR',
+      Amount: parseFloat(amount).toFixed(2),
+      TransactionReference: transactionRef,
+      BankReference: bankRef,
+      CancelUrl: cancelUrl,
+      ErrorUrl: errorUrl,
+      SuccessUrl: successUrl,
+      NotifyUrl: notifyUrl,
+      IsTest: isTest,
+      HashCheck: hashCheck,
     };
 
-    // Force card-only checkout when payment_method is 'cc'
-    if (payment_method === 'cc') {
-      paymentData.payment_method = 'cc';
-    }
-
-    // Enable ad-hoc tokenization (save card) when requested
-    // PayFast will return a token in the ITN callback that can be used for future charges
-    if (save_card === true && payment_method === 'cc') {
-      paymentData.subscription_type = '2';
-    }
-
-    // Build full payment URL with query params so WebView can load it directly
-    const queryString = Object.entries(paymentData)
-      .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
-      .join('&');
-    const fullPaymentUrl = `${payfastUrl}?${queryString}`;
-
-    console.log(`[payment] Initiated ${payment_method || 'eft'} payment, amount=R${amount}, save_card=${!!save_card}, task=${taskId}`);
-
-    res.json({
-      ok: true,
-      payment_url: fullPaymentUrl,
-      payfast_url: payfastUrl,
-      payment_data: paymentData,
+    // POST to Ozow API to get payment URL
+    const ozowResp = await fetch(ozowUrl, {
+      method: 'POST',
+      headers: {
+        'Accept': 'application/json',
+        'ApiKey': apiKey,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(paymentData),
     });
+
+    const ozowBody = await ozowResp.json();
+    console.log('Ozow PostPaymentRequest response:', JSON.stringify(ozowBody));
+
+    if (ozowBody.url || ozowBody.paymentUrl || ozowBody.redirectUrl) {
+      const paymentUrl = ozowBody.url || ozowBody.paymentUrl || ozowBody.redirectUrl;
+
+      // Store payment reference for tracking
+      try {
+        await admin.firestore().collection('payment_links').doc(transactionRef).set({
+          transaction_ref: transactionRef,
+          amount: parseFloat(amount).toFixed(2),
+          item_name: String(item_name),
+          task_id: custom_str1 || '',
+          payment_url: paymentUrl,
+          provider: 'ozow',
+          status: 'pending',
+          created_at: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      } catch (dbErr) {
+        console.warn('Could not store payment link:', dbErr.message);
+      }
+
+      res.json({
+        ok: true,
+        payment_url: paymentUrl,
+        transaction_ref: transactionRef,
+      });
+    } else {
+      console.error('Ozow did not return payment URL:', ozowBody);
+      res.status(502).json({
+        error: 'Ozow did not return a payment URL',
+        details: ozowBody.errorMessage || ozowBody.message || JSON.stringify(ozowBody),
+      });
+    }
   } catch (error) {
     console.error('❌ Payment initiation error:', error);
     res.status(500).json({ error: 'Payment initiation failed' });
   }
 });
 
-// ── Charge Saved Card (ad-hoc tokenization) ──
-// Uses a previously saved PayFast token to charge a card without redirecting
-app.post('/api/payment/charge-token', authMiddleware, assistantLimiter, async (req, res) => {
-  try {
-    const merchantId = env('PAYFAST_MERCHANT_ID');
-    const merchantKey = env('PAYFAST_MERCHANT_KEY');
-    const passphrase = env('PAYFAST_PASSPHRASE') || merchantKey;
-
-    if (!merchantId || !merchantKey) {
-      return res.status(503).json({ error: 'Payment credentials not configured' });
-    }
-
-    const { token: rawToken, card_id, amount, item_name, custom_str1 } = req.body;
-    if (!amount || !item_name) {
-      return res.status(400).json({ error: 'Missing required: amount, item_name' });
-    }
-
-    // Resolve token: either directly provided or look up from card_id
-    let chargeToken = rawToken;
-    if (!chargeToken && card_id) {
-      const userId = req.user.uid;
-      const cardSnap = await admin.firestore()
-        .collection('users').doc(userId).collection('saved_cards').doc(card_id).get();
-      if (!cardSnap.exists || !cardSnap.data().is_active) {
-        return res.status(404).json({ error: 'Saved card not found or inactive' });
-      }
-      chargeToken = cardSnap.data().token;
-
-      // Update last_used_at
-      await cardSnap.ref.update({ last_used_at: new Date().toISOString() });
-    }
-
-    if (!chargeToken) {
-      return res.status(400).json({ error: 'Missing required: token or card_id' });
-    }
-
-    // PayFast ad-hoc tokenization charge API
-    const chargeData = {
-      'merchant-id': merchantId,
-      'version': 'v1',
-      'timestamp': new Date().toISOString().replace('T', ' ').slice(0, 19),
-      'amount': String(parseFloat(amount).toFixed(2) * 100), // amount in cents
-      'item_name': String(item_name),
-      ...(custom_str1 ? { custom_str1 } : {}),
-    };
-
-    // Generate signature
-    const pfParamString = Object.keys(chargeData)
-      .sort()
-      .map(key => `${key}=${encodeURIComponent(String(chargeData[key] || '')).replace(/%20/g, '+')}`)
-      .join('&');
-    const signature = crypto
-      .createHash('md5')
-      .update(pfParamString + `&passphrase=${encodeURIComponent(passphrase)}`)
-      .digest('hex');
-
-    // Call PayFast subscription/adhoc charge API
-    const chargeResponse = await fetch(`https://api.payfast.co.za/subscriptions/${chargeToken}/adhoc`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'merchant-id': merchantId,
-        'version': 'v1',
-        'timestamp': chargeData.timestamp,
-        'signature': signature,
-      },
-      body: JSON.stringify({
-        amount: parseInt(parseFloat(amount).toFixed(2) * 100), // cents
-        item_name: String(item_name),
-        ...(custom_str1 ? { custom_str1 } : {}),
-      }),
-      signal: AbortSignal.timeout(30000),
-    });
-
-    const result = await chargeResponse.json();
-
-    if (chargeResponse.ok && result.data) {
-      console.log(`💳 Token charge successful: R${amount}, task=${custom_str1 || 'N/A'}`);
-
-      // Update task payment status
-      if (custom_str1) {
-        const taskRef = admin.firestore().collection('tasksManagement').doc(custom_str1);
-        await taskRef.update({
-          payment_status: 'paid',
-          payment_verified: true,
-          payment_verified_at: new Date().toISOString(),
-          payment_verified_via: 'payfast_token_charge',
-          payment_method: 'saved_card',
-          updated_at: new Date().toISOString(),
-        });
-      }
-
-      res.json({ ok: true, message: 'Payment charged successfully', data: result.data });
-    } else {
-      console.error('❌ Token charge failed:', result);
-      res.status(400).json({ ok: false, error: result.message || 'Charge failed' });
-    }
-  } catch (error) {
-    console.error('❌ Token charge error:', error);
-    res.status(500).json({ error: 'Card charge failed' });
-  }
-});
-
-// ── Saved Cards Management ──
-// GET: List user's saved cards (masked)
-app.get('/api/payment/saved-cards', authMiddleware, async (req, res) => {
-  try {
-    const userId = req.user.uid;
-    const cardsSnap = await admin.firestore()
-      .collection('users').doc(userId).collection('saved_cards')
-      .where('is_active', '==', true)
-      .orderBy('created_at', 'desc')
-      .get();
-
-    const cards = cardsSnap.docs.map(doc => {
-      const d = doc.data();
-      return {
-        id: d.id,
-        last4: d.last4 || '****',
-        card_type: d.card_type || 'card',
-        created_at: d.created_at,
-        last_used_at: d.last_used_at,
-      };
-      // Note: token is NEVER sent to the client — stays server-side only
-    });
-
-    res.json({ ok: true, cards });
-  } catch (error) {
-    console.error('❌ Saved cards fetch error:', error);
-    res.status(500).json({ error: 'Failed to fetch saved cards' });
-  }
-});
-
-// DELETE: Remove a saved card
-app.delete('/api/payment/saved-cards/:cardId', authMiddleware, async (req, res) => {
-  try {
-    const userId = req.user.uid;
-    const { cardId } = req.params;
-
-    const cardRef = admin.firestore()
-      .collection('users').doc(userId).collection('saved_cards').doc(cardId);
-    const cardSnap = await cardRef.get();
-
-    if (!cardSnap.exists) {
-      return res.status(404).json({ error: 'Card not found' });
-    }
-
-    // Soft-delete: mark as inactive rather than deleting
-    await cardRef.update({ is_active: false, deleted_at: new Date().toISOString() });
-    console.log(`🗑️ Deactivated saved card ${cardId} for user ${userId}`);
-
-    res.json({ ok: true, message: 'Card removed' });
-  } catch (error) {
-    console.error('❌ Card deletion error:', error);
-    res.status(500).json({ error: 'Failed to remove card' });
-  }
-});
-
-// ── Refund Processing ──
-// Processes refund for a paid booking. Supports two methods:
-//   method='wallet' → immediate wallet credit (no PayFast call)
-//   method='card'   → PayFast refund API call (takes 3-5 business days)
-// Anti-fraud: rate-limited, cooldown check, max refund limits, idempotent
-app.post('/api/payment/refund', authMiddleware, assistantLimiter, async (req, res) => {
-  try {
-    const userId = req.user.uid;
-    const { booking_id, doc_type, method, reason } = req.body;
-
-    if (!booking_id || !method) {
-      return res.status(400).json({ error: 'Missing required: booking_id, method' });
-    }
-    if (method !== 'wallet' && method !== 'card') {
-      return res.status(400).json({ error: 'Invalid method. Must be "wallet" or "card".' });
-    }
-
-    const now = new Date().toISOString();
-    const db = admin.firestore();
-
-    // ── Anti-fraud: rate limit – max 3 refunds per user per 24 hours ──
-    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-    const recentRefunds = await db.collection('transactionLogs')
-      .where('user_id', '==', userId)
-      .where('subtype', '==', 'refund')
-      .where('transaction_at', '>=', oneDayAgo)
-      .get();
-    if (recentRefunds.size >= 3) {
-      console.warn(`[refund] Rate limit hit: user ${userId} has ${recentRefunds.size} refunds in 24h`);
-      return res.status(429).json({ error: 'Too many refund requests. Please try again later or contact support.' });
-    }
-
-    // ── Look up the booking ──
-    const collectionName = doc_type === 'futureBookings' ? 'futureBookings' : 'tasksManagement';
-    const docRef = db.collection(collectionName).doc(booking_id);
-    const docSnap = await docRef.get();
-    if (!docSnap.exists) {
-      return res.status(404).json({ error: 'Booking not found' });
-    }
-
-    const data = docSnap.data();
-    const docUserId = data.user_id || data.userId || '';
-
-    // ── Security: verify the requesting user owns this booking ──
-    if (docUserId !== userId) {
-      console.warn(`[refund] User ${userId} attempted refund on booking owned by ${docUserId}`);
-      return res.status(403).json({ error: 'You are not authorized to refund this booking.' });
-    }
-
-    // ── Check booking is actually cancelled ──
-    const status = (data.status || '').toString().toLowerCase();
-    if (status !== 'cancelled') {
-      return res.status(400).json({ error: 'Booking must be cancelled before requesting a refund.' });
-    }
-
-    // ── Idempotency: check if already refunded ──
-    const refundStatus = (data.refund_status || '').toString().toLowerCase();
-    const walletRefunded = (data.wallet_refunded || '').toString().toLowerCase();
-    if (refundStatus === 'refunded' || walletRefunded === 'yes') {
-      return res.json({ ok: true, already_refunded: true, message: 'This booking has already been refunded.' });
-    }
-
-    // ── Anti-fraud: cooldown – booking must be at least 5 minutes old ──
-    const createdAt = data.created_at || data.createdAt || data.creation_date || '';
-    if (createdAt) {
-      const bookingAge = Date.now() - new Date(createdAt).getTime();
-      if (bookingAge < 5 * 60 * 1000) {
-        return res.status(400).json({ error: 'Please wait a few minutes before requesting a refund.' });
-      }
-    }
-
-    // ── Determine refund amount ──
-    let refundAmount = 0;
-    // Try original transaction first
-    const txSnap = await db.collection('transactionLogs')
-      .where('tasks_management_id', '==', booking_id)
-      .where('subtype', '==', 'service_payment')
-      .where('status', '==', 'success')
-      .limit(1)
-      .get();
-    if (!txSnap.empty) {
-      refundAmount = parseFloat(txSnap.docs[0].data().amount || '0');
-    }
-    if (refundAmount <= 0) {
-      refundAmount = parseFloat(data.cost || data.total_cost || data.payment_amount || data.wallet_deduct_amount || '0');
-    }
-    if (refundAmount <= 0) {
-      return res.status(400).json({ error: 'Could not determine refund amount.' });
-    }
-
-    // ── Anti-fraud: max single refund cap R50,000 ──
-    if (refundAmount > 50000) {
-      console.warn(`[refund] Suspiciously large refund R${refundAmount} for booking ${booking_id}`);
-      return res.status(400).json({ error: 'Refund amount exceeds limit. Please contact support.' });
-    }
-
-    const txId = crypto.randomUUID();
-
-    // ═══════════════════════════════════════════════════════════
-    // METHOD: WALLET (instant credit)
-    // ═══════════════════════════════════════════════════════════
-    if (method === 'wallet') {
-      // Atomic wallet refund via Firestore transaction
-      await db.runTransaction(async (tx) => {
-        const freshDoc = await tx.get(docRef);
-        const freshData = freshDoc.data() || {};
-        // Double-check idempotency inside transaction
-        if ((freshData.refund_status || '') === 'refunded' || (freshData.wallet_refunded || '') === 'yes') {
-          throw new Error('ALREADY_REFUNDED');
-        }
-
-        const userRef = db.collection('users').doc(userId);
-        const userSnap = await tx.get(userRef);
-        const userData = userSnap.data() || {};
-        const currentBalance = parseFloat(userData.balance || '0');
-        const newBalance = currentBalance + refundAmount;
-
-        tx.update(userRef, { balance: newBalance.toFixed(2) });
-        tx.update(docRef, {
-          wallet_refunded: 'yes',
-          wallet_refund_reason: reason || 'cancelled_by_customer',
-          wallet_refund_amount: refundAmount,
-          wallet_refunded_at: now,
-          wallet_refund_txn_id: txId,
-          refund_status: 'refunded',
-          refund_method: 'wallet',
-          updated_at: now,
-        });
-        tx.set(db.collection('transactionLogs').doc(txId), {
-          id: txId,
-          amount: refundAmount.toFixed(2),
-          transaction_at: now,
-          status: 'success',
-          tasks_management_id: booking_id,
-          user_id: userId,
-          type: 'wallet',
-          subtype: 'refund',
-          direction: 'in',
-          cash_movement: false,
-          schema_version: 2,
-          reason: reason || 'cancelled_by_customer',
-          balance_after: newBalance.toFixed(2),
-          previous_balance: currentBalance.toFixed(2),
-          refund_source: collectionName,
-        });
-      });
-
-      console.log(`💰 Wallet refund R${refundAmount.toFixed(2)} for user ${userId}, booking ${booking_id}`);
-      return res.json({
-        ok: true,
-        method: 'wallet',
-        amount: refundAmount.toFixed(2),
-        message: `R${refundAmount.toFixed(2)} refunded to your wallet instantly.`,
-      });
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    // METHOD: CARD (PayFast refund API)
-    // ═══════════════════════════════════════════════════════════
-    if (method === 'card') {
-      const merchantId = env('PAYFAST_MERCHANT_ID');
-      const merchantKey = env('PAYFAST_MERCHANT_KEY');
-      const passphrase = env('PAYFAST_PASSPHRASE') || merchantKey;
-
-      if (!merchantId || !merchantKey) {
-        return res.status(503).json({ error: 'Payment credentials not configured.' });
-      }
-
-      // Find the original PayFast payment ID
-      const pfPaymentId = data.payfast_payment_id || '';
-      if (!pfPaymentId) {
-        // No PayFast payment ID — fall back to creating a refund request for admin
-        await db.collection('refund_requests').doc(txId).set({
-          id: txId,
-          source_doc_id: booking_id,
-          source_doc_type: collectionName,
-          user_id: userId,
-          amount: refundAmount,
-          payment_method: data.payment_method || 'card',
-          reason: reason || 'cancelled_by_customer',
-          status: 'pending',
-          initiated_by: userId,
-          created_at: now,
-          updated_at: now,
-        });
-        await docRef.update({ refund_status: 'pending_admin_review', updated_at: now });
-
-        console.log(`📋 Card refund request (no pf_id) created for booking ${booking_id}`);
-        return res.json({
-          ok: true,
-          method: 'refund_request',
-          amount: refundAmount.toFixed(2),
-          message: `Card refund of R${refundAmount.toFixed(2)} submitted. It will be processed within 3-5 business days.`,
-        });
-      }
-
-      // Call PayFast refund API
-      try {
-        const timestamp = new Date().toISOString().replace('T', ' ').slice(0, 19);
-        const refundData = {
-          'merchant-id': merchantId,
-          'version': 'v1',
-          'timestamp': timestamp,
-          'amount': Math.round(refundAmount * 100), // cents
-        };
-
-        const pfParamString = Object.keys(refundData)
-          .sort()
-          .map(key => `${key}=${encodeURIComponent(String(refundData[key] || '')).replace(/%20/g, '+')}`)
-          .join('&');
-        const signature = crypto
-          .createHash('md5')
-          .update(pfParamString + `&passphrase=${encodeURIComponent(passphrase)}`)
-          .digest('hex');
-
-        const refundResponse = await fetch(`https://api.payfast.co.za/refunds/v1/transaction/${pfPaymentId}`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'merchant-id': merchantId,
-            'version': 'v1',
-            'timestamp': timestamp,
-            'signature': signature,
-          },
-          body: JSON.stringify({ amount: Math.round(refundAmount * 100) }),
-          signal: AbortSignal.timeout(30000),
-        });
-
-        const refundResult = await refundResponse.json();
-
-        if (refundResponse.ok && refundResult.status === 'success') {
-          // PayFast refund succeeded
-          await docRef.update({
-            refund_status: 'refunded',
-            refund_method: 'card',
-            refund_amount: refundAmount,
-            refunded_at: now,
-            refund_txn_id: txId,
-            payfast_refund_id: refundResult.refund_id || '',
-            updated_at: now,
-          });
-
-          await db.collection('transactionLogs').doc(txId).set({
-            id: txId,
-            amount: refundAmount.toFixed(2),
-            transaction_at: now,
-            status: 'success',
-            tasks_management_id: booking_id,
-            user_id: userId,
-            type: 'card_refund',
-            subtype: 'refund',
-            direction: 'in',
-            cash_movement: true,
-            schema_version: 2,
-            reason: reason || 'cancelled_by_customer',
-            refund_source: collectionName,
-            payfast_refund_id: refundResult.refund_id || '',
-            payfast_payment_id: pfPaymentId,
-          });
-
-          console.log(`💳 Card refund R${refundAmount.toFixed(2)} processed for booking ${booking_id}`);
-          return res.json({
-            ok: true,
-            method: 'card',
-            amount: refundAmount.toFixed(2),
-            message: `R${refundAmount.toFixed(2)} card refund initiated. It will reflect in 3-5 business days.`,
-          });
-        } else {
-          // PayFast refund API failed — fall back to admin review
-          console.error(`[refund] PayFast refund API failed:`, refundResult);
-          await db.collection('refund_requests').doc(txId).set({
-            id: txId,
-            source_doc_id: booking_id,
-            source_doc_type: collectionName,
-            user_id: userId,
-            amount: refundAmount,
-            payment_method: 'card',
-            reason: reason || 'cancelled_by_customer',
-            status: 'pending',
-            initiated_by: userId,
-            payfast_payment_id: pfPaymentId,
-            payfast_refund_error: JSON.stringify(refundResult).slice(0, 500),
-            created_at: now,
-            updated_at: now,
-          });
-          await docRef.update({ refund_status: 'pending_admin_review', updated_at: now });
-
-          return res.json({
-            ok: true,
-            method: 'refund_request',
-            amount: refundAmount.toFixed(2),
-            message: `Card refund of R${refundAmount.toFixed(2)} submitted for processing. It will be handled within 3-5 business days.`,
-          });
-        }
-      } catch (pfErr) {
-        console.error(`[refund] PayFast refund API error:`, pfErr);
-        // Fall back to admin review
-        await db.collection('refund_requests').doc(txId).set({
-          id: txId,
-          source_doc_id: booking_id,
-          source_doc_type: collectionName,
-          user_id: userId,
-          amount: refundAmount,
-          payment_method: 'card',
-          reason: reason || 'cancelled_by_customer',
-          status: 'pending',
-          initiated_by: userId,
-          payfast_payment_id: pfPaymentId,
-          payfast_refund_error: pfErr.message || 'API call failed',
-          created_at: now,
-          updated_at: now,
-        });
-        await docRef.update({ refund_status: 'pending_admin_review', updated_at: now });
-
-        return res.json({
-          ok: true,
-          method: 'refund_request',
-          amount: refundAmount.toFixed(2),
-          message: `Card refund of R${refundAmount.toFixed(2)} submitted for processing. It will be handled within 3-5 business days.`,
-        });
-      }
-    }
-  } catch (error) {
-    if (error.message === 'ALREADY_REFUNDED') {
-      return res.json({ ok: true, already_refunded: true, message: 'This booking has already been refunded.' });
-    }
-    console.error('❌ Refund error:', error);
-    res.status(500).json({ error: 'Refund processing failed. Please contact support.' });
-  }
-});
-
-// ── Payment Result Page (return URL after PayFast payment) ──
-// Shows a simple HTML page for WhatsApp customers after payment completes/cancels.
-// Also used by the Flutter WebView to detect payment result.
+// ── Ozow Payment Result Page (SuccessUrl / CancelUrl / ErrorUrl) ──
+// Simple HTML page that apps' WebView can detect via URL
 app.get('/api/payment/ozow-result', (req, res) => {
-  const { status, booking_id } = req.query;
-  const isSuccess = status === 'success';
-  const title = isSuccess ? 'Payment Successful!' : 'Payment Cancelled';
-  const emoji = isSuccess ? '✅' : '❌';
-  const message = isSuccess
-    ? `Your payment for booking ${booking_id || ''} has been received. You will receive a confirmation on WhatsApp shortly.`
-    : `Your payment was cancelled. You can try again from WhatsApp or the Square 15 app.`;
-  const color = isSuccess ? '#22c55e' : '#ef4444';
-
-  res.type('html').send(`<!DOCTYPE html><html><head>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${title}</title>
-<style>body{font-family:-apple-system,sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;background:#f8f9fa;padding:20px}
-.card{background:white;border-radius:16px;padding:40px;text-align:center;max-width:400px;box-shadow:0 4px 20px rgba(0,0,0,.1)}
-h1{color:${color};margin:0 0 16px}p{color:#555;line-height:1.6;margin:0}</style>
-</head><body><div class="card">
-<div style="font-size:64px">${emoji}</div>
-<h1>${title}</h1>
-<p>${message}</p>
-<p style="margin-top:20px;color:#999;font-size:14px">You can close this page.</p>
-</div></body></html>`);
+  const status = String(req.query.status || 'unknown');
+  const ref = String(req.query.ref || '');
+  const titles = { success: 'Payment Successful', cancel: 'Payment Cancelled', error: 'Payment Error' };
+  const colors = { success: '#4CAF50', cancel: '#FF9800', error: '#f44336' };
+  const icons = { success: '✅', cancel: '⚠️', error: '❌' };
+  res.send(`<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>${titles[status] || 'Payment'}</title></head>
+    <body style="font-family:sans-serif;text-align:center;padding:40px;background:#f5f5f5">
+    <div style="background:white;border-radius:12px;padding:30px;max-width:400px;margin:auto;box-shadow:0 2px 8px rgba(0,0,0,0.1)">
+    <div style="font-size:48px">${icons[status] || '❓'}</div>
+    <h2 style="color:${colors[status] || '#333'}">${titles[status] || 'Unknown Status'}</h2>
+    <p style="color:#666">Reference: ${ref}</p>
+    <p style="color:#999;font-size:12px">You can close this page and return to the app.</p>
+    </div></body></html>`);
 });
 
-// ── PayFast ITN (Instant Transaction Notification) Webhook ──
-// Server-side payment verification — PayFast posts here after payment
-app.post('/api/payment/itn', async (req, res) => {
+// ── Ozow Payment Notification Webhook ──
+// Ozow POSTs here after payment completion
+app.post('/api/payment/ozow-notify', async (req, res) => {
   try {
     const data = req.body;
-    console.log('📥 PayFast ITN received:', JSON.stringify(data));
+    console.log('📥 Ozow notification received:', JSON.stringify(data));
 
-    // 1. Verify signature
-    const merchantKey = env('PAYFAST_MERCHANT_KEY');
-    if (!merchantKey) {
-      console.error('❌ ITN: PAYFAST_MERCHANT_KEY not configured');
+    const privateKey = env('OZOW_PRIVATE_KEY');
+    if (!privateKey) {
+      console.error('❌ Ozow notify: OZOW_PRIVATE_KEY not configured');
       return res.status(503).send('Server misconfigured');
     }
 
-    const receivedSignature = data.signature;
-    if (!receivedSignature) {
-      console.error('❌ ITN: No signature in payload');
-      return res.status(400).send('Missing signature');
+    // Verify hash check
+    const receivedHash = String(data.HashCheck || data.hashCheck || '').toLowerCase();
+    if (!receivedHash) {
+      console.error('❌ Ozow notify: No HashCheck in payload');
+      return res.status(400).send('Missing HashCheck');
     }
 
-    // Build param string for signature verification (exclude signature itself)
-    const paramString = Object.keys(data)
-      .filter(key => key !== 'signature')
-      .sort()
-      .map(key => `${key}=${encodeURIComponent(String(data[key] || '')).replace(/%20/g, '+')}`)
-      .join('&');
+    // Ozow notification hash: SiteCode + TransactionId + TransactionReference + Amount
+    //   + Status + Optional1-5 + CurrencyCode + IsTest + StatusMessage + PrivateKey (lowercase SHA512)
+    const hashValues = [
+      String(data.SiteCode || data.siteCode || ''),
+      String(data.TransactionId || data.transactionId || ''),
+      String(data.TransactionReference || data.transactionReference || ''),
+      String(data.Amount || data.amount || ''),
+      String(data.Status || data.status || ''),
+      String(data.Optional1 || ''),
+      String(data.Optional2 || ''),
+      String(data.Optional3 || ''),
+      String(data.Optional4 || ''),
+      String(data.Optional5 || ''),
+      String(data.CurrencyCode || data.currencyCode || ''),
+      String(data.IsTest || data.isTest || ''),
+      String(data.StatusMessage || data.statusMessage || ''),
+    ];
+    const expectedHash = ozowHashCheck(hashValues, privateKey);
 
-    const passphrase = env('PAYFAST_PASSPHRASE') || merchantKey;
-    const expectedSignature = crypto
-      .createHash('md5')
-      .update(paramString + `&passphrase=${encodeURIComponent(passphrase)}`)
-      .digest('hex');
-
-    if (receivedSignature !== expectedSignature) {
-      console.error('❌ ITN: Signature mismatch');
-      return res.status(403).send('Invalid signature');
+    if (receivedHash !== expectedHash) {
+      console.error('❌ Ozow notify: Hash mismatch');
+      console.error('  received:', receivedHash);
+      console.error('  expected:', expectedHash);
+      return res.status(403).send('Invalid HashCheck');
     }
 
-    // 2. Extract payment info
-    const paymentStatus = String(data.payment_status || '');
-    const pfPaymentId = String(data.pf_payment_id || '');
-    const amountGross = String(data.amount_gross || '0');
-    const customStr1 = String(data.custom_str1 || ''); // tasksManagement ID
-    const itemName = String(data.item_name || '');
-    const token = String(data.token || ''); // Card tokenization token (when subscription_type=2)
-    const billingDate = String(data.billing_date || '');
+    // Extract payment info
+    const ozowStatus = String(data.Status || data.status || '').toLowerCase();
+    const transactionId = String(data.TransactionId || data.transactionId || '');
+    const transactionRef = String(data.TransactionReference || data.transactionReference || '');
+    const amountGross = String(data.Amount || data.amount || '0');
 
-    console.log(`✅ ITN verified: status=${paymentStatus}, pfId=${pfPaymentId}, amount=R${amountGross}, taskId=${customStr1}${token ? ', token=***' : ''}`);
+    console.log(`✅ Ozow verified: status=${ozowStatus}, txId=${transactionId}, amount=R${amountGross}, ref=${transactionRef}`);
 
-    // 3a. Save card token if tokenization was used (subscription_type=2, ad-hoc)
-    if (token && paymentStatus === 'COMPLETE' && customStr1) {
-      try {
-        // Look up user_id from the task
-        const taskSnap = await admin.firestore().collection('tasksManagement').doc(customStr1).get();
-        const taskData = taskSnap.exists ? taskSnap.data() : {};
-        const userId = taskData.user_id || taskData.userId || '';
-
-        if (userId) {
-          // Extract card info from ITN data (PayFast provides these for card payments)
-          const cardLast4 = String(data.custom_str2 || '').slice(-4) || '****';
-          const cardType = String(data.payment_method_type || data.custom_str3 || 'card');
-
-          // Store token in user's saved_cards subcollection
-          const cardId = crypto.randomUUID();
-          await admin.firestore().collection('users').doc(userId).collection('saved_cards').doc(cardId).set({
-            id: cardId,
-            token: token,
-            last4: cardLast4,
-            card_type: cardType,
-            created_at: now,
-            last_used_at: now,
-            payfast_payment_id: pfPaymentId,
-            is_active: true,
-          });
-          console.log(`💳 Saved card token for user ${userId}, card ${cardId}`);
-        }
-      } catch (tokenErr) {
-        console.warn(`[ITN] Card token save failed: ${tokenErr.message}`);
-      }
-    }
-
-    // 3. Update Firestore
+    // Look up associated task from payment_links collection
     const now = new Date().toISOString();
+    let taskId = '';
 
-    if (customStr1) {
-      // Update tasksManagement if we have a task ID
-      const taskRef = admin.firestore().collection('tasksManagement').doc(customStr1);
+    try {
+      const plSnap = await admin.firestore().collection('payment_links').doc(transactionRef).get();
+      if (plSnap.exists) {
+        taskId = plSnap.data().task_id || '';
+        await plSnap.ref.update({
+          ozow_transaction_id: transactionId,
+          ozow_status: ozowStatus,
+          status: ozowStatus === 'complete' ? 'paid' : ozowStatus,
+          updated_at: now,
+        });
+      }
+    } catch (plErr) {
+      console.warn('Could not update payment_links:', plErr.message);
+    }
+
+    // Update tasksManagement if we have a task ID
+    if (taskId) {
+      const taskRef = admin.firestore().collection('tasksManagement').doc(taskId);
       const taskSnap = await taskRef.get();
 
       if (taskSnap.exists) {
+        const taskData_notify = taskSnap.data() || {};
         const updateData = {
-          payfast_payment_id: pfPaymentId,
-          payfast_itn_status: paymentStatus,
-          payfast_itn_amount: amountGross,
-          payfast_itn_received_at: now,
+          ozow_transaction_id: transactionId,
+          ozow_status: ozowStatus,
+          ozow_amount: amountGross,
+          ozow_notify_received_at: now,
           updated_at: now,
         };
 
-        if (paymentStatus === 'COMPLETE') {
-          updateData.payment_status = 'paid';
+        if (ozowStatus === 'complete') {
           updateData.payment_verified = true;
           updateData.payment_verified_at = now;
-          updateData.payment_verified_via = 'payfast_itn';
-        } else if (paymentStatus === 'CANCELLED') {
+          updateData.payment_verified_via = 'ozow_notify';
+
+          // Determine deposit vs full vs balance payment
+          const paidAmount = parseFloat(amountGross) || 0;
+          const totalCost = parseFloat(taskData_notify.cost || '0') || 0;
+          const wasDepositPaid = taskData_notify.deposit_paid === true;
+
+          if (wasDepositPaid) {
+            updateData.balance_paid = true;
+            updateData.balance_paid_at = now;
+            updateData.payment_status = 'paid';
+          } else if (totalCost > 0 && paidAmount < totalCost * 0.7) {
+            updateData.deposit_paid = true;
+            updateData.deposit_paid_at = now;
+            updateData.payment_type = 'deposit';
+            updateData.payment_status = 'deposit_paid';
+          } else {
+            updateData.deposit_paid = true;
+            updateData.balance_paid = true;
+            updateData.payment_status = 'paid';
+          }
+        } else if (ozowStatus === 'cancelled' || ozowStatus === 'abandoned') {
           updateData.payment_status = 'cancelled';
-        } else if (paymentStatus === 'FAILED') {
+        } else if (ozowStatus === 'error') {
           updateData.payment_status = 'failed';
+        } else if (ozowStatus === 'pendinginvestigation') {
+          updateData.payment_status = 'pending_investigation';
         }
 
         await taskRef.update(updateData);
-        console.log(`📝 Updated tasksManagement/${customStr1}: payment_status=${updateData.payment_status || paymentStatus}`);
+        console.log(`📝 Updated tasksManagement/${taskId}: payment_status=${updateData.payment_status || ozowStatus}`);
 
-        // Also update futureBookings if this is a WA booking
-        if (paymentStatus === 'COMPLETE') {
-          const taskData = taskSnap.data() || {};
-          const source = (taskData.source || '').toString().toLowerCase();
-          const futureBookingId = taskData.future_booking_id || '';
-          // For WA bookings, customStr1 IS the main booking ID
-          const fbId = futureBookingId || customStr1;
-
+        // ── Record partner commission on successful payment ──
+        if (ozowStatus === 'complete') {
           try {
-            const fbRef = admin.firestore().collection('futureBookings').doc(fbId);
-            const fbSnap = await fbRef.get();
-            if (fbSnap.exists) {
-              await fbRef.update({
-                payment_status: 'paid',
-                payment_method: 'payfast',
-                payment_paid_at: now,
-                status: 'accepted',
-                updated_at: now,
-              });
-              console.log(`📝 Updated futureBookings/${fbId}: payment_status=paid`);
-            }
-          } catch (fbErr) {
-            console.warn(`[ITN] futureBookings update failed: ${fbErr.message}`);
-          }
-
-          // Notify WhatsApp customer if booking originated from WhatsApp
-          if (source === 'whatsapp' || source === 'whatsapp_rfq') {
-            const phone = taskData.customerPhone || taskData.contact || '';
-            if (phone) {
-              try {
-                const waBot = env('WHATSAPP_BOT_URL') || 'https://square15-whatsapp-bot.onrender.com';
-                await fetch(`${waBot}/api/booking-status-update`, {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({
-                    bookingId: fbId,
-                    status: 'payment_received',
-                    message: `💳 *Payment received!* R${amountGross} for your booking #${taskData.order_no || fbId}.\n\nYour booking is now confirmed. Your artisan will contact you to arrange the visit.\n\nThank you for choosing Square 15! 🙏`,
-                  }),
-                  signal: AbortSignal.timeout(10000),
-                });
-              } catch (waErr) {
-                console.warn(`[ITN] WhatsApp notification failed: ${waErr.message}`);
+            const userId = (taskData_notify.user_id || taskData_notify.userId || '').toString().trim();
+            if (userId) {
+              const userDoc = await admin.firestore().collection('users').doc(userId).get();
+              if (userDoc.exists) {
+                const partnerId = (userDoc.data().referred_by_partner_id || '').toString().trim();
+                if (partnerId) {
+                  // Check for duplicate commission
+                  const existingComm = await admin.firestore().collection('commissions')
+                    .where('task_management_id', '==', taskId)
+                    .where('partner_id', '==', partnerId)
+                    .limit(1).get();
+                  if (existingComm.empty) {
+                    const partnerDoc = await admin.firestore().collection('corporate_partners').doc(partnerId).get();
+                    if (partnerDoc.exists && (partnerDoc.data().status || 'active') === 'active') {
+                      const pData = partnerDoc.data();
+                      const rate = parseFloat(pData.commission_rate || 5) / 100;
+                      const paidAmount = parseFloat(amountGross) || 0;
+                      const commAmt = paidAmount * rate;
+                      if (commAmt > 0) {
+                        const commId = `COMM-${Date.now().toString(36).toUpperCase()}`;
+                        await admin.firestore().collection('commissions').doc(commId).set({
+                          id: commId,
+                          partner_id: partnerId,
+                          user_id: userId,
+                          task_management_id: taskId,
+                          booking_id: taskId,
+                          job_amount: paidAmount,
+                          commission_rate: parseFloat(pData.commission_rate || 5),
+                          commission_amount: commAmt,
+                          status: 'pending_payout',
+                          source: 'ozow_webhook',
+                          partner_name: pData.company_name || '',
+                          client_name: userDoc.data().name || userDoc.data().userName || '',
+                          job_description: taskData_notify.description || taskData_notify.category_name || '',
+                          created_at: now,
+                        });
+                        await admin.firestore().collection('corporate_partners').doc(partnerId).update({
+                          pending_payout: admin.firestore.FieldValue.increment(commAmt),
+                          total_earned: admin.firestore.FieldValue.increment(commAmt),
+                          updated_at: now,
+                        });
+                        console.log(`💰 Commission R${commAmt.toFixed(2)} recorded for partner ${partnerId} (booking ${taskId})`);
+                      }
+                    }
+                  }
+                }
               }
             }
+          } catch (commErr) {
+            console.warn('[ozow-notify] Commission recording failed:', commErr.message);
           }
         }
-      }
 
-      // Create/update transaction log
-      const txRef = admin.firestore().collection('transactionLogs');
-      const existingTx = await txRef
-        .where('payfast_payment_id', '==', pfPaymentId)
-        .limit(1)
-        .get();
+        // Also update futureBookings for consistency
+        try {
+          await admin.firestore().collection('futureBookings').doc(taskId).update({
+            payment_status: updateData.payment_status || ozowStatus,
+            ozow_transaction_id: transactionId,
+            updated_at: now,
+            ...(ozowStatus === 'complete' ? {
+              payment_verified: true, payment_verified_at: now,
+              ...(updateData.deposit_paid ? { deposit_paid: true } : {}),
+              ...(updateData.balance_paid ? { balance_paid: true } : {}),
+              ...(updateData.payment_type ? { payment_type: updateData.payment_type } : {}),
+            } : {}),
+          }).catch(() => {});
+        } catch (_) {}
 
-      if (existingTx.empty) {
-        const taskData = taskSnap.exists ? taskSnap.data() : {};
-        const txId = crypto.randomUUID();
-        await txRef.doc(txId).set({
-          id: txId,
-          amount: amountGross,
-          transaction_at: now,
-          status: paymentStatus === 'COMPLETE' ? 'success' : paymentStatus.toLowerCase(),
-          user_id: taskData.user_id || taskData.userId || '',
-          type: 'payfast',
-          subtype: 'payment',
-          direction: 'in',
-          cash_movement: true,
-          schema_version: 2,
-          tasks_management_id: customStr1,
-          payfast_payment_id: pfPaymentId,
-          payfast_itn_status: paymentStatus,
-          verified_via: 'payfast_itn',
-          item_name: itemName,
-        });
-        console.log(`📝 Created transactionLog for ITN: ${txId}`);
-      } else {
-        // Update existing transaction log
-        const existingDoc = existingTx.docs[0];
-        await existingDoc.ref.update({
-          payfast_itn_status: paymentStatus,
-          payfast_itn_received_at: now,
-          status: paymentStatus === 'COMPLETE' ? 'success' : paymentStatus.toLowerCase(),
-          verified_via: 'payfast_itn',
-        });
-        console.log(`📝 Updated existing transactionLog: ${existingDoc.id}`);
+        // Send WhatsApp notification for WhatsApp-originated bookings
+        if (taskData_notify.source === 'whatsapp' && (taskData_notify.customerPhone || taskData_notify.contact)) {
+          try {
+            const waToken = env('WHATSAPP_TOKEN') || env('WA_TOKEN');
+            const waPhoneId = env('WHATSAPP_PHONE_NUMBER_ID') || env('WA_PHONE_ID');
+            if (waToken && waPhoneId) {
+              const customerPhone = String(taskData_notify.customerPhone || taskData_notify.contact || '').replace(/\D/g, '');
+              const orderNo = taskData_notify.order_no || taskId;
+              let waMessage;
+              if (ozowStatus === 'complete') {
+                waMessage = `✅ *Payment Confirmed!*\n\nYour payment of R${amountGross} for booking *${orderNo}* has been received and verified.\n\n🔒 Your funds are held in secure escrow until you confirm satisfaction with the completed work.\n\nWe'll notify you when your artisan is on the way!`;
+              } else if (ozowStatus === 'cancelled' || ozowStatus === 'abandoned') {
+                waMessage = `⚠️ *Payment Cancelled*\n\nYour payment of R${amountGross} for booking *${orderNo}* was cancelled.\n\nYou can retry by replying "pay" or "payment" to get a new payment link.`;
+              } else if (ozowStatus === 'error') {
+                waMessage = `❌ *Payment Failed*\n\nYour payment of R${amountGross} for booking *${orderNo}* could not be processed.\n\nPlease try again by replying "pay" or "payment", or use a different payment method.`;
+              }
+              if (waMessage) {
+                const waResp = await fetch(`https://graph.facebook.com/v18.0/${waPhoneId}/messages`, {
+                  method: 'POST',
+                  headers: {
+                    'Authorization': `Bearer ${waToken}`,
+                    'Content-Type': 'application/json',
+                  },
+                  body: JSON.stringify({
+                    messaging_product: 'whatsapp',
+                    to: customerPhone,
+                    type: 'text',
+                    text: { body: waMessage },
+                  }),
+                });
+                console.log(`📱 WhatsApp Ozow notification sent to ${customerPhone}: ${ozowStatus} (status=${waResp.status})`);
+              }
+            }
+          } catch (waErr) {
+            console.warn('Ozow WhatsApp notification failed:', waErr.message);
+          }
+        }
+
+        // Notify customer for cancelled/failed payments
+        if (ozowStatus === 'cancelled' || ozowStatus === 'abandoned' || ozowStatus === 'error') {
+          const taskData = taskSnap.data() || {};
+          const userId = taskData.user_id || taskData.userId || '';
+          const statusLabel = ozowStatus === 'error' ? 'failed' : 'cancelled';
+
+          if (userId) {
+            try {
+              await admin.firestore().collection('notifications').add({
+                title: `Payment ${statusLabel === 'cancelled' ? 'Cancelled' : 'Failed'}`,
+                body: `Your payment of R${amountGross} for booking ${taskData.order_no || taskId} was ${statusLabel}. You can retry from your bookings page.`,
+                type: 'payment_' + statusLabel,
+                user_id: userId,
+                user_type: 'user',
+                booking_id: taskId,
+                read: false,
+                created_at: now,
+              });
+            } catch (notifErr) {
+              console.warn('Ozow notification save failed:', notifErr.message);
+            }
+
+            // Send FCM push
+            try {
+              const userSnap = await admin.firestore().collection('users').doc(userId).get();
+              const fcmToken = (userSnap.data() || {}).fcm_token || (userSnap.data() || {}).deviceToken || '';
+              if (fcmToken) {
+                await admin.messaging().send({
+                  token: fcmToken,
+                  notification: {
+                    title: `Payment ${statusLabel === 'cancelled' ? 'Cancelled' : 'Failed'}`,
+                    body: `Your R${amountGross} payment was ${statusLabel}. Tap to retry.`,
+                  },
+                  data: { type: 'payment_' + statusLabel, booking_id: taskId },
+                  android: { notification: { channelId: 'payment_channel' } },
+                }).catch(() => {});
+              }
+            } catch (_) {}
+          }
+
+          // Notify admin
+          try {
+            await admin.firestore().collection('notifications').add({
+              title: `Ozow Payment ${ozowStatus}`,
+              body: `Payment of R${amountGross} for task ${taskId} was ${statusLabel}. Ozow ID: ${transactionId}`,
+              type: 'payment_' + statusLabel,
+              user_type: 'admin',
+              booking_id: taskId,
+              read: false,
+              created_at: now,
+            });
+          } catch (_) {}
+        }
       }
     }
 
-    // PayFast expects a 200 OK response
+    // Create/update transaction log
+    const txRef = admin.firestore().collection('transactionLogs');
+    const existingTx = await txRef
+      .where('ozow_transaction_id', '==', transactionId)
+      .limit(1)
+      .get();
+
+    if (existingTx.empty) {
+      const txId = crypto.randomUUID();
+      await txRef.doc(txId).set({
+        id: txId,
+        amount: amountGross,
+        transaction_at: now,
+        status: ozowStatus === 'complete' ? 'success' : ozowStatus,
+        user_id: '',
+        type: 'ozow',
+        subtype: 'payment',
+        direction: 'in',
+        cash_movement: true,
+        schema_version: 2,
+        tasks_management_id: taskId,
+        ozow_transaction_id: transactionId,
+        transaction_reference: transactionRef,
+        ozow_status: ozowStatus,
+        verified_via: 'ozow_notify',
+      });
+      console.log(`📝 Created transactionLog for Ozow: ${txId}`);
+    } else {
+      const existingDoc = existingTx.docs[0];
+      await existingDoc.ref.update({
+        ozow_status: ozowStatus,
+        ozow_notify_received_at: now,
+        status: ozowStatus === 'complete' ? 'success' : ozowStatus,
+        verified_via: 'ozow_notify',
+      });
+      console.log(`📝 Updated existing transactionLog: ${existingDoc.id}`);
+    }
+
+    // Ozow expects a 200 OK response
     res.status(200).send('OK');
   } catch (error) {
-    console.error('❌ PayFast ITN error:', error);
-    res.status(200).send('OK'); // Always return 200 so PayFast doesn't retry indefinitely
+    console.error('❌ Ozow notification error:', error);
+    res.status(200).send('OK'); // Always return 200 so Ozow doesn't retry indefinitely
   }
 });
 
@@ -7498,7 +7553,18 @@ app.get('/api/finance/requests', adminLimiter, async (req, res) => {
   if (status) q = firestore.collection('finance_requests').where('status', '==', status).orderBy('created_at', 'desc').limit(limit);
 
   try {
-    const snap = await q.get();
+    let snap;
+    try {
+      snap = await q.get();
+    } catch (indexErr) {
+      // Composite index may not exist yet — fall back to simpler query
+      console.warn('[finance-requests] composite index missing, falling back:', indexErr.message);
+      if (status) {
+        snap = await firestore.collection('finance_requests').where('status', '==', status).limit(limit).get();
+      } else {
+        snap = await firestore.collection('finance_requests').limit(limit).get();
+      }
+    }
     const items = snap.docs.map(d => {
       const r = d.data() || {};
       return {
@@ -7542,13 +7608,13 @@ app.get('/api/finance/fraud-alerts', adminLimiter, async (req, res) => {
         .get();
     } catch (indexErr) {
       // Composite index may not exist yet — fall back to status-only query
-      console.warn('[fraud-alerts] Index query failed, falling back:', indexErr.message);
+      console.warn('[fraud-alerts] composite index missing, falling back:', indexErr.message);
       snap = await firestore.collection('fraud_alerts')
         .where('status', '==', status)
         .limit(limit)
         .get();
     }
-    const items = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    const items = snap.docs.map(d => ({ id: d.id, ...(d.data() || {}) }));
     return res.json({ success: true, count: items.length, items });
   } catch (e) {
     return res.status(500).json({ error: 'internal_error', message: e.message });
@@ -7613,5 +7679,231 @@ if (require.main === module) {
     console.log(`🧠 Voice start endpoint: http://localhost:${PORT}/api/voice/start`);
     console.log(`📦 Environment: ${process.env.NODE_ENV}`);
     console.log('✅ Server ready to accept requests\n');
+
+    // Initialize Firestore for background processors
+    let firestore = null;
+    try {
+      initFirebaseIfPossible();
+      if (!firebaseInitError) {
+        firestore = admin.firestore();
+      }
+    } catch (e) {
+      console.warn('⚠️ Firebase not available for background processors:', e.message);
+    }
+
+    // ── Retargeting Queue Processor — runs every 15 minutes ──
+    if (firestore) {
+      const RETARGET_INTERVAL = 15 * 60 * 1000; // 15 min
+      async function processRetargetingQueue() {
+        try {
+          const now = new Date();
+          const nowStr = now.toISOString();
+          const dueSnap = await firestore.collection('retargeting_queue')
+            .where('status', '==', 'active')
+            .where('next_send_at', '<=', nowStr)
+            .limit(20)
+            .get();
+
+          if (dueSnap.empty) return;
+          console.log(`🔄 Retargeting: processing ${dueSnap.size} due items`);
+
+          for (const doc of dueSnap.docs) {
+            try {
+              const data = doc.data() || {};
+              const userId = String(data.user_id || '').trim();
+              const category = String(data.category_name || 'maintenance').trim();
+              const step = parseInt(data.next_step) || 1;
+              const amount = parseFloat(data.quoted_amount) || 0;
+
+              if (!userId) { await doc.ref.update({ status: 'expired' }); continue; }
+
+              // Check if user booked since (cancel retargeting)
+              const recentBookings = await firestore.collection('futureBookings')
+                .where('userId', '==', userId)
+                .where('status', 'in', ['pending', 'in_progress', 'completed'])
+                .limit(1)
+                .get();
+              const recentTasks = await firestore.collection('tasksManagement')
+                .where('userId', '==', userId)
+                .where('status', 'in', ['pending', 'in_progress', 'completed'])
+                .limit(1)
+                .get();
+              if (!recentBookings.empty || !recentTasks.empty) {
+                await doc.ref.update({ status: 'converted' });
+                continue;
+              }
+
+              // Get user's push tokens
+              const tokens = await getUserTokens(userId);
+              if (tokens.length === 0) {
+                await doc.ref.update({ status: 'expired', expired_reason: 'no_push_token' });
+                continue;
+              }
+
+              // Get user name
+              const userSnap = await firestore.collection('users').doc(userId).get();
+              const userName = String((userSnap.data() || {}).name || 'there').split(' ')[0];
+
+              const amountStr = amount > 0 ? ` (R${amount.toFixed(0)})` : '';
+
+              switch (step) {
+                case 1: // 1 hour: reminder
+                  await sendPushToTokens({
+                    tokens,
+                    title: `Still need that ${category} done?`,
+                    body: `Hi ${userName}, your quote${amountStr} is waiting! Tap to continue booking.`,
+                    data: { type: 'retarget_reminder', session_id: doc.id },
+                  });
+                  await doc.ref.update({
+                    next_step: 2,
+                    next_send_at: new Date(now.getTime() + 23 * 3600000).toISOString(),
+                    last_sent_at: nowStr,
+                  });
+                  break;
+
+                case 2: { // 24 hours: 5% discount
+                  const code = `BACK5-${doc.id.slice(-6).toUpperCase()}`;
+                  const expires = new Date(now.getTime() + 48 * 3600000);
+                  await firestore.collection('promo_codes').doc(code).set({
+                    code, discount_percent: 5, created_at: now.toISOString(),
+                    expires_at: expires.toISOString(), user_id: userId,
+                    type: 'retargeting', status: 'active', max_uses: 1, uses: 0,
+                  });
+                  await sendPushToTokens({
+                    tokens,
+                    title: `5% off your ${category} booking!`,
+                    body: `Hi ${userName}, use code ${code} for 5% off${amountStr}. Valid 48 hours!`,
+                    data: { type: 'retarget_discount', promo_code: code },
+                  });
+                  await doc.ref.update({
+                    next_step: 3,
+                    next_send_at: new Date(now.getTime() + 48 * 3600000).toISOString(),
+                    last_sent_at: nowStr, promo_code: code,
+                  });
+                  break;
+                }
+
+                case 3: { // 72 hours: 10% discount
+                  const code = `BACK10-${doc.id.slice(-6).toUpperCase()}`;
+                  const expires = new Date(now.getTime() + 96 * 3600000);
+                  await firestore.collection('promo_codes').doc(code).set({
+                    code, discount_percent: 10, created_at: now.toISOString(),
+                    expires_at: expires.toISOString(), user_id: userId,
+                    type: 'retargeting', status: 'active', max_uses: 1, uses: 0,
+                  });
+                  await sendPushToTokens({
+                    tokens,
+                    title: '10% off — limited time!',
+                    body: `Hi ${userName}, your ${category} issue won't fix itself. Use ${code} for 10% off!`,
+                    data: { type: 'retarget_discount', promo_code: code },
+                  });
+                  await doc.ref.update({
+                    next_step: 4,
+                    next_send_at: new Date(now.getTime() + 4 * 24 * 3600000).toISOString(),
+                    last_sent_at: nowStr, promo_code: code,
+                  });
+                  break;
+                }
+
+                case 4: { // 7 days: final 15%
+                  const code = `FINAL15-${doc.id.slice(-6).toUpperCase()}`;
+                  const expires = new Date(now.getTime() + 24 * 3600000);
+                  await firestore.collection('promo_codes').doc(code).set({
+                    code, discount_percent: 15, created_at: now.toISOString(),
+                    expires_at: expires.toISOString(), user_id: userId,
+                    type: 'retargeting', status: 'active', max_uses: 1, uses: 0,
+                  });
+                  await sendPushToTokens({
+                    tokens,
+                    title: 'Last chance: 15% off expires tomorrow!',
+                    body: `${userName}, final offer on your ${category} booking. Code ${code} — 24 hours only.`,
+                    data: { type: 'retarget_final', promo_code: code },
+                  });
+                  await doc.ref.update({
+                    status: 'expired', last_sent_at: nowStr, promo_code: code,
+                  });
+                  break;
+                }
+
+                default:
+                  await doc.ref.update({ status: 'expired' });
+              }
+            } catch (itemErr) {
+              console.warn(`⚠️ Retargeting item ${doc.id} error:`, itemErr.message);
+            }
+          }
+        } catch (e) {
+          console.warn('⚠️ Retargeting queue error:', e.message);
+        }
+      }
+
+      // Also detect stale bookings and queue them for retargeting
+      async function detectStaleBookings() {
+        try {
+          const staleThreshold = new Date(Date.now() - 24 * 3600000); // 24h old
+          const staleStatuses = [
+            'pending', 'pending_payment', 'pending_client_response',
+            'rfq_submitted', 'rfq_pending',
+          ];
+
+          for (const collection of ['futureBookings', 'tasksManagement']) {
+            for (const status of staleStatuses) {
+              const staleSnap = await firestore.collection(collection)
+                .where('status', '==', status)
+                .limit(10)
+                .get();
+
+              for (const doc of staleSnap.docs) {
+                const data = doc.data() || {};
+                const createdAt = data.createdAt?.toDate?.() || data.created_at?.toDate?.();
+                if (!createdAt || createdAt > staleThreshold) continue;
+
+                const uid = String(data.userId || data.user_id || data.clientId || '').trim();
+                if (!uid) continue;
+
+                // Check if already queued
+                const existing = await firestore.collection('retargeting_queue')
+                  .where('session_id', '==', doc.id)
+                  .limit(1)
+                  .get();
+                if (!existing.empty) continue;
+
+                const category = String(data.category || data.serviceCategory || 'maintenance').trim();
+                const amount = parseFloat(data.cost || data.total_cost || data.quoted_price || '0');
+
+                await firestore.collection('retargeting_queue').doc(doc.id).set({
+                  user_id: uid,
+                  session_id: doc.id,
+                  booking_id: doc.id,
+                  category_name: category,
+                  quoted_amount: amount,
+                  stale_status: status,
+                  source: 'stale_detection',
+                  created_at: new Date().toISOString(),
+                  status: 'active',
+                  next_step: 1,
+                  next_send_at: new Date().toISOString(), // Send immediately
+                });
+              }
+            }
+          }
+        } catch (e) {
+          console.warn('⚠️ Stale booking detection error:', e.message);
+        }
+      }
+
+      // Run every 15 minutes
+      setInterval(async () => {
+        await detectStaleBookings();
+        await processRetargetingQueue();
+      }, RETARGET_INTERVAL).unref?.();
+
+      // Also run once on startup (after 30s warm-up)
+      setTimeout(async () => {
+        await detectStaleBookings();
+        await processRetargetingQueue();
+      }, 30_000);
+      console.log('📋 Retargeting queue processor started (every 15 min)');
+    }
   });
 }

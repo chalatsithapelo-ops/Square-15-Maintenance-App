@@ -499,6 +499,7 @@ async def entrypoint(ctx: JobContext):
             "- BACKEND tools for data: get_booking_status, list_my_bookings, explain_quote, check_payment, get_wallet_balance, get_messages, get_case_status.\n"
             "- BACKEND tools for ACTIONS: cancel_booking, reschedule_booking, send_message_to_artisan, send_message_to_client, send_message_to_admin, mark_booking_in_progress, artisan_cancel_and_reassign, submit_rating, submit_complaint. These tools EXECUTE real actions on the backend — use them, NOT ui_navigate.\n"
             "- RFQ QUOTE tools: generate_rfq_quote (trigger AI quote), accept_rfq (accept quote → payment), reject_rfq (negotiate quote). Use when handling RFQ requests.\n"
+            "- PAYMENT tools: request_payment_link (generates a PayFast payment link and sends it to the customer's phone). IMPORTANT: Only offer payment AFTER an artisan has accepted the job. NEVER offer payment immediately after booking creation. When customer wants to pay, ALWAYS ask 'Would you like to pay the full amount or a 35 percent deposit?' before calling request_payment_link.\n"
             "- lookup_service_pricing for pricing: when user asks 'how much is...', 'what's the price for...', call lookup_service_pricing.\n"
             "- FINANCE tools (admin-only, read-only): get_finance_overview, get_daily_revenue_report, get_failed_payments_report, get_fraud_alerts_report. Use when admin asks 'What's the revenue today?', 'Any failed payments?', 'Show financial summary', 'Any fraud alerts?'. These are READ-ONLY and safe. NEVER process refunds, payouts, or wallet adjustments via voice — those require the admin app approval workflow.\n"
             "- ui_navigate ONLY for opening screens/navigation: open_bookings_tab, open_future_bookings, open_wallet, open_profile, open_settings, open_notifications, open_calendar, open_help, open_support, go_home, go_back, close_window, create_order_booking, call_assigned_artisan.\n"
@@ -551,8 +552,15 @@ async def entrypoint(ctx: JobContext):
             "- When user asks how much a service costs, MUST call lookup_service_pricing. Do NOT answer without calling this tool.\n"
             "- Pass query with the service name (e.g. query='plumbing', query='unblock toilet', query='painting').\n"
             "- The tool ALWAYS returns pricing data. Read back the prices from the results.\n"
+            "- lookup_service_pricing now also returns pricingGuidance with laborCostPerHour, outsourcedLaborRate, and materialMultiplier — use these for accurate estimates.\n"
             "- If cost is null for a service, say 'This service requires a quote from an artisan'.\n"
             "- NEVER guess or make up prices. ALWAYS call lookup_service_pricing.\n"
+            "\n"
+            "BUILDERS PRODUCT BROWSING:\n"
+            "- When a customer asks about specific products, materials, or brands, use lookup_builders_product to search Builders Warehouse.\n"
+            "- Present the product name, brand, price, and mention they can view it on the Builders website.\n"
+            "- When presenting RFQ quotes with materials, offer to look up specific products on Builders if the customer wants different brands or options.\n"
+            "- If a customer wants to compare brands (e.g. 'what geyser options are there?'), search Builders and present the options with prices.\n"
             "\n"
             "DIAGNOSIS & QUOTING (IMPORTANT — ASK BEFORE BOOKING):\n"
             "- When a user describes a maintenance problem, DO NOT immediately create a booking.\n"
@@ -587,9 +595,22 @@ async def entrypoint(ctx: JobContext):
             "  1. Call list_my_bookings() to find the RFQ booking.\n"
             "  2. Call explain_quote(booking_id) to get the AI-generated breakdown.\n"
             "  3. Read back: labour cost, materials list, equipment, contingency, and grand total.\n"
-            "- QUOTE ACCEPTANCE: When user says 'accept the quote' or 'go ahead' → call accept_rfq(booking_id)\n"
+            "- QUOTE ACCEPTANCE: When user says 'accept the quote' or 'go ahead' → call accept_rfq(booking_id). After acceptance, tell them an artisan needs to accept the job before payment.\n"
             "- QUOTE NEGOTIATION: When user says 'too expensive' or 'can you adjust' → call reject_rfq(booking_id, reason)\n"
             "- ALWAYS present the quote breakdown verbally: labour hours and rate, materials with markup, contingency, and grand total.\n"
+            "\n"
+            "PAYMENT FLOW (CRITICAL — Artisan must accept BEFORE payment):\n"
+            "- NEVER offer payment immediately after creating a booking or accepting an RFQ quote.\n"
+            "- Tell customer: 'An artisan needs to accept your job first. You will be notified when one accepts, and then you can pay.'\n"
+            "- When artisan has accepted and customer wants to pay, ALWAYS ask: 'Would you like to pay the full amount or a 35 percent deposit with the balance due after job completion?'\n"
+            "- If customer says 'deposit' or '35 percent' → call request_payment_link with payment_type='deposit'\n"
+            "- If customer says 'full' or 'pay everything' → call request_payment_link with payment_type='full'\n"
+            "\n"
+            "FINANCIAL SECURITY (ALWAYS mention when discussing payment):\n"
+            "- 'Your payment is held in a secure escrow account. The artisan does not receive your money until you confirm you are satisfied with the completed work.'\n"
+            "- '100 percent money-back guarantee. Not satisfied? Full refund, no questions asked within 24 hours.'\n"
+            "- 'Free cancellation before artisan dispatch.'\n"
+            "- If deposit chosen: 'Your deposit is protected in escrow. The remaining balance is only due after the job is completed to your satisfaction.'\n"
             "- If the quote is not ready yet, say: 'The quote is still being prepared. Check back in a moment.'\n"
             "\n"
             "BOOKING CREATION (IMPORTANT):\n"
@@ -622,6 +643,8 @@ async def entrypoint(ctx: JobContext):
                 "- Accept job → ui_navigate(action='accept_latest_request')\n"
                 "- Reject job → ui_navigate(action='reject_latest_request')\n"
                 "- Start job → mark_booking_in_progress(booking_id)\n"
+                "- Buying materials → mark_buying_material(booking_id) — client gets a WhatsApp notification\n"
+                "- Job completed → mark_job_completed(booking_id) — client gets notified + prompted to rate and pay balance\n"
                 "- Cancel+reassign → artisan_cancel_and_reassign(booking_id, reason)\n"
                 "  IMPORTANT: Before calling artisan_cancel_and_reassign, you MUST ask the artisan to confirm. "
                 "Say something like 'Are you sure you want to cancel this job and have it reassigned to another artisan?' "
@@ -633,9 +656,6 @@ async def entrypoint(ctx: JobContext):
             base += (
                 "\nCLIENT ACTIONS:\n"
                 "- Create booking: First run the DIAGNOSIS flow (ask 2-3 questions about scope, urgency, and sub-category). "
-                "Then REMIND the customer to upload photos: 'Before I create the booking, could you please upload photos of the issue? "
-                "Tap the camera icon or send photos in the app — this helps our artisans understand the problem and come prepared.' "
-                "If they say they will or already have, proceed. If they say they can't right now, proceed without blocking. "
                 "Then call ui_navigate(action='create_order_booking') with category_name and the enriched problem_description. "
                 "The app handles pricing, RFQ creation, AI quoting, and artisan dispatch automatically.\n"
                 "- For complex jobs (renovations, full installs, geyser replacement): use create_booking with is_rfq='yes'. "
@@ -1222,7 +1242,7 @@ async def entrypoint(ctx: JobContext):
             data = result.get('data', result.get('result', {}))
             price = data.get('price', '0')
             rfq_no = data.get('rfq_no', booking_id)
-            return f"Quote accepted for RFQ {rfq_no}! The total is {price} rand. Your booking is now ready for payment. You can pay via wallet or card in the app."
+            return f"Quote accepted for RFQ {rfq_no}! The total is {price} rand. Next step: an artisan needs to accept your job before payment. You'll be notified as soon as one accepts. Your money will be held securely in escrow — the artisan does not receive payment until you confirm you are satisfied. Once an artisan accepts, you can choose to pay the full amount or a 35 percent deposit."
         except Exception as e:
             logger.error(f"accept_rfq error: {e}", exc_info=True)
             return "Sorry, I had trouble accepting the quote. Please try again."
@@ -1291,6 +1311,49 @@ async def entrypoint(ctx: JobContext):
         except Exception as e:
             logger.error(f"check_payment error: {e}", exc_info=True)
             return "Sorry, I had trouble checking payment. Please try again."
+
+    @llm.function_tool(
+        description=(
+            "Request a payment link for a booking. Generates a secure PayFast payment link "
+            "and sends it to the customer's phone as a notification. "
+            "IMPORTANT: Only use this AFTER an artisan has accepted the job. "
+            "ALWAYS ask the customer to choose payment_type: 'deposit' (35%) or 'full' before calling. "
+            "Use when the customer says 'I want to pay', 'send me a payment link', "
+            "'how do I pay', or after an artisan has accepted."
+        )
+    )
+    async def request_payment_link(booking_id: str, payment_type: str = "full") -> str:
+        """Request a payment link via the backend."""
+        nonlocal backend_client
+        if not backend_client:
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
+
+        try:
+            result = await backend_client.call_backend_action(
+                'request_payment_link',
+                {'booking_id': booking_id, 'source': 'voice', 'payment_type': payment_type}
+            )
+            if not result.get('ok') and not result.get('success'):
+                error = result.get('error', 'unknown_error')
+                if error == 'no_confirmed_price':
+                    return "This booking doesn't have a confirmed price yet. The quote needs to be accepted first."
+                if 'artisan' in error.lower():
+                    return "An artisan hasn't accepted this job yet. You'll be notified when an artisan accepts, and then you can pay."
+                return f"Could not generate payment link: {error}"
+
+            data = result.get('data', result.get('result', {}))
+            message = data.get('message', '')
+            amount = data.get('amount', 0)
+
+            escrow_msg = " Your money is held securely in escrow until you confirm you are satisfied with the work. 100 percent money-back guarantee."
+            if message:
+                return message + escrow_msg
+            pt_label = "deposit" if payment_type == "deposit" else "full payment"
+            return f"A {pt_label} link for {amount} rand has been sent to your phone. Check your notifications to complete payment.{escrow_msg}"
+        except Exception as e:
+            logger.error(f"request_payment_link error: {e}", exc_info=True)
+            return "Sorry, I had trouble generating the payment link. Please try again or use the app to pay directly."
 
     @llm.function_tool(
         description=(
@@ -1377,6 +1440,55 @@ async def entrypoint(ctx: JobContext):
                 "Please check the services section in the app for current pricing, or try asking me again in a moment."
             )
 
+    @llm.function_tool(
+        description=(
+            "Search for products, materials, and brands on Builders Warehouse. "
+            "Use when customer asks about specific products, wants to compare brands, "
+            "or needs material prices. Returns product names, brands, prices, and links."
+        )
+    )
+    async def lookup_builders_product(query: str = "") -> str:
+        """Search Builders Warehouse for products and materials."""
+        if not query.strip():
+            return "Please tell me what product or material you'd like me to look up on Builders."
+
+        logger.info(f"🔍 lookup_builders_product called: query={query}")
+
+        try:
+            import urllib.parse
+            encoded_q = urllib.parse.quote(query.strip())
+            url = f"{backend_url}/api/pricing/builders-lookup?q={encoded_q}"
+            logger.info(f"🔍 Calling Builders lookup: {url}")
+
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as http_session:
+                async with http_session.get(url) as resp:
+                    if resp.status != 200:
+                        return "Sorry, I couldn't search Builders right now. Please try again."
+                    result = await resp.json()
+
+            if not result.get('ok') or not result.get('result'):
+                return f"I couldn't find any products matching '{query}' on Builders. Try a different search term."
+
+            r = result['result']
+            name = r.get('title', r.get('name', 'Unknown'))
+            price = r.get('priceZar', 0)
+            brand = r.get('brand', '')
+            prod_url = r.get('url', '')
+
+            response = f"Found on Builders: {name}"
+            if brand:
+                response += f" by {brand}"
+            if price and price > 0:
+                response += f" — R{price:.2f}"
+            if prod_url:
+                response += f". You can view it at {prod_url}"
+
+            logger.info(f"🔍 Builders result: {name} R{price}")
+            return response
+        except Exception as e:
+            logger.error(f"lookup_builders_product error: {e}", exc_info=True)
+            return "I'm having trouble searching Builders right now. Please try again in a moment."
+
     # Phase 1: Write operations with propose/confirm
     @llm.function_tool(
         description=(
@@ -1456,14 +1568,14 @@ async def entrypoint(ctx: JobContext):
                         response += f"Grand total: {gt} rand. "
                         if duration:
                             response += f"Estimated duration: {duration}. "
-                        response += "Would you like to accept this quote or negotiate?"
+                        response += "Would you like to accept this quote, or would you like to negotiate the price?"
                         return response.strip()
                 except Exception as qe:
                     logger.warning(f"Auto-quote generation failed for RFQ {booking_id}: {qe}")
 
                 return f"Your RFQ request has been submitted (booking {booking_id}). A detailed quote is being prepared. Ask me to check the quote status anytime."
             else:
-                return f"Booking {booking_id} created successfully! Dispatching the nearest available artisan now. You'll be notified once an artisan accepts."
+                return f"Booking {booking_id} created successfully! Dispatching the nearest available artisan now. You'll be notified once an artisan accepts. Important: payment is only required after an artisan accepts your job. Your money will be held securely in escrow, so the artisan does not receive payment until you confirm you are satisfied with the work. Once an artisan accepts, you can choose to pay the full amount or a 35 percent deposit."
 
         except Exception as e:
             logger.error(f"create_booking error: {e}", exc_info=True)
@@ -1885,6 +1997,59 @@ async def entrypoint(ctx: JobContext):
         except Exception as e:
             logger.error(f"mark_booking_in_progress error: {e}", exc_info=True)
             return "Sorry, I had trouble updating the booking status. Please try again."
+
+    @llm.function_tool(
+        description=(
+            "Mark that the artisan is buying materials for a booking. "
+            "Use when artisan says they are purchasing or buying materials. "
+            "Requires: booking_id. The client will be notified via WhatsApp."
+        )
+    )
+    async def mark_buying_material(booking_id: str) -> str:
+        """Mark buying material status via backend API."""
+        nonlocal backend_client
+        if not backend_client:
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
+
+        try:
+            payload = {'booking_id': booking_id}
+            result = await backend_client.call_backend_action('mark_buying_material', payload)
+
+            if not result.get('ok') and not result.get('success'):
+                error = result.get('error', 'unknown_error')
+                return f"I couldn't update the buying material status: {error}"
+
+            return f"Booking {booking_id} is now marked as buying material. The client has been notified."
+        except Exception as e:
+            logger.error(f"mark_buying_material error: {e}", exc_info=True)
+            return "Sorry, I had trouble updating the status. Please try again."
+
+    @llm.function_tool(
+        description=(
+            "Mark a booking as completed. Use when artisan says the job is done or finished. "
+            "Requires: booking_id. The client will be notified via WhatsApp and prompted to rate."
+        )
+    )
+    async def mark_job_completed(booking_id: str) -> str:
+        """Mark job as completed via backend API."""
+        nonlocal backend_client
+        if not backend_client:
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
+
+        try:
+            payload = {'booking_id': booking_id}
+            result = await backend_client.call_backend_action('mark_job_completed', payload)
+
+            if not result.get('ok') and not result.get('success'):
+                error = result.get('error', 'unknown_error')
+                return f"I couldn't mark the job as completed: {error}"
+
+            return f"Booking {booking_id} is now marked as completed. The client has been notified and prompted to rate the service."
+        except Exception as e:
+            logger.error(f"mark_job_completed error: {e}", exc_info=True)
+            return "Sorry, I had trouble completing the booking. Please try again."
 
     @llm.function_tool(
         description=(
@@ -2491,6 +2656,7 @@ async def entrypoint(ctx: JobContext):
             check_payment,
             get_wallet_balance,
             lookup_service_pricing,
+            lookup_builders_product,
             get_transaction_history,
             get_deposit_requests,
             get_service_categories,

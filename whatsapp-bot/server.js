@@ -94,9 +94,37 @@ async function sendWhatsAppMessage(to, text) {
       type: 'text',
       text: { body: text },
     }),
-    signal: AbortSignal.timeout(15000),
   });
   if (!res.ok) console.error('[wa] send failed:', await res.text());
+}
+
+// Send an image via WhatsApp Cloud API (public URL)
+async function sendWhatsAppImage(to, imageUrl, caption) {
+  const phoneId = process.env.WHATSAPP_PHONE_NUMBER_ID;
+  const token   = process.env.WHATSAPP_ACCESS_TOKEN;
+  if (!phoneId || !token) { console.error('[wa-image] Missing credentials'); return; }
+
+  try {
+    const res = await fetch(`${WA_API}/${phoneId}/messages`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        messaging_product: 'whatsapp',
+        to,
+        type: 'image',
+        image: {
+          link: imageUrl,
+          ...(caption ? { caption } : {}),
+        },
+      }),
+    });
+    if (!res.ok) console.error('[wa-image] send failed:', res.status, await res.text().catch(() => ''));
+  } catch (e) {
+    console.error('[wa-image] network error:', e.message);
+  }
 }
 
 async function sendWhatsAppInteractive(to, header, body, buttons) {
@@ -111,7 +139,6 @@ async function sendWhatsAppInteractive(to, header, body, buttons) {
         'Authorization': `Bearer ${token}`,
         'Content-Type': 'application/json',
       },
-      signal: AbortSignal.timeout(15000),
       body: JSON.stringify({
         messaging_product: 'whatsapp',
         to,
@@ -146,7 +173,6 @@ async function sendWhatsAppList(to, header, body, buttonText, sections) {
       'Authorization': `Bearer ${token}`,
       'Content-Type': 'application/json',
     },
-    signal: AbortSignal.timeout(15000),
     body: JSON.stringify({
       messaging_product: 'whatsapp',
       to,
@@ -180,7 +206,6 @@ async function downloadWhatsAppMedia(mediaId) {
     // Step 1: Get the media URL
     const metaRes = await fetch(`${WA_API}/${mediaId}`, {
       headers: { 'Authorization': `Bearer ${token}` },
-      signal: AbortSignal.timeout(15000),
     });
     if (!metaRes.ok) { console.error('[wa-media] metadata fetch failed:', metaRes.status); return null; }
     const meta = await metaRes.json();
@@ -190,7 +215,6 @@ async function downloadWhatsAppMedia(mediaId) {
     // Step 2: Download the media binary
     const dlRes = await fetch(mediaUrl, {
       headers: { 'Authorization': `Bearer ${token}` },
-      signal: AbortSignal.timeout(30000),
     });
     if (!dlRes.ok) { console.error('[wa-media] download failed:', dlRes.status); return null; }
     const buffer = Buffer.from(await dlRes.arrayBuffer());
@@ -201,28 +225,6 @@ async function downloadWhatsAppMedia(mediaId) {
     console.error('[wa-media] error:', e.message);
     // Log media download failure to admin
     logErrorToAdmin('media_download_error', 'WhatsApp media download failed', 'whatsapp_bot', e.message).catch(() => {});
-    return null;
-  }
-}
-
-// ─── Upload image buffer to Firebase Storage and return download URL ───
-
-async function uploadImageToStorage(buffer, mimeType) {
-  try {
-    const bucket = admin.storage().bucket('promaintapp-b618a.firebasestorage.app');
-    const ext = (mimeType || 'image/jpeg').includes('png') ? 'png' : 'jpg';
-    const fileName = `booking_images/${Date.now()}_${Math.random().toString(36).substring(2, 10)}.${ext}`;
-    const file = bucket.file(fileName);
-    await file.save(buffer, {
-      metadata: { contentType: mimeType || 'image/jpeg' },
-      public: true,
-    });
-    // Get public download URL
-    const url = `https://storage.googleapis.com/${bucket.name}/${fileName}`;
-    console.log(`[wa-media] Uploaded image to Storage: ${fileName}`);
-    return url;
-  } catch (e) {
-    console.error('[wa-media] Storage upload failed:', e.message);
     return null;
   }
 }
@@ -326,9 +328,7 @@ function getSession(phone) {
       linkedUserId: null,   // app account link
       promoCode: null,      // active promo for current booking
       promoDiscount: 0,
-      photoUrls: [],        // Firebase Storage URLs for photos sent during this session
       lastActivity: Date.now(),
-      _restored: false,     // whether Firestore restore was attempted
     };
     sessions.set(phone, s);
   }
@@ -372,29 +372,12 @@ async function findUserByPhone(phone) {
   if (phone.startsWith('+27')) variants.push('0' + phone.slice(3), phone.slice(1));
   if (phone.startsWith('0')) variants.push('27' + phone.slice(1), '+27' + phone.slice(1));
 
-  // Also build numeric (int) variants — Flutter app stores `contact` as int
-  const numericVariants = new Set();
-  for (const v of variants) {
-    const n = parseInt(v, 10);
-    if (!isNaN(n)) numericVariants.add(n);
-  }
-
   for (const v of variants) {
     for (const field of ['contact', 'phone', 'mobile', 'phoneNumber', 'phone_number']) {
-      // Search with string value
       const snap = await firestore.collection('users').where(field, '==', v).limit(1).get();
       if (!snap.empty) return { id: snap.docs[0].id, ...snap.docs[0].data() };
     }
   }
-
-  // Search with numeric (int) values for fields that might be stored as numbers
-  for (const n of numericVariants) {
-    for (const field of ['contact', 'phone', 'mobile', 'phoneNumber', 'phone_number']) {
-      const snap = await firestore.collection('users').where(field, '==', n).limit(1).get();
-      if (!snap.empty) return { id: snap.docs[0].id, ...snap.docs[0].data() };
-    }
-  }
-
   return null;
 }
 
@@ -455,12 +438,13 @@ const waTools = [
     type: 'function',
     function: {
       name: 'lookup_pricing',
-      description: 'MUST be called BEFORE create_booking. Looks up fixed pricing for a service. Returns the exact fixed price if available, or suggests RFQ if not.',
+      description: 'MUST be called BEFORE create_booking. Looks up fixed pricing for a service and real-time material prices from Builders.co.za. Returns the exact fixed price if available, or suggests RFQ if not.',
       parameters: {
         type: 'object',
         properties: {
           category:    { type: 'string', description: 'Service category (e.g. plumbing, electrical, painting)' },
           subcategory: { type: 'string', description: 'Specific service needed (e.g. toilet unblocking, leak repair, light installation)' },
+          material:    { type: 'string', description: 'Specific material or product to look up on Builders.co.za (e.g. geyser 150L, 20mm copper pipe, circuit breaker)' },
         },
         required: ['category'],
       },
@@ -483,14 +467,37 @@ const waTools = [
   {
     type: 'function',
     function: {
+      name: 'check_auto_discounts',
+      description: 'Check if the customer qualifies for any automatic discounts (first-job discount, off-peak discount, loyalty points). Call this BEFORE creating a booking to inform the customer of available savings.',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_upsell_addons',
+      description: 'Get recommended add-on services for a booking category. These are discounted extra services the customer might want to add. Call this after the customer picks a category and BEFORE creating the booking.',
+      parameters: {
+        type: 'object',
+        properties: {
+          categoryId: { type: 'string', description: 'The service category slug (e.g. plumbing, electrical, painting)' },
+        },
+        required: ['categoryId'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'request_payment_link',
-      description: 'Generate a payment link for an unpaid booking so the customer can pay via card. Use when customer asks to pay.',
+      description: 'Generate a payment link for an unpaid booking so the customer can pay via card. Customer must choose deposit (35%) or full payment. Artisan must have accepted the job first.',
       parameters: {
         type: 'object',
         properties: {
           bookingId: { type: 'string', description: 'The booking ID to generate payment for' },
+          payment_type: { type: 'string', enum: ['deposit', 'full'], description: 'Whether to pay the deposit (35%) or the full amount. Ask the customer to choose.' },
         },
-        required: ['bookingId'],
+        required: ['bookingId', 'payment_type'],
       },
     },
   },
@@ -506,13 +513,14 @@ const waTools = [
     type: 'function',
     function: {
       name: 'pay_with_wallet',
-      description: 'Pay for a booking using wallet balance',
+      description: 'Pay for a booking using wallet balance. Customer must choose deposit (35%) or full payment. Artisan must have accepted the job first.',
       parameters: {
         type: 'object',
         properties: {
-          bookingId: { type: 'string', description: 'The booking ID to pay for' },
+          bookingId: { type: 'string', description: 'The booking ID to pay for (optional, uses last booking if not provided)' },
+          payment_type: { type: 'string', enum: ['deposit', 'full'], description: 'Whether to pay the deposit (35%) or the full amount. Ask the customer to choose.' },
         },
-        required: ['bookingId'],
+        required: ['payment_type'],
       },
     },
   },
@@ -774,6 +782,20 @@ const waTools = [
           caseId: { type: 'string', description: 'The case ID' },
         },
         required: ['caseId'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'lookup_builders_product',
+      description: 'Search Builders Warehouse (builders.co.za) for real products with live pricing. Use when a customer wants to see specific materials, compare brands, or choose items for their job. Returns product names, prices, and links.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Product search query (e.g. "150L geyser", "PVC pipe 110mm", "Kwikot geyser")' },
+        },
+        required: ['query'],
       },
     },
   },
@@ -1059,6 +1081,53 @@ async function getLearningFactor(firestore, category) {
   } catch (e) { console.error('[wa-learning] error:', e.message); return 1.0; }
 }
 
+// ─── Fixed-price lookup helper (shared by generateAIQuote & submit_rfq) ───
+
+async function lookupFixedPrice(category, description) {
+  const firestore = db();
+  if (!firestore) return null;
+  try {
+    const catSlug = (category || '').toLowerCase().replace(/\s+/g, '_');
+    const searchQ = [category || '', description || ''].join(' ').toLowerCase().trim();
+
+    const _matchScore = (a, b) => {
+      const al = a.toLowerCase(), bl = b.toLowerCase();
+      if (al === bl) return 1000;
+      if (al.includes(bl) || bl.includes(al)) return 100;
+      const aw = al.split(/\s+/).filter(w => w.length >= 3);
+      const bw = bl.split(/\s+/).filter(w => w.length >= 3);
+      let score = 0;
+      for (const w of aw) { if (bl.includes(w)) score++; }
+      for (const w of bw) { if (al.includes(w)) score++; }
+      return score;
+    };
+
+    const taskSnap = await firestore.collection('tasks').limit(200).get();
+    let bestScore = 0, matchedService = null, matchedPrice = null;
+    for (const td of taskSnap.docs) {
+      const d = td.data();
+      const name = (d.name || d.title || d.task_name || '').toString();
+      const cost = parseFloat(d.cost || d.price || d.amount || 0);
+      if (name && cost > 0) {
+        const score = _matchScore(name, searchQ);
+        if (score > bestScore) {
+          bestScore = score;
+          matchedService = name;
+          matchedPrice = cost;
+        }
+      }
+    }
+    if (matchedService && matchedPrice && bestScore >= 2) {
+      console.log(`[fixed-price] Matched "${matchedService}" @ R${matchedPrice} (score ${bestScore}) for "${searchQ}"`);
+      return { service: matchedService, price: matchedPrice, score: bestScore };
+    }
+    return null;
+  } catch (e) {
+    console.error('[fixed-price] lookup error:', e.message);
+    return null;
+  }
+}
+
 // ─── AI Quote Generation for RFQ (with Builders.co.za real-time pricing) ───
 
 async function generateAIQuote(category, description, materialsResponsibility, additionalContext) {
@@ -1069,6 +1138,43 @@ async function generateAIQuote(category, description, materialsResponsibility, a
   additionalContext = sanitizeForPrompt(additionalContext, 500);
 
   const firestore = db();
+
+  // 0. Check tasks collection for a fixed price FIRST — if found, return it directly
+  try {
+    const fixedMatch = await lookupFixedPrice(category, description);
+    if (fixedMatch) {
+      console.log(`[ai-quote] Using fixed price R${fixedMatch.price} for "${fixedMatch.service}" instead of AI generation`);
+      const r2 = (v) => Math.round(v * 100) / 100;
+      return {
+        laborHours: 0,
+        laborCostPerHour: 0,
+        laborCost: 0,
+        complexity: 2,
+        materialsBOM: [],
+        materialsMultiplier: 1,
+        materials_subtotal: 0,
+        materials_with_markup: 0,
+        materials_responsibility: materialsResponsibility || 'artisan',
+        equipmentCost: 0,
+        subtotal: r2(fixedMatch.price),
+        contingency: 0,
+        grand_total: r2(fixedMatch.price),
+        scope_of_work: description || fixedMatch.service,
+        estimated_duration: 'To be determined on-site',
+        learning_factor: 1,
+        pricing_sources: { fixed_price: 1, builders: 0, catalog: 0, ai_estimate: 0 },
+        breakdown: [
+          { description: `Fixed price: ${fixedMatch.service}`, cost: fixedMatch.price.toFixed(2) },
+        ],
+        disclaimer: 'This is a fixed price set by admin for this service.',
+        generated_at: new Date().toISOString(),
+        source: 'tasks_fixed_price',
+        fixed_price_match: fixedMatch.service,
+      };
+    }
+  } catch (e) {
+    console.warn('[ai-quote] fixed price check failed, continuing with AI:', e.message);
+  }
 
   // 1. Look up pricing guidance from Firestore
   let laborRate = 150;
@@ -1267,10 +1373,16 @@ function formatQuoteForWhatsApp(quote, rfqNo) {
     lines.push(`\u{1F4E6} *Materials List (from Builders.co.za):*`);
     quote.materialsBOM.forEach((m, i) => {
       const src = m.matched_by && m.matched_by.startsWith('builders') ? '\u2705' : m.matched_by && m.matched_by.startsWith('catalog') ? '\u{1F4D7}' : '\u{1F4CA}';
-      lines.push(`${i + 1}. ${src} ${m.name} \u2014 ${m.qty} ${m.unit} @ R${m.unit_price.toFixed(2)} = R${m.line_base.toFixed(2)}`);
+      let line = `${i + 1}. ${src} ${m.name} \u2014 ${m.qty} ${m.unit} @ R${m.unit_price.toFixed(2)} = R${m.line_base.toFixed(2)}`;
+      if (m.builders_url) {
+        line += `\n   \u{1F517} ${m.builders_url}`;
+      }
+      lines.push(line);
     });
     lines.push('');
     lines.push('\u2705 = Builders.co.za price | \u{1F4D7} = Catalog | \u{1F4CA} = Estimated');
+    lines.push('');
+    lines.push('\u{1F6D2} _Want a different brand or product? Tell me what you prefer and I\'ll look it up on Builders for you!_');
   }
 
   lines.push('');
@@ -1318,95 +1430,51 @@ async function executeWaTool(name, args, session) {
       const orderNo = `SQ15-${bookingId}`;
       const now = new Date().toISOString();
 
-      // Look up pricing estimate — tasks collection is AUTHORITATIVE (admin-managed)
+      // Look up pricing estimate from pricingGuidance service_prices map and tasks collection
       let estimatedCost = '0';
       let pricingSource = 'none';
       try {
         const catSlug = (args.category || '').toLowerCase().replace(/\s+/g, '_');
         const subQuery = (args.subcategory || args.description || '').toLowerCase();
 
-        // Reuse fuzzy matching helpers (stem, synonyms, fuzzyMatch)
-        const _normalize = (s) => s.toLowerCase().replace(/[_\-]+/g, ' ').trim();
-        const _stem = (w) => w.replace(/(ing|ed|tion|ment|ness|able|ible|er|est|ly|s)$/i, '');
-        const _synonyms = {
-          plumbing:    ['toilet', 'cistern', 'basin', 'bath', 'tap', 'pipe', 'drain', 'geyser', 'shower', 'sink', 'plumb', 'blocked', 'leak', 'water', 'bathroom', 'kitchen'],
-          electrical:  ['light', 'switch', 'socket', 'wire', 'wiring', 'breaker', 'db board', 'plug', 'circuit', 'electric', 'power', 'volt'],
-          painting:    ['paint', 'wall', 'ceiling', 'enamel', 'pva', 'varnish', 'roof', 'garage', 'door'],
-          cleaning:    ['clean', 'wash', 'deep clean', 'carpet', 'window', 'scrub'],
-          tiling:      ['tile', 'floor', 'grout', 'ceramic'],
-          carpentry:   ['wood', 'cabinet', 'shelf', 'cupboard', 'door', 'frame', 'carpenter'],
-          solar:       ['panel', 'pv', 'inverter', 'battery', 'geyser', 'energy'],
-          maintenance: ['repair', 'fix', 'maintain', 'service', 'general'],
-          bathroom:    ['toilet', 'cistern', 'basin', 'bath', 'shower', 'tap', 'plumb', 'blocked', 'drain'],
-          kitchen:     ['tap', 'mixer', 'sink', 'faucet', 'cupboard'],
-          door:        ['lock', 'handle', 'hinge', 'frame', 'door'],
-          window:      ['glass', 'pane', 'frame', 'window'],
-          installation:['install', 'setup', 'mount', 'fit'],
-        };
-        const _fuzzyMatch = (qNorm, sNorm) => {
-          if (sNorm.includes(qNorm) || qNorm.includes(sNorm)) return true;
-          const qW = qNorm.split(/\s+/).filter(w => w.length >= 3);
-          const sW = sNorm.split(/\s+/).filter(w => w.length >= 3);
-          if (qW.some(w => sNorm.includes(w)) || sW.some(w => qNorm.includes(w))) return true;
-          const qS = qW.map(_stem), sS = sW.map(_stem);
-          if (qS.some(qs => sS.some(ss => qs === ss || qs.includes(ss) || ss.includes(qs)))) return true;
-          const expanded = new Set(qW.concat(qS));
-          for (const w of qW.concat(qS)) {
-            if (_synonyms[w]) _synonyms[w].forEach(s => expanded.add(s));
-            // Bidirectional: if word appears in a category's synonyms, add the category key + all siblings
-            for (const [key, syns] of Object.entries(_synonyms)) {
-              if (syns.includes(w)) {
-                expanded.add(key);
-                syns.forEach(s => expanded.add(s));
-              }
+        // 1) Check pricingGuidance doc's service_prices map
+        const guidanceDoc = await firestore.collection('pricingGuidance').doc(catSlug).get();
+        if (guidanceDoc.exists) {
+          const gd = guidanceDoc.data();
+          const servicePrices = gd.service_prices || gd.servicePrices || {};
+          // Try to match subcategory/description against service_prices keys
+          for (const [svcName, price] of Object.entries(servicePrices)) {
+            const svcLower = svcName.toLowerCase();
+            if (subQuery.includes(svcLower) || svcLower.includes(subQuery) ||
+                subQuery.split(/\s+/).some(w => w.length >= 3 && svcLower.includes(w))) {
+              estimatedCost = (typeof price === 'number' ? price : parseFloat(price)).toString();
+              pricingSource = 'fixed';
+              break;
             }
           }
-          const exp = [...expanded];
-          if (exp.some(qe => sW.some(sw => sw.includes(qe) || qe.includes(sw)))
-              || exp.some(qe => sS.some(ss => ss.includes(qe) || qe.includes(ss)))) return true;
-          return false;
-        };
-        const subNorm = _normalize(subQuery);
+          // If no service match, use labor_cost_per_hour as rough baseline (not fallback R500)
+          if (pricingSource === 'none') {
+            const laborRate = gd.labor_cost_per_hour || gd.laborCostPerHour;
+            if (laborRate) {
+              estimatedCost = (parseFloat(laborRate) * 2).toString(); // 2-hour minimum estimate
+              pricingSource = 'labor_estimate';
+            }
+          }
+        }
 
-        // Score a match by specificity (higher = better)
-        const _matchScore = (qNorm, sNorm) => {
-          if (sNorm === qNorm) return 100;                                   // exact
-          if (sNorm.includes(qNorm)) return 90;                              // query is substring of task
-          if (qNorm.includes(sNorm)) return 85;                              // task is substring of query
-          const qW = qNorm.split(/\s+/).filter(w => w.length >= 3);
-          const sW = sNorm.split(/\s+/).filter(w => w.length >= 3);
-          // Count how many query words appear literally in the task name
-          const wordHits = qW.filter(w => sNorm.includes(w)).length + sW.filter(w => qNorm.includes(w)).length;
-          if (wordHits >= 2) return 70 + wordHits;                           // multiple word hits
-          if (wordHits === 1) return 60;                                     // single word hit
-          const qS = qW.map(_stem), sS = sW.map(_stem);
-          const stemHits = qS.filter(qs => sS.some(ss => qs === ss || qs.includes(ss) || ss.includes(qs))).length;
-          if (stemHits > 0) return 40 + stemHits;                            // stem match
-          return 20;                                                         // synonym-only match
-        };
-
-        // SOLE SOURCE: tasks collection (admin-managed fixed prices)
-        // pricingGuidance is NOT used (stale default data, deleted).
-        if (subQuery) {
+        // 2) Also check tasks collection for exact service pricing
+        if (pricingSource !== 'fixed' && subQuery) {
           const taskSnap = await firestore.collection('tasks').limit(200).get();
-          let bestMatch = null;
           for (const td of taskSnap.docs) {
             const d = td.data();
-            const status = (d.status || '').toLowerCase();
-            if (status && status !== 'publish' && status !== 'active') continue;
-            const name = (d.name || d.title || d.task_name || '').toString();
-            const cost = parseFloat(d.client_rate || d.cost || d.clientRate || d.price || d.amount || 0);
-            if (name && cost > 0 && _fuzzyMatch(subNorm, _normalize(name))) {
-              const score = _matchScore(subNorm, _normalize(name));
-              if (!bestMatch || score > bestMatch.score) {
-                bestMatch = { name, cost, score };
-              }
+            const name = (d.name || d.title || d.task_name || '').toString().toLowerCase();
+            const cost = parseFloat(d.cost || d.price || d.amount || 0);
+            if (name && cost > 0 && (subQuery.includes(name) || name.includes(subQuery) ||
+                subQuery.split(/\s+/).some(w => w.length >= 3 && name.includes(w)))) {
+              estimatedCost = cost.toString();
+              pricingSource = 'fixed';
+              break;
             }
-          }
-          if (bestMatch) {
-            estimatedCost = bestMatch.cost.toString();
-            pricingSource = 'fixed';
-            console.log(`[create_booking] Best price match: "${bestMatch.name}" R${bestMatch.cost} (score=${bestMatch.score})`);
           }
         }
       } catch (e) {
@@ -1416,6 +1484,55 @@ async function executeWaTool(name, args, session) {
       // If no pricing found at all, don't default to R500 — flag it
       if (estimatedCost === '0' || pricingSource === 'none') {
         estimatedCost = '0';
+      }
+
+      // Auto-check for first-job / off-peak discounts if no promo applied yet
+      if (!session.promoCode) {
+        try {
+          const uid = session.linkedUserId;
+          // First-job check
+          let isFirstJob = false;
+          if (uid) {
+            const co = await firestore.collection('tasksManagement')
+              .where('user_id', '==', uid).where('status', 'in', ['completed', 'closed']).limit(1).get();
+            isFirstJob = co.empty;
+          }
+          if (!isFirstJob) {
+            const wao = await firestore.collection('tasksManagement')
+              .where('customerPhone', '==', session.phone).where('status', 'in', ['completed', 'closed']).limit(1).get();
+            isFirstJob = wao.empty;
+          }
+          if (isFirstJob) {
+            const fjSnap = await firestore.collection('promo_codes')
+              .where('promo_type', '==', 'first_job').where('status', '==', 'active').limit(1).get();
+            if (!fjSnap.empty) {
+              const fj = fjSnap.docs[0].data();
+              session.promoCode = fj.code || 'FIRSTJOB';
+              session.promoId = fjSnap.docs[0].id;
+              session.promoDiscountType = fj.discount_type || fj.discountType || 'percentage';
+              session.promoDiscount = fj.discount_value || fj.discountValue || 0;
+              session.autoDiscount = 'first_job';
+            }
+          }
+          // Off-peak check (only if no first-job)
+          if (!session.promoCode) {
+            const sast = new Date(new Date().toLocaleString('en-US', { timeZone: 'Africa/Johannesburg' }));
+            const day = sast.getDay();
+            const hour = sast.getHours();
+            if (day >= 1 && day <= 5 && hour < 10) {
+              const opSnap = await firestore.collection('promo_codes')
+                .where('promo_type', '==', 'off_peak').where('status', '==', 'active').limit(1).get();
+              if (!opSnap.empty) {
+                const op = opSnap.docs[0].data();
+                session.promoCode = op.code || 'OFFPEAK';
+                session.promoId = opSnap.docs[0].id;
+                session.promoDiscountType = op.discount_type || op.discountType || 'percentage';
+                session.promoDiscount = op.discount_value || op.discountValue || 0;
+                session.autoDiscount = 'off_peak';
+              }
+            }
+          }
+        } catch (e) { console.warn('[create_booking] auto-discount check error:', e.message); }
       }
 
       // Apply promo discount if active
@@ -1430,8 +1547,12 @@ async function executeWaTool(name, args, session) {
         }
         discount = Math.min(discount, finalCost);
         finalCost = Math.max(0, finalCost - discount);
-        promoApplied = { code: session.promoCode, discount, type: session.promoDiscountType || 'fixed' };
+        promoApplied = { code: session.promoCode, discount, type: session.promoDiscountType || 'fixed', autoApplied: session.autoDiscount || null };
       }
+
+      // Calculate deposit amount (35% of total, matching app's deposit_service.dart)
+      const depositAmount = Math.round(finalCost * 0.35 * 100) / 100;
+      const balanceAmount = Math.round((finalCost - depositAmount) * 100) / 100;
 
       // Core booking doc (compatible with Flutter app tasksManagement queries)
       const booking = {
@@ -1450,30 +1571,25 @@ async function executeWaTool(name, args, session) {
         contact: session.phone,
         user_id: session.linkedUserId || '',
         source: 'whatsapp',
-        status: 'pending',
+        status: 'pending_artisan_acceptance',
         accept: '',
+        artisan_confirmed: 'pending',
         cost: finalCost.toFixed(2),
+        deposit_amount: depositAmount.toFixed(2),
+        balance_amount: balanceAmount.toFixed(2),
+        payment_type: '',
+        deposit_paid: false,
+        balance_paid: false,
         payment_status: 'unpaid',
         paymentStatus: 'pending',
         promo_code: promoApplied ? promoApplied.code : null,
         promo_discount: promoApplied ? promoApplied.discount : 0,
-        // Photo URLs from customer images sent during this session
-        work_images: session.photoUrls.length ? session.photoUrls : [],
-        image_urls: session.photoUrls.length ? session.photoUrls : [],
-        imageUrls: session.photoUrls.length ? session.photoUrls : [],
-        has_photos: session.photoUrls.length ? 'yes' : 'no',
-        creation_date: now,
         created_at: now,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
         updated_at: now,
       };
 
       await firestore.collection('tasksManagement').doc(bookingId).set(booking);
-      console.log(`[create_booking] ✅ Written tasksManagement/${bookingId} cost=${finalCost} source=whatsapp`);
-
-      // Verify write
-      const verifyDoc = await firestore.collection('tasksManagement').doc(bookingId).get();
-      console.log(`[create_booking] Verify: exists=${verifyDoc.exists}`);
 
       // Also create futureBookings entry (modern flow)
       const futureBooking = {
@@ -1488,7 +1604,13 @@ async function executeWaTool(name, args, session) {
         address: args.address || '',
         urgency: args.urgency || 'normal',
         cost: finalCost.toFixed(2),
-        status: 'pending',
+        deposit_amount: depositAmount.toFixed(2),
+        balance_amount: balanceAmount.toFixed(2),
+        payment_type: '',
+        deposit_paid: false,
+        balance_paid: false,
+        status: 'pending_artisan_acceptance',
+        artisan_confirmed: 'pending',
         payment_status: 'unpaid',
         source: 'whatsapp',
         service_provider_id: '',
@@ -1499,20 +1621,11 @@ async function executeWaTool(name, args, session) {
         promo_code: promoApplied ? promoApplied.code : null,
         promo_discount: promoApplied ? promoApplied.discount : 0,
         tasks_management_id: bookingId,
-        // Photo URLs from customer images sent during this session
-        work_images: session.photoUrls.length ? session.photoUrls : [],
-        image_urls: session.photoUrls.length ? session.photoUrls : [],
-        imageUrls: session.photoUrls.length ? session.photoUrls : [],
-        has_photos: session.photoUrls.length ? 'yes' : 'no',
-        creation_date: now,
         created_at: now,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
       };
 
       await firestore.collection('futureBookings').doc(bookingId).set(futureBooking);
-
-      // Clear photo URLs after storing them in the booking
-      session.photoUrls = [];
 
       // Record promo redemption if used
       if (promoApplied && session.promoId) {
@@ -1580,115 +1693,44 @@ async function executeWaTool(name, args, session) {
         });
       } catch (e) { console.warn('[wa-tool] booking notification failed:', e.message); }
 
-      // ── Dispatch: create tasksManagement bridge per artisan + FCM push ──
-      // Artisan app queries tasksManagement WHERE service_provider_id == artisanId.
-      // We create a separate bridge record for each matching artisan so the booking
-      // appears in their "New Requests" screen. When one accepts, others get cancelled.
-      let dispatchedCount = 0;
+      // ── Notify available artisans via FCM push ──
       try {
         const catSlug = (args.category || '').toLowerCase().replace(/\s+/g, '_');
-        // Fetch all service providers and filter in-code to avoid Firestore
-        // compound-inequality index issues and the != gotcha (docs without
-        // the is_suspended field are excluded by Firestore != queries).
-        let artisanSnap;
-        try {
-          artisanSnap = await firestore.collection('serviceProvider').where('status', '==', 'publish').limit(200).get();
-          if (artisanSnap.empty) artisanSnap = await firestore.collection('serviceProvider').where('status', '==', 'approved').limit(200).get();
-          if (artisanSnap.empty) artisanSnap = await firestore.collection('serviceProvider').limit(200).get();
-        } catch (qErr) {
-          console.warn('[wa-tool] artisan query fallback:', qErr.message);
-          artisanSnap = await firestore.collection('serviceProvider').limit(200).get();
-        }
-
-        console.log(`[wa-tool] Found ${artisanSnap.docs.length} serviceProvider docs, catSlug=${catSlug}`);
-
-        const photoUrls = booking.work_images || [];
-
+        const artisanSnap = await firestore.collection('serviceProvider')
+          .where('status', '==', 'approved')
+          .where('is_suspended', '!=', true)
+          .limit(20)
+          .get();
         for (const artDoc of artisanSnap.docs) {
           const ad = artDoc.data() || {};
-          // Filter: status must be publish/approved, not suspended
-          const st = (ad.status || '').toString().toLowerCase();
-          if (st && st !== 'publish' && st !== 'published' && st !== 'approved' && st !== 'approve') continue;
-          if (ad.is_suspended === true) continue;
+          // Check if artisan serves this category
           const cats = (ad.categories || ad.category || '').toString().toLowerCase();
           if (cats && !cats.includes(catSlug) && catSlug !== 'general_maintenance') continue;
-
-          const artisanId = artDoc.id;
-          const bridgeId = `${bookingId}_${artisanId}`;
-
-          // Create tasksManagement bridge record for this artisan
-          try {
-            await firestore.collection('tasksManagement').doc(bridgeId).set({
-              id: bridgeId,
-              bookingId: bridgeId,
-              order_no: orderNo,
-              future_booking_id: bookingId,
-              category_name: args.category || '',
-              category: args.category || '',
-              subcategory: args.subcategory || '',
-              description: args.description || '',
-              address: args.address || '',
-              urgency: args.urgency || 'normal',
-              name: args.customerName || '',
-              customerName: args.customerName || '',
-              customerPhone: session.phone,
-              contact: session.phone,
-              user_id: session.linkedUserId || '',
-              source: 'whatsapp',
-              status: 'pending',
-              accept: '',
-              cost: finalCost.toFixed(2),
-              payment_status: 'unpaid',
-              paymentStatus: 'pending',
-              service_provider_id: artisanId,
-              service_provider_name: ad.name || ad.fullName || '',
-              work_images: photoUrls,
-              image_urls: photoUrls,
-              imageUrls: photoUrls,
-              has_photos: photoUrls.length > 0 ? 'yes' : 'no',
-              creation_date: now,
-              created_at: now,
-              createdAt: admin.firestore.FieldValue.serverTimestamp(),
-              updated_at: now,
-            });
-            dispatchedCount++;
-          } catch (bridgeErr) {
-            console.warn(`[wa-tool] Bridge record for artisan ${artisanId} failed:`, bridgeErr.message);
-          }
-
-          // Send FCM push notification
           const token = (ad.fcm_token || ad.deviceToken || '').toString().trim();
-          if (token) {
-            try {
-              await admin.messaging().send({
-                token,
-                notification: {
-                  title: '🔔 New Booking Request',
-                  body: `New ${args.category || 'maintenance'} job: ${args.description || args.subcategory || 'maintenance work'}. Tap to view and accept.`,
-                },
-                data: {
-                  type: 'new_booking',
-                  booking_id: bridgeId,
-                  order_no: orderNo,
-                  future_booking_id: bookingId,
-                  has_photos: photoUrls.length > 0 ? 'true' : 'false',
-                },
-                android: { notification: { channelId: 'order_request_channel', sound: 'sound' } },
-              });
-            } catch (fcmErr) {
-              console.warn(`[wa-tool] FCM to artisan ${artDoc.id} failed:`, fcmErr.message);
-            }
+          if (!token) continue;
+          try {
+            await admin.messaging().send({
+              token,
+              notification: {
+                title: '🔔 New Booking Request',
+                body: `New ${args.category || 'maintenance'} job available. Tap to view and accept.`,
+              },
+              data: {
+                type: 'new_booking',
+                booking_id: bookingId,
+                order_no: orderNo,
+              },
+              android: { notification: { channelId: 'order_request_channel', sound: 'sound' } },
+            });
+          } catch (fcmErr) {
+            console.warn(`[wa-tool] FCM to artisan ${artDoc.id} failed:`, fcmErr.message);
           }
         }
-        console.log(`[wa-tool] Dispatched booking ${bookingId} to ${dispatchedCount} artisans`);
-      } catch (e) { console.warn('[wa-tool] artisan dispatch failed:', e.message); }
+      } catch (e) { console.warn('[wa-tool] artisan dispatch notification failed:', e.message); }
 
       // Store last booking ID for quick payment follow-up
       session.lastBookingId = bookingId;
       session.lastBookingCost = finalCost;
-
-      const depositAmount = Math.round(finalCost * 0.35 * 100) / 100;
-      const balanceAmount = Math.round((finalCost - depositAmount) * 100) / 100;
 
       return {
         success: true,
@@ -1791,130 +1833,101 @@ async function executeWaTool(name, args, session) {
     // 5) LOOKUP PRICING
     // ═══════════════════════════════════════════
     case 'lookup_pricing': {
-      if (!firestore) return { matched: false, estimate: 'Pricing service temporarily unavailable. Please try again.', note: 'Suggest the customer try again or submit an RFQ.' };
+      if (!firestore) return { estimate: 'R350 – R1,200 (typical range for most services)' };
       try {
         const catSlug = (args.category || '').toLowerCase().replace(/\s+/g, '_');
         const subQuery = (args.subcategory || '').toLowerCase();
 
-        // Fuzzy matching helpers
-        const normalize = (s) => s.toLowerCase().replace(/[_\-]+/g, ' ').trim();
-        const stem = (w) => w.replace(/(ing|ed|tion|ment|ness|able|ible|er|est|ly|s)$/i, '');
-        // Comprehensive 14-category synonym map (matches livekit-backend)
-        const SYNONYMS = {
-          plumbing:    ['toilet', 'cistern', 'basin', 'bath', 'tap', 'pipe', 'drain', 'geyser', 'shower', 'sink', 'plumb', 'blocked', 'leak', 'water', 'bathroom', 'kitchen'],
-          electrical:  ['light', 'switch', 'socket', 'wire', 'wiring', 'breaker', 'db board', 'plug', 'circuit', 'electric', 'power', 'volt'],
-          painting:    ['paint', 'wall', 'ceiling', 'enamel', 'pva', 'varnish', 'roof', 'garage', 'door'],
-          cleaning:    ['clean', 'wash', 'deep clean', 'carpet', 'window', 'scrub'],
-          tiling:      ['tile', 'floor', 'grout', 'ceramic'],
-          carpentry:   ['wood', 'cabinet', 'shelf', 'cupboard', 'door', 'frame', 'carpenter'],
-          solar:       ['panel', 'pv', 'inverter', 'battery', 'geyser', 'energy'],
-          maintenance: ['repair', 'fix', 'maintain', 'service', 'general'],
-          bathroom:    ['toilet', 'cistern', 'basin', 'bath', 'shower', 'tap', 'plumb', 'blocked', 'drain'],
-          kitchen:     ['tap', 'mixer', 'sink', 'faucet', 'cupboard'],
-          door:        ['lock', 'handle', 'hinge', 'frame', 'door'],
-          window:      ['glass', 'pane', 'frame', 'window'],
-          installation:['install', 'setup', 'mount', 'fit'],
+        // Scoring helper: exact > substring > word overlap count
+        const _matchScore = (a, b) => {
+          const al = a.toLowerCase(), bl = b.toLowerCase();
+          if (al === bl) return 1000;
+          if (al.includes(bl) || bl.includes(al)) return 100;
+          const aw = al.split(/\s+/).filter(w => w.length >= 3);
+          const bw = bl.split(/\s+/).filter(w => w.length >= 3);
+          let score = 0;
+          for (const w of aw) { if (bl.includes(w)) score++; }
+          for (const w of bw) { if (al.includes(w)) score++; }
+          return score;
         };
-        const expandWithSynonyms = (words) => {
-          const expanded = new Set(words);
-          for (const w of words) {
-            const stemmed = stem(w);
-            expanded.add(stemmed);
-            // Bidirectional: if word matches a category key, add all its synonyms
-            if (SYNONYMS[w]) SYNONYMS[w].forEach(s => expanded.add(s));
-            if (SYNONYMS[stemmed]) SYNONYMS[stemmed].forEach(s => expanded.add(s));
-            // Reverse: if word appears in a category's synonyms, add the category key + all siblings
-            for (const [key, syns] of Object.entries(SYNONYMS)) {
-              if (syns.includes(w) || syns.includes(stemmed)) {
-                expanded.add(key);
-                syns.forEach(s => expanded.add(s));
-              }
-            }
-          }
-          return [...expanded];
-        };
-        const fuzzyMatch = (queryNorm, svcNorm) => {
-          if (svcNorm.includes(queryNorm) || queryNorm.includes(svcNorm)) return true;
-          const qWords = queryNorm.split(/\s+/).filter(w => w.length >= 3);
-          const sWords = svcNorm.split(/\s+/).filter(w => w.length >= 3);
-          if (qWords.some(w => svcNorm.includes(w)) || sWords.some(w => queryNorm.includes(w))) return true;
-          const qStems = qWords.map(stem);
-          const sStems = sWords.map(stem);
-          if (qStems.some(qs => sStems.some(ss => qs === ss || qs.includes(ss) || ss.includes(qs)))) return true;
-          const qExpanded = expandWithSynonyms(qWords.concat(qStems));
-          if (qExpanded.some(qe => sWords.some(sw => sw.includes(qe) || qe.includes(sw)))
-              || qExpanded.some(qe => sStems.some(ss => ss.includes(qe) || qe.includes(ss)))) return true;
-          return false;
-        };
-        const subNorm = normalize(subQuery);
 
+        const combinedQuery = [args.category || '', args.subcategory || ''].join(' ').toLowerCase().trim();
+        const searchQ = subQuery || combinedQuery;
+
+        // 1) AUTHORITATIVE SOURCE: tasks collection (admin-managed fixed prices)
         let matchedService = null;
         let matchedPrice = null;
-        let categoryName = args.category || '';
-
-        // ── SOLE SOURCE: tasks collection (admin-managed fixed prices) ──
-        // These are the prices set by the admin via the admin app categories.
-        // pricingGuidance collection is NOT used (stale default data, deleted).
+        let bestScore = 0;
         const taskResults = [];
         try {
           const taskSnap = await firestore.collection('tasks').limit(200).get();
           for (const td of taskSnap.docs) {
             const d = td.data();
-            const status = (d.status || '').toLowerCase();
-            if (status && status !== 'publish' && status !== 'active') continue;
             const name = (d.name || d.title || d.task_name || '').toString();
-            const cost = parseFloat(d.client_rate || d.cost || d.clientRate || d.price || d.amount || 0);
+            const cost = parseFloat(d.cost || d.price || d.amount || 0);
             if (name && cost > 0) {
-              taskResults.push({ name, cost, category_id: d.categoryId || d.category_id || '', category_name: d.category_name || d.categoryName || '' });
+              taskResults.push({ name, cost, category_id: d.categoryId || d.category_id || '' });
+              if (searchQ) {
+                const score = _matchScore(name, searchQ);
+                if (score > bestScore) {
+                  bestScore = score;
+                  matchedService = name;
+                  matchedPrice = cost;
+                }
+              }
             }
           }
         } catch (e) { console.warn('[wa-tool] tasks lookup failed:', e.message); }
 
-        // Score a match by specificity (higher = better)
-        const matchScore = (qNorm, sNorm) => {
-          if (sNorm === qNorm) return 100;
-          if (sNorm.includes(qNorm)) return 90;
-          if (qNorm.includes(sNorm)) return 85;
-          const qW = qNorm.split(/\s+/).filter(w => w.length >= 3);
-          const sW = sNorm.split(/\s+/).filter(w => w.length >= 3);
-          const wordHits = qW.filter(w => sNorm.includes(w)).length + sW.filter(w => qNorm.includes(w)).length;
-          if (wordHits >= 2) return 70 + wordHits;
-          if (wordHits === 1) return 60;
-          const qS = qW.map(stem), sS = sW.map(stem);
-          const stemHits = qS.filter(qs => sS.some(ss => qs === ss || qs.includes(ss) || ss.includes(qs))).length;
-          if (stemHits > 0) return 40 + stemHits;
-          return 20;
-        };
-
-        // Try to match subcategory against tasks — pick BEST match
-        if (subQuery) {
-          let bestMatch = null;
-          for (const t of taskResults) {
-            const tNorm = normalize(t.name);
-            if (fuzzyMatch(subNorm, tNorm)) {
-              const score = matchScore(subNorm, tNorm);
-              if (!bestMatch || score > bestMatch.score) {
-                bestMatch = { ...t, score };
-              }
-            }
+        // 2) pricingGuidance — for AI context only (labor rates, material multipliers)
+        //    Does NOT override task-matched price.
+        let categoryName = args.category || '';
+        let laborCostPerHour = null;
+        let outsourcedLaborRate = null;
+        let materialMultiplier = null;
+        let guidanceServicePrices = {};
+        try {
+          const guidanceDoc = await firestore.collection('pricingGuidance').doc(catSlug).get();
+          if (guidanceDoc.exists) {
+            const gd = guidanceDoc.data();
+            guidanceServicePrices = gd.service_prices || gd.servicePrices || {};
+            categoryName = gd.category_name || gd.categoryName || categoryName;
+            laborCostPerHour = parseFloat(gd.labor_cost_per_hour || gd.laborCostPerHour || 0) || null;
+            outsourcedLaborRate = parseFloat(gd.outsourced_labor_rate || 0) || null;
+            materialMultiplier = parseFloat(gd.material_multiplier || 0) || null;
           }
-          if (bestMatch) {
-            matchedService = bestMatch.name;
-            matchedPrice = bestMatch.cost;
-            categoryName = bestMatch.category_name || categoryName;
+        } catch (e) { /* ignore guidance errors */ }
+
+        // Build the available fixed prices list from tasks
+        const allFixedPrices = [];
+        const addedNames = new Set();
+        for (const t of taskResults) {
+          const catId = (t.category_id || '').toLowerCase();
+          const catScore = _matchScore(catId, catSlug);
+          const nameScore = _matchScore(t.name, combinedQuery);
+          if (catScore > 0 || nameScore > 0) {
+            if (!addedNames.has(t.name.toLowerCase())) {
+              allFixedPrices.push({ service: t.name, fixedPrice: `R${t.cost.toFixed(2)}` });
+              addedNames.add(t.name.toLowerCase());
+            }
           }
         }
 
-        // Build list of all available fixed prices for context
-        const allFixedPrices = [];
-        for (const t of taskResults) {
-          const catId = normalize(t.category_id);
-          const catNameNorm = normalize(t.category_name);
-          const catSlugNorm = normalize(catSlug);
-          if (!catSlug || catId === catSlugNorm || catId.includes(catSlugNorm) || catSlugNorm.includes(catId)
-              || catNameNorm === catSlugNorm || catNameNorm.includes(catSlugNorm) || catSlugNorm.includes(catNameNorm)) {
-            allFixedPrices.push({ service: t.name, fixedPrice: `R${t.cost.toFixed(2)}` });
-          }
+        // 4) Look up real-time Builders.co.za prices for materials
+        let buildersPrice = null;
+        const materialQuery = args.material || args.subcategory || args.item || '';
+        if (materialQuery) {
+          try {
+            const bp = await lookupBuildersPriceOne(materialQuery);
+            if (bp && !bp.blocked && bp.priceZar > 0) {
+              buildersPrice = {
+                title: bp.title,
+                priceZar: `R${bp.priceZar.toFixed(2)}`,
+                url: bp.url,
+                source: 'builders.co.za',
+              };
+            }
+          } catch (e) { console.warn('[lookup_pricing] Builders lookup failed:', e.message); }
         }
 
         if (matchedService && matchedPrice) {
@@ -1923,8 +1936,21 @@ async function executeWaTool(name, args, session) {
             service: matchedService,
             fixedPrice: `R${matchedPrice.toFixed(2)}`,
             category: categoryName,
+            ...(laborCostPerHour ? { laborCostPerHour: `R${laborCostPerHour}/hr` } : {}),
+            ...(materialMultiplier ? { materialMultiplier } : {}),
             allServicesInCategory: allFixedPrices,
-            note: 'This is a FIXED price. Use this exact amount when creating the booking.',
+            ...(buildersPrice ? { buildersRetailPrice: buildersPrice } : {}),
+            note: 'This is a FIXED price from the current pricing guide. Use this exact amount when creating the booking.',
+          };
+        }
+
+        if (buildersPrice) {
+          return {
+            matched: false,
+            category: categoryName,
+            buildersRetailPrice: buildersPrice,
+            availableServices: allFixedPrices,
+            note: `Found a retail price on Builders.co.za for "${buildersPrice.title}": ${buildersPrice.priceZar}. This is a retail/material price, not a service price. For a full quote including labor, suggest submitting an RFQ.`,
           };
         }
 
@@ -1940,13 +1966,280 @@ async function executeWaTool(name, args, session) {
         return { matched: false, estimate: 'No fixed pricing found for this category.', note: 'Suggest the customer submit an RFQ for a detailed quote.' };
       } catch (e) {
         console.error('[lookup_pricing] Error:', e.message);
-        return { matched: false, estimate: 'Pricing lookup failed. Please try again.', note: 'Suggest the customer submit an RFQ for a detailed quote.' };
+        return { estimate: 'R350 – R1,200 (typical range)' };
+      }
+    }
+
+    // ═══════════════════════════════════════════
+    // 5b) LOOKUP BUILDERS PRODUCT (browse items/brands on builders.co.za)
+    // ═══════════════════════════════════════════
+    case 'lookup_builders_product': {
+      const query = (args.query || '').trim();
+      if (!query) return { error: 'Please provide a product search query.' };
+      try {
+        const cfg = await getBuildersBffConfig();
+        if (!cfg) return { error: 'Builders.co.za is temporarily unavailable. Try again later.' };
+
+        const uri = `https://www.builders.co.za/wmapi/bff/graphql/${cfg.searchKey}/${cfg.searchHash}`;
+        let decoded;
+        try {
+          const r = await buildersFetch(uri, {
+            method: 'POST',
+            headers: buildersBffHeaders({ operationName: cfg.searchKey, operationHash: cfg.searchHash }),
+            body: JSON.stringify({ variables: { keyword: query, offset: 0, pageSize: 10, dynamicPriceRange: true, site: cfg.site } }),
+            timeoutMs: 12000,
+          });
+          if (!r.ok) return { error: 'Builders search unavailable right now.' };
+          decoded = await r.json();
+        } catch { return { error: 'Could not reach Builders.co.za.' }; }
+
+        const items = decoded?.data?.search?.data?.results?.items;
+        if (!Array.isArray(items) || !items.length) return { products: [], message: `No products found on Builders.co.za for "${query}".` };
+
+        const products = [];
+        for (const it of items.slice(0, 8)) {
+          if (!it) continue;
+          const title = _str(it.name || it.title || it.productName);
+          if (!title) continue;
+          let urlPath = _str(it.url || it.productUrl || it.seoUrl || it.link);
+          if (!urlPath) { const code = _str(it.code || it.id || it.productCode); if (code) urlPath = `/p/${code}`; }
+          const url = urlPath ? (urlPath.startsWith('http') ? urlPath : `https://www.builders.co.za${urlPath.startsWith('/') ? '' : '/'}${urlPath}`) : '';
+          const price = extractPriceFromBffItem(it);
+          const brand = _str(it.brand || it.brandName || '');
+          products.push({
+            title,
+            brand: brand || undefined,
+            price: price > 0 ? `R${price.toFixed(2)}` : 'Price in-store',
+            priceZar: price > 0 ? price : null,
+            url: url || undefined,
+          });
+        }
+
+        return {
+          products,
+          searchQuery: query,
+          source: 'builders.co.za',
+          message: products.length > 0
+            ? `Found ${products.length} product(s) on Builders.co.za for "${query}". Present these to the customer so they can choose their preferred brand or item.`
+            : `No products found for "${query}".`,
+          instruction: 'Show these products to the customer with prices and ask which one they prefer. Include the Builders link so they can view it.',
+        };
+      } catch (e) {
+        console.error('[lookup_builders_product] Error:', e.message);
+        return { error: 'Product search failed. Try again.' };
       }
     }
 
     // ═══════════════════════════════════════════
     // 6) APPLY PROMO CODE
     // ═══════════════════════════════════════════
+    // ═══════════════════════════════════════════
+    // 6a) CHECK AUTO-DISCOUNTS
+    // ═══════════════════════════════════════════
+    case 'check_auto_discounts': {
+      if (!firestore) return { error: 'Database unavailable' };
+      const discounts = [];
+      const userId = session.linkedUserId;
+
+      // 1) First-job discount — check if user has zero completed orders
+      if (userId) {
+        try {
+          const completedOrders = await firestore.collection('tasksManagement')
+            .where('user_id', '==', userId)
+            .where('status', 'in', ['completed', 'closed'])
+            .limit(1).get();
+          if (completedOrders.empty) {
+            // Also check WhatsApp bookings by phone
+            const waOrders = await firestore.collection('tasksManagement')
+              .where('customerPhone', '==', session.phone)
+              .where('status', 'in', ['completed', 'closed'])
+              .limit(1).get();
+            if (waOrders.empty) {
+              const fjSnap = await firestore.collection('promo_codes')
+                .where('promo_type', '==', 'first_job')
+                .where('status', '==', 'active').limit(1).get();
+              if (!fjSnap.empty) {
+                const fj = fjSnap.docs[0].data();
+                const discType = fj.discount_type || fj.discountType || 'percentage';
+                const discVal = fj.discount_value || fj.discountValue || 0;
+                discounts.push({
+                  type: 'first_job',
+                  label: 'First Job Discount',
+                  discountType: discType,
+                  discountValue: discVal,
+                  description: discType === 'percentage' ? `${discVal}% off your first booking!` : `R${discVal} off your first booking!`,
+                  promoId: fjSnap.docs[0].id,
+                  code: fj.code || 'FIRSTJOB',
+                });
+              }
+            }
+          }
+        } catch (e) { console.warn('[auto-discount] first-job check error:', e.message); }
+      } else {
+        // No linked account — check by phone only
+        try {
+          const waOrders = await firestore.collection('tasksManagement')
+            .where('customerPhone', '==', session.phone)
+            .where('status', 'in', ['completed', 'closed'])
+            .limit(1).get();
+          if (waOrders.empty) {
+            const fjSnap = await firestore.collection('promo_codes')
+              .where('promo_type', '==', 'first_job')
+              .where('status', '==', 'active').limit(1).get();
+            if (!fjSnap.empty) {
+              const fj = fjSnap.docs[0].data();
+              const discType = fj.discount_type || fj.discountType || 'percentage';
+              const discVal = fj.discount_value || fj.discountValue || 0;
+              discounts.push({
+                type: 'first_job',
+                label: 'First Job Discount',
+                discountType: discType,
+                discountValue: discVal,
+                description: discType === 'percentage' ? `${discVal}% off your first booking!` : `R${discVal} off your first booking!`,
+                promoId: fjSnap.docs[0].id,
+                code: fj.code || 'FIRSTJOB',
+              });
+            }
+          }
+        } catch (e) { console.warn('[auto-discount] first-job phone check error:', e.message); }
+      }
+
+      // 2) Off-peak discount — weekdays before 10am SAST
+      try {
+        const sast = new Date(new Date().toLocaleString('en-US', { timeZone: 'Africa/Johannesburg' }));
+        const day = sast.getDay(); // 0=Sun, 6=Sat
+        const hour = sast.getHours();
+        if (day >= 1 && day <= 5 && hour < 10) {
+          const opSnap = await firestore.collection('promo_codes')
+            .where('promo_type', '==', 'off_peak')
+            .where('status', '==', 'active').limit(1).get();
+          if (!opSnap.empty) {
+            const op = opSnap.docs[0].data();
+            const discType = op.discount_type || op.discountType || 'percentage';
+            const discVal = op.discount_value || op.discountValue || 0;
+            discounts.push({
+              type: 'off_peak',
+              label: 'Off-Peak Discount',
+              discountType: discType,
+              discountValue: discVal,
+              description: discType === 'percentage' ? `${discVal}% off for booking during off-peak hours!` : `R${discVal} off for booking during off-peak hours!`,
+              promoId: opSnap.docs[0].id,
+              code: op.code || 'OFFPEAK',
+            });
+          }
+        }
+      } catch (e) { console.warn('[auto-discount] off-peak check error:', e.message); }
+
+      // 3) Loyalty points balance
+      if (userId) {
+        try {
+          const lpDoc = await firestore.collection('loyalty_points').doc(userId).get();
+          if (lpDoc.exists) {
+            const pts = lpDoc.data().totalPoints || 0;
+            if (pts >= 100) {
+              const randValue = Math.floor(pts / 10); // 100pts = R10
+              discounts.push({
+                type: 'loyalty_points',
+                label: 'Loyalty Points',
+                points: pts,
+                randValue,
+                description: `You have ${pts} loyalty points (worth R${randValue})! You can redeem up to 10% of your booking total.`,
+              });
+            }
+          }
+        } catch (e) { console.warn('[auto-discount] loyalty check error:', e.message); }
+      }
+
+      // Auto-apply the best promo if no manual promo is active
+      if (!session.promoCode && discounts.length > 0) {
+        const bestPromo = discounts.find(d => d.type === 'first_job') || discounts.find(d => d.type === 'off_peak');
+        if (bestPromo && bestPromo.promoId) {
+          session.promoCode = bestPromo.code;
+          session.promoId = bestPromo.promoId;
+          session.promoDiscountType = bestPromo.discountType;
+          session.promoDiscount = bestPromo.discountValue;
+          session.autoDiscount = bestPromo.type;
+        }
+      }
+
+      if (discounts.length === 0) {
+        return { discounts: [], message: 'No automatic discounts available right now, but you can still enter a promo code if you have one!' };
+      }
+
+      return {
+        discounts,
+        autoApplied: session.autoDiscount || null,
+        message: `Great news! You qualify for: ${discounts.map(d => d.description).join(' | ')}`,
+      };
+    }
+
+    // ═══════════════════════════════════════════
+    // 6b) GET UPSELL ADD-ONS
+    // ═══════════════════════════════════════════
+    case 'get_upsell_addons': {
+      if (!firestore) return { error: 'Database unavailable' };
+      const catId = (args.categoryId || '').toLowerCase().replace(/\s+/g, '_');
+      if (!catId) return { addons: [], message: 'No category provided.' };
+
+      try {
+        let addonDocs;
+        try {
+          const snap = await firestore.collection('upsell_addons')
+            .where('trigger_category_id', '==', catId)
+            .where('status', '==', 'active')
+            .orderBy('sort_order').get();
+          addonDocs = snap.docs;
+        } catch (indexErr) {
+          // Fallback without orderBy if composite index doesn't exist
+          const snap = await firestore.collection('upsell_addons')
+            .where('trigger_category_id', '==', catId)
+            .where('status', '==', 'active').get();
+          addonDocs = snap.docs;
+        }
+
+        if (addonDocs.length === 0) {
+          return { addons: [], message: 'No add-on services available for this category.' };
+        }
+
+        const addons = addonDocs.map(d => {
+          const a = d.data();
+          const base = parseFloat(a.base_price || a.basePrice || 0);
+          const disc = parseFloat(a.discount_percent || a.discountPercent || 0);
+          const discounted = Math.round(base * (1 - disc / 100));
+          return {
+            id: d.id,
+            name: a.name || a.title || '',
+            description: a.description || '',
+            originalPrice: base,
+            discountPercent: disc,
+            discountedPrice: discounted,
+            savings: Math.round(base - discounted),
+          };
+        });
+
+        // Log that upsells were shown
+        for (const addon of addons) {
+          firestore.collection('upsell_logs').add({
+            user_id: session.linkedUserId || session.phone,
+            addon_id: addon.id,
+            event_type: 'shown',
+            addon_name: addon.name,
+            addon_price: addon.discountedPrice,
+            source: 'whatsapp',
+            created_at: new Date().toISOString(),
+          }).catch(() => {});
+        }
+
+        return {
+          addons,
+          message: `Recommended add-ons for your ${args.categoryId} booking (special bundle prices when added to your booking):\n${addons.map((a, i) => `${i+1}. ${a.name} — R${a.discountedPrice}${a.discountPercent > 0 ? ` (was R${a.originalPrice}, save ${a.discountPercent}%)` : ''}`).join('\n')}\n\nWould you like to add any of these to your booking?`,
+        };
+      } catch (e) {
+        console.error('[get_upsell_addons] Error:', e.message);
+        return { addons: [], message: 'Could not load add-ons right now.' };
+      }
+    }
+
     case 'apply_promo_code': {
       if (!firestore) return { error: 'Cannot validate promo codes right now. Please try again later.' };
       const code = (args.code || '').trim().toUpperCase();
@@ -1997,73 +2290,119 @@ async function executeWaTool(name, args, session) {
     }
 
     // ═══════════════════════════════════════════
-    // 7) REQUEST PAYMENT LINK (generates real payment URL via backend)
+    // 7) REQUEST PAYMENT LINK (Ozow)
     // ═══════════════════════════════════════════
     case 'request_payment_link': {
       if (!firestore) return { error: 'Database unavailable' };
       const bid = args.bookingId || session.lastBookingId;
       if (!bid) return { error: 'Please provide a booking ID.' };
 
-      let doc = await firestore.collection('futureBookings').doc(bid).get();
-      if (!doc.exists) doc = await firestore.collection('tasksManagement').doc(bid).get();
+      let doc = await firestore.collection('tasksManagement').doc(bid).get();
+      if (!doc.exists) doc = await firestore.collection('futureBookings').doc(bid).get();
       if (!doc.exists) return { error: `Booking "${bid}" not found.` };
 
       const d = doc.data();
-      const cost = parseFloat(d.cost || '0');
+
+      // Enforce artisan acceptance before payment
+      const artisanAccepted = d.accept === '1' || d.accept === 1 || d.artisan_confirmed === 'yes';
+      if (!artisanAccepted) {
+        return { error: `An artisan hasn't accepted this job yet. You'll be notified when an artisan accepts, and then you can proceed to payment. Your booking ${d.order_no || bid} is in the queue.` };
+      }
+
+      const cost = parseFloat(d.cost || d.total_cost || d.quoted_price || '0');
       if (cost <= 0) return { error: 'This booking does not have a confirmed price yet.' };
 
       if (d.payment_status === 'paid' || d.paymentStatus === 'paid') {
         return { message: 'This booking is already paid!', bookingId: bid };
       }
 
-      // Generate real payment link via backend
-      let paymentUrl = '';
+      // If deposit already paid, only balance remains
+      if (d.deposit_paid === true && d.balance_paid !== true) {
+        const bal = parseFloat(d.balance_amount || '0');
+        if (bal <= 0) return { message: 'Deposit already paid. No balance due yet.', bookingId: bid };
+        args.payment_type = 'full';
+      }
+
+      // Determine payment amount based on deposit vs full
+      const paymentType = args.payment_type || 'full';
+      let payAmount;
+      let itemSuffix;
+      if (paymentType === 'deposit') {
+        payAmount = Math.round(cost * 0.35 * 100) / 100;
+        itemSuffix = '(35% Deposit)';
+      } else {
+        payAmount = d.deposit_paid === true ? parseFloat(d.balance_amount || cost) : cost;
+        itemSuffix = d.deposit_paid === true ? '(Balance Payment)' : '(Full Payment)';
+      }
+
+      // Try to generate an Ozow payment URL via the backend
       try {
-        const backendUrl = process.env.LIVEKIT_BACKEND_URL || 'https://square15-livekit-backend.onrender.com';
-        const resp = await fetch(`${backendUrl}/api/payment/whatsapp-initiate`, {
+        const backendUrl = process.env.BACKEND_URL || 'https://square15-livekit-backend.onrender.com';
+        const fetch = (await import('node-fetch')).default;
+        const ozowResp = await fetch(`${backendUrl}/api/payment/initiate`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            amount: cost.toFixed(2),
-            booking_id: bid,
-            customer_name: d.customerName || d.name || '',
-            customer_phone: session.phone,
-            description: d.description || d.subcategory || d.category_name || `Booking ${bid}`,
+            amount: payAmount.toFixed(2),
+            item_name: `Square 15 Booking ${d.order_no || d.rfq_no || bid} ${itemSuffix}`,
+            custom_str1: bid,
           }),
-          signal: AbortSignal.timeout(15000),
         });
-        const result = await resp.json();
-        if (result.ok && result.payment_url) {
-          paymentUrl = result.payment_url;
+        const ozowBody = await ozowResp.json();
+
+        if (ozowBody.ok && ozowBody.payment_url) {
+          // Update booking with payment_type
+          try {
+            await firestore.collection('tasksManagement').doc(bid).update({ payment_type: paymentType }).catch(() => {});
+            await firestore.collection('futureBookings').doc(bid).update({ payment_type: paymentType }).catch(() => {});
+          } catch (e) { /* ignore */ }
+
+          const escrowMsg = paymentType === 'deposit'
+            ? `\n\n🔒 Your deposit of R${payAmount.toFixed(2)} is held securely in escrow. The remaining R${(cost - payAmount).toFixed(2)} is due after job completion. The artisan does NOT receive your money until you confirm satisfaction.`
+            : `\n\n🔒 Your payment is held securely in escrow. The artisan does NOT receive your money until you confirm you are satisfied with the completed work.`;
+
+          return {
+            success: true,
+            message: `Here's your ${itemSuffix} link for R${payAmount.toFixed(2)}:\n\n${ozowBody.payment_url}\n\nClick to pay securely via Ozow (instant EFT).${escrowMsg}\n\n✅ 100% Money-Back Guarantee — not satisfied? Full refund, no questions asked within 24 hours.\n🚫 Free cancellation before artisan dispatch.`,
+            amount: `R${payAmount.toFixed(2)}`,
+            paymentUrl: ozowBody.payment_url,
+            reference: ozowBody.transaction_ref || '',
+            bookingId: bid,
+          };
         }
       } catch (e) {
-        console.warn('[wa-tool] payment link generation failed:', e.message);
+        console.warn('[request_payment_link] Ozow API call failed:', e.message);
       }
 
-      if (paymentUrl) {
-        return {
-          message: `Here is your secure payment link for R${cost.toFixed(2)}:\n\n${paymentUrl}\n\nClick the link above to pay securely. Your payment is protected and held in escrow until you confirm satisfaction with the work.`,
-          amount: `R${cost.toFixed(2)}`,
-          payment_url: paymentUrl,
-          bookingId: bid,
-        };
-      } else {
-        // Fallback: notify admin to send payment link manually
-        await firestore.collection('notifications').add({
-          title: 'WhatsApp Payment Request',
-          body: `Customer requests payment link for booking ${bid} (R${cost.toFixed(2)})`,
-          type: 'payment_request',
-          user_type: 'admin',
-          booking_id: bid,
-          read: false,
-          created_at: admin.firestore.FieldValue.serverTimestamp(),
-        });
-        return {
-          message: `We're preparing your payment link for R${cost.toFixed(2)}. Our team will send it to you shortly. You can also pay via the Square 15 app.`,
-          amount: `R${cost.toFixed(2)}`,
-          bookingId: bid,
-        };
-      }
+      // Fallback: store request and notify admin
+      const payRef = `PAY-${bid}-${Date.now().toString(36)}`;
+      await firestore.collection('payment_links').doc(payRef).set({
+        booking_id: bid,
+        amount: payAmount,
+        payment_type: paymentType,
+        phone: session.phone,
+        user_id: session.linkedUserId || '',
+        status: 'pending',
+        source: 'whatsapp',
+        created_at: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      await firestore.collection('notifications').add({
+        title: 'WhatsApp Payment Request',
+        body: `Customer requests ${itemSuffix} for booking ${bid} (R${payAmount.toFixed(2)})`,
+        type: 'payment_request',
+        user_type: 'admin',
+        booking_id: bid,
+        read: false,
+        created_at: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      return {
+        message: `${itemSuffix} request for R${payAmount.toFixed(2)} submitted for booking ${d.order_no || d.rfq_no || bid}. You can also pay via the Square 15 app.\n\nAlternatively, reply "pay with wallet" if you have sufficient balance.\n\n🔒 Your money is protected in escrow until you confirm satisfaction.`,
+        amount: `R${payAmount.toFixed(2)}`,
+        reference: payRef,
+        bookingId: bid,
+      };
     }
 
     // ═══════════════════════════════════════════
@@ -2094,18 +2433,41 @@ async function executeWaTool(name, args, session) {
         else return { error: 'Your WhatsApp number is not linked to a Square 15 account. Wallet payment requires an app account.' };
       }
 
-      const bid = args.bookingId;
+      const bid = args.bookingId || session.lastBookingId;
       if (!bid) return { error: 'Please provide a booking ID.' };
 
-      // Get booking
+      // Get booking — check both collections (RFQs live in futureBookings only)
       let bookDoc = await firestore.collection('tasksManagement').doc(bid).get();
+      let bookingCollection = 'tasksManagement';
+      if (!bookDoc.exists) {
+        bookDoc = await firestore.collection('futureBookings').doc(bid).get();
+        bookingCollection = 'futureBookings';
+      }
       if (!bookDoc.exists) return { error: `Booking "${bid}" not found.` };
       const bookData = bookDoc.data();
 
       if (bookData.payment_status === 'paid') return { message: 'This booking is already paid!' };
 
+      // Enforce artisan acceptance before payment
+      const artisanAccepted = bookData.accept === '1' || bookData.accept === 1 || bookData.artisan_confirmed === 'yes';
+      if (!artisanAccepted) {
+        return { error: `An artisan hasn't accepted this job yet. You'll be notified when an artisan accepts, and then you can proceed to payment.` };
+      }
+
       const cost = parseFloat(bookData.cost || '0');
       if (cost <= 0) return { error: 'This booking does not have a confirmed price yet.' };
+
+      // Determine payment amount based on deposit vs full
+      const paymentType = args.payment_type || 'full';
+      let payAmount;
+      if (bookData.deposit_paid === true && bookData.balance_paid !== true) {
+        // Deposit already paid, only balance remains
+        payAmount = parseFloat(bookData.balance_amount || cost);
+      } else if (paymentType === 'deposit') {
+        payAmount = Math.round(cost * 0.35 * 100) / 100;
+      } else {
+        payAmount = cost;
+      }
 
       // Get user balance (atomic transaction)
       try {
@@ -2115,26 +2477,41 @@ async function executeWaTool(name, args, session) {
           if (!userSnap.exists) throw new Error('User not found');
 
           const balance = parseFloat(userSnap.data().balance || '0');
-          if (balance < cost) throw new Error(`Insufficient balance. You have R${balance.toFixed(2)} but need R${cost.toFixed(2)}.`);
+          if (balance < payAmount) throw new Error(`Insufficient balance. You have R${balance.toFixed(2)} but need R${payAmount.toFixed(2)}.`);
 
-          const newBalance = balance - cost;
+          const newBalance = balance - payAmount;
           txn.update(userRef, { balance: newBalance.toFixed(2) });
-          txn.update(firestore.collection('tasksManagement').doc(bid), {
-            payment_status: 'paid',
-            paymentStatus: 'paid',
-            payment_method: 'wallet',
-            paid_at: new Date().toISOString(),
-          });
 
-          // Also update futureBookings if exists
-          const fbRef = firestore.collection('futureBookings').doc(bid);
-          const fbSnap = await txn.get(fbRef);
-          if (fbSnap.exists) {
-            txn.update(fbRef, {
-              payment_status: 'paid',
-              wallet_deducted: true,
-              paid_at: new Date().toISOString(),
-            });
+          // Determine payment status fields
+          const isDeposit = paymentType === 'deposit' && bookData.deposit_paid !== true;
+          const paymentFields = isDeposit
+            ? {
+                payment_status: 'deposit_paid',
+                paymentStatus: 'deposit_paid',
+                deposit_paid: true,
+                payment_type: 'deposit',
+                payment_method: 'wallet',
+                paid_at: new Date().toISOString(),
+              }
+            : {
+                payment_status: 'paid',
+                paymentStatus: 'paid',
+                balance_paid: bookData.deposit_paid === true ? true : false,
+                deposit_paid: bookData.deposit_paid === true ? true : true,
+                payment_type: bookData.deposit_paid === true ? 'deposit' : 'full',
+                payment_method: 'wallet',
+                paid_at: new Date().toISOString(),
+              };
+
+          // Update the primary collection where the booking was found
+          txn.update(firestore.collection(bookingCollection).doc(bid), paymentFields);
+
+          // Also update the OTHER collection if it exists there too
+          const otherCollection = bookingCollection === 'tasksManagement' ? 'futureBookings' : 'tasksManagement';
+          const otherRef = firestore.collection(otherCollection).doc(bid);
+          const otherSnap = await txn.get(otherRef);
+          if (otherSnap.exists) {
+            txn.update(otherRef, { ...paymentFields, wallet_deducted: true });
           }
         });
 
@@ -2142,15 +2519,32 @@ async function executeWaTool(name, args, session) {
         await firestore.collection('transactionLogs').add({
           user_id: session.linkedUserId,
           type: 'payment',
-          subtype: 'wallet_deduction',
-          amount: cost,
+          subtype: paymentType === 'deposit' ? 'wallet_deposit_payment' : 'wallet_deduction',
+          amount: payAmount,
           booking_id: bid,
+          payment_type: paymentType,
           source: 'whatsapp',
           status: 'success',
           created_at: admin.firestore.FieldValue.serverTimestamp(),
         });
 
-        return { success: true, message: `Payment of R${cost.toFixed(2)} successful via wallet! Your booking ${bid} is now confirmed.`, paid: `R${cost.toFixed(2)}` };
+        const isDeposit = paymentType === 'deposit' && bookData.deposit_paid !== true;
+        const balanceRemaining = Math.round((cost - payAmount) * 100) / 100;
+
+        if (isDeposit) {
+          return {
+            success: true,
+            message: `Deposit payment of R${payAmount.toFixed(2)} successful via wallet! 🔒 Your deposit is held securely in escrow.\n\nRemaining balance: R${balanceRemaining.toFixed(2)} (due after job completion).\nThe artisan does NOT receive your money until you confirm satisfaction.\n\n✅ 100% Money-Back Guarantee`,
+            paid: `R${payAmount.toFixed(2)}`,
+            paymentType: 'deposit',
+          };
+        }
+        return {
+          success: true,
+          message: `Payment of R${payAmount.toFixed(2)} successful via wallet! 🔒 Your payment is held securely in escrow. The artisan does NOT receive your money until you confirm you are satisfied with the completed work.\n\n✅ 100% Money-Back Guarantee — not satisfied? Full refund, no questions asked within 24 hours.`,
+          paid: `R${payAmount.toFixed(2)}`,
+          paymentType: 'full',
+        };
       } catch (e) {
         return { error: e.message || 'Payment failed. Please try again.' };
       }
@@ -2188,19 +2582,11 @@ async function executeWaTool(name, args, session) {
         service_provider_name: '',
         scheduled_date: '',
         scheduled_time: '',
-        // Photo URLs from customer images sent during this session
-        work_images: session.photoUrls.length ? session.photoUrls : [],
-        image_urls: session.photoUrls.length ? session.photoUrls : [],
-        imageUrls: session.photoUrls.length ? session.photoUrls : [],
-        has_photos: session.photoUrls.length ? 'yes' : 'no',
         created_at: now,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
       };
 
       await firestore.collection('futureBookings').doc(rfqId).set(rfqDoc);
-
-      // Clear photo URLs after storing them in the RFQ
-      session.photoUrls = [];
 
       // Track in session for follow-up
       session.lastRfqId = rfqId;
@@ -2244,6 +2630,7 @@ async function executeWaTool(name, args, session) {
           await firestore.collection('futureBookings').doc(rfqId).update({
             ai_quote: quote,
             quoted_price: quote.grand_total.toString(),
+            admin_quote_total: quote.grand_total,
             quote_details: quote.scope_of_work,
             rfq_status: 'pending_client_response',
             total_price: quote.grand_total.toString(),
@@ -2264,6 +2651,18 @@ async function executeWaTool(name, args, session) {
         }
       } catch (quoteErr) {
         console.error('[submit_rfq] AI quote generation error:', quoteErr.message);
+        // Notify admin that AI quote failed so they can manually create one
+        try {
+          await firestore.collection('notifications').add({
+            title: '⚠️ AI Quote Generation Failed',
+            body: `AI quote failed for RFQ ${rfqNo} (${args.category || 'unknown category'}). Error: ${quoteErr.message}. Please create a manual quote.`,
+            type: 'rfq_quote_failed',
+            user_type: 'admin',
+            booking_id: rfqId,
+            read: false,
+            created_at: admin.firestore.FieldValue.serverTimestamp(),
+          });
+        } catch (nErr) { console.warn('[submit_rfq] Failed to notify admin of quote failure:', nErr.message); }
       }
 
       // Fallback if quote generation fails
@@ -2285,6 +2684,7 @@ async function executeWaTool(name, args, session) {
       if (!bid) return { error: 'Please provide a booking ID.' };
 
       let doc = await firestore.collection('tasksManagement').doc(bid).get();
+      if (!doc.exists) doc = await firestore.collection('futureBookings').doc(bid).get();
       if (!doc.exists) return { error: `Booking "${bid}" not found.` };
 
       const d = doc.data();
@@ -2305,28 +2705,17 @@ async function executeWaTool(name, args, session) {
       const now = new Date().toISOString();
       const wasPaid = d.payment_status === 'paid' || d.paymentStatus === 'paid';
 
-      // Cancel in tasksManagement
-      await firestore.collection('tasksManagement').doc(bid).update({
+      const cancelUpdate = {
         status: 'cancelled',
         cancelled_at: now,
         cancelled_by: 'client_whatsapp',
         cancel_reason: args.reason || 'Cancelled via WhatsApp',
         cancellation_reason: args.reason || 'Cancelled via WhatsApp',
-      });
+      };
 
-      // Cancel in futureBookings if exists
-      try {
-        const fbDoc = await firestore.collection('futureBookings').doc(bid).get();
-        if (fbDoc.exists) {
-          await firestore.collection('futureBookings').doc(bid).update({
-            status: 'cancelled',
-            cancelled_at: now,
-            cancelled_by: 'client_whatsapp',
-            cancel_reason: args.reason || 'Cancelled via WhatsApp',
-            cancellation_reason: args.reason || 'Cancelled via WhatsApp',
-          });
-        }
-      } catch (e) { console.warn('[wa-tool] futureBookings cancel sync failed:', e.message); }
+      // Cancel in both collections (safe — only updates if doc exists)
+      try { await firestore.collection('tasksManagement').doc(bid).update(cancelUpdate); } catch (e) { /* doc may not exist */ }
+      try { await firestore.collection('futureBookings').doc(bid).update(cancelUpdate); } catch (e) { /* doc may not exist */ }
 
       // Initiate refund if paid
       let refundMsg = '';
@@ -2515,6 +2904,7 @@ async function executeWaTool(name, args, session) {
       if (!bid) return { error: 'Please provide a booking ID.' };
 
       let doc = await firestore.collection('tasksManagement').doc(bid).get();
+      if (!doc.exists) doc = await firestore.collection('futureBookings').doc(bid).get();
       if (!doc.exists) return { error: `Booking "${bid}" not found.` };
 
       const d = doc.data();
@@ -2582,7 +2972,7 @@ async function executeWaTool(name, args, session) {
       if (!session.linkedUserId) {
         const user = await findUserByPhone(session.phone);
         if (user) session.linkedUserId = user.id;
-        else return { error: 'Your WhatsApp number is not linked to a Square 15 account. Please sign up in the app first to use referral codes.' };
+        else return { error: 'You don\'t have a Square 15 account yet. Please register first by telling me your name, and I\'ll set you up — then we can link the referral code.' };
       }
 
       // Check if already linked
@@ -2625,7 +3015,7 @@ async function executeWaTool(name, args, session) {
 
       return {
         linked: false,
-        message: 'No Square 15 account found for this phone number. Would you like me to register a new account for you right here on WhatsApp? Just provide your full name to get started.',
+        message: 'No Square 15 account found for this phone number. I can register you right here on WhatsApp — just tell me your full name and I\'ll create your account. Or if you already have the app, make sure you registered with this same phone number.',
       };
     }
 
@@ -2646,7 +3036,7 @@ async function executeWaTool(name, args, session) {
       const existingUser = await findUserByPhone(session.phone);
       if (existingUser) {
         session.linkedUserId = existingUser.id;
-        return { registered: true, message: `You already have an account (${existingUser.name || customerName}). I've linked it to this WhatsApp chat.` };
+        return { registered: true, message: `You already have an account (${existingUser.name || customerName}). I\'ve linked it to this WhatsApp chat.` };
       }
 
       // Create a new user document (compatible with Flutter app UserModel)
@@ -2875,18 +3265,7 @@ async function executeWaTool(name, args, session) {
         accepted_via: 'whatsapp',
       }, { merge: true });
 
-      // Notify admin to assign an artisan
-      await firestore.collection('notifications').add({
-        title: 'RFQ Quote Accepted — Assign Artisan',
-        body: `Customer accepted quote for RFQ ${data.rfq_no || rfqId} (R${priceNum.toFixed(2)}). Please assign an artisan.`,
-        type: 'rfq_accepted',
-        user_type: 'admin',
-        booking_id: rfqId,
-        read: false,
-        created_at: admin.firestore.FieldValue.serverTimestamp(),
-      });
-
-      // ── Auto-dispatch: route directly to artisans when conditions met ──
+      // ── Auto-dispatch: route directly to artisans when conditions are met ──
       const materialsResp = (data.materials_responsibility || '').toString().trim().toLowerCase();
       const clientBuysMaterials = materialsResp === 'client';
       const underThreshold = priceNum > 0 && priceNum < 12000;
@@ -2896,6 +3275,7 @@ async function executeWaTool(name, args, session) {
         const autoReason = clientBuysMaterials ? 'client_buys_materials' : 'under_12k';
         const cat = (data.category || data.category_name || '').toLowerCase().replace(/\s+/g, '_');
         try {
+          // Find matching artisans by category
           const artisanSnap = await firestore.collection('serviceProvider')
             .where('status', '==', 'approved')
             .where('is_suspended', '!=', true)
@@ -2910,11 +3290,13 @@ async function executeWaTool(name, args, session) {
             matchedArtisans.push({ id: artDoc.id, name: aName, token: (ad.fcm_token || ad.deviceToken || '').toString().trim() });
             if (matchedArtisans.length >= 3) break;
           }
+
           if (matchedArtisans.length > 0) {
             const artisanIds = matchedArtisans.map(a => a.id);
             const artisanNames = {};
             matchedArtisans.forEach(a => { artisanNames[a.id] = a.name; });
 
+            // Update futureBooking with assigned artisans
             await firestore.collection('futureBookings').doc(rfqId).update({
               rfq_status: 'pending_artisan_acceptance',
               status: 'pending_artisan_acceptance',
@@ -2928,6 +3310,7 @@ async function executeWaTool(name, args, session) {
               artisan_name: matchedArtisans[0].name,
             });
 
+            // Update tasksManagement bridge
             await firestore.collection('tasksManagement').doc(rfqId).update({
               status: 'pending_artisan_acceptance',
               rfq_assigned_artisan_ids: artisanIds,
@@ -2935,16 +3318,22 @@ async function executeWaTool(name, args, session) {
               rfq_auto_assign_reason: autoReason,
             });
 
+            // Send targeted FCM to matched artisans
             for (const art of matchedArtisans) {
               if (!art.token) continue;
               try {
                 await admin.messaging().send({
                   token: art.token,
-                  notification: { title: '🔔 New RFQ Job Available', body: `RFQ ${data.rfq_no || rfqId} — R${priceNum.toFixed(2)}. Tap to view and accept.` },
+                  notification: {
+                    title: '🔔 New RFQ Job Available',
+                    body: `RFQ ${data.rfq_no || rfqId} — R${priceNum.toFixed(2)}. Tap to view and accept.`,
+                  },
                   data: { type: 'rfq_accepted', booking_id: rfqId },
                   android: { notification: { channelId: 'order_request_channel', sound: 'sound' } },
                 });
-              } catch (fcmErr) { console.warn(`[wa-tool] FCM to artisan ${art.id} failed:`, fcmErr.message); }
+              } catch (fcmErr) {
+                console.warn(`[wa-tool] FCM to artisan ${art.id} failed:`, fcmErr.message);
+              }
             }
             autoDispatched = true;
             console.log(`[wa-tool] Auto-dispatched RFQ ${rfqId} to ${artisanIds.length} artisans (${autoReason})`);
@@ -2952,8 +3341,47 @@ async function executeWaTool(name, args, session) {
         } catch (e) { console.warn('[wa-tool] auto-dispatch failed, falling back to admin:', e.message); }
       }
 
-      if (autoDispatched) {
-        console.log(`[wa-tool] RFQ ${rfqId} auto-dispatched to artisans (under R12K or client buys materials)`);
+      if (!autoDispatched) {
+        // Notify admin to assign an artisan
+        await firestore.collection('notifications').add({
+          title: 'RFQ Quote Accepted — Assign Artisan',
+          body: `Customer accepted quote for RFQ ${data.rfq_no || rfqId} (R${priceNum.toFixed(2)}). Please assign an artisan.`,
+          type: 'rfq_accepted',
+          user_type: 'admin',
+          booking_id: rfqId,
+          read: false,
+          created_at: admin.firestore.FieldValue.serverTimestamp(),
+        });
+
+        // Broad FCM blast to available artisans
+        try {
+          const cat = (data.category || data.category_name || '').toLowerCase().replace(/\s+/g, '_');
+          const artisanSnap = await firestore.collection('serviceProvider')
+            .where('status', '==', 'approved')
+            .where('is_suspended', '!=', true)
+            .limit(20)
+            .get();
+          for (const artDoc of artisanSnap.docs) {
+            const ad = artDoc.data() || {};
+            const cats = (ad.categories || ad.category || '').toString().toLowerCase();
+            if (cats && cat && !cats.includes(cat) && cat !== 'general_maintenance') continue;
+            const token = (ad.fcm_token || ad.deviceToken || '').toString().trim();
+            if (!token) continue;
+            try {
+              await admin.messaging().send({
+                token,
+                notification: {
+                  title: '🔔 New RFQ Job Available',
+                  body: `RFQ ${data.rfq_no || rfqId} — R${priceNum.toFixed(2)}. Tap to view and accept.`,
+                },
+                data: { type: 'rfq_accepted', booking_id: rfqId },
+                android: { notification: { channelId: 'order_request_channel', sound: 'sound' } },
+              });
+            } catch (fcmErr) {
+              console.warn(`[wa-tool] FCM to artisan ${artDoc.id} failed:`, fcmErr.message);
+            }
+          }
+        } catch (e) { console.warn('[wa-tool] artisan RFQ dispatch failed:', e.message); }
       }
 
       // Store for quick payment follow-up
@@ -3255,8 +3683,25 @@ YOUR FULL CAPABILITIES:
 💰 PAYMENTS:
 - Check wallet balance
 - Pay for bookings using wallet balance
-- Request payment link for card payment
+- Generate secure Ozow payment links for instant EFT payment
 - Apply promo/discount codes before booking
+
+PAYMENT FLOW (CRITICAL — Artisan must accept BEFORE payment):
+1. After creating a booking or accepting an RFQ quote, DO NOT offer payment immediately.
+2. Tell the customer: "An artisan needs to accept your job first. You'll be notified when one accepts, and then you can pay."
+3. ONLY offer payment AFTER the booking status shows an artisan has accepted (accept='1' or artisan_confirmed='yes').
+4. When an artisan has accepted and customer wants to pay, ALWAYS ask: "Would you like to pay the full amount (R{total}) or a 35% deposit (R{deposit}) with the balance due after job completion?"
+5. If customer says "pay deposit" or "35%" → call request_payment_link or pay_with_wallet with payment_type='deposit'
+6. If customer says "pay full" or "pay everything" → call request_payment_link or pay_with_wallet with payment_type='full'
+7. NEVER skip the deposit/full question — ALWAYS let the customer choose
+8. After payment, explain the escrow protection and guarantee
+
+🔒 FINANCIAL SECURITY (ALWAYS mention these when discussing payment):
+- "Your payment is held in a secure escrow account. The artisan does NOT receive your money until you confirm you are satisfied with the completed work. You are always in control."
+- "100% Money-Back Guarantee — not satisfied? Full refund, no questions asked within 24 hours."
+- "Free cancellation before artisan dispatch. Full refund within 2 hours of payment."
+- When a customer asks "is my money safe?" or expresses concern, explain all three protections
+- If deposit is chosen: "Your deposit of R{amount} is protected in escrow. The remaining R{balance} is only due after the job is completed to your satisfaction."
 
 📝 RFQ (Request for Quote) — AI-POWERED QUOTING:
 - Submit RFQ for complex/large jobs that need a detailed quote first
@@ -3282,6 +3727,28 @@ PHOTO ANALYSIS FOR RFQ:
 - Use the photo analysis to build a detailed description for the RFQ
 - The AI quote generator uses the conversation context including your photo analysis
 
+🎁 AUTO-DISCOUNTS (IMPORTANT — check and mention these proactively):
+- FIRST-JOB DISCOUNT: New customers who have never completed a booking get an automatic discount. Call check_auto_discounts to verify eligibility and tell them about their savings BEFORE creating the booking.
+- OFF-PEAK DISCOUNT: Bookings made on weekdays before 10am SAST qualify for an automatic off-peak discount.
+- LOYALTY POINTS: Returning customers earn loyalty points (10 pts per R100 spent). 100+ points can be redeemed for up to 10% off (100pts = R10).
+- Auto-discounts are applied automatically at booking time even if you don't call check_auto_discounts — but ALWAYS mention the discount to make the customer feel valued.
+- If a customer already has a manual promo code applied, auto-discounts won't override it.
+
+🛒 UPSELL ADD-ONS (use these to offer more value):
+- After the customer picks a service category, call get_upsell_addons(categoryId) to check for recommended add-on services.
+- Add-ons come with special bundle discounts (e.g. "Add a geyser inspection to your plumbing booking — 30% off!").
+- Present add-ons BEFORE creating the booking. Let the customer choose which (if any) they want.
+- Example flow: Customer wants plumbing → you call get_upsell_addons('plumbing') → present options → customer picks → include them in the booking description and add their costs.
+- NEVER pressure the customer — frame it as "Here are some recommended services that pair well with your booking".
+
+DISCOUNT & UPSELL FLOW (follow this for every booking):
+1. Customer describes their need → you identify the category
+2. Call check_auto_discounts — mention any available discounts enthusiastically
+3. Call get_upsell_addons(categoryId) — present relevant add-ons with bundle pricing
+4. Call lookup_pricing → get the service price
+5. Let customer confirm what they want
+6. Call create_booking — discounts are auto-applied to the final price
+
 ⭐ RATINGS & REVIEWS:
 - Rate completed jobs (1-5 stars with optional comment)
 - Prompt customers to rate after asking about completed bookings
@@ -3293,12 +3760,22 @@ PHOTO ANALYSIS FOR RFQ:
 🤝 PARTNER CODES:
 - Link corporate partner / referral codes for commission tracking
 - Validate referral codes
+- Referral codes can be provided during registration or linked afterwards
 
-🔗 ACCOUNT:
-- Auto-link WhatsApp number to existing Square 15 app account
-- Register new accounts directly via WhatsApp (register_account) — collect customer's full name, optionally email, address, and referral/partner code
-- When link_account fails (no existing account found), offer to register a new account right here on WhatsApp
-- Inform customers about app features when relevant
+📝 REGISTRATION & ACCOUNT:
+- Register new customers directly on WhatsApp (register_account) — NO app download needed
+- During registration, ALWAYS ask: "Do you have a referral or partner code?" (but make it clear it's optional)
+- Collect: full name (required), email (optional but recommended), address (optional), referral code (optional)
+- Auto-link WhatsApp number to existing Square 15 app account (link_account) for customers who already have the app
+- If a new user tries to book or use a referral code without an account, suggest registering first
+
+FIRST-TIME USER FLOW (IMPORTANT):
+1. When you detect a new/unregistered user (no linked account), warmly welcome them and offer to register them
+2. Ask for their full name
+3. Ask "Do you have a referral or partner code? (No worries if you don't!)"
+4. Call register_account with the collected info
+5. Then proceed with whatever they originally wanted (booking, RFQ, etc.)
+6. For returning users who already have the app, use link_account to sync their WhatsApp
 
 💬 MESSAGING:
 - Get messages/chat history for a booking (get_messages)
@@ -3313,32 +3790,42 @@ PHOTO ANALYSIS FOR RFQ:
 - Explain a quote breakdown (explain_quote)
 - Check payment status for a booking (check_payment)
 
+🔍 BUILDERS PRODUCT BROWSING:
+- Search for products, materials, and brands on Builders Warehouse (lookup_builders_product)
+- Help customers compare brands and prices for materials they need
+- Show product names, brands, prices, and direct links to Builders website
+
 CRITICAL PRICING RULES:
 - You MUST call lookup_pricing BEFORE calling create_booking, EVERY TIME, NO EXCEPTIONS.
 - When calling lookup_pricing, pass the specific service as subcategory (e.g. category="plumbing", subcategory="toilet unblocking").
+- lookup_pricing now returns laborCostPerHour, outsourcedLaborRate, and materialMultiplier from admin pricing guidance — use these for accurate quotes.
 - If lookup_pricing returns matched=true with a fixedPrice, use that EXACT price — do NOT estimate or use a different amount.
 - If lookup_pricing returns matched=false and no fixedPrice service matches, tell the customer: "This job needs a detailed quote" and use submit_rfq instead of create_booking.
 - NEVER guess or make up a price. Only use prices returned by lookup_pricing.
 - If create_booking returns an estimated cost of R0.00, it means no fixed price was found — inform the customer and suggest an RFQ.
 
-PHOTO REQUIREMENT (CRITICAL):
-- ALWAYS ask the customer to send a photo of the issue BEFORE creating a booking or RFQ.
-- Say something like: "Could you please send me a photo of the issue? This helps our artisans understand the problem and come prepared."
-- If the customer has already sent a photo during this conversation, you do NOT need to ask again.
-- If the customer says they cannot send a photo (e.g. "I can't right now"), proceed without one — don't block the booking.
-- Photos are automatically attached to the booking and sent to artisans when they receive the job request.
-- The artisan will see the photos alongside the job description, address, and pricing.
+BUILDERS PRODUCT BROWSING RULES:
+- When presenting RFQ quotes that include materials, mention that you can look up specific products on Builders if they want different brands or options.
+- When a customer asks about specific products, materials, or brands, use lookup_builders_product to search Builders Warehouse.
+- Present results with product name, brand, price, and a direct link to the Builders website.
+- Let the customer choose which product/brand they prefer — then factor that into the quote.
+- If a customer wants to compare brands (e.g. "show me geyser options"), search Builders and present the top options with prices.
+- Always show the Builders link so the customer can view the product details themselves.
 
 GUIDELINES:
 - Be warm, professional, and concise (WhatsApp messages should be short)
-- Always collect: category, description, address, customer name, AND photos BEFORE creating a booking
+- Always collect: category, description, address, customer name BEFORE creating a booking
 - For complex jobs (renovations, full installations), suggest submitting an RFQ instead of a regular booking
 - Use South African Rands (R) for all pricing
 - When a customer sends a photo, ANALYSE the image using your vision capabilities. Identify the maintenance issue (e.g. leaking pipe, broken socket, cracked wall), suggest the correct service category, and offer to create a booking or RFQ
-- For emergencies, emphasise urgency and prioritise booking creation (still ask for photo but don't delay)
-- When a booking is created, always mention the estimated cost and payment options
-- After job completion, encourage rating
-- If payment is discussed, explain: "Payment is held securely in escrow and only released to the artisan once you confirm the job is done"
+- For emergencies, emphasise urgency and prioritise booking creation
+- When a booking is created, mention the estimated cost and explain that an artisan needs to accept first before payment
+- NEVER offer payment immediately after booking creation — artisan must accept first
+- After an artisan accepts, ask the customer to choose between FULL PAYMENT or 35% DEPOSIT before generating a payment link
+- After accepting an RFQ quote, tell the customer an artisan needs to accept the job — do NOT offer payment immediately
+- If customer asks to pay but artisan hasn't accepted, explain: "An artisan needs to accept your job first. You'll be notified when one accepts."
+- NEVER say "admin will send a link" or "you'll receive a link soon" — when artisan has accepted, generate the link yourself using request_payment_link
+- After payment, explain: "Your payment is held securely in escrow. The artisan does NOT receive your money until you confirm you are satisfied. 100% money-back guarantee."
 - For promo codes, apply them BEFORE creating the booking
 - Keep messages under 500 characters when possible
 - Always include the booking ID/order number in responses about specific bookings
@@ -3395,13 +3882,7 @@ async function handleMessage(session, userMessage, imageDataUrl) {
         try { toolArgs = JSON.parse(tc.function.arguments); } catch (_) {}
         console.log(`[tool] ${tc.function.name}(${JSON.stringify(toolArgs).substring(0, 100)})`);
 
-        let result;
-        try {
-          result = await executeWaTool(tc.function.name, toolArgs, session);
-        } catch (toolErr) {
-          console.error(`[tool] ${tc.function.name} THREW:`, toolErr.message, toolErr.stack);
-          result = { error: `Tool ${tc.function.name} failed: ${toolErr.message}` };
-        }
+        const result = await executeWaTool(tc.function.name, toolArgs, session);
         session.messages.push({
           role: 'tool',
           tool_call_id: tc.id,
@@ -3512,19 +3993,6 @@ app.post('/webhook', async (req, res) => {
       // Restore session from Firestore if this is a fresh in-memory session
       await restoreSessionFromFirestore(session);
 
-      // Auto-link: if no linked account yet, try to find existing app user by phone number
-      if (!session.linkedUserId) {
-        try {
-          const appUser = await findUserByPhone(session.phone);
-          if (appUser) {
-            session.linkedUserId = appUser.id;
-            console.log(`[auto-link] Matched WhatsApp ${session.phone} to app user ${appUser.id} (${appUser.name || 'unknown'})`);
-          }
-        } catch (e) {
-          console.warn('[auto-link] Phone lookup failed:', e.message);
-        }
-      }
-
       let userText = '';
 
       switch (msg.type) {
@@ -3534,6 +4002,23 @@ app.post('/webhook', async (req, res) => {
         case 'interactive':
           // Button replies and list replies
           if (msg.interactive?.button_reply) {
+            const btnId = msg.interactive.button_reply.id || '';
+            // Direct rating handler — rate_{bookingId}_{score}
+            if (btnId.startsWith('rate_')) {
+              const parts = btnId.split('_');
+              const ratingScore = parseInt(parts[parts.length - 1], 10);
+              const ratingBookingId = parts.slice(1, -1).join('_');
+              if (ratingBookingId && ratingScore >= 1 && ratingScore <= 5) {
+                try {
+                  const session = getSession(from);
+                  userText = `I want to rate booking ${ratingBookingId} with ${ratingScore} stars`;
+                  console.log(`[msg] ${from}: [RATING BUTTON: booking=${ratingBookingId} score=${ratingScore}]`);
+                  break;
+                } catch (e) {
+                  console.error('[webhook] Rating button handler error:', e.message);
+                }
+              }
+            }
             userText = msg.interactive.button_reply.title;
           } else if (msg.interactive?.list_reply) {
             userText = msg.interactive.list_reply.title;
@@ -3546,12 +4031,6 @@ app.post('/webhook', async (req, res) => {
           const imageMedia = await downloadWhatsAppMedia(msg.image?.id);
           const caption = msg.image?.caption || '';
           if (imageMedia) {
-            // Upload photo to Firebase Storage so artisans can see it
-            const storageUrl = await uploadImageToStorage(imageMedia.buffer, imageMedia.mimeType);
-            if (storageUrl) {
-              session.photoUrls.push(storageUrl);
-              console.log(`[msg] ${from}: [IMAGE uploaded to Storage, ${session.photoUrls.length} total]`);
-            }
             userText = caption
               ? `[Customer sent a photo with caption: "${caption}"] Analyse this image of a maintenance/repair issue. Identify the problem, suggest the service category, and offer to create a booking or RFQ.`
               : '[Customer sent a photo of a maintenance issue] Analyse this image. Identify what repair or maintenance is needed, suggest the service category (plumbing, electrical, painting, etc.), estimate the scope, and offer to create a booking or submit an RFQ.';
@@ -3611,221 +4090,6 @@ app.post('/webhook', async (req, res) => {
 // Health check
 app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot' }));
 
-// ─── Diagnostic: test Firebase read/write ───
-app.get('/debug/firebase-test', async (req, res) => {
-  const results = { firebase_init: false, project_id: null, read_ok: false, write_ok: false, delete_ok: false, sp_count: 0, tm_count: 0, wa_bookings: 0, errors: [] };
-  try {
-    const firestore = db();
-    if (!firestore) { results.errors.push('db() returned null — Firebase not initialized'); return res.json(results); }
-    results.firebase_init = true;
-
-    // Report which Firebase project we're connected to
-    try {
-      const app = admin.app();
-      results.project_id = app.options.credential?.projectId || app.options.projectId || (app.options.credential?.certificate?.projectId) || 'unknown';
-      // Try to get from Firestore settings
-      if (results.project_id === 'unknown') {
-        results.project_id = firestore._settings?.projectId || firestore.projectId || 'unknown';
-      }
-    } catch (e) { results.errors.push('project_id lookup: ' + e.message); }
-
-    // Test read
-    try {
-      const tmCount = await firestore.collection('tasksManagement').select().limit(1).get();
-      results.read_ok = true;
-      const tmAll = await firestore.collection('tasksManagement').select().get();
-      results.tm_count = tmAll.docs.length;
-    } catch (e) { results.errors.push('read failed: ' + e.message); }
-
-    // Count WA bookings
-    try {
-      const allTm = await firestore.collection('tasksManagement').get();
-      const waBookings = allTm.docs.filter(d => d.id.startsWith('WA-') || (d.data().source === 'whatsapp'));
-      results.wa_bookings = waBookings.length;
-      // Show latest 3 WA bookings
-      results.wa_latest = waBookings.slice(-3).map(d => {
-        const dd = d.data();
-        return { id: d.id, order_no: dd.order_no, status: dd.status, cost: dd.cost, sp_id: dd.service_provider_id, created_at: dd.created_at, source: dd.source, category: dd.category_name };
-      });
-    } catch (e) { results.errors.push('wa count failed: ' + e.message); }
-
-    // Test write + delete
-    const testDocId = `_diag_test_${Date.now()}`;
-    try {
-      await firestore.collection('tasksManagement').doc(testDocId).set({ _test: true, created_at: new Date().toISOString() });
-      results.write_ok = true;
-    } catch (e) { results.errors.push('write failed: ' + e.message); }
-    try {
-      await firestore.collection('tasksManagement').doc(testDocId).delete();
-      results.delete_ok = true;
-    } catch (e) { results.errors.push('delete failed: ' + e.message); }
-
-    // Service providers
-    try {
-      const spSnap = await firestore.collection('serviceProvider').get();
-      results.sp_count = spSnap.docs.length;
-      results.sp_sample_fields = spSnap.docs.length > 0 ? Object.keys(spSnap.docs[0].data()) : [];
-      results.sp_first = spSnap.docs.length > 0 ? { id: spSnap.docs[0].id, name: spSnap.docs[0].data().name, active: spSnap.docs[0].data().active, status: spSnap.docs[0].data().status } : null;
-    } catch (e) { results.errors.push('sp read failed: ' + e.message); }
-  } catch (e) { results.errors.push('outer error: ' + e.message); }
-  res.json(results);
-});
-
-// ─── Artisan App → WhatsApp: Notify client when artisan accepts/rejects ───
-app.post('/api/artisan-accepted', async (req, res) => {
-  try {
-    const { bookingId, artisanName } = req.body || {};
-    if (!bookingId) return res.status(400).json({ error: 'bookingId required' });
-
-    const firestore = db();
-    if (!firestore) return res.status(503).json({ error: 'Database unavailable' });
-
-    // Look up booking to find customer phone + details
-    // bookingId may be the bridge ID (WA-XXX_artisanId) or the main booking ID (WA-XXX)
-    const mainBookingId = bookingId.includes('_') ? bookingId.split('_')[0] : bookingId;
-
-    let customerPhone = '';
-    let bookingCost = '';
-    let bookingDescription = '';
-    let orderNo = '';
-
-    // Try futureBookings first (has the canonical data)
-    const fbDoc = await firestore.collection('futureBookings').doc(mainBookingId).get();
-    if (fbDoc.exists) {
-      const d = fbDoc.data();
-      customerPhone = d.user_phone || d.customerPhone || d.contact || '';
-      bookingCost = d.cost || '';
-      bookingDescription = d.description || d.subcategory || d.category_name || '';
-      orderNo = d.order_no || '';
-    }
-
-    // Fallback to tasksManagement
-    if (!customerPhone) {
-      const tmDoc = await firestore.collection('tasksManagement').doc(mainBookingId).get();
-      if (tmDoc.exists) {
-        const d = tmDoc.data();
-        customerPhone = d.customerPhone || d.contact || '';
-        bookingCost = d.cost || '';
-        bookingDescription = d.description || d.subcategory || d.category_name || '';
-        orderNo = d.order_no || '';
-      }
-    }
-
-    if (!customerPhone) {
-      return res.status(404).json({ error: 'No customer phone found for booking' });
-    }
-
-    // Normalise phone to international format (27...)
-    let to = customerPhone.replace(/[^0-9]/g, '');
-    if (to.startsWith('0')) to = '27' + to.slice(1);
-
-    // Generate payment link for WhatsApp customer
-    let paymentUrl = '';
-    if (bookingCost && parseFloat(bookingCost) > 0) {
-      try {
-        const backendUrl = process.env.LIVEKIT_BACKEND_URL || 'https://square15-livekit-backend.onrender.com';
-        const resp = await fetch(`${backendUrl}/api/payment/whatsapp-initiate`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            amount: parseFloat(bookingCost).toFixed(2),
-            booking_id: mainBookingId,
-            customer_name: artisanName ? '' : '',
-            customer_phone: to,
-            description: bookingDescription || `Booking ${mainBookingId}`,
-          }),
-          signal: AbortSignal.timeout(15000),
-        });
-        const result = await resp.json();
-        if (result.ok && result.payment_url) paymentUrl = result.payment_url;
-      } catch (e) {
-        console.warn('[api/artisan-accepted] payment link generation failed:', e.message);
-      }
-    }
-
-    // Send artisan acceptance message with payment link
-    const name = artisanName || 'Your artisan';
-    const costStr = bookingCost ? `R${parseFloat(bookingCost).toFixed(2)}` : '';
-    const descStr = bookingDescription || 'your maintenance request';
-
-    let msg = `✅ *Great news!* ${name} has accepted your booking`;
-    if (orderNo) msg += ` (#${orderNo})`;
-    msg += `!\n\n`;
-    msg += `📋 *Job:* ${descStr}\n`;
-    if (costStr) msg += `💰 *Cost:* ${costStr}\n`;
-    msg += `\n${name} will contact you to confirm the schedule and arrive at your location.\n`;
-
-    // Payment section with link
-    msg += `\n💳 *Payment Options:*\n`;
-    if (paymentUrl) {
-      msg += `1️⃣ *Pay now securely:* ${paymentUrl}\n`;
-      msg += `2️⃣ Pay via the Square 15 app\n`;
-    } else {
-      msg += `Pay via the Square 15 app or reply "pay" to get a payment link.\n`;
-    }
-    msg += `\n🔒 Your payment is held in escrow until you confirm satisfaction with the completed work.\n`;
-    msg += `\nReply anytime if you have questions! 😊`;
-
-    await sendWhatsAppMessage(to, msg);
-    console.log(`[api/artisan-accepted] Sent acceptance notification to ${to} for booking ${mainBookingId}`);
-
-    res.json({ success: true, to, bookingId: mainBookingId, hasPaymentLink: !!paymentUrl });
-  } catch (err) {
-    console.error('[api/artisan-accepted] error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ─── Artisan App → WhatsApp: Notify client of booking status changes ───
-app.post('/api/booking-status-update', async (req, res) => {
-  try {
-    const { bookingId, status, message: customMsg } = req.body || {};
-    if (!bookingId || !status) return res.status(400).json({ error: 'bookingId and status required' });
-
-    const firestore = db();
-    if (!firestore) return res.status(503).json({ error: 'Database unavailable' });
-
-    const mainBookingId = bookingId.includes('_') ? bookingId.split('_')[0] : bookingId;
-
-    let customerPhone = '';
-    const fbDoc = await firestore.collection('futureBookings').doc(mainBookingId).get();
-    if (fbDoc.exists) {
-      const d = fbDoc.data();
-      customerPhone = d.user_phone || d.customerPhone || d.contact || '';
-    }
-    if (!customerPhone) {
-      const tmDoc = await firestore.collection('tasksManagement').doc(mainBookingId).get();
-      if (tmDoc.exists) {
-        const d = tmDoc.data();
-        customerPhone = d.customerPhone || d.contact || '';
-      }
-    }
-    if (!customerPhone) return res.status(404).json({ error: 'No customer phone found' });
-
-    let to = customerPhone.replace(/[^0-9]/g, '');
-    if (to.startsWith('0')) to = '27' + to.slice(1);
-
-    // Default status messages
-    const statusMessages = {
-      'in_progress': '🔧 Your artisan has started working on your job. We\'ll update you when they\'re done!',
-      'progress': '🔧 Your artisan has started working on your job. We\'ll update you when they\'re done!',
-      'completed': '✅ Your job has been completed! Please review the work and confirm satisfaction in the app.',
-      'closed': '✅ Your job has been completed and closed. Thank you for using Square 15!',
-      'cancelled': '❌ Your booking has been cancelled. If you need help, reply here.',
-      'payment_received': '💳 Payment received! Thank you. Your booking is confirmed.',
-    };
-
-    const msg = customMsg || statusMessages[status] || `📋 Your booking status has been updated to: *${status}*`;
-    await sendWhatsAppMessage(to, msg);
-    console.log(`[api/booking-status-update] Status "${status}" sent to ${to} for ${mainBookingId}`);
-
-    res.json({ success: true, to, status });
-  } catch (err) {
-    console.error('[api/booking-status-update] error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
 // ─── Admin → WhatsApp: Send RFQ response back to client ───
 app.post('/api/send-rfq-response', async (req, res) => {
   try {
@@ -3840,6 +4104,276 @@ app.post('/api/send-rfq-response', async (req, res) => {
     res.json({ success: true, to, rfqNo });
   } catch (err) {
     console.error('[send-rfq-response] error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Webhook: Artisan accepted a booking → notify client via WhatsApp ───
+app.post('/api/artisan-accepted', async (req, res) => {
+  try {
+    const { bookingId, artisanName } = req.body || {};
+    if (!bookingId) return res.status(400).json({ error: 'bookingId required' });
+
+    const firestore = admin.firestore();
+
+    // Find booking in tasksManagement
+    const tmDoc = await firestore.collection('tasksManagement').doc(bookingId).get();
+    if (!tmDoc.exists) return res.status(404).json({ error: 'Booking not found' });
+    const tm = tmDoc.data();
+
+    // Find customer phone
+    let phone = (tm.phone || tm.customer_phone || '').toString().trim();
+    if (!phone && tm.user_id) {
+      try {
+        const userDoc = await firestore.collection('users').doc(tm.user_id).get();
+        phone = (userDoc.data()?.phone || userDoc.data()?.phoneNumber || '').toString().trim();
+      } catch (_) {}
+    }
+
+    if (!phone) return res.status(404).json({ error: 'Customer phone not found' });
+
+    // Normalise phone
+    phone = phone.replace(/[^0-9]/g, '');
+    if (phone.startsWith('0')) phone = '27' + phone.slice(1);
+
+    const cost = parseFloat(tm.cost || tm.total_cost || '0');
+    const deposit = (cost * 0.35).toFixed(2);
+    const name = artisanName || tm.service_provider_name || 'An artisan';
+    const orderNo = tm.order_no || tm.booking_id || bookingId;
+
+    await sendWhatsAppMessage(phone,
+      `✅ *Great news!* ${name} has accepted your booking ${orderNo}.\n\n` +
+      `You can now proceed with payment:\n` +
+      `💰 Full amount: R${cost.toFixed(2)}\n` +
+      `💰 Deposit (35%): R${deposit} now, R${(cost - parseFloat(deposit)).toFixed(2)} after completion\n\n` +
+      `🔒 Your payment is held in secure escrow — the artisan only gets paid when you're satisfied.\n\n` +
+      `Reply "pay" or "payment" to get your payment link.`
+    );
+
+    res.json({ success: true, phone });
+  } catch (err) {
+    console.error('[artisan-accepted] error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Webhook: Payment confirmed → update booking + notify client ───
+app.post('/api/payment-confirmed', async (req, res) => {
+  try {
+    const { bookingId, paymentType, amount } = req.body || {};
+    if (!bookingId) return res.status(400).json({ error: 'bookingId required' });
+
+    const firestore = admin.firestore();
+    const tmRef = firestore.collection('tasksManagement').doc(bookingId);
+    const tmDoc = await tmRef.get();
+    if (!tmDoc.exists) return res.status(404).json({ error: 'Booking not found' });
+    const tm = tmDoc.data();
+
+    // Update payment status
+    const isDeposit = paymentType === 'deposit';
+    const updateData = isDeposit
+      ? { deposit_paid: true, deposit_paid_at: new Date().toISOString(), payment_status: 'deposit_paid' }
+      : { deposit_paid: true, balance_paid: true, balance_paid_at: new Date().toISOString(), payment_status: 'paid' };
+    await tmRef.update(updateData);
+
+    // Also update futureBookings if exists
+    const fbId = (tm.future_booking_id || '').toString().trim();
+    if (fbId) {
+      try {
+        await firestore.collection('futureBookings').doc(fbId).update(updateData);
+      } catch (_) {}
+    }
+
+    // Find customer phone and send WhatsApp confirmation
+    let phone = (tm.phone || tm.customer_phone || '').toString().trim();
+    if (!phone && tm.user_id) {
+      try {
+        const userDoc = await firestore.collection('users').doc(tm.user_id).get();
+        phone = (userDoc.data()?.phone || userDoc.data()?.phoneNumber || '').toString().trim();
+      } catch (_) {}
+    }
+
+    if (phone) {
+      phone = phone.replace(/[^0-9]/g, '');
+      if (phone.startsWith('0')) phone = '27' + phone.slice(1);
+
+      const paidAmt = amount || (isDeposit ? tm.deposit_amount : tm.cost);
+      const orderNo = tm.order_no || tm.booking_id || bookingId;
+
+      let msg = `✅ *Payment Received!* R${parseFloat(paidAmt).toFixed(2)} for booking ${orderNo}.\n\n`;
+      if (isDeposit) {
+        const balance = parseFloat(tm.balance_amount || (parseFloat(tm.cost) * 0.65));
+        msg += `💰 Deposit secured. Remaining balance: R${balance.toFixed(2)} (due after job completion).\n\n`;
+      }
+      msg += `🔧 Your artisan will be dispatched according to the scheduled date/time. We'll keep you updated!\n\n`;
+      msg += `🔒 Remember: Your money is in escrow — the artisan only gets paid when you confirm you're satisfied.`;
+
+      await sendWhatsAppMessage(phone, msg);
+    }
+
+    res.json({ success: true, bookingId, paymentStatus: updateData.payment_status });
+  } catch (err) {
+    console.error('[payment-confirmed] error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Webhook: Job status update → notify client via WhatsApp ───
+app.post('/api/job-status-update', async (req, res) => {
+  try {
+    const { bookingId, status, artisanName, imageUrl, imageType } = req.body || {};
+    if (!bookingId || !status) return res.status(400).json({ error: 'bookingId and status required' });
+
+    const firestore = admin.firestore();
+    const tmDoc = await firestore.collection('tasksManagement').doc(bookingId).get();
+    if (!tmDoc.exists) return res.status(404).json({ error: 'Booking not found' });
+    const tm = tmDoc.data();
+
+    let phone = (tm.phone || tm.customer_phone || '').toString().trim();
+    if (!phone && tm.user_id) {
+      try {
+        const userDoc = await firestore.collection('users').doc(tm.user_id).get();
+        phone = (userDoc.data()?.phone || userDoc.data()?.phoneNumber || '').toString().trim();
+      } catch (_) {}
+    }
+    // Also try futureBookings for WA customer phone
+    if (!phone) {
+      try {
+        const fbDoc = await firestore.collection('futureBookings').doc(bookingId).get();
+        if (fbDoc.exists) {
+          const fbd = fbDoc.data();
+          phone = (fbd.user_phone || fbd.customerPhone || fbd.contact || '').toString().trim();
+        }
+      } catch (_) {}
+    }
+
+    if (!phone) return res.status(404).json({ error: 'Customer phone not found' });
+    phone = phone.replace(/[^0-9]/g, '');
+    if (phone.startsWith('0')) phone = '27' + phone.slice(1);
+
+    const name = artisanName || tm.service_provider_name || 'Your artisan';
+    const orderNo = tm.order_no || tm.booking_id || bookingId;
+
+    // ── Handle each status ──
+    if (status === 'progress' || status === 'in_progress' || status === 'en_route') {
+      await sendWhatsAppMessage(phone,
+        `🚗 *${name} is on the way!* Booking #${orderNo}.\n\nYour artisan is heading to your location now. You can track their progress in the Square 15 app.`
+      );
+    } else if (status === 'on_site') {
+      await sendWhatsAppMessage(phone,
+        `📍 *${name} has arrived!* Booking #${orderNo}.\n\nYour artisan is now on site and will begin work shortly.`
+      );
+    } else if (status === 'buying_material') {
+      await sendWhatsAppMessage(phone,
+        `🛒 *${name} is purchasing materials* for your job (Booking #${orderNo}).\n\nThe artisan is buying the materials needed. Work will begin once materials are ready.`
+      );
+    } else if (status === 'before_photo') {
+      // Send the before photo image to the client
+      let msg = `📸 *Before-work photo* — Booking #${orderNo}.\n\n${name} has documented the current state before starting work.`;
+      if (imageUrl) {
+        await sendWhatsAppImage(phone, imageUrl, msg);
+      } else {
+        await sendWhatsAppMessage(phone, msg);
+      }
+    } else if (status === 'started_work') {
+      await sendWhatsAppMessage(phone,
+        `🔧 *Work has started!* Booking #${orderNo}.\n\n${name} has begun working on your job. We'll notify you when it's done.`
+      );
+    } else if (status === 'completed') {
+      // Fetch before/after images
+      let beforeUrl = '';
+      let afterUrl = '';
+      try {
+        const imgDocId = tm.artisan_image_doc_id || '';
+        if (imgDocId) {
+          const imgDoc = await firestore.collection('artisanTasksImages').doc(imgDocId).get();
+          if (imgDoc.exists) {
+            const imgData = imgDoc.data();
+            beforeUrl = imgData.before_work || '';
+            afterUrl = imgData.after_work || '';
+          }
+        }
+      } catch (e) {
+        console.warn('[job-status-update] Image fetch error:', e.message);
+      }
+
+      // Generate payment link for outstanding balance
+      let paymentNote = '';
+      const isDeposit = tm.payment_type === 'deposit';
+      const balancePaid = (tm.balance_paid || '').toString().toLowerCase() === 'yes';
+      const balanceAmount = parseFloat(tm.balance_amount || 0);
+
+      if (isDeposit && !balancePaid && balanceAmount > 0) {
+        try {
+          const backendUrl = process.env.LIVEKIT_BACKEND_URL || 'https://square15-livekit-backend.onrender.com';
+          const payResp = await fetch(`${backendUrl}/api/payment/whatsapp-initiate`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              amount: balanceAmount.toFixed(2),
+              booking_id: bookingId,
+              item_name: `Balance Payment — Booking #${orderNo}`,
+            }),
+          });
+          const payResult = await payResp.json();
+          if (payResult.ok && payResult.payment_url) {
+            paymentNote = `\n\n💰 *Outstanding Balance: R${balanceAmount.toFixed(2)}*\nPay securely here: ${payResult.payment_url}`;
+          } else {
+            paymentNote = `\n\n💰 *Outstanding Balance: R${balanceAmount.toFixed(2)}*\nPlease pay via the Square 15 app or reply "pay balance" to get a payment link.`;
+          }
+        } catch (e) {
+          paymentNote = `\n\n💰 *Outstanding Balance: R${balanceAmount.toFixed(2)}*\nReply "pay balance" to get a payment link.`;
+        }
+      }
+
+      // Send completion message
+      let completionMsg = `✅ *Job completed!* Booking #${orderNo}.\n\n${name} has finished the work.`;
+      completionMsg += paymentNote;
+
+      await sendWhatsAppMessage(phone, completionMsg);
+
+      // Send before/after images if available
+      if (beforeUrl) {
+        await sendWhatsAppImage(phone, beforeUrl, `📸 *Before* — Booking #${orderNo}`);
+      }
+      if (afterUrl) {
+        await sendWhatsAppImage(phone, afterUrl, `📸 *After* — Booking #${orderNo}`);
+      }
+
+      // Proactive rating prompt with interactive buttons
+      try {
+        await sendWhatsAppInteractive(
+          phone,
+          '⭐ Rate Your Artisan',
+          `How was the service from ${name}? Your feedback helps maintain quality.`,
+          [
+            { id: `rate_${bookingId}_5`, title: '⭐⭐⭐⭐⭐ Excellent' },
+            { id: `rate_${bookingId}_4`, title: '⭐⭐⭐⭐ Good' },
+            { id: `rate_${bookingId}_3`, title: '⭐⭐⭐ Average' },
+          ]
+        );
+      } catch (e) {
+        // Fallback to text if interactive fails
+        await sendWhatsAppMessage(phone,
+          `⭐ *Please rate your experience* with ${name}.\n\nReply with a number from 1 to 5:\n1 ⭐ Poor\n2 ⭐⭐ Fair\n3 ⭐⭐⭐ Average\n4 ⭐⭐⭐⭐ Good\n5 ⭐⭐⭐⭐⭐ Excellent`
+        );
+      }
+    } else if (status === 'after_photo') {
+      // Send after photo to client
+      let msg = `📸 *After-work photo* — Booking #${orderNo}.\n\n${name} has documented the completed work.`;
+      if (imageUrl) {
+        await sendWhatsAppImage(phone, imageUrl, msg);
+      } else {
+        await sendWhatsAppMessage(phone, msg);
+      }
+    } else {
+      return res.status(400).json({ error: `Unknown status: ${status}` });
+    }
+
+    console.log(`[job-status-update] ${status} notification sent for booking ${bookingId}`);
+    res.json({ success: true, status, orderNo });
+  } catch (err) {
+    console.error('[job-status-update] error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -3872,33 +4406,4 @@ app.get('/terms', (req, res) => {
 app.listen(PORT, () => {
   console.log(`[whatsapp-bot] listening on :${PORT}`);
   initFirebase();
-
-  // One-time cleanup: remove stale service_prices from pricingGuidance documents.
-  // Keep labor_cost_per_hour, material_multiplier, outsourced_labor_rate (used by RFQ).
-  // Fixed pricing now comes solely from the tasks collection (admin-managed categories).
-  try {
-    const firestore = db();
-    if (firestore) {
-      const FieldValue = admin.firestore.FieldValue;
-      firestore.collection('pricingGuidance').get().then(snap => {
-        if (snap.empty) { console.log('[cleanup] pricingGuidance empty, nothing to clean'); return; }
-        const batch = firestore.batch();
-        let cleaned = 0;
-        snap.docs.forEach(doc => {
-          const d = doc.data();
-          if (d.service_prices || d.servicePrices) {
-            batch.update(doc.ref, {
-              service_prices: FieldValue.delete(),
-              servicePrices: FieldValue.delete(),
-            });
-            cleaned++;
-          }
-        });
-        if (cleaned === 0) { console.log('[cleanup] pricingGuidance service_prices already removed'); return; }
-        return batch.commit().then(() => {
-          console.log(`[cleanup] Removed service_prices from ${cleaned} pricingGuidance docs (labor rates preserved for RFQ)`);
-        });
-      }).catch(e => console.warn('[cleanup] pricingGuidance cleanup failed:', e.message));
-    }
-  } catch (e) { console.warn('[cleanup] error:', e.message); }
 });
