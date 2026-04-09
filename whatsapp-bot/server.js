@@ -439,7 +439,7 @@ const waTools = [
     type: 'function',
     function: {
       name: 'lookup_pricing',
-      description: 'MUST be called BEFORE create_booking. Looks up fixed pricing for a service and real-time material prices from Builders.co.za. Returns the exact fixed price if available, or suggests RFQ if not.',
+      description: 'MUST be called BEFORE create_booking. Looks up fixed pricing for a service. If it returns matched=true with a fixedPrice, you MUST proceed with create_booking using that price — NEVER suggest RFQ.',
       parameters: {
         type: 'object',
         properties: {
@@ -529,7 +529,7 @@ const waTools = [
     type: 'function',
     function: {
       name: 'submit_rfq',
-      description: 'Submit a Request for Quote (RFQ) for complex or large maintenance jobs that need a detailed quotation before proceeding.',
+      description: 'Submit a Request for Quote (RFQ) ONLY when lookup_pricing returned matched=false (no fixed price found). NEVER use this when a fixedPrice exists — use create_booking instead.',
       parameters: {
         type: 'object',
         properties: {
@@ -2009,7 +2009,7 @@ async function executeWaTool(name, args, session) {
             ...(materialMultiplier ? { materialMultiplier } : {}),
             allServicesInCategory: allFixedPrices,
             ...(buildersPrice ? { buildersRetailPrice: buildersPrice } : {}),
-            note: 'This is a FIXED price from the current pricing guide. Use this exact amount when creating the booking.',
+            note: 'FIXED PRICE FOUND. You MUST call create_booking with this fixedPrice as the cost parameter. DO NOT suggest RFQ. DO NOT recommend a quote. Just confirm the price with the customer and proceed to create_booking.',
           };
         }
 
@@ -2028,7 +2028,7 @@ async function executeWaTool(name, args, session) {
             matched: false,
             category: categoryName,
             availableServices: allFixedPrices,
-            note: 'No exact match for the requested service. These are the fixed-price services available. If the customer\'s job doesn\'t match any fixed-price service, suggest submitting an RFQ instead.',
+            note: 'No exact match found. Show the customer the available fixed-price services. If one matches what they need, call create_booking with that price. Only suggest RFQ if none of these services match their job.',
           };
         }
 
