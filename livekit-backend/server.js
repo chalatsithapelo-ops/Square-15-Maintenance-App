@@ -6036,38 +6036,60 @@ app.post('/api/payment/whatsapp-initiate', assistantLimiter, async (req, res) =>
 
 // ── Server-side PayFast Payment Initiation ──
 // Replaces client-side hardcoded merchant credentials
+// Supports: payment_method='eft' (default/Ozow), 'cc' (card-only)
+// Supports: subscription_type=2 for ad-hoc tokenization (save card for future use)
 app.post('/api/payment/initiate', authMiddleware, assistantLimiter, async (req, res) => {
   try {
     const merchantId = env('PAYFAST_MERCHANT_ID');
     const merchantKey = env('PAYFAST_MERCHANT_KEY');
     const payfastUrl = env('PAYFAST_URL') || 'https://www.payfast.co.za/eng/process';
+    const backendUrl = env('RENDER_EXTERNAL_URL') || 'https://square15-livekit-backend.onrender.com';
 
     if (!merchantId || !merchantKey) {
       return res.status(503).json({ error: 'Payment credentials not configured on server' });
     }
 
-    const { amount, item_name, return_url, cancel_url, notify_url, custom_str1 } = req.body;
+    const { amount, item_name, return_url, cancel_url, notify_url, custom_str1, payment_method, save_card } = req.body;
 
     if (!amount || !item_name) {
       return res.status(400).json({ error: 'Missing required fields: amount, item_name' });
     }
+
+    // Default return/cancel URLs point to our result page
+    const taskId = custom_str1 || '';
+    const defaultReturn = `${backendUrl}/api/payment/ozow-result?status=success&booking_id=${encodeURIComponent(taskId)}`;
+    const defaultCancel = `${backendUrl}/api/payment/ozow-result?status=cancel&booking_id=${encodeURIComponent(taskId)}`;
+    const defaultNotify = `${backendUrl}/api/payment/itn`;
 
     const paymentData = {
       merchant_id: merchantId,
       merchant_key: merchantKey,
       amount: String(amount),
       item_name: String(item_name),
-      ...(return_url ? { return_url } : {}),
-      ...(cancel_url ? { cancel_url } : {}),
-      ...(notify_url ? { notify_url } : {}),
+      return_url: return_url || defaultReturn,
+      cancel_url: cancel_url || defaultCancel,
+      notify_url: notify_url || defaultNotify,
       ...(custom_str1 ? { custom_str1 } : {}),
     };
+
+    // Force card-only checkout when payment_method is 'cc'
+    if (payment_method === 'cc') {
+      paymentData.payment_method = 'cc';
+    }
+
+    // Enable ad-hoc tokenization (save card) when requested
+    // PayFast will return a token in the ITN callback that can be used for future charges
+    if (save_card === true && payment_method === 'cc') {
+      paymentData.subscription_type = '2';
+    }
 
     // Build full payment URL with query params so WebView can load it directly
     const queryString = Object.entries(paymentData)
       .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
       .join('&');
     const fullPaymentUrl = `${payfastUrl}?${queryString}`;
+
+    console.log(`[payment] Initiated ${payment_method || 'eft'} payment, amount=R${amount}, save_card=${!!save_card}, task=${taskId}`);
 
     res.json({
       ok: true,
@@ -6078,6 +6100,164 @@ app.post('/api/payment/initiate', authMiddleware, assistantLimiter, async (req, 
   } catch (error) {
     console.error('❌ Payment initiation error:', error);
     res.status(500).json({ error: 'Payment initiation failed' });
+  }
+});
+
+// ── Charge Saved Card (ad-hoc tokenization) ──
+// Uses a previously saved PayFast token to charge a card without redirecting
+app.post('/api/payment/charge-token', authMiddleware, assistantLimiter, async (req, res) => {
+  try {
+    const merchantId = env('PAYFAST_MERCHANT_ID');
+    const merchantKey = env('PAYFAST_MERCHANT_KEY');
+    const passphrase = env('PAYFAST_PASSPHRASE') || merchantKey;
+
+    if (!merchantId || !merchantKey) {
+      return res.status(503).json({ error: 'Payment credentials not configured' });
+    }
+
+    const { token: rawToken, card_id, amount, item_name, custom_str1 } = req.body;
+    if (!amount || !item_name) {
+      return res.status(400).json({ error: 'Missing required: amount, item_name' });
+    }
+
+    // Resolve token: either directly provided or look up from card_id
+    let chargeToken = rawToken;
+    if (!chargeToken && card_id) {
+      const userId = req.user.uid;
+      const cardSnap = await admin.firestore()
+        .collection('users').doc(userId).collection('saved_cards').doc(card_id).get();
+      if (!cardSnap.exists || !cardSnap.data().is_active) {
+        return res.status(404).json({ error: 'Saved card not found or inactive' });
+      }
+      chargeToken = cardSnap.data().token;
+
+      // Update last_used_at
+      await cardSnap.ref.update({ last_used_at: new Date().toISOString() });
+    }
+
+    if (!chargeToken) {
+      return res.status(400).json({ error: 'Missing required: token or card_id' });
+    }
+
+    // PayFast ad-hoc tokenization charge API
+    const chargeData = {
+      'merchant-id': merchantId,
+      'version': 'v1',
+      'timestamp': new Date().toISOString().replace('T', ' ').slice(0, 19),
+      'amount': String(parseFloat(amount).toFixed(2) * 100), // amount in cents
+      'item_name': String(item_name),
+      ...(custom_str1 ? { custom_str1 } : {}),
+    };
+
+    // Generate signature
+    const pfParamString = Object.keys(chargeData)
+      .sort()
+      .map(key => `${key}=${encodeURIComponent(String(chargeData[key] || '')).replace(/%20/g, '+')}`)
+      .join('&');
+    const signature = crypto
+      .createHash('md5')
+      .update(pfParamString + `&passphrase=${encodeURIComponent(passphrase)}`)
+      .digest('hex');
+
+    // Call PayFast subscription/adhoc charge API
+    const chargeResponse = await fetch(`https://api.payfast.co.za/subscriptions/${chargeToken}/adhoc`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'merchant-id': merchantId,
+        'version': 'v1',
+        'timestamp': chargeData.timestamp,
+        'signature': signature,
+      },
+      body: JSON.stringify({
+        amount: parseInt(parseFloat(amount).toFixed(2) * 100), // cents
+        item_name: String(item_name),
+        ...(custom_str1 ? { custom_str1 } : {}),
+      }),
+      signal: AbortSignal.timeout(30000),
+    });
+
+    const result = await chargeResponse.json();
+
+    if (chargeResponse.ok && result.data) {
+      console.log(`💳 Token charge successful: R${amount}, task=${custom_str1 || 'N/A'}`);
+
+      // Update task payment status
+      if (custom_str1) {
+        const taskRef = admin.firestore().collection('tasksManagement').doc(custom_str1);
+        await taskRef.update({
+          payment_status: 'paid',
+          payment_verified: true,
+          payment_verified_at: new Date().toISOString(),
+          payment_verified_via: 'payfast_token_charge',
+          payment_method: 'saved_card',
+          updated_at: new Date().toISOString(),
+        });
+      }
+
+      res.json({ ok: true, message: 'Payment charged successfully', data: result.data });
+    } else {
+      console.error('❌ Token charge failed:', result);
+      res.status(400).json({ ok: false, error: result.message || 'Charge failed' });
+    }
+  } catch (error) {
+    console.error('❌ Token charge error:', error);
+    res.status(500).json({ error: 'Card charge failed' });
+  }
+});
+
+// ── Saved Cards Management ──
+// GET: List user's saved cards (masked)
+app.get('/api/payment/saved-cards', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.uid;
+    const cardsSnap = await admin.firestore()
+      .collection('users').doc(userId).collection('saved_cards')
+      .where('is_active', '==', true)
+      .orderBy('created_at', 'desc')
+      .get();
+
+    const cards = cardsSnap.docs.map(doc => {
+      const d = doc.data();
+      return {
+        id: d.id,
+        last4: d.last4 || '****',
+        card_type: d.card_type || 'card',
+        created_at: d.created_at,
+        last_used_at: d.last_used_at,
+      };
+      // Note: token is NEVER sent to the client — stays server-side only
+    });
+
+    res.json({ ok: true, cards });
+  } catch (error) {
+    console.error('❌ Saved cards fetch error:', error);
+    res.status(500).json({ error: 'Failed to fetch saved cards' });
+  }
+});
+
+// DELETE: Remove a saved card
+app.delete('/api/payment/saved-cards/:cardId', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.uid;
+    const { cardId } = req.params;
+
+    const cardRef = admin.firestore()
+      .collection('users').doc(userId).collection('saved_cards').doc(cardId);
+    const cardSnap = await cardRef.get();
+
+    if (!cardSnap.exists) {
+      return res.status(404).json({ error: 'Card not found' });
+    }
+
+    // Soft-delete: mark as inactive rather than deleting
+    await cardRef.update({ is_active: false, deleted_at: new Date().toISOString() });
+    console.log(`🗑️ Deactivated saved card ${cardId} for user ${userId}`);
+
+    res.json({ ok: true, message: 'Card removed' });
+  } catch (error) {
+    console.error('❌ Card deletion error:', error);
+    res.status(500).json({ error: 'Failed to remove card' });
   }
 });
 
@@ -6152,8 +6332,42 @@ app.post('/api/payment/itn', async (req, res) => {
     const amountGross = String(data.amount_gross || '0');
     const customStr1 = String(data.custom_str1 || ''); // tasksManagement ID
     const itemName = String(data.item_name || '');
+    const token = String(data.token || ''); // Card tokenization token (when subscription_type=2)
+    const billingDate = String(data.billing_date || '');
 
-    console.log(`✅ ITN verified: status=${paymentStatus}, pfId=${pfPaymentId}, amount=R${amountGross}, taskId=${customStr1}`);
+    console.log(`✅ ITN verified: status=${paymentStatus}, pfId=${pfPaymentId}, amount=R${amountGross}, taskId=${customStr1}${token ? ', token=***' : ''}`);
+
+    // 3a. Save card token if tokenization was used (subscription_type=2, ad-hoc)
+    if (token && paymentStatus === 'COMPLETE' && customStr1) {
+      try {
+        // Look up user_id from the task
+        const taskSnap = await admin.firestore().collection('tasksManagement').doc(customStr1).get();
+        const taskData = taskSnap.exists ? taskSnap.data() : {};
+        const userId = taskData.user_id || taskData.userId || '';
+
+        if (userId) {
+          // Extract card info from ITN data (PayFast provides these for card payments)
+          const cardLast4 = String(data.custom_str2 || '').slice(-4) || '****';
+          const cardType = String(data.payment_method_type || data.custom_str3 || 'card');
+
+          // Store token in user's saved_cards subcollection
+          const cardId = crypto.randomUUID();
+          await admin.firestore().collection('users').doc(userId).collection('saved_cards').doc(cardId).set({
+            id: cardId,
+            token: token,
+            last4: cardLast4,
+            card_type: cardType,
+            created_at: now,
+            last_used_at: now,
+            payfast_payment_id: pfPaymentId,
+            is_active: true,
+          });
+          console.log(`💳 Saved card token for user ${userId}, card ${cardId}`);
+        }
+      } catch (tokenErr) {
+        console.warn(`[ITN] Card token save failed: ${tokenErr.message}`);
+      }
+    }
 
     // 3. Update Firestore
     const now = new Date().toISOString();
