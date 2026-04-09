@@ -361,6 +361,8 @@ async function restoreSessionFromFirestore(session) {
     }
     // Restore linked account
     if (data.linkedUserId) session.linkedUserId = data.linkedUserId;
+    if (data.lastBookingId) session.lastBookingId = data.lastBookingId;
+    if (data.lastBookingCost) session.lastBookingCost = data.lastBookingCost;
     console.log(`[session] Restored ${session.phone} from Firestore (${session.messages.length} msgs)`);
   } catch (e) {
     console.warn('[session] Firestore restore failed:', e.message);
@@ -4107,6 +4109,8 @@ async function handleMessage(session, userMessage, imageDataUrl) {
       firestore.collection('wa_sessions').doc(session.phone).set({
         phone: session.phone,
         linkedUserId: session.linkedUserId || null,
+        lastBookingId: session.lastBookingId || null,
+        lastBookingCost: session.lastBookingCost || null,
         messages: session.messages.slice(-10),
         lastActivity: admin.firestore.FieldValue.serverTimestamp(),
       }).catch(() => {});
@@ -4314,13 +4318,28 @@ app.post('/api/artisan-accepted', async (req, res) => {
 
     const firestore = admin.firestore();
 
-    // Find booking in tasksManagement
-    const tmDoc = await firestore.collection('tasksManagement').doc(bookingId).get();
-    if (!tmDoc.exists) return res.status(404).json({ error: 'Booking not found' });
-    const tm = tmDoc.data();
+    // Find booking — try tasksManagement first, then futureBookings
+    let tmDoc = await firestore.collection('tasksManagement').doc(bookingId).get();
+    let tm = tmDoc.exists ? tmDoc.data() : null;
+    if (!tm) {
+      const fbDoc = await firestore.collection('futureBookings').doc(bookingId).get();
+      tm = fbDoc.exists ? fbDoc.data() : null;
+    }
+    if (!tm) return res.status(404).json({ error: 'Booking not found' });
+
+    // Update the main tasksManagement doc to mark as accepted (so payment check passes)
+    try {
+      await firestore.collection('tasksManagement').doc(bookingId).set({
+        accept: '1',
+        artisan_confirmed: 'yes',
+        status: 'pending_payment',
+        service_provider_name: artisanName || tm.service_provider_name || '',
+        updated_at: new Date().toISOString(),
+      }, { merge: true });
+    } catch (e) { console.warn('[artisan-accepted] main doc update failed:', e.message); }
 
     // Find customer phone
-    let phone = (tm.phone || tm.customer_phone || '').toString().trim();
+    let phone = (tm.phone || tm.customer_phone || tm.customerPhone || tm.contact || tm.user_phone || '').toString().trim();
     if (!phone && tm.user_id) {
       try {
         const userDoc = await firestore.collection('users').doc(tm.user_id).get();
