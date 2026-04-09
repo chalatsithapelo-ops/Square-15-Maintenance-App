@@ -7381,6 +7381,7 @@ app.post('/api/payment/itn', async (req, res) => {
       const taskSnap = await taskRef.get();
 
       if (taskSnap.exists) {
+        const taskData = taskSnap.data() || {};
         const updateData = {
           payfast_payment_id: pfPaymentId,
           payfast_itn_status: paymentStatus,
@@ -7390,10 +7391,31 @@ app.post('/api/payment/itn', async (req, res) => {
         };
 
         if (paymentStatus === 'COMPLETE') {
-          updateData.payment_status = 'paid';
           updateData.payment_verified = true;
           updateData.payment_verified_at = now;
           updateData.payment_verified_via = 'payfast_itn';
+
+          // Determine if this is a deposit or balance payment
+          const isDepositBooking = taskData.payment_type === 'deposit';
+          const depositAlreadyPaid = taskData.deposit_paid === true;
+          const balanceAlreadyPaid = taskData.balance_paid === true;
+
+          if (isDepositBooking && !depositAlreadyPaid) {
+            // First payment on a deposit booking → this is the deposit
+            updateData.deposit_paid = true;
+            updateData.deposit_paid_at = now;
+            updateData.payment_status = 'deposit_paid';
+            console.log(`📝 ITN: Deposit payment received for ${customStr1}`);
+          } else if (isDepositBooking && depositAlreadyPaid && !balanceAlreadyPaid) {
+            // Deposit already paid, this is the balance payment
+            updateData.balance_paid = true;
+            updateData.balance_paid_at = now;
+            updateData.payment_status = 'paid';
+            console.log(`📝 ITN: Balance payment received for ${customStr1}`);
+          } else {
+            // Full payment or non-deposit booking
+            updateData.payment_status = 'paid';
+          }
         } else if (paymentStatus === 'CANCELLED') {
           updateData.payment_status = 'cancelled';
         } else if (paymentStatus === 'FAILED') {
@@ -7405,24 +7427,40 @@ app.post('/api/payment/itn', async (req, res) => {
 
         // Also update futureBookings if this is a WA booking
         if (paymentStatus === 'COMPLETE') {
-          const taskData = taskSnap.data() || {};
           const source = (taskData.source || '').toString().toLowerCase();
           const futureBookingId = taskData.future_booking_id || '';
           // For WA bookings, customStr1 IS the main booking ID
           const fbId = futureBookingId || customStr1;
 
+          // Determine what was just paid for futureBookings update
+          const isBalancePayment = updateData.balance_paid === true;
+          const isDepositPayment = updateData.deposit_paid === true;
+
           try {
             const fbRef = admin.firestore().collection('futureBookings').doc(fbId);
             const fbSnap = await fbRef.get();
             if (fbSnap.exists) {
-              await fbRef.update({
-                payment_status: 'paid',
+              const fbUpdate = {
                 payment_method: 'payfast',
                 payment_paid_at: now,
-                status: 'accepted',
                 updated_at: now,
-              });
-              console.log(`📝 Updated futureBookings/${fbId}: payment_status=paid`);
+              };
+              if (isBalancePayment) {
+                fbUpdate.balance_paid = true;
+                fbUpdate.balance_paid_at = now;
+                fbUpdate.payment_status = 'paid';
+                fbUpdate.status = 'accepted';
+              } else if (isDepositPayment) {
+                fbUpdate.deposit_paid = true;
+                fbUpdate.deposit_paid_at = now;
+                fbUpdate.payment_status = 'deposit_paid';
+                fbUpdate.status = 'accepted';
+              } else {
+                fbUpdate.payment_status = 'paid';
+                fbUpdate.status = 'accepted';
+              }
+              await fbRef.update(fbUpdate);
+              console.log(`📝 Updated futureBookings/${fbId}: payment_status=${fbUpdate.payment_status}`);
             }
           } catch (fbErr) {
             console.warn(`[ITN] futureBookings update failed: ${fbErr.message}`);
@@ -7434,13 +7472,22 @@ app.post('/api/payment/itn', async (req, res) => {
             if (phone) {
               try {
                 const waBot = env('WHATSAPP_BOT_URL') || 'https://square15-whatsapp-bot.onrender.com';
+                let waMessage;
+                if (isBalancePayment) {
+                  waMessage = `💳 *Balance payment received!* R${amountGross} for booking #${taskData.order_no || fbId}.\n\n✅ Your booking is now fully paid. You can now rate your artisan.\n\nThank you for choosing Square 15! 🙏`;
+                } else if (isDepositPayment) {
+                  const balAmount = parseFloat(taskData.balance_amount || 0).toFixed(2);
+                  waMessage = `💳 *Deposit received!* R${amountGross} for booking #${taskData.order_no || fbId}.\n\n✅ Your booking is confirmed. The remaining balance of R${balAmount} will be due after job completion.\n\nYour artisan will contact you to arrange the visit. 🙏`;
+                } else {
+                  waMessage = `💳 *Payment received!* R${amountGross} for booking #${taskData.order_no || fbId}.\n\n✅ Your booking is confirmed. Your artisan will contact you to arrange the visit.\n\nThank you for choosing Square 15! 🙏`;
+                }
                 await fetch(`${waBot}/api/booking-status-update`, {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({
                     bookingId: fbId,
-                    status: 'payment_received',
-                    message: `💳 *Payment received!* R${amountGross} for your booking #${taskData.order_no || fbId}.\n\nYour booking is now confirmed. Your artisan will contact you to arrange the visit.\n\nThank you for choosing Square 15! 🙏`,
+                    status: isBalancePayment ? 'balance_received' : 'payment_received',
+                    message: waMessage,
                   }),
                   signal: AbortSignal.timeout(10000),
                 });
@@ -7460,7 +7507,6 @@ app.post('/api/payment/itn', async (req, res) => {
         .get();
 
       if (existingTx.empty) {
-        const taskData = taskSnap.exists ? taskSnap.data() : {};
         const txId = crypto.randomUUID();
         await txRef.doc(txId).set({
           id: txId,
@@ -7478,6 +7524,7 @@ app.post('/api/payment/itn', async (req, res) => {
           payfast_itn_status: paymentStatus,
           verified_via: 'payfast_itn',
           item_name: itemName,
+          payment_type: updateData.balance_paid ? 'balance' : updateData.deposit_paid ? 'deposit' : 'full',
         });
         console.log(`📝 Created transactionLog for ITN: ${txId}`);
       } else {

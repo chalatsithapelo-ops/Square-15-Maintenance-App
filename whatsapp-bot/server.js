@@ -4220,6 +4220,46 @@ app.post('/api/payment-confirmed', async (req, res) => {
   }
 });
 
+// ─── Webhook: Booking status update → generic notification endpoint ───
+// Called by backend ITN webhook to notify WhatsApp customer of payment status changes
+app.post('/api/booking-status-update', async (req, res) => {
+  try {
+    const { bookingId, status, message } = req.body || {};
+    if (!bookingId) return res.status(400).json({ error: 'bookingId required' });
+
+    const firestore = admin.firestore();
+
+    // Find booking to get customer phone
+    let tmDoc = await firestore.collection('tasksManagement').doc(bookingId).get();
+    if (!tmDoc.exists) tmDoc = await firestore.collection('futureBookings').doc(bookingId).get();
+    if (!tmDoc.exists) return res.status(404).json({ error: 'Booking not found' });
+
+    const tm = tmDoc.data();
+    let phone = (tm.customerPhone || tm.customer_phone || tm.phone || tm.contact || '').toString().trim();
+    if (!phone && tm.user_id) {
+      try {
+        const userDoc = await firestore.collection('users').doc(tm.user_id).get();
+        phone = (userDoc.data()?.phone || userDoc.data()?.phoneNumber || '').toString().trim();
+      } catch (_) {}
+    }
+
+    if (!phone) return res.status(404).json({ error: 'Customer phone not found' });
+
+    phone = phone.replace(/[^0-9]/g, '');
+    if (phone.startsWith('0')) phone = '27' + phone.slice(1);
+
+    if (message) {
+      await sendWhatsAppMessage(phone, message);
+    }
+
+    console.log(`[booking-status-update] ${status} notification sent for booking ${bookingId}`);
+    res.json({ success: true, status, bookingId });
+  } catch (err) {
+    console.error('[booking-status-update] error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ─── Webhook: Job status update → notify client via WhatsApp ───
 app.post('/api/job-status-update', async (req, res) => {
   try {
@@ -4302,7 +4342,8 @@ app.post('/api/job-status-update', async (req, res) => {
       // Generate payment link for outstanding balance
       let paymentNote = '';
       const isDeposit = tm.payment_type === 'deposit';
-      const balancePaid = (tm.balance_paid || '').toString().toLowerCase() === 'yes';
+      const balancePaidRaw = tm.balance_paid;
+      const balancePaid = balancePaidRaw === true || balancePaidRaw === 'true' || (balancePaidRaw || '').toString().toLowerCase() === 'yes';
       const balanceAmount = parseFloat(tm.balance_amount || 0);
 
       if (isDeposit && !balancePaid && balanceAmount > 0) {
@@ -4314,7 +4355,8 @@ app.post('/api/job-status-update', async (req, res) => {
             body: JSON.stringify({
               amount: balanceAmount.toFixed(2),
               booking_id: bookingId,
-              item_name: `Balance Payment — Booking #${orderNo}`,
+              description: `Balance Payment — Booking #${orderNo}`,
+              payment_method: 'cc',
             }),
           });
           const payResult = await payResp.json();
