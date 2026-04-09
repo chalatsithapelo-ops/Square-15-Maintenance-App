@@ -6261,6 +6261,337 @@ app.delete('/api/payment/saved-cards/:cardId', authMiddleware, async (req, res) 
   }
 });
 
+// ── Refund Processing ──
+// Processes refund for a paid booking. Supports two methods:
+//   method='wallet' → immediate wallet credit (no PayFast call)
+//   method='card'   → PayFast refund API call (takes 3-5 business days)
+// Anti-fraud: rate-limited, cooldown check, max refund limits, idempotent
+app.post('/api/payment/refund', authMiddleware, assistantLimiter, async (req, res) => {
+  try {
+    const userId = req.user.uid;
+    const { booking_id, doc_type, method, reason } = req.body;
+
+    if (!booking_id || !method) {
+      return res.status(400).json({ error: 'Missing required: booking_id, method' });
+    }
+    if (method !== 'wallet' && method !== 'card') {
+      return res.status(400).json({ error: 'Invalid method. Must be "wallet" or "card".' });
+    }
+
+    const now = new Date().toISOString();
+    const db = admin.firestore();
+
+    // ── Anti-fraud: rate limit – max 3 refunds per user per 24 hours ──
+    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const recentRefunds = await db.collection('transactionLogs')
+      .where('user_id', '==', userId)
+      .where('subtype', '==', 'refund')
+      .where('transaction_at', '>=', oneDayAgo)
+      .get();
+    if (recentRefunds.size >= 3) {
+      console.warn(`[refund] Rate limit hit: user ${userId} has ${recentRefunds.size} refunds in 24h`);
+      return res.status(429).json({ error: 'Too many refund requests. Please try again later or contact support.' });
+    }
+
+    // ── Look up the booking ──
+    const collectionName = doc_type === 'futureBookings' ? 'futureBookings' : 'tasksManagement';
+    const docRef = db.collection(collectionName).doc(booking_id);
+    const docSnap = await docRef.get();
+    if (!docSnap.exists) {
+      return res.status(404).json({ error: 'Booking not found' });
+    }
+
+    const data = docSnap.data();
+    const docUserId = data.user_id || data.userId || '';
+
+    // ── Security: verify the requesting user owns this booking ──
+    if (docUserId !== userId) {
+      console.warn(`[refund] User ${userId} attempted refund on booking owned by ${docUserId}`);
+      return res.status(403).json({ error: 'You are not authorized to refund this booking.' });
+    }
+
+    // ── Check booking is actually cancelled ──
+    const status = (data.status || '').toString().toLowerCase();
+    if (status !== 'cancelled') {
+      return res.status(400).json({ error: 'Booking must be cancelled before requesting a refund.' });
+    }
+
+    // ── Idempotency: check if already refunded ──
+    const refundStatus = (data.refund_status || '').toString().toLowerCase();
+    const walletRefunded = (data.wallet_refunded || '').toString().toLowerCase();
+    if (refundStatus === 'refunded' || walletRefunded === 'yes') {
+      return res.json({ ok: true, already_refunded: true, message: 'This booking has already been refunded.' });
+    }
+
+    // ── Anti-fraud: cooldown – booking must be at least 5 minutes old ──
+    const createdAt = data.created_at || data.createdAt || data.creation_date || '';
+    if (createdAt) {
+      const bookingAge = Date.now() - new Date(createdAt).getTime();
+      if (bookingAge < 5 * 60 * 1000) {
+        return res.status(400).json({ error: 'Please wait a few minutes before requesting a refund.' });
+      }
+    }
+
+    // ── Determine refund amount ──
+    let refundAmount = 0;
+    // Try original transaction first
+    const txSnap = await db.collection('transactionLogs')
+      .where('tasks_management_id', '==', booking_id)
+      .where('subtype', '==', 'service_payment')
+      .where('status', '==', 'success')
+      .limit(1)
+      .get();
+    if (!txSnap.empty) {
+      refundAmount = parseFloat(txSnap.docs[0].data().amount || '0');
+    }
+    if (refundAmount <= 0) {
+      refundAmount = parseFloat(data.cost || data.total_cost || data.payment_amount || data.wallet_deduct_amount || '0');
+    }
+    if (refundAmount <= 0) {
+      return res.status(400).json({ error: 'Could not determine refund amount.' });
+    }
+
+    // ── Anti-fraud: max single refund cap R50,000 ──
+    if (refundAmount > 50000) {
+      console.warn(`[refund] Suspiciously large refund R${refundAmount} for booking ${booking_id}`);
+      return res.status(400).json({ error: 'Refund amount exceeds limit. Please contact support.' });
+    }
+
+    const txId = crypto.randomUUID();
+
+    // ═══════════════════════════════════════════════════════════
+    // METHOD: WALLET (instant credit)
+    // ═══════════════════════════════════════════════════════════
+    if (method === 'wallet') {
+      // Atomic wallet refund via Firestore transaction
+      await db.runTransaction(async (tx) => {
+        const freshDoc = await tx.get(docRef);
+        const freshData = freshDoc.data() || {};
+        // Double-check idempotency inside transaction
+        if ((freshData.refund_status || '') === 'refunded' || (freshData.wallet_refunded || '') === 'yes') {
+          throw new Error('ALREADY_REFUNDED');
+        }
+
+        const userRef = db.collection('users').doc(userId);
+        const userSnap = await tx.get(userRef);
+        const userData = userSnap.data() || {};
+        const currentBalance = parseFloat(userData.balance || '0');
+        const newBalance = currentBalance + refundAmount;
+
+        tx.update(userRef, { balance: newBalance.toFixed(2) });
+        tx.update(docRef, {
+          wallet_refunded: 'yes',
+          wallet_refund_reason: reason || 'cancelled_by_customer',
+          wallet_refund_amount: refundAmount,
+          wallet_refunded_at: now,
+          wallet_refund_txn_id: txId,
+          refund_status: 'refunded',
+          refund_method: 'wallet',
+          updated_at: now,
+        });
+        tx.set(db.collection('transactionLogs').doc(txId), {
+          id: txId,
+          amount: refundAmount.toFixed(2),
+          transaction_at: now,
+          status: 'success',
+          tasks_management_id: booking_id,
+          user_id: userId,
+          type: 'wallet',
+          subtype: 'refund',
+          direction: 'in',
+          cash_movement: false,
+          schema_version: 2,
+          reason: reason || 'cancelled_by_customer',
+          balance_after: newBalance.toFixed(2),
+          previous_balance: currentBalance.toFixed(2),
+          refund_source: collectionName,
+        });
+      });
+
+      console.log(`💰 Wallet refund R${refundAmount.toFixed(2)} for user ${userId}, booking ${booking_id}`);
+      return res.json({
+        ok: true,
+        method: 'wallet',
+        amount: refundAmount.toFixed(2),
+        message: `R${refundAmount.toFixed(2)} refunded to your wallet instantly.`,
+      });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // METHOD: CARD (PayFast refund API)
+    // ═══════════════════════════════════════════════════════════
+    if (method === 'card') {
+      const merchantId = env('PAYFAST_MERCHANT_ID');
+      const merchantKey = env('PAYFAST_MERCHANT_KEY');
+      const passphrase = env('PAYFAST_PASSPHRASE') || merchantKey;
+
+      if (!merchantId || !merchantKey) {
+        return res.status(503).json({ error: 'Payment credentials not configured.' });
+      }
+
+      // Find the original PayFast payment ID
+      const pfPaymentId = data.payfast_payment_id || '';
+      if (!pfPaymentId) {
+        // No PayFast payment ID — fall back to creating a refund request for admin
+        await db.collection('refund_requests').doc(txId).set({
+          id: txId,
+          source_doc_id: booking_id,
+          source_doc_type: collectionName,
+          user_id: userId,
+          amount: refundAmount,
+          payment_method: data.payment_method || 'card',
+          reason: reason || 'cancelled_by_customer',
+          status: 'pending',
+          initiated_by: userId,
+          created_at: now,
+          updated_at: now,
+        });
+        await docRef.update({ refund_status: 'pending_admin_review', updated_at: now });
+
+        console.log(`📋 Card refund request (no pf_id) created for booking ${booking_id}`);
+        return res.json({
+          ok: true,
+          method: 'refund_request',
+          amount: refundAmount.toFixed(2),
+          message: `Card refund of R${refundAmount.toFixed(2)} submitted. It will be processed within 3-5 business days.`,
+        });
+      }
+
+      // Call PayFast refund API
+      try {
+        const timestamp = new Date().toISOString().replace('T', ' ').slice(0, 19);
+        const refundData = {
+          'merchant-id': merchantId,
+          'version': 'v1',
+          'timestamp': timestamp,
+          'amount': Math.round(refundAmount * 100), // cents
+        };
+
+        const pfParamString = Object.keys(refundData)
+          .sort()
+          .map(key => `${key}=${encodeURIComponent(String(refundData[key] || '')).replace(/%20/g, '+')}`)
+          .join('&');
+        const signature = crypto
+          .createHash('md5')
+          .update(pfParamString + `&passphrase=${encodeURIComponent(passphrase)}`)
+          .digest('hex');
+
+        const refundResponse = await fetch(`https://api.payfast.co.za/refunds/v1/transaction/${pfPaymentId}`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'merchant-id': merchantId,
+            'version': 'v1',
+            'timestamp': timestamp,
+            'signature': signature,
+          },
+          body: JSON.stringify({ amount: Math.round(refundAmount * 100) }),
+          signal: AbortSignal.timeout(30000),
+        });
+
+        const refundResult = await refundResponse.json();
+
+        if (refundResponse.ok && refundResult.status === 'success') {
+          // PayFast refund succeeded
+          await docRef.update({
+            refund_status: 'refunded',
+            refund_method: 'card',
+            refund_amount: refundAmount,
+            refunded_at: now,
+            refund_txn_id: txId,
+            payfast_refund_id: refundResult.refund_id || '',
+            updated_at: now,
+          });
+
+          await db.collection('transactionLogs').doc(txId).set({
+            id: txId,
+            amount: refundAmount.toFixed(2),
+            transaction_at: now,
+            status: 'success',
+            tasks_management_id: booking_id,
+            user_id: userId,
+            type: 'card_refund',
+            subtype: 'refund',
+            direction: 'in',
+            cash_movement: true,
+            schema_version: 2,
+            reason: reason || 'cancelled_by_customer',
+            refund_source: collectionName,
+            payfast_refund_id: refundResult.refund_id || '',
+            payfast_payment_id: pfPaymentId,
+          });
+
+          console.log(`💳 Card refund R${refundAmount.toFixed(2)} processed for booking ${booking_id}`);
+          return res.json({
+            ok: true,
+            method: 'card',
+            amount: refundAmount.toFixed(2),
+            message: `R${refundAmount.toFixed(2)} card refund initiated. It will reflect in 3-5 business days.`,
+          });
+        } else {
+          // PayFast refund API failed — fall back to admin review
+          console.error(`[refund] PayFast refund API failed:`, refundResult);
+          await db.collection('refund_requests').doc(txId).set({
+            id: txId,
+            source_doc_id: booking_id,
+            source_doc_type: collectionName,
+            user_id: userId,
+            amount: refundAmount,
+            payment_method: 'card',
+            reason: reason || 'cancelled_by_customer',
+            status: 'pending',
+            initiated_by: userId,
+            payfast_payment_id: pfPaymentId,
+            payfast_refund_error: JSON.stringify(refundResult).slice(0, 500),
+            created_at: now,
+            updated_at: now,
+          });
+          await docRef.update({ refund_status: 'pending_admin_review', updated_at: now });
+
+          return res.json({
+            ok: true,
+            method: 'refund_request',
+            amount: refundAmount.toFixed(2),
+            message: `Card refund of R${refundAmount.toFixed(2)} submitted for processing. It will be handled within 3-5 business days.`,
+          });
+        }
+      } catch (pfErr) {
+        console.error(`[refund] PayFast refund API error:`, pfErr);
+        // Fall back to admin review
+        await db.collection('refund_requests').doc(txId).set({
+          id: txId,
+          source_doc_id: booking_id,
+          source_doc_type: collectionName,
+          user_id: userId,
+          amount: refundAmount,
+          payment_method: 'card',
+          reason: reason || 'cancelled_by_customer',
+          status: 'pending',
+          initiated_by: userId,
+          payfast_payment_id: pfPaymentId,
+          payfast_refund_error: pfErr.message || 'API call failed',
+          created_at: now,
+          updated_at: now,
+        });
+        await docRef.update({ refund_status: 'pending_admin_review', updated_at: now });
+
+        return res.json({
+          ok: true,
+          method: 'refund_request',
+          amount: refundAmount.toFixed(2),
+          message: `Card refund of R${refundAmount.toFixed(2)} submitted for processing. It will be handled within 3-5 business days.`,
+        });
+      }
+    }
+  } catch (error) {
+    if (error.message === 'ALREADY_REFUNDED') {
+      return res.json({ ok: true, already_refunded: true, message: 'This booking has already been refunded.' });
+    }
+    console.error('❌ Refund error:', error);
+    res.status(500).json({ error: 'Refund processing failed. Please contact support.' });
+  }
+});
+
 // ── Payment Result Page (return URL after PayFast payment) ──
 // Shows a simple HTML page for WhatsApp customers after payment completes/cancels.
 // Also used by the Flutter WebView to detect payment result.
