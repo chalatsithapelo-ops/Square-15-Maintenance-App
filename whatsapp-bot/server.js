@@ -1697,14 +1697,33 @@ async function executeWaTool(name, args, session) {
             .where('status', '==', 'approved')
             .limit(50)
             .get();
+          if (artisanSnap.empty) {
+            artisanSnap = await firestore.collection('serviceProvider')
+              .where('status', '==', 'publish')
+              .limit(50)
+              .get();
+          }
+          if (artisanSnap.empty) {
+            artisanSnap = await firestore.collection('serviceProvider')
+              .where('status', '==', 'published')
+              .limit(50)
+              .get();
+          }
+          if (artisanSnap.empty) {
+            // Last resort: get all and filter in code
+            artisanSnap = await firestore.collection('serviceProvider')
+              .limit(50)
+              .get();
+          }
         } catch (qErr) {
+          console.warn('[wa-tool] artisan query error, trying unfiltered:', qErr.message);
           artisanSnap = await firestore.collection('serviceProvider')
-            .where('status', '==', 'publish')
             .limit(50)
             .get();
         }
+        console.log(`[wa-tool] Found ${artisanSnap.docs.length} artisans to dispatch to`);
 
-        const photoUrls = booking.work_images || [];
+        const photoUrls = futureBooking.work_images || [];
 
         for (const artDoc of artisanSnap.docs) {
           const ad = artDoc.data() || {};
@@ -1783,6 +1802,10 @@ async function executeWaTool(name, args, session) {
       session.lastBookingId = bookingId;
       session.lastBookingCost = finalCost;
 
+      const discountNote = promoApplied
+        ? `\n\n🎉 *Discount applied:* ${promoApplied.code} saved you R${promoApplied.discount.toFixed(2)}! (Original price: R${(finalCost + promoApplied.discount).toFixed(2)})`
+        : '';
+
       return {
         success: true,
         bookingId,
@@ -1791,8 +1814,9 @@ async function executeWaTool(name, args, session) {
         depositAmount: `R${depositAmount.toFixed(2)}`,
         balanceAmount: `R${balanceAmount.toFixed(2)}`,
         promoApplied: promoApplied ? `${promoApplied.code} (-R${promoApplied.discount.toFixed(2)})` : null,
+        artisansNotified: dispatchedCount,
         paymentStatus: 'awaiting_artisan',
-        message: `Booking ${orderNo} created! Estimated cost: R${finalCost.toFixed(2)}.\n\n⏳ *Next step:* An artisan needs to accept your job before payment. We're dispatching the nearest available artisan now — you'll be notified as soon as one accepts.\n\n🔒 *Your money is protected:* When it's time to pay, your payment is held in a secure escrow account. The artisan does NOT receive your money until you confirm you are satisfied with the completed work.\n\n💰 *Payment options (after artisan accepts):*\n• Full amount: R${finalCost.toFixed(2)}\n• Deposit (35%): R${depositAmount.toFixed(2)} now, R${balanceAmount.toFixed(2)} after job completion`,
+        message: `Booking ${orderNo} created! Estimated cost: R${finalCost.toFixed(2)}.${discountNote}\n\n⏳ *Next step:* An artisan needs to accept your job before payment. We're dispatching the nearest available artisan now — you'll be notified as soon as one accepts.\n\n🔒 *Your money is protected:* When it's time to pay, your payment is held in a secure escrow account. The artisan does NOT receive your money until you confirm you are satisfied with the completed work.\n\n💰 *Payment options (after artisan accepts):*\n• Full amount: R${finalCost.toFixed(2)}\n• Deposit (35%): R${depositAmount.toFixed(2)} now, R${balanceAmount.toFixed(2)} after job completion`,
       };
     }
 
