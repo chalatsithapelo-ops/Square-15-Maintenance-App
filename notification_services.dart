@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
@@ -9,6 +10,7 @@ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:get/get.dart';
 import 'package:maintenanceapp/controller/app_controller.dart';
 import 'package:maintenanceapp/providers/position_provider.dart';
+import 'package:maintenanceapp/screens/home/booking/future_bookings_list_screen.dart';
 import 'package:maintenanceapp/screens/service_provider_panel/Serviceprovider/notification_screen.dart';
 import 'package:maintenanceapp/utils/navigation.dart';
 import 'package:provider/provider.dart';
@@ -204,12 +206,12 @@ class NotificationService {
       sound: RawResourceAndroidNotificationSound('sound_small'),
     );
 
-    // 🔹 Order request channel (loud custom sound for artisan requests)
+    // 🔹 Order request channel (custom sound for artisan requests)
     const AndroidNotificationChannel orderRequestChannel = AndroidNotificationChannel(
       'order_request_channel',
       'Order Requests',
-      description: 'Loud notification sound for new order/booking requests.',
-      importance: Importance.max,
+      description: 'Notification sound for new order/booking requests.',
+      importance: Importance.high,
       playSound: true,
       enableVibration: true,
       sound: RawResourceAndroidNotificationSound('sound'),
@@ -242,11 +244,36 @@ class NotificationService {
 
     await flutterLocalNotificationsPlugin.initialize(initializationSettings, onDidReceiveNotificationResponse:
         (NotificationResponse notificationResponse) async {
-      navigateToPage(
-          context: context,
-          pageName: NotificationPageView(
-              type: Provider.of<PositionProvider>(context, listen: false)
-                  .notificationType));
+      // Try to parse the payload to determine where to navigate.
+      final payload = notificationResponse.payload ?? '';
+      Map<String, dynamic>? data;
+      try {
+        if (payload.startsWith('{')) {
+          data = jsonDecode(payload) as Map<String, dynamic>;
+        }
+      } catch (_) {}
+
+      final type = (data?['type'] ?? payload).toString();
+      const bookingTypes = {
+        'future_booking_payment_required',
+        'future_booking',
+        'booking_request',
+        'new_booking',
+        'order_request',
+        'Order Request',
+      };
+
+      if (bookingTypes.contains(type)) {
+        navigateToPage(
+            context: context,
+            pageName: const FutureBookingsListScreen());
+      } else {
+        navigateToPage(
+            context: context,
+            pageName: NotificationPageView(
+                type: Provider.of<PositionProvider>(context, listen: false)
+                    .notificationType));
+      }
     });
   }
 
@@ -301,12 +328,12 @@ class NotificationService {
       isOrderRequest ? 'order_request_channel' : 'high_importance_channel',
       isOrderRequest ? 'Order Requests' : 'High Importance Notifications',
       channelDescription: isOrderRequest
-          ? 'Loud notification sound for new order/booking requests.'
+          ? 'Notification sound for new order/booking requests.'
           : 'This channel is used for important notifications.',
       sound: RawResourceAndroidNotificationSound(
         isOrderRequest ? 'sound' : 'sound_small',
       ),
-      importance: Importance.max,
+      importance: Importance.high,
       priority: Priority.high,
       playSound: true,
       enableVibration: true,
@@ -329,7 +356,7 @@ class NotificationService {
       title,
       body,
       platformChannelSpecifics,
-      payload: notifType,
+      payload: message.data.isNotEmpty ? jsonEncode(message.data) : notifType,
     );
   }
 }

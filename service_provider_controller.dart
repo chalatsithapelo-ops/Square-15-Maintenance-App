@@ -17,6 +17,8 @@ import 'package:maintenanceapp/model/future_booking_model.dart';
 import 'package:maintenanceapp/services/firestore_services/firebase_services.dart';
 import 'package:maintenanceapp/services/future_booking_service.dart';
 import 'package:maintenanceapp/services/storage_services.dart';
+import 'package:maintenanceapp/services/ai_photo_diagnosis_service.dart';
+import 'package:maintenanceapp/screens/service_provider_panel/artisan_flag_issue_screen.dart';
 import 'package:maintenanceapp/utils/helper.dart';
 import 'package:maintenanceapp/utils/splash_timer.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -265,6 +267,9 @@ class ServiceProviderController extends GetxController {
         } else {
           stopMusic();
         }
+      }, onError: (e) {
+        isLoading.value = false;
+        debugPrint("requestQueryForProviders stream error: $e");
       });
     } catch (e) {
       isLoading.value = false;
@@ -294,7 +299,7 @@ class ServiceProviderController extends GetxController {
       final futureBookingId =
           (tmData['future_booking_id'] ?? '').toString().trim();
       final isFutureBookingBridge =
-          source == 'future_booking' && futureBookingId.isNotEmpty;
+          (source == 'future_booking' || source == 'whatsapp' || source == 'whatsapp_rfq') && futureBookingId.isNotEmpty;
 
       if (isFutureBookingBridge && accept == '1') {
         final fbSnap = await FutureBookingService.futureBookingsRef
@@ -342,16 +347,46 @@ class ServiceProviderController extends GetxController {
 
       if (isFutureBookingBridge) {
         if (accept == '1') {
-          await FutureBookingService.futureBookingsRef
+          // Read original booking to preserve RFQ flags for client visibility.
+          final fbSnap2 = await FutureBookingService.futureBookingsRef
               .doc(futureBookingId)
-              .update({
+              .get();
+          final fbData2 = fbSnap2.data() ?? <String, dynamic>{};
+
+          final Map<String, dynamic> fbPatch = {
             'artisan_confirmed': 'yes',
             // Once the artisan accepts, the next step is client payment.
             'status': 'pending_payment',
             'tasks_management_id': id,
             'service_provider_id': from,
             'updated_at': DateTime.now().toString(),
-          });
+          };
+
+          // Ensure RFQ-related flags stay on the booking for the client filter.
+          final existingIsRfq =
+              (fbData2['is_rfq'] ?? '').toString().trim().toLowerCase();
+          final existingOrderType =
+              (fbData2['order_type'] ?? '').toString().trim().toLowerCase();
+          final tmOrderType =
+              (tmData['order_type'] ?? '').toString().trim().toLowerCase();
+          if (existingIsRfq.isEmpty && (tmOrderType == 'rfq' || existingOrderType == 'rfq')) {
+            fbPatch['is_rfq'] = 'yes';
+          }
+          if (existingOrderType.isEmpty && tmOrderType == 'rfq') {
+            fbPatch['order_type'] = 'rfq';
+          }
+          // Backfill order_no from tasksManagement if booking has none.
+          final fbOrderNo =
+              (fbData2['order_no'] ?? '').toString().trim();
+          final tmOrderNo =
+              (tmData['order_no'] ?? '').toString().trim();
+          if (fbOrderNo.isEmpty && tmOrderNo.isNotEmpty) {
+            fbPatch['order_no'] = tmOrderNo;
+          }
+
+          await FutureBookingService.futureBookingsRef
+              .doc(futureBookingId)
+              .set(fbPatch, SetOptions(merge: true));
 
           // Deduct wallet immediately once the booking is confirmed.
           final paidViaWallet =
@@ -384,6 +419,14 @@ class ServiceProviderController extends GetxController {
               label: 'payment_required',
             );
           }
+
+          // ── Notify WhatsApp client if booking originated from WhatsApp ──
+          if (source == 'whatsapp' || source == 'whatsapp_rfq') {
+            fireAndForget(
+              _notifyWhatsAppClient(id, appController.userName.value),
+              label: 'wa_artisan_accepted',
+            );
+          }
         } else if (accept == '0') {
           final fbSnap = await FutureBookingService.futureBookingsRef
               .doc(futureBookingId)
@@ -413,6 +456,27 @@ class ServiceProviderController extends GetxController {
     } catch (e, st) {
       debugPrint("responseToRequest error: $e\n$st");
       rethrow;
+    }
+  }
+
+  /// Notify WhatsApp client via bot webhook when artisan accepts.
+  static Future<void> _notifyWhatsAppClient(
+      String bookingId, String artisanName) async {
+    try {
+      const botUrl =
+          'https://square15-whatsapp-bot.onrender.com/api/artisan-accepted';
+      final response = await post(
+        Uri.parse(botUrl),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'bookingId': bookingId,
+          'artisanName': artisanName,
+        }),
+      );
+      debugPrint(
+          '[wa-webhook] artisan-accepted response: ${response.statusCode}');
+    } catch (e) {
+      debugPrint('[wa-webhook] artisan-accepted error: $e');
     }
   }
 
@@ -591,7 +655,7 @@ class ServiceProviderController extends GetxController {
         'provider_id': appController.userId.value,
         'created_at': DateTime.now().toString(),
         'updated_at': "",
-        'account_type': "PayFast",
+        'account_type': "Ozow",
       }).then((_) {
         appController.serviceProviderRef
             .doc(appController.userId.value)
@@ -611,7 +675,7 @@ class ServiceProviderController extends GetxController {
         'merchantKey': key,
         'merchantId': id,
         'updated_at': DateTime.now().toString(),
-        'account_type': "PayFast",
+        'account_type': "Ozow",
       });
     } catch (e) {
       debugPrint("saveAccountInformation $e");
@@ -682,6 +746,31 @@ class ServiceProviderController extends GetxController {
           "after_work": link,
         });
 
+        // ── AI Quality Verification (compare before vs after photos) ──
+        try {
+          final beforeDoc = await FirebaseService.artisanTaskImages.doc(id).get();
+          final beforeUrl = (beforeDoc.data()?['before_work'] ?? '').toString();
+          if (beforeUrl.isNotEmpty) {
+            final tmSnap = await FirebaseService.tasksManagementRef.doc(tmId).get();
+            final taskDesc = (tmSnap.data()?['description'] ?? '').toString();
+            final verification = await AIPhotoDiagnosisService.instance
+                .verifyWorkQuality(
+                  beforeImageUrl: beforeUrl,
+                  afterImageUrl: link,
+                  jobDescription: taskDesc,
+                );
+            // Store quality result on the task
+            await FirebaseService.tasksManagementRef.doc(tmId).update({
+              'quality_score': verification.qualityScore,
+              'quality_recommendation': verification.recommendation,
+              'quality_verified_at': DateTime.now().toIso8601String(),
+            });
+            debugPrint('[quality] score=${verification.qualityScore} rec=${verification.recommendation}');
+          }
+        } catch (e) {
+          debugPrint('[quality] verification skipped: $e');
+        }
+
         // Notify client: artisan finished work
         FutureBookingService.sendNotificationToUser(
           userId: toId,
@@ -695,6 +784,23 @@ class ServiceProviderController extends GetxController {
         ).catchError((e) {
           debugPrint('After-work notification error: $e');
         });
+
+        // ── Notify WhatsApp client of job completion ──
+        try {
+          final tmSnap2 = await FirebaseService.tasksManagementRef.doc(tmId).get();
+          final src = (tmSnap2.data()?['source'] ?? '').toString().toLowerCase();
+          if (src == 'whatsapp' || src == 'whatsapp_rfq') {
+            post(
+              Uri.parse('https://square15-whatsapp-bot.onrender.com/api/job-status-update'),
+              headers: {'Content-Type': 'application/json'},
+              body: jsonEncode({
+                'bookingId': tmId,
+                'status': 'completed',
+                'artisanName': appController.userName.value,
+              }),
+            );
+          }
+        } catch (_) {}
 
         // Legacy notification fallback
         DocumentSnapshot dc = await FirebaseService.userRef.doc(toId).get();
@@ -728,6 +834,21 @@ class ServiceProviderController extends GetxController {
           await pushCustomNotification(
               notificationModel: notificationModel, message: message);
         }
+
+        // Offer artisan to flag additional issues for upselling
+        try {
+          // Fetch category info from the task management doc
+          final tmSnap = await FirebaseService.tasksManagementRef.doc(tmId).get();
+          final tmData = tmSnap.data() ?? <String, dynamic>{};
+          final categoryId = (tmData['category_id'] ?? '').toString().trim();
+          final categoryName = (tmData['category_name'] ?? '').toString().trim();
+          Get.to(() => ArtisanFlagIssueScreen(
+            taskManagementId: tmId,
+            clientUserId: toId,
+            categoryId: categoryId,
+            categoryName: categoryName,
+          ));
+        } catch (_) {}
       } else {
         await FirebaseService.artisanTaskImages.doc(id).set(imageData.toMap());
 
@@ -769,17 +890,21 @@ class ServiceProviderController extends GetxController {
           'accept': 'application/json',
           'Authorization': 'key=${Helper.fireBaseServerKey}',
         });
-    var data = jsonDecode(response.body);
-    if (response.statusCode == 200) {
-      if (data["success"] == 1) {
-        debugPrint("Notification send");
-      } else if (data["failure"] == 1) {
-        debugPrint("Notification Failed");
-        await FirebaseFirestore.instance
-            .collection('notifications')
-            .doc(id)
-            .delete();
+    try {
+      var data = jsonDecode(response.body);
+      if (response.statusCode == 200) {
+        if (data["success"] == 1) {
+          debugPrint("Notification send");
+        } else if (data["failure"] == 1) {
+          debugPrint("Notification Failed");
+          await FirebaseFirestore.instance
+              .collection('notifications')
+              .doc(id)
+              .delete();
+        }
       }
+    } on FormatException catch (e) {
+      debugPrint('FCM response parse error (non-JSON body): $e');
     }
   }
 

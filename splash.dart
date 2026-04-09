@@ -1,18 +1,18 @@
+import 'dart:async' as dart_async;
 import 'package:flutter/material.dart';
-import 'package:flutter/foundation.dart';
 import 'package:firebase_core/firebase_core.dart';
-import 'package:firebase_app_check/firebase_app_check.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:get/get.dart';
 import 'package:loading_animation_widget/loading_animation_widget.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:maintenanceapp/controller/app_controller.dart';
 import 'package:maintenanceapp/controller/service_provider_controller.dart';
+import 'package:maintenanceapp/services/booking_monitor_service.dart';
 import 'package:maintenanceapp/services/config_service.dart';
-import 'package:maintenanceapp/services/fcm_background_handler.dart';
 import 'package:maintenanceapp/services/future_booking_scheduler.dart';
 import 'package:maintenanceapp/services/notification_services.dart';
 import 'package:maintenanceapp/services/presence_service.dart';
+import 'package:maintenanceapp/screens/home/booking/future_bookings_list_screen.dart';
 
 import '../utils/splash_timer.dart';
 
@@ -28,9 +28,12 @@ class SplashScreen extends StatefulWidget {
 class _SplashScreenState extends State<SplashScreen> {
   String _versionLabel = '';
   bool _bootstrapped = false;
+  dart_async.StreamSubscription? _fcmSub;
 
   Future<void> _bootstrap() async {
     if (_bootstrapped) return;
+    // Firebase.initializeApp() is already called in main.dart (top-level)
+    // so we only guard against rare edge-cases here.
     try {
       await Firebase.initializeApp();
     } catch (_) {
@@ -66,25 +69,57 @@ class _SplashScreenState extends State<SplashScreen> {
     if (!Get.isRegistered<ServiceProviderController>()) {
       Get.put(ServiceProviderController());
     }
-
-    try {
-      FirebaseMessaging.onBackgroundMessage(
-        firebaseMessagingBackgroundHandler,
-      );
-    } catch (_) {
-      // ignore
+    if (!Get.isRegistered<BookingMonitorService>()) {
+      Get.put(BookingMonitorService());
     }
+
+    // NOTE: onBackgroundMessage is now registered in main.dart (top-level)
+    // per Firebase requirements for reliable Android background delivery.
 
     try {
       NotificationService.requestPermission();
       // Ensure local notification channel is created + foreground messages are surfaced.
       NotificationService.initializeNotification(context);
 
-      FirebaseMessaging.onMessage.listen((RemoteMessage message) {
+      _fcmSub = FirebaseMessaging.onMessage.listen((RemoteMessage message) {
         try {
           if (!mounted) return;
           if (message.notification == null) return;
           NotificationService.displayNotification(context, message: message);
+
+          // Show in-app dialog for booking-related notifications
+          final type = (message.data['type'] ?? '').toString();
+          if (type == 'future_booking_payment_required' ||
+              type == 'future_booking' ||
+              type == 'new_booking') {
+            final title = message.notification?.title ?? 'Booking Update';
+            final body = message.notification?.body ?? '';
+            showDialog(
+              context: context,
+              builder: (ctx) => AlertDialog(
+                title: Text(title),
+                content: Text(body),
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.pop(ctx),
+                    child: const Text('Later'),
+                  ),
+                  TextButton(
+                    onPressed: () {
+                      Navigator.pop(ctx);
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (_) => const FutureBookingsListScreen(),
+                        ),
+                      );
+                    },
+                    child: const Text('View Bookings'),
+                  ),
+                ],
+              ),
+            );
+          }
         } catch (_) {
           // ignore
         }
@@ -109,6 +144,12 @@ class _SplashScreenState extends State<SplashScreen> {
     }
 
     _bootstrapped = true;
+  }
+
+  @override
+  void dispose() {
+    _fcmSub?.cancel();
+    super.dispose();
   }
 
   Future<void> _loadVersion() async {

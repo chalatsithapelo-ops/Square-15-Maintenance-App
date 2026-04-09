@@ -1368,10 +1368,28 @@ async function executeWaTool(name, args, session) {
         };
         const subNorm = _normalize(subQuery);
 
+        // Score a match by specificity (higher = better)
+        const _matchScore = (qNorm, sNorm) => {
+          if (sNorm === qNorm) return 100;                                   // exact
+          if (sNorm.includes(qNorm)) return 90;                              // query is substring of task
+          if (qNorm.includes(sNorm)) return 85;                              // task is substring of query
+          const qW = qNorm.split(/\s+/).filter(w => w.length >= 3);
+          const sW = sNorm.split(/\s+/).filter(w => w.length >= 3);
+          // Count how many query words appear literally in the task name
+          const wordHits = qW.filter(w => sNorm.includes(w)).length + sW.filter(w => qNorm.includes(w)).length;
+          if (wordHits >= 2) return 70 + wordHits;                           // multiple word hits
+          if (wordHits === 1) return 60;                                     // single word hit
+          const qS = qW.map(_stem), sS = sW.map(_stem);
+          const stemHits = qS.filter(qs => sS.some(ss => qs === ss || qs.includes(ss) || ss.includes(qs))).length;
+          if (stemHits > 0) return 40 + stemHits;                            // stem match
+          return 20;                                                         // synonym-only match
+        };
+
         // SOLE SOURCE: tasks collection (admin-managed fixed prices)
         // pricingGuidance is NOT used (stale default data, deleted).
         if (subQuery) {
           const taskSnap = await firestore.collection('tasks').limit(200).get();
+          let bestMatch = null;
           for (const td of taskSnap.docs) {
             const d = td.data();
             const status = (d.status || '').toLowerCase();
@@ -1379,10 +1397,16 @@ async function executeWaTool(name, args, session) {
             const name = (d.name || d.title || d.task_name || '').toString();
             const cost = parseFloat(d.client_rate || d.cost || d.clientRate || d.price || d.amount || 0);
             if (name && cost > 0 && _fuzzyMatch(subNorm, _normalize(name))) {
-              estimatedCost = cost.toString();
-              pricingSource = 'fixed';
-              break;
+              const score = _matchScore(subNorm, _normalize(name));
+              if (!bestMatch || score > bestMatch.score) {
+                bestMatch = { name, cost, score };
+              }
             }
+          }
+          if (bestMatch) {
+            estimatedCost = bestMatch.cost.toString();
+            pricingSource = 'fixed';
+            console.log(`[create_booking] Best price match: "${bestMatch.name}" R${bestMatch.cost} (score=${bestMatch.score})`);
           }
         }
       } catch (e) {
@@ -1438,6 +1462,7 @@ async function executeWaTool(name, args, session) {
         image_urls: session.photoUrls.length ? session.photoUrls : [],
         imageUrls: session.photoUrls.length ? session.photoUrls : [],
         has_photos: session.photoUrls.length ? 'yes' : 'no',
+        creation_date: now,
         created_at: now,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
         updated_at: now,
@@ -1479,6 +1504,7 @@ async function executeWaTool(name, args, session) {
         image_urls: session.photoUrls.length ? session.photoUrls : [],
         imageUrls: session.photoUrls.length ? session.photoUrls : [],
         has_photos: session.photoUrls.length ? 'yes' : 'no',
+        creation_date: now,
         created_at: now,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
       };
@@ -1620,6 +1646,7 @@ async function executeWaTool(name, args, session) {
               image_urls: photoUrls,
               imageUrls: photoUrls,
               has_photos: photoUrls.length > 0 ? 'yes' : 'no',
+              creation_date: now,
               created_at: now,
               createdAt: admin.firestore.FieldValue.serverTimestamp(),
               updated_at: now,
@@ -1843,16 +1870,38 @@ async function executeWaTool(name, args, session) {
           }
         } catch (e) { console.warn('[wa-tool] tasks lookup failed:', e.message); }
 
-        // Try to match subcategory against tasks
+        // Score a match by specificity (higher = better)
+        const matchScore = (qNorm, sNorm) => {
+          if (sNorm === qNorm) return 100;
+          if (sNorm.includes(qNorm)) return 90;
+          if (qNorm.includes(sNorm)) return 85;
+          const qW = qNorm.split(/\s+/).filter(w => w.length >= 3);
+          const sW = sNorm.split(/\s+/).filter(w => w.length >= 3);
+          const wordHits = qW.filter(w => sNorm.includes(w)).length + sW.filter(w => qNorm.includes(w)).length;
+          if (wordHits >= 2) return 70 + wordHits;
+          if (wordHits === 1) return 60;
+          const qS = qW.map(stem), sS = sW.map(stem);
+          const stemHits = qS.filter(qs => sS.some(ss => qs === ss || qs.includes(ss) || ss.includes(qs))).length;
+          if (stemHits > 0) return 40 + stemHits;
+          return 20;
+        };
+
+        // Try to match subcategory against tasks — pick BEST match
         if (subQuery) {
+          let bestMatch = null;
           for (const t of taskResults) {
             const tNorm = normalize(t.name);
             if (fuzzyMatch(subNorm, tNorm)) {
-              matchedService = t.name;
-              matchedPrice = t.cost;
-              categoryName = t.category_name || categoryName;
-              break;
+              const score = matchScore(subNorm, tNorm);
+              if (!bestMatch || score > bestMatch.score) {
+                bestMatch = { ...t, score };
+              }
             }
+          }
+          if (bestMatch) {
+            matchedService = bestMatch.name;
+            matchedPrice = bestMatch.cost;
+            categoryName = bestMatch.category_name || categoryName;
           }
         }
 
