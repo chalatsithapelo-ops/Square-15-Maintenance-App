@@ -3545,11 +3545,21 @@ app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-wha
 
 // ─── Diagnostic: test Firebase read/write ───
 app.get('/debug/firebase-test', async (req, res) => {
-  const results = { firebase_init: false, read_ok: false, write_ok: false, delete_ok: false, sp_count: 0, tm_count: 0, wa_bookings: 0, errors: [] };
+  const results = { firebase_init: false, project_id: null, read_ok: false, write_ok: false, delete_ok: false, sp_count: 0, tm_count: 0, wa_bookings: 0, errors: [] };
   try {
     const firestore = db();
     if (!firestore) { results.errors.push('db() returned null — Firebase not initialized'); return res.json(results); }
     results.firebase_init = true;
+
+    // Report which Firebase project we're connected to
+    try {
+      const app = admin.app();
+      results.project_id = app.options.credential?.projectId || app.options.projectId || (app.options.credential?.certificate?.projectId) || 'unknown';
+      // Try to get from Firestore settings
+      if (results.project_id === 'unknown') {
+        results.project_id = firestore._settings?.projectId || firestore.projectId || 'unknown';
+      }
+    } catch (e) { results.errors.push('project_id lookup: ' + e.message); }
 
     // Test read
     try {
@@ -3562,7 +3572,13 @@ app.get('/debug/firebase-test', async (req, res) => {
     // Count WA bookings
     try {
       const allTm = await firestore.collection('tasksManagement').get();
-      results.wa_bookings = allTm.docs.filter(d => d.id.startsWith('WA-') || (d.data().source === 'whatsapp')).length;
+      const waBookings = allTm.docs.filter(d => d.id.startsWith('WA-') || (d.data().source === 'whatsapp'));
+      results.wa_bookings = waBookings.length;
+      // Show latest 3 WA bookings
+      results.wa_latest = waBookings.slice(-3).map(d => {
+        const dd = d.data();
+        return { id: d.id, order_no: dd.order_no, status: dd.status, cost: dd.cost, sp_id: dd.service_provider_id, created_at: dd.created_at, source: dd.source, category: dd.category_name };
+      });
     } catch (e) { results.errors.push('wa count failed: ' + e.message); }
 
     // Test write + delete
