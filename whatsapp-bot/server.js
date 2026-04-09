@@ -2627,6 +2627,49 @@ async function executeWaTool(name, args, session) {
     case 'submit_rfq': {
       if (!firestore) return { error: 'Database unavailable' };
 
+      // ── CODE-LEVEL GUARD: If a fixed price exists, auto-redirect to create_booking ──
+      // The AI model sometimes calls submit_rfq even when a fixed price exists.
+      // This catches that and creates a proper booking instead.
+      try {
+        const rfqDesc = (args.description || '').toLowerCase();
+        const rfqCat = (args.category || '').toLowerCase();
+        const rfqSearch = `${rfqCat} ${rfqDesc}`.trim();
+        if (rfqSearch) {
+          const taskSnap = await firestore.collection('tasks').limit(200).get();
+          let rfqBestService = null, rfqBestPrice = null, rfqBestScore = 0;
+          for (const td of taskSnap.docs) {
+            const d = td.data();
+            const tName = (d.name || d.title || '').toString();
+            const tCost = parseFloat(d.cost || d.price || d.amount || d.client_rate || d.clientRate || 0);
+            if (!tName || tCost <= 0) continue;
+            const tl = tName.toLowerCase(), sl = rfqSearch;
+            let sc = 0;
+            if (tl === sl) sc = 1000;
+            else if (tl.includes(sl) || sl.includes(tl)) sc = 100;
+            else {
+              const tw = sl.split(/\s+/).filter(w => w.length >= 3);
+              for (const w of tw) { if (tl.includes(w)) sc += 10; }
+            }
+            if (sc > rfqBestScore) { rfqBestScore = sc; rfqBestService = tName; rfqBestPrice = tCost; }
+          }
+          if (rfqBestService && rfqBestPrice > 0 && rfqBestScore >= 20) {
+            console.log(`[submit_rfq] REDIRECTING to create_booking — fixed price found: "${rfqBestService}" @ R${rfqBestPrice} (score ${rfqBestScore})`);
+            // Redirect: call create_booking logic inline
+            args.cost = rfqBestPrice;
+            args.subcategory = rfqBestService;
+            // Fall through to create_booking by re-dispatching
+            const redirectResult = await executeWaTool('create_booking', args, session);
+            return {
+              ...redirectResult,
+              _redirected: true,
+              _note: `Auto-converted from RFQ to booking because a fixed price of R${rfqBestPrice.toFixed(2)} exists for "${rfqBestService}".`,
+            };
+          }
+        }
+      } catch (guardErr) {
+        console.warn('[submit_rfq] Fixed-price guard check failed, proceeding with RFQ:', guardErr.message);
+      }
+
       const rfqId = `RFQ-${Date.now().toString(36).toUpperCase()}`;
       const rfqNo = `SQ15-RFQ-${rfqId}`;
       const now = new Date().toISOString();
