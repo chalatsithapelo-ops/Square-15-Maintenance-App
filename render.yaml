@@ -67,3 +67,29 @@ services:
         value: square15-voice-assistant
       - key: OPENAI_API_KEY
         sync: false
+
+  # 3) WhatsApp Bot webhook server
+  - type: web
+    name: square15-whatsapp-bot
+    env: node
+    rootDir: whatsapp-bot
+    plan: starter
+    buildCommand: npm install
+    startCommand: node server.js
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_VERSION
+        value: "20"
+      - key: WHATSAPP_VERIFY_TOKEN
+        sync: false
+      - key: WHATSAPP_ACCESS_TOKEN
+        sync: false
+      - key: WHATSAPP_PHONE_NUMBER_ID
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: FIREBASE_SERVICE_ACCOUNT_JSON
+        sync: false
