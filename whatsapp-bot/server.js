@@ -1558,10 +1558,13 @@ async function executeWaTool(name, args, session) {
         subcategory: args.subcategory || '',
         description: args.description || '',
         address: args.address || '',
+        provided_address: args.address || '',
         urgency: args.urgency || 'normal',
         name: args.customerName || '',
         customerName: args.customerName || '',
         customerPhone: session.phone,
+        customer_phone: session.phone,
+        phone: session.phone,
         contact: session.phone,
         user_id: session.linkedUserId || '',
         source: 'whatsapp',
@@ -1596,6 +1599,7 @@ async function executeWaTool(name, args, session) {
         subcategory: args.subcategory || '',
         description: args.description || '',
         address: args.address || '',
+        provided_address: args.address || '',
         urgency: args.urgency || 'normal',
         cost: finalCost.toFixed(2),
         deposit_amount: depositAmount.toFixed(2),
@@ -1612,6 +1616,10 @@ async function executeWaTool(name, args, session) {
         scheduled_date: args.scheduledDate || '',
         scheduled_time: args.scheduledTime || '',
         is_rfq: 'no',
+        work_images: photoUrls,
+        image_urls: photoUrls,
+        imageUrls: photoUrls,
+        has_photos: photoUrls.length > 0 ? 'yes' : 'no',
         promo_code: promoApplied ? promoApplied.code : null,
         promo_discount: promoApplied ? promoApplied.discount : 0,
         tasks_management_id: bookingId,
@@ -1745,10 +1753,13 @@ async function executeWaTool(name, args, session) {
             subcategory: args.subcategory || '',
             description: args.description || '',
             address: args.address || '',
+            provided_address: args.address || '',
             urgency: args.urgency || 'normal',
             name: args.customerName || '',
             customerName: args.customerName || '',
             customerPhone: session.phone,
+            customer_phone: session.phone,
+            phone: session.phone,
             contact: session.phone,
             user_id: session.linkedUserId || '',
             source: 'whatsapp',
@@ -1765,6 +1776,8 @@ async function executeWaTool(name, args, session) {
             balance_paid: false,
             payment_status: 'unpaid',
             work_images: photoUrls,
+            image_urls: photoUrls,
+            imageUrls: photoUrls,
             has_photos: photoUrls.length > 0 ? 'yes' : 'no',
             creation_date: now,
             created_at: now,
@@ -2382,7 +2395,27 @@ async function executeWaTool(name, args, session) {
       const d = doc.data();
 
       // Enforce artisan acceptance before payment
-      const artisanAccepted = d.accept === '1' || d.accept === 1 || d.artisan_confirmed === 'yes';
+      let artisanAccepted = d.accept === '1' || d.accept === 1 || d.artisan_confirmed === 'yes' || d.status === 'pending_payment';
+      // Also check futureBookings for artisan_confirmed (artisan updates futureBookings, not main tasksManagement doc)
+      if (!artisanAccepted) {
+        try {
+          const fbDoc = await firestore.collection('futureBookings').doc(bid).get();
+          if (fbDoc.exists) {
+            const fb = fbDoc.data();
+            artisanAccepted = fb.artisan_confirmed === 'yes' || fb.status === 'pending_payment';
+          }
+        } catch (_) {}
+      }
+      // Also check if any bridge record was accepted
+      if (!artisanAccepted) {
+        try {
+          const bridgeSnap = await firestore.collection('tasksManagement')
+            .where('future_booking_id', '==', bid)
+            .where('accept', '==', '1')
+            .limit(1).get();
+          artisanAccepted = !bridgeSnap.empty;
+        } catch (_) {}
+      }
       if (!artisanAccepted) {
         return { error: `An artisan hasn't accepted this job yet. You'll be notified when an artisan accepts, and then you can proceed to payment. Your booking ${d.order_no || bid} is in the queue.` };
       }
@@ -2529,7 +2562,27 @@ async function executeWaTool(name, args, session) {
       if (bookData.payment_status === 'paid') return { message: 'This booking is already paid!' };
 
       // Enforce artisan acceptance before payment
-      const artisanAccepted = bookData.accept === '1' || bookData.accept === 1 || bookData.artisan_confirmed === 'yes';
+      let artisanAccepted = bookData.accept === '1' || bookData.accept === 1 || bookData.artisan_confirmed === 'yes' || bookData.status === 'pending_payment';
+      // Also check futureBookings for artisan_confirmed
+      if (!artisanAccepted) {
+        try {
+          const fbDoc = await firestore.collection('futureBookings').doc(bid).get();
+          if (fbDoc.exists) {
+            const fb = fbDoc.data();
+            artisanAccepted = fb.artisan_confirmed === 'yes' || fb.status === 'pending_payment';
+          }
+        } catch (_) {}
+      }
+      // Also check if any bridge record was accepted
+      if (!artisanAccepted) {
+        try {
+          const bridgeSnap = await firestore.collection('tasksManagement')
+            .where('future_booking_id', '==', bid)
+            .where('accept', '==', '1')
+            .limit(1).get();
+          artisanAccepted = !bridgeSnap.empty;
+        } catch (_) {}
+      }
       if (!artisanAccepted) {
         return { error: `An artisan hasn't accepted this job yet. You'll be notified when an artisan accepts, and then you can proceed to payment.` };
       }
