@@ -5979,6 +5979,61 @@ app.post('/api/notifications/send', authMiddleware, assistantLimiter, async (req
   }
 });
 
+// ── WhatsApp Payment Link Generation (no Firebase auth required) ──
+// Called by WhatsApp bot to generate a payment link for customers who may not have the app.
+app.post('/api/payment/whatsapp-initiate', assistantLimiter, async (req, res) => {
+  try {
+    const merchantId = env('PAYFAST_MERCHANT_ID');
+    const merchantKey = env('PAYFAST_MERCHANT_KEY');
+    const payfastUrl = env('PAYFAST_URL') || 'https://www.payfast.co.za/eng/process';
+    const backendUrl = env('RENDER_EXTERNAL_URL') || 'https://square15-livekit-backend.onrender.com';
+
+    if (!merchantId || !merchantKey) {
+      return res.status(503).json({ error: 'Payment credentials not configured' });
+    }
+
+    const { amount, booking_id, customer_name, customer_phone, description } = req.body;
+    if (!amount || !booking_id) {
+      return res.status(400).json({ error: 'Missing required: amount, booking_id' });
+    }
+
+    const itemName = description || `Square 15 Booking ${booking_id}`;
+    const returnUrl = `${backendUrl}/api/payment/ozow-result?status=success&booking_id=${encodeURIComponent(booking_id)}`;
+    const cancelUrl = `${backendUrl}/api/payment/ozow-result?status=cancel&booking_id=${encodeURIComponent(booking_id)}`;
+    const notifyUrl = `${backendUrl}/api/payment/itn`;
+
+    const paymentData = {
+      merchant_id: merchantId,
+      merchant_key: merchantKey,
+      amount: String(parseFloat(amount).toFixed(2)),
+      item_name: itemName,
+      return_url: returnUrl,
+      cancel_url: cancelUrl,
+      notify_url: notifyUrl,
+      custom_str1: booking_id,
+      ...(customer_name ? { name_first: customer_name } : {}),
+      ...(customer_phone ? { cell_number: customer_phone } : {}),
+    };
+
+    const queryString = Object.entries(paymentData)
+      .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+      .join('&');
+    const fullPaymentUrl = `${payfastUrl}?${queryString}`;
+
+    console.log(`[wa-payment] Generated payment link for booking ${booking_id}, R${amount}`);
+
+    res.json({
+      ok: true,
+      payment_url: fullPaymentUrl,
+      booking_id,
+      amount: parseFloat(amount).toFixed(2),
+    });
+  } catch (error) {
+    console.error('❌ WhatsApp payment link error:', error);
+    res.status(500).json({ error: 'Payment link generation failed' });
+  }
+});
+
 // ── Server-side PayFast Payment Initiation ──
 // Replaces client-side hardcoded merchant credentials
 app.post('/api/payment/initiate', authMiddleware, assistantLimiter, async (req, res) => {
@@ -6008,8 +6063,15 @@ app.post('/api/payment/initiate', authMiddleware, assistantLimiter, async (req, 
       ...(custom_str1 ? { custom_str1 } : {}),
     };
 
+    // Build full payment URL with query params so WebView can load it directly
+    const queryString = Object.entries(paymentData)
+      .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+      .join('&');
+    const fullPaymentUrl = `${payfastUrl}?${queryString}`;
+
     res.json({
       ok: true,
+      payment_url: fullPaymentUrl,
       payfast_url: payfastUrl,
       payment_data: paymentData,
     });
@@ -6017,6 +6079,33 @@ app.post('/api/payment/initiate', authMiddleware, assistantLimiter, async (req, 
     console.error('❌ Payment initiation error:', error);
     res.status(500).json({ error: 'Payment initiation failed' });
   }
+});
+
+// ── Payment Result Page (return URL after PayFast payment) ──
+// Shows a simple HTML page for WhatsApp customers after payment completes/cancels.
+// Also used by the Flutter WebView to detect payment result.
+app.get('/api/payment/ozow-result', (req, res) => {
+  const { status, booking_id } = req.query;
+  const isSuccess = status === 'success';
+  const title = isSuccess ? 'Payment Successful!' : 'Payment Cancelled';
+  const emoji = isSuccess ? '✅' : '❌';
+  const message = isSuccess
+    ? `Your payment for booking ${booking_id || ''} has been received. You will receive a confirmation on WhatsApp shortly.`
+    : `Your payment was cancelled. You can try again from WhatsApp or the Square 15 app.`;
+  const color = isSuccess ? '#22c55e' : '#ef4444';
+
+  res.type('html').send(`<!DOCTYPE html><html><head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${title}</title>
+<style>body{font-family:-apple-system,sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;background:#f8f9fa;padding:20px}
+.card{background:white;border-radius:16px;padding:40px;text-align:center;max-width:400px;box-shadow:0 4px 20px rgba(0,0,0,.1)}
+h1{color:${color};margin:0 0 16px}p{color:#555;line-height:1.6;margin:0}</style>
+</head><body><div class="card">
+<div style="font-size:64px">${emoji}</div>
+<h1>${title}</h1>
+<p>${message}</p>
+<p style="margin-top:20px;color:#999;font-size:14px">You can close this page.</p>
+</div></body></html>`);
 });
 
 // ── PayFast ITN (Instant Transaction Notification) Webhook ──
@@ -6096,6 +6185,54 @@ app.post('/api/payment/itn', async (req, res) => {
 
         await taskRef.update(updateData);
         console.log(`📝 Updated tasksManagement/${customStr1}: payment_status=${updateData.payment_status || paymentStatus}`);
+
+        // Also update futureBookings if this is a WA booking
+        if (paymentStatus === 'COMPLETE') {
+          const taskData = taskSnap.data() || {};
+          const source = (taskData.source || '').toString().toLowerCase();
+          const futureBookingId = taskData.future_booking_id || '';
+          // For WA bookings, customStr1 IS the main booking ID
+          const fbId = futureBookingId || customStr1;
+
+          try {
+            const fbRef = admin.firestore().collection('futureBookings').doc(fbId);
+            const fbSnap = await fbRef.get();
+            if (fbSnap.exists) {
+              await fbRef.update({
+                payment_status: 'paid',
+                payment_method: 'payfast',
+                payment_paid_at: now,
+                status: 'accepted',
+                updated_at: now,
+              });
+              console.log(`📝 Updated futureBookings/${fbId}: payment_status=paid`);
+            }
+          } catch (fbErr) {
+            console.warn(`[ITN] futureBookings update failed: ${fbErr.message}`);
+          }
+
+          // Notify WhatsApp customer if booking originated from WhatsApp
+          if (source === 'whatsapp' || source === 'whatsapp_rfq') {
+            const phone = taskData.customerPhone || taskData.contact || '';
+            if (phone) {
+              try {
+                const waBot = env('WHATSAPP_BOT_URL') || 'https://square15-whatsapp-bot.onrender.com';
+                await fetch(`${waBot}/api/booking-status-update`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    bookingId: fbId,
+                    status: 'payment_received',
+                    message: `💳 *Payment received!* R${amountGross} for your booking #${taskData.order_no || fbId}.\n\nYour booking is now confirmed. Your artisan will contact you to arrange the visit.\n\nThank you for choosing Square 15! 🙏`,
+                  }),
+                  signal: AbortSignal.timeout(10000),
+                });
+              } catch (waErr) {
+                console.warn(`[ITN] WhatsApp notification failed: ${waErr.message}`);
+              }
+            }
+          }
+        }
       }
 
       // Create/update transaction log

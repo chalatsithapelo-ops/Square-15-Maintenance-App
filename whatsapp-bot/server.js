@@ -1997,15 +1997,15 @@ async function executeWaTool(name, args, session) {
     }
 
     // ═══════════════════════════════════════════
-    // 7) REQUEST PAYMENT LINK (Ozow)
+    // 7) REQUEST PAYMENT LINK (generates real payment URL via backend)
     // ═══════════════════════════════════════════
     case 'request_payment_link': {
       if (!firestore) return { error: 'Database unavailable' };
-      const bid = args.bookingId;
+      const bid = args.bookingId || session.lastBookingId;
       if (!bid) return { error: 'Please provide a booking ID.' };
 
-      let doc = await firestore.collection('tasksManagement').doc(bid).get();
-      if (!doc.exists) doc = await firestore.collection('futureBookings').doc(bid).get();
+      let doc = await firestore.collection('futureBookings').doc(bid).get();
+      if (!doc.exists) doc = await firestore.collection('tasksManagement').doc(bid).get();
       if (!doc.exists) return { error: `Booking "${bid}" not found.` };
 
       const d = doc.data();
@@ -2016,35 +2016,54 @@ async function executeWaTool(name, args, session) {
         return { message: 'This booking is already paid!', bookingId: bid };
       }
 
-      // Generate a payment reference and store it
-      const payRef = `PAY-${bid}-${Date.now().toString(36)}`;
-      await firestore.collection('payment_links').doc(payRef).set({
-        booking_id: bid,
-        amount: cost,
-        phone: session.phone,
-        user_id: session.linkedUserId || '',
-        status: 'pending',
-        source: 'whatsapp',
-        created_at: admin.firestore.FieldValue.serverTimestamp(),
-      });
+      // Generate real payment link via backend
+      let paymentUrl = '';
+      try {
+        const backendUrl = process.env.LIVEKIT_BACKEND_URL || 'https://square15-livekit-backend.onrender.com';
+        const resp = await fetch(`${backendUrl}/api/payment/whatsapp-initiate`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            amount: cost.toFixed(2),
+            booking_id: bid,
+            customer_name: d.customerName || d.name || '',
+            customer_phone: session.phone,
+            description: d.description || d.subcategory || d.category_name || `Booking ${bid}`,
+          }),
+          signal: AbortSignal.timeout(15000),
+        });
+        const result = await resp.json();
+        if (result.ok && result.payment_url) {
+          paymentUrl = result.payment_url;
+        }
+      } catch (e) {
+        console.warn('[wa-tool] payment link generation failed:', e.message);
+      }
 
-      // Notify admin about pending payment
-      await firestore.collection('notifications').add({
-        title: 'WhatsApp Payment Request',
-        body: `Customer requests payment link for booking ${bid} (R${cost.toFixed(2)})`,
-        type: 'payment_request',
-        user_type: 'admin',
-        booking_id: bid,
-        read: false,
-        created_at: admin.firestore.FieldValue.serverTimestamp(),
-      });
-
-      return {
-        message: `Payment request for R${cost.toFixed(2)} has been submitted for booking ${bid}. Our admin will share a secure payment link with you shortly. You can also pay via the Square 15 app.`,
-        amount: `R${cost.toFixed(2)}`,
-        reference: payRef,
-        bookingId: bid,
-      };
+      if (paymentUrl) {
+        return {
+          message: `Here is your secure payment link for R${cost.toFixed(2)}:\n\n${paymentUrl}\n\nClick the link above to pay securely. Your payment is protected and held in escrow until you confirm satisfaction with the work.`,
+          amount: `R${cost.toFixed(2)}`,
+          payment_url: paymentUrl,
+          bookingId: bid,
+        };
+      } else {
+        // Fallback: notify admin to send payment link manually
+        await firestore.collection('notifications').add({
+          title: 'WhatsApp Payment Request',
+          body: `Customer requests payment link for booking ${bid} (R${cost.toFixed(2)})`,
+          type: 'payment_request',
+          user_type: 'admin',
+          booking_id: bid,
+          read: false,
+          created_at: admin.firestore.FieldValue.serverTimestamp(),
+        });
+        return {
+          message: `We're preparing your payment link for R${cost.toFixed(2)}. Our team will send it to you shortly. You can also pay via the Square 15 app.`,
+          amount: `R${cost.toFixed(2)}`,
+          bookingId: bid,
+        };
+      }
     }
 
     // ═══════════════════════════════════════════
@@ -3700,7 +3719,31 @@ app.post('/api/artisan-accepted', async (req, res) => {
     let to = customerPhone.replace(/[^0-9]/g, '');
     if (to.startsWith('0')) to = '27' + to.slice(1);
 
-    // Send artisan acceptance message
+    // Generate payment link for WhatsApp customer
+    let paymentUrl = '';
+    if (bookingCost && parseFloat(bookingCost) > 0) {
+      try {
+        const backendUrl = process.env.LIVEKIT_BACKEND_URL || 'https://square15-livekit-backend.onrender.com';
+        const resp = await fetch(`${backendUrl}/api/payment/whatsapp-initiate`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            amount: parseFloat(bookingCost).toFixed(2),
+            booking_id: mainBookingId,
+            customer_name: artisanName ? '' : '',
+            customer_phone: to,
+            description: bookingDescription || `Booking ${mainBookingId}`,
+          }),
+          signal: AbortSignal.timeout(15000),
+        });
+        const result = await resp.json();
+        if (result.ok && result.payment_url) paymentUrl = result.payment_url;
+      } catch (e) {
+        console.warn('[api/artisan-accepted] payment link generation failed:', e.message);
+      }
+    }
+
+    // Send artisan acceptance message with payment link
     const name = artisanName || 'Your artisan';
     const costStr = bookingCost ? `R${parseFloat(bookingCost).toFixed(2)}` : '';
     const descStr = bookingDescription || 'your maintenance request';
@@ -3711,13 +3754,22 @@ app.post('/api/artisan-accepted', async (req, res) => {
     msg += `📋 *Job:* ${descStr}\n`;
     if (costStr) msg += `💰 *Cost:* ${costStr}\n`;
     msg += `\n${name} will contact you to confirm the schedule and arrive at your location.\n`;
-    msg += `\n💳 *Payment:* Please make payment via the Square 15 app or contact us to arrange payment. Your funds are held in escrow until you confirm satisfaction with the work.\n`;
-    msg += `\nIf you have any questions, just reply here! 😊`;
+
+    // Payment section with link
+    msg += `\n💳 *Payment Options:*\n`;
+    if (paymentUrl) {
+      msg += `1️⃣ *Pay now securely:* ${paymentUrl}\n`;
+      msg += `2️⃣ Pay via the Square 15 app\n`;
+    } else {
+      msg += `Pay via the Square 15 app or reply "pay" to get a payment link.\n`;
+    }
+    msg += `\n🔒 Your payment is held in escrow until you confirm satisfaction with the completed work.\n`;
+    msg += `\nReply anytime if you have questions! 😊`;
 
     await sendWhatsAppMessage(to, msg);
     console.log(`[api/artisan-accepted] Sent acceptance notification to ${to} for booking ${mainBookingId}`);
 
-    res.json({ success: true, to, bookingId: mainBookingId });
+    res.json({ success: true, to, bookingId: mainBookingId, hasPaymentLink: !!paymentUrl });
   } catch (err) {
     console.error('[api/artisan-accepted] error:', err.message);
     res.status(500).json({ error: err.message });
