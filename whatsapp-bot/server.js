@@ -396,20 +396,21 @@ const waTools = [
     type: 'function',
     function: {
       name: 'create_booking',
-      description: 'Create a new maintenance booking. Collect category, description, address, urgency, and customer name before calling.',
+      description: 'Create a new maintenance booking. You MUST call lookup_pricing first and pass the returned fixedPrice as the cost parameter. Collect category, description, address, urgency, and customer name before calling.',
       parameters: {
         type: 'object',
         properties: {
           category:     { type: 'string', description: 'Service category (e.g. plumbing, electrical)' },
-          subcategory:  { type: 'string', description: 'Specific service needed' },
+          subcategory:  { type: 'string', description: 'Specific service needed (e.g. toilet unblocking)' },
           description:  { type: 'string', description: 'Detailed description of the issue' },
           address:      { type: 'string', description: 'Service address' },
           urgency:      { type: 'string', enum: ['normal', 'urgent', 'emergency'] },
           customerName: { type: 'string', description: 'Customer full name' },
           scheduledDate:{ type: 'string', description: 'Preferred date (YYYY-MM-DD) if customer specifies' },
           scheduledTime:{ type: 'string', description: 'Preferred time (HH:MM) if customer specifies' },
+          cost:         { type: 'number', description: 'The exact fixedPrice returned by lookup_pricing. MUST be provided — do NOT omit this.' },
         },
-        required: ['category', 'description', 'customerName'],
+        required: ['category', 'description', 'customerName', 'cost'],
       },
     },
   },
@@ -1433,6 +1434,13 @@ async function executeWaTool(name, args, session) {
       // Look up pricing estimate from pricingGuidance service_prices map and tasks collection
       let estimatedCost = '0';
       let pricingSource = 'none';
+
+      // If cost was passed from lookup_pricing, use it directly (most reliable)
+      if (args.cost && parseFloat(args.cost) > 0) {
+        estimatedCost = parseFloat(args.cost).toString();
+        pricingSource = 'fixed';
+        console.log(`[create_booking] Using cost from lookup_pricing: R${estimatedCost}`);
+      } else {
       try {
         const catSlug = (args.category || '').toLowerCase().replace(/\s+/g, '_');
         const subQuery = (args.subcategory || args.description || '').toLowerCase();
@@ -1480,6 +1488,7 @@ async function executeWaTool(name, args, session) {
       } catch (e) {
         console.error('[create_booking] Pricing lookup error:', e.message);
       }
+      } // end else (no args.cost)
 
       // If no pricing found at all, don't default to R500 — flag it
       if (estimatedCost === '0' || pricingSource === 'none') {
@@ -1693,40 +1702,97 @@ async function executeWaTool(name, args, session) {
         });
       } catch (e) { console.warn('[wa-tool] booking notification failed:', e.message); }
 
-      // ── Notify available artisans via FCM push ──
+      // ── Dispatch: create tasksManagement bridge per artisan + FCM push ──
+      let dispatchedCount = 0;
       try {
         const catSlug = (args.category || '').toLowerCase().replace(/\s+/g, '_');
-        const artisanSnap = await firestore.collection('serviceProvider')
-          .where('status', '==', 'approved')
-          .where('is_suspended', '!=', true)
-          .limit(20)
-          .get();
+        let artisanSnap;
+        try {
+          artisanSnap = await firestore.collection('serviceProvider')
+            .where('status', '==', 'approved')
+            .limit(50)
+            .get();
+        } catch (qErr) {
+          artisanSnap = await firestore.collection('serviceProvider')
+            .where('status', '==', 'publish')
+            .limit(50)
+            .get();
+        }
+
+        const photoUrls = booking.work_images || [];
+
         for (const artDoc of artisanSnap.docs) {
           const ad = artDoc.data() || {};
-          // Check if artisan serves this category
+          if (ad.is_suspended === true) continue;
           const cats = (ad.categories || ad.category || '').toString().toLowerCase();
           if (cats && !cats.includes(catSlug) && catSlug !== 'general_maintenance') continue;
+
+          const artisanId = artDoc.id;
+          const bridgeId = `${bookingId}_${artisanId}`;
+
+          // Create bridge record — artisan app queries tasksManagement WHERE service_provider_id == artisanId
+          await firestore.collection('tasksManagement').doc(bridgeId).set({
+            id: bridgeId,
+            bookingId: bridgeId,
+            order_no: orderNo,
+            future_booking_id: bookingId,
+            category_name: args.category || '',
+            category: args.category || '',
+            subcategory: args.subcategory || '',
+            description: args.description || '',
+            address: args.address || '',
+            urgency: args.urgency || 'normal',
+            name: args.customerName || '',
+            customerName: args.customerName || '',
+            customerPhone: session.phone,
+            contact: session.phone,
+            user_id: session.linkedUserId || '',
+            source: 'whatsapp',
+            status: 'pending',
+            accept: '',
+            artisan_confirmed: 'pending',
+            service_provider_id: artisanId,
+            service_provider_name: ad.name || ad.fullName || ad.full_name || '',
+            cost: finalCost.toFixed(2),
+            deposit_amount: depositAmount.toFixed(2),
+            balance_amount: balanceAmount.toFixed(2),
+            payment_type: '',
+            deposit_paid: false,
+            balance_paid: false,
+            payment_status: 'unpaid',
+            work_images: photoUrls,
+            has_photos: photoUrls.length > 0 ? 'yes' : 'no',
+            creation_date: now,
+            created_at: now,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+          dispatchedCount++;
+
           const token = (ad.fcm_token || ad.deviceToken || '').toString().trim();
-          if (!token) continue;
-          try {
-            await admin.messaging().send({
-              token,
-              notification: {
-                title: '🔔 New Booking Request',
-                body: `New ${args.category || 'maintenance'} job available. Tap to view and accept.`,
-              },
-              data: {
-                type: 'new_booking',
-                booking_id: bookingId,
-                order_no: orderNo,
-              },
-              android: { notification: { channelId: 'order_request_channel', sound: 'sound' } },
-            });
-          } catch (fcmErr) {
-            console.warn(`[wa-tool] FCM to artisan ${artDoc.id} failed:`, fcmErr.message);
+          if (token) {
+            try {
+              await admin.messaging().send({
+                token,
+                notification: {
+                  title: '🔔 New Booking Request',
+                  body: `New ${args.category || 'maintenance'} job: ${args.subcategory || args.description || 'maintenance work'}. Tap to view and accept.`,
+                },
+                data: {
+                  type: 'new_booking',
+                  booking_id: bridgeId,
+                  order_no: orderNo,
+                  future_booking_id: bookingId,
+                  has_photos: photoUrls.length > 0 ? 'true' : 'false',
+                },
+                android: { notification: { channelId: 'order_request_channel', sound: 'sound' } },
+              });
+            } catch (fcmErr) {
+              console.warn(`[wa-tool] FCM to artisan ${artDoc.id} failed:`, fcmErr.message);
+            }
           }
         }
-      } catch (e) { console.warn('[wa-tool] artisan dispatch notification failed:', e.message); }
+        console.log(`[wa-tool] Dispatched booking ${bookingId} to ${dispatchedCount} artisans with bridge records`);
+      } catch (e) { console.warn('[wa-tool] artisan dispatch failed:', e.message); }
 
       // Store last booking ID for quick payment follow-up
       session.lastBookingId = bookingId;
@@ -1838,7 +1904,8 @@ async function executeWaTool(name, args, session) {
         const catSlug = (args.category || '').toLowerCase().replace(/\s+/g, '_');
         const subQuery = (args.subcategory || '').toLowerCase();
 
-        // Scoring helper: exact > substring > word overlap count
+        // Scoring helper: exact > substring > word overlap
+        // Scores: exact=1000, full-substring=100, word-overlap=10 per matching word
         const _matchScore = (a, b) => {
           const al = a.toLowerCase(), bl = b.toLowerCase();
           if (al === bl) return 1000;
@@ -1846,8 +1913,8 @@ async function executeWaTool(name, args, session) {
           const aw = al.split(/\s+/).filter(w => w.length >= 3);
           const bw = bl.split(/\s+/).filter(w => w.length >= 3);
           let score = 0;
-          for (const w of aw) { if (bl.includes(w)) score++; }
-          for (const w of bw) { if (al.includes(w)) score++; }
+          for (const w of aw) { if (bl.includes(w)) score += 10; }
+          for (const w of bw) { if (al.includes(w)) score += 10; }
           return score;
         };
 
@@ -1930,11 +1997,13 @@ async function executeWaTool(name, args, session) {
           } catch (e) { console.warn('[lookup_pricing] Builders lookup failed:', e.message); }
         }
 
-        if (matchedService && matchedPrice) {
+        if (matchedService && matchedPrice && bestScore >= 50) {
+          console.log(`[lookup_pricing] Matched "${matchedService}" @ R${matchedPrice} (score ${bestScore}) for "${searchQ}"`);
           return {
             matched: true,
             service: matchedService,
             fixedPrice: `R${matchedPrice.toFixed(2)}`,
+            fixedPriceNum: matchedPrice,
             category: categoryName,
             ...(laborCostPerHour ? { laborCostPerHour: `R${laborCostPerHour}/hr` } : {}),
             ...(materialMultiplier ? { materialMultiplier } : {}),
@@ -3820,6 +3889,7 @@ GUIDELINES:
 - For complex jobs (renovations, full installations), suggest submitting an RFQ instead of a regular booking
 - Use South African Rands (R) for all pricing
 - When a customer sends a photo, ANALYSE the image using your vision capabilities. Identify the maintenance issue (e.g. leaking pipe, broken socket, cracked wall), suggest the correct service category, and offer to create a booking or RFQ
+- PHOTO REQUIREMENT (CRITICAL): ALWAYS ask the customer to send a photo of the issue BEFORE creating a booking or RFQ. Say: "Could you please send me a photo of the issue? This helps our artisans understand the problem and come prepared with the right tools." If the customer has already sent a photo during this conversation, do NOT ask again. If the customer says they cannot send a photo, proceed without one — do not block the booking.
 - For emergencies, emphasise urgency and prioritise booking creation
 - When a booking is created, mention the estimated cost and explain that an artisan needs to accept first before payment
 - NEVER offer payment immediately after booking creation — artisan must accept first
