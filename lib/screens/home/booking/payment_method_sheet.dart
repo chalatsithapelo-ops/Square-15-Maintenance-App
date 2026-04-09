@@ -357,7 +357,9 @@ class _ModelBottomSheetState extends State<ModelBottomSheet> {
                   final payFastCost = discountedPayCost.toStringAsFixed(2);
                   if (discountedPayCost > 0) {
                     appController.webUrl.value =
-                        await appController.initiatePayment(cost: payFastCost);
+                        await appController.initiatePayment(
+                            cost: payFastCost,
+                            taskManagementId: widget.record.id);
                     if (appController.webUrl.value.isEmpty) {
                       EasyLoading.dismiss();
                       Get.showSnackbar(GetSnackBar(

@@ -36,6 +36,7 @@ import 'package:maintenanceapp/services/loyalty_service.dart';
 import 'package:maintenanceapp/services/booking_funnel_service.dart';
 import 'package:maintenanceapp/services/retargeting_service.dart';
 import 'package:maintenanceapp/services/deposit_service.dart';
+import 'package:maintenanceapp/services/error_reporting_service.dart';
 import 'package:maintenanceapp/utils/helper.dart';
 import 'package:maintenanceapp/utils/splash_timer.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -357,6 +358,13 @@ class AppController extends GetxController {
       } catch (uploadError) {
         debugPrint('[sendDepositRequest] Storage upload error: $uploadError');
         debugPrint('[sendDepositRequest] Error type: ${uploadError.runtimeType}');
+        ErrorReportingService.reportError(
+          errorType: 'image_upload_error',
+          description: 'Deposit request image upload failed',
+          source: 'client_app',
+          errorDetails: uploadError.toString(),
+          severity: 'medium',
+        );
         // Provide more specific error messages
         final errStr = uploadError.toString();
         if (errStr.contains('permission') || errStr.contains('unauthorized')) {
@@ -1083,7 +1091,7 @@ class AppController extends GetxController {
 
   //Payment
   Future<String> initiatePayment(
-      {required String cost, String? id, String? key}) async {
+      {required String cost, String? id, String? key, String? taskManagementId}) async {
     debugPrint("payment");
     webUrl.value = "";
     String web = '';
@@ -1093,11 +1101,13 @@ class AppController extends GetxController {
     final mKey = key ?? PaymentCredential.merchantKey;
 
     if (mId.isNotEmpty && mKey.isNotEmpty) {
-      var body = {
+      var body = <String, String>{
         'merchant_id': mId,
         'merchant_key': mKey,
         'amount': cost,
         'item_name': "Payment (PayFast)",
+        if (taskManagementId != null && taskManagementId.isNotEmpty)
+          'custom_str1': taskManagementId,
       };
 
       final url = Uri.parse('https://www.payfast.co.za/eng/process');
@@ -1131,6 +1141,8 @@ class AppController extends GetxController {
         body: jsonEncode({
           'amount': cost,
           'item_name': 'Payment (PayFast)',
+          if (taskManagementId != null && taskManagementId.isNotEmpty)
+            'custom_str1': taskManagementId,
         }),
       );
 
@@ -1157,6 +1169,14 @@ class AppController extends GetxController {
       debugPrint("Backend payment initiation failed: ${response.statusCode}");
     } catch (e) {
       debugPrint("Backend payment error: $e");
+      ErrorReportingService.reportError(
+        errorType: 'payment_error',
+        description: 'Payment initiation failed via backend',
+        source: 'client_app',
+        errorDetails: e.toString(),
+        bookingId: taskManagementId,
+        severity: 'high',
+      );
     }
 
     return web;
@@ -1507,6 +1527,14 @@ class AppController extends GetxController {
           message: 'Transaction Successful'));
     } catch (e) {
       debugPrint("savePaymentStatus $e");
+      ErrorReportingService.reportErrorAsSupportCase(
+        errorType: 'payment_error',
+        description: 'Payment save failed for task $taskManagementId (R$cost, $status)',
+        source: 'client_app',
+        errorDetails: e.toString(),
+        bookingId: taskManagementId,
+        severity: 'critical',
+      );
       if (status == 'success') {
         final Map<String, dynamic> transactionData = {
           'id': transactionId,
@@ -2199,6 +2227,13 @@ class AppController extends GetxController {
       });
     } catch (e) {
       debugPrint("savePaymentStatus $e");
+      ErrorReportingService.reportErrorAsSupportCase(
+        errorType: 'wallet_error',
+        description: 'Provider wallet transaction failed for task "$taskName" (R$cost)',
+        source: 'client_app',
+        errorDetails: e.toString(),
+        severity: 'high',
+      );
       if (status == 'success') {
         final Map<String, dynamic> transactionData = {
           'id': transactionId,

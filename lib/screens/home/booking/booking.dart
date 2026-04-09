@@ -1880,7 +1880,9 @@ class _BalancePaymentSheet extends StatelessWidget {
                     await appController.getUser(id: appController.userId.value);
                     final costStr = balanceAmount.toStringAsFixed(2);
                     appController.webUrl.value =
-                        await appController.initiatePayment(cost: costStr);
+                        await appController.initiatePayment(
+                            cost: costStr,
+                            taskManagementId: record.id);
                     // markBalancePaid is called by PaymentMethodView on PayFast
                     // success callback — not here, to avoid marking paid before
                     // user completes the external payment.
