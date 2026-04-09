@@ -525,24 +525,9 @@ const waTools = [
       },
     },
   },
-  {
-    type: 'function',
-    function: {
-      name: 'submit_rfq',
-      description: 'Submit a Request for Quote (RFQ) ONLY when lookup_pricing returned matched=false (no fixed price found). NEVER use this when a fixedPrice exists — use create_booking instead.',
-      parameters: {
-        type: 'object',
-        properties: {
-          category:     { type: 'string', description: 'Service category' },
-          description:  { type: 'string', description: 'Detailed description of the work needed' },
-          address:      { type: 'string', description: 'Property address' },
-          customerName: { type: 'string', description: 'Customer full name' },
-          materialsResponsibility: { type: 'string', enum: ['client', 'artisan'], description: 'Who provides materials' },
-        },
-        required: ['category', 'description', 'customerName'],
-      },
-    },
-  },
+  // submit_rfq REMOVED from AI tools — the AI kept calling it even for fixed-price services.
+  // RFQ creation is now handled automatically inside create_booking when no fixed price exists.
+  // The submit_rfq handler still exists in executeWaTool for backward compatibility.
   {
     type: 'function',
     function: {
@@ -3817,24 +3802,20 @@ PAYMENT FLOW (CRITICAL — Artisan must accept BEFORE payment):
 - When a customer asks "is my money safe?" or expresses concern, explain all three protections
 - If deposit is chosen: "Your deposit of R{amount} is protected in escrow. The remaining R{balance} is only due after the job is completed to your satisfaction."
 
-📝 RFQ (Request for Quote) — AI-POWERED QUOTING:
-- Submit RFQ ONLY for complex/large jobs that have NO fixed price (e.g. full bathroom renovation, roof replacement, geyser installation)
-- NEVER suggest RFQ when lookup_pricing returned matched=true with a fixedPrice — ALWAYS use create_booking instead
-- AI automatically generates a full cost breakdown: labour, materials BOM, equipment, contingency (15%), and grand total
-- Customer receives the quote instantly on WhatsApp with line-by-line materials pricing
+📝 RFQ (Request for Quote):
+- When create_booking finds NO fixed price, it automatically converts to an RFQ and generates an AI quote
+- You do NOT need to call a separate RFQ tool — just call create_booking and it handles everything
 - Customer can ACCEPT the quote (proceeds to payment) or NEGOTIATE (admin reviews and adjusts)
-- Check status of existing RFQs
+- Check status of existing RFQs with check_rfq_status
+- accept_rfq_quote and reject_rfq_quote are available for managing RFQ responses
 
-RFQ FLOW (CRITICAL — Follow this exactly):
-1. Customer describes a complex job or sends photos of the issue
-2. Collect: category, detailed description, address, name, materials responsibility (client or artisan)
-3. Call submit_rfq — this creates the RFQ AND generates an AI quote instantly
-4. The AI quote includes: labour hours × rate, materials BOM with markup (1.5×), equipment, and 15% contingency
-5. Present the full quote breakdown to the customer (it's included in the submit_rfq response)
-6. Ask if they want to ACCEPT or NEGOTIATE the quote
-7. If ACCEPT → call accept_rfq_quote → proceed to payment
-8. If NEGOTIATE → call reject_rfq_quote with their feedback → admin reviews
-9. Customer can check RFQ status anytime with check_rfq_status
+RFQ FLOW:
+1. Customer describes a complex job → you collect details
+2. Call create_booking — if no fixed price exists, it auto-creates an RFQ with AI quote
+3. Present the quote to the customer
+4. If ACCEPT → call accept_rfq_quote → proceed to payment after artisan accepts
+5. If NEGOTIATE → call reject_rfq_quote with their feedback → admin reviews
+6. Customer can check RFQ status anytime with check_rfq_status
 
 PHOTO ANALYSIS FOR RFQ:
 - When a customer sends photos, analyse them with vision to identify the issue
@@ -3858,21 +3839,20 @@ PHOTO ANALYSIS FOR RFQ:
 BOOKING FLOW (follow this for EVERY booking — CRITICAL):
 1. Customer describes their need → you identify the category
 2. Ask for a photo of the issue (PHOTO REQUIREMENT)
-3. Call check_auto_discounts — mention any available discounts enthusiastically
-4. Call get_upsell_addons(categoryId) — present relevant add-ons with bundle pricing
-5. Call lookup_pricing → get the service price
-6. If lookup_pricing returned matched=true with a fixedPrice:
+3. Call lookup_pricing → get the service price
+4. If lookup_pricing returned matched=true with a fixedPrice:
    → Tell the customer the price
    → Ask them to confirm they want to proceed
    → Call create_booking with the fixedPrice as cost parameter
-   → NEVER suggest RFQ when a fixed price exists
-7. If lookup_pricing returned matched=false (no fixed price):
+5. If lookup_pricing returned matched=false (no fixed price):
    → Tell the customer: "This job needs a detailed quote"
-   → Call submit_rfq instead of create_booking
-8. After booking is created, tell the customer an artisan needs to accept first
-9. When artisan accepts (you get notified), ask customer: "Would you like to pay the full amount or a 35% deposit?"
-10. Generate payment link using request_payment_link with their choice
-11. After payment, confirm escrow protection
+   → Call create_booking anyway — it will auto-generate an RFQ with AI quote
+6. After booking/RFQ is created, tell the customer an artisan needs to accept first
+7. When artisan accepts, ask customer: "Would you like to pay the full amount or a 35% deposit?"
+8. Generate payment link using request_payment_link with their choice
+9. After payment, confirm escrow protection
+
+IMPORTANT: ALWAYS use create_booking for ALL requests. It handles both fixed-price bookings AND RFQs automatically. There is NO separate RFQ submission tool.
 
 ⭐ RATINGS & REVIEWS:
 - Rate completed jobs (1-5 stars with optional comment)
@@ -3923,11 +3903,10 @@ FIRST-TIME USER FLOW (IMPORTANT):
 CRITICAL PRICING RULES:
 - You MUST call lookup_pricing BEFORE calling create_booking, EVERY TIME, NO EXCEPTIONS.
 - When calling lookup_pricing, pass the specific service as subcategory (e.g. category="plumbing", subcategory="toilet unblocking").
-- lookup_pricing now returns laborCostPerHour, outsourcedLaborRate, and materialMultiplier from admin pricing guidance — use these for accurate quotes.
 - If lookup_pricing returns matched=true with a fixedPrice, use that EXACT price — do NOT estimate or use a different amount.
-- If lookup_pricing returns matched=false and no fixedPrice service matches, tell the customer: "This job needs a detailed quote" and use submit_rfq instead of create_booking.
+- If lookup_pricing returns matched=false, call create_booking anyway — it will auto-handle as RFQ.
 - NEVER guess or make up a price. Only use prices returned by lookup_pricing.
-- If create_booking returns an estimated cost of R0.00, it means no fixed price was found — inform the customer and suggest an RFQ.
+- ALWAYS call create_booking. There is no separate RFQ submission tool.
 
 BUILDERS PRODUCT BROWSING RULES:
 - When presenting RFQ quotes that include materials, mention that you can look up specific products on Builders if they want different brands or options.
@@ -3940,11 +3919,10 @@ BUILDERS PRODUCT BROWSING RULES:
 GUIDELINES:
 - Be warm, professional, and concise (WhatsApp messages should be short)
 - Always collect: category, description, address, customer name BEFORE creating a booking
-- For complex jobs (renovations, full installations) WHERE lookup_pricing returned matched=false, suggest submitting an RFQ
-- If lookup_pricing returned a fixedPrice, ALWAYS use create_booking — NEVER suggest RFQ regardless of job complexity
+- ALWAYS use create_booking for all service requests — it handles both fixed-price bookings and RFQs automatically
 - Use South African Rands (R) for all pricing
-- When a customer sends a photo, ANALYSE the image using your vision capabilities. Identify the maintenance issue (e.g. leaking pipe, broken socket, cracked wall), suggest the correct service category, and offer to create a booking or RFQ
-- PHOTO REQUIREMENT (CRITICAL): ALWAYS ask the customer to send a photo of the issue BEFORE creating a booking or RFQ. Say: "Could you please send me a photo of the issue? This helps our artisans understand the problem and come prepared with the right tools." If the customer has already sent a photo during this conversation, do NOT ask again. If the customer says they cannot send a photo, proceed without one — do not block the booking.
+- When a customer sends a photo, ANALYSE the image using your vision capabilities. Identify the maintenance issue (e.g. leaking pipe, broken socket, cracked wall), suggest the correct service category, and offer to create a booking
+- PHOTO REQUIREMENT (CRITICAL): ALWAYS ask the customer to send a photo of the issue BEFORE creating a booking. Say: "Could you please send me a photo of the issue? This helps our artisans understand the problem and come prepared with the right tools." If the customer has already sent a photo during this conversation, do NOT ask again. If the customer says they cannot send a photo, proceed without one — do not block the booking.
 - For emergencies, emphasise urgency and prioritise booking creation
 - When a booking is created, mention the estimated cost and explain that an artisan needs to accept first before payment
 - NEVER offer payment immediately after booking creation — artisan must accept first
