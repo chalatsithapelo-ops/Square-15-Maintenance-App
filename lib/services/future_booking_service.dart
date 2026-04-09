@@ -1,8 +1,10 @@
+import 'dart:convert';
 import 'dart:math';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/foundation.dart';
 import 'package:geocoding/geocoding.dart';
+import 'package:http/http.dart' as http;
 import 'package:intl/intl.dart';
 import 'package:maintenanceapp/model/future_booking_model.dart';
 import 'package:maintenanceapp/services/backend_fcm_service.dart';
@@ -154,7 +156,7 @@ class FutureBookingService {
       if (q.docs.isNotEmpty) {
         final data = q.docs.first.data();
         final amount = _toAmount(
-          data['cost'] ?? data['price'] ?? data['amount'] ?? data['unit_price'],
+          data['client_rate'] ?? data['clientRate'] ?? data['cost'] ?? data['price'] ?? data['amount'] ?? data['unit_price'],
         );
         if (amount != null && amount > 0) return amount;
       }
@@ -167,7 +169,7 @@ class FutureBookingService {
       if (doc.exists) {
         final data = doc.data() ?? <String, dynamic>{};
         final amount = _toAmount(
-          data['cost'] ?? data['price'] ?? data['amount'] ?? data['unit_price'],
+          data['client_rate'] ?? data['clientRate'] ?? data['cost'] ?? data['price'] ?? data['amount'] ?? data['unit_price'],
         );
         if (amount != null && amount > 0) return amount;
       }
@@ -408,6 +410,12 @@ class FutureBookingService {
 
         // Only act on real (non-RFQ) bookings.
         if (_isYes(bookingData['is_rfq'])) return false;
+
+        // Skip auto-deduction for WhatsApp bookings — payment is handled
+        // via WhatsApp (the customer may not have the app installed).
+        final source =
+            (bookingData['source'] ?? '').toString().trim().toLowerCase();
+        if (source == 'whatsapp' || source == 'whatsapp_rfq') return false;
 
         final alreadyDeducted = _isYes(bookingData['wallet_deducted']) ||
             bookingData['wallet_deducted'] == true;
@@ -1107,6 +1115,22 @@ class FutureBookingService {
         );
       }
 
+      // Resolve task names for display on artisan screen.
+      final resolvedJobNames = <String>[];
+      for (final jid in effectiveJobIds) {
+        try {
+          final tDoc = await taskRef.doc(jid).get();
+          final tName = (tDoc.data()?['name'] ?? '').toString().trim();
+          if (tName.isNotEmpty) resolvedJobNames.add(tName);
+        } catch (_) {}
+      }
+      // If no explicit description, fall back to resolved task names.
+      final effectiveDescription = description.isNotEmpty
+          ? description
+          : resolvedJobNames.isNotEmpty
+              ? resolvedJobNames.join(', ')
+              : '';
+
       await tasksManagementRef.doc(tmId).set({
         'id': tmId,
         // Keep consistent with the linked futureBookings order_no.
@@ -1133,7 +1157,7 @@ class FutureBookingService {
         'creation_date': now,
         'updated_at': now,
         'updated_by': userId,
-        'description': description,
+        'description': effectiveDescription,
         'service_on_location': serviceOnCurrentLocation ? 'yes' : 'no',
         'provided_address': effectiveAddress,
         'other_lat': effectiveLat,
@@ -1161,6 +1185,12 @@ class FutureBookingService {
       for (final jobTaskId in effectiveJobIds) {
         final jobDocId = const Uuid().v4();
         final jobCost = resolvedTaskCosts[jobTaskId] ?? 0.0;
+        // Resolve task name for artisan display
+        String jobName = '';
+        try {
+          final tDoc = await taskRef.doc(jobTaskId).get();
+          jobName = (tDoc.data()?['name'] ?? '').toString().trim();
+        } catch (_) {}
         await tasksManagementRef
             .doc(tmId)
             .collection('jobs')
@@ -1168,11 +1198,12 @@ class FutureBookingService {
             .set({
           'id': jobDocId,
           'task_id': jobTaskId,
+          'name': jobName,
           'height': '',
           'width': '',
           'area': '',
           'cost': jobCost > 0 ? jobCost.toStringAsFixed(2) : '0',
-          'description': description,
+          'description': effectiveDescription,
           'image': firstImage,
         });
       }
@@ -1340,6 +1371,7 @@ class FutureBookingService {
     String createdBy = 'manual',
     String? aiSessionId,
     String? aiTranscript,
+    Map<String, dynamic>? aiDiagnosis,
   }) async {
     final String bookingId = const Uuid().v4();
     final hasPhotos = workImageUrls.isNotEmpty;
@@ -1723,6 +1755,9 @@ class FutureBookingService {
     if (aiTranscript != null && aiTranscript.isNotEmpty) {
       bookingMap['ai_transcript'] = aiTranscript;
     }
+    if (aiDiagnosis != null && aiDiagnosis.isNotEmpty) {
+      bookingMap['ai_photo_diagnosis'] = aiDiagnosis;
+    }
 
     await futureBookingsRef.doc(bookingId).set(bookingMap);
 
@@ -1768,9 +1803,9 @@ class FutureBookingService {
     }
 
     if (isRFQ) {
-      // ── Auto-assign RFQ to artisans when:
+      // ── Auto-assign RFQ to artisans when EITHER:
       //   1. Client buys materials themselves (materialsResponsibility == 'client')
-      //   2. Total amount is under R30,000
+      //   2. Total amount is under R12,000
       // In this case, publish directly to relevant artisans instead of routing
       // to admin. Only escalate to admin if 3 artisans reject the job.
       final double rfqAmount = totalCost > 0
@@ -1778,10 +1813,11 @@ class FutureBookingService {
           : _extractAiQuoteTotal(resolvedAiQuote);
       final bool clientBuysMaterials =
           materialsResponsibility.trim().toLowerCase() == 'client';
+      final bool underThreshold = rfqAmount > 0 && rfqAmount < 12000;
 
-      print('[RFQ_AUTO] clientBuysMaterials=$clientBuysMaterials amount=$rfqAmount');
+      print('[RFQ_AUTO] clientBuysMaterials=$clientBuysMaterials amount=$rfqAmount underThreshold=$underThreshold');
 
-      if (clientBuysMaterials) {
+      if (clientBuysMaterials || underThreshold) {
         // Auto-assign: find up to 3 relevant artisans and publish the RFQ
         final String resolvedLat = serviceOnCurrentLocation ? userLat : otherLat;
         final String resolvedLng = serviceOnCurrentLocation ? userLng : otherLng;
@@ -1823,7 +1859,7 @@ class FutureBookingService {
             'rfq_assigned_artisan_ids': assignedArtisanIds,
             'rfq_assigned_artisan_names': artisanNamesById,
             'rfq_auto_assigned': true,
-            'rfq_auto_assign_reason': 'client_buys_materials',
+            'rfq_auto_assign_reason': clientBuysMaterials ? 'client_buys_materials' : 'under_12k',
             'rfq_artisan_rejection_count': 0,
             'rfq_artisan_rejections': [],
             'status': 'rfq_pending',
@@ -1978,6 +2014,133 @@ class FutureBookingService {
       }
     }
     return 0.0;
+  }
+
+  /// Auto-dispatch an accepted RFQ to artisans if conditions are met:
+  ///   • materials_responsibility == 'client', OR
+  ///   • quoted price < R12,000
+  /// Returns `true` if dispatched to artisans, `false` if admin should handle.
+  static Future<bool> tryAutoDispatchRfq(String bookingId) async {
+    try {
+      final doc = await futureBookingsRef.doc(bookingId).get();
+      if (!doc.exists) return false;
+      final data = doc.data() ?? {};
+
+      final materialsResp =
+          (data['materials_responsibility'] ?? '').toString().trim().toLowerCase();
+      final clientBuysMaterials = materialsResp == 'client';
+      final price = double.tryParse(
+              (data['quoted_price'] ?? data['cost'] ?? data['total_cost'] ?? '0')
+                  .toString()) ??
+          0;
+      final bool underThreshold = price > 0 && price < 12000;
+
+      if (!clientBuysMaterials && !underThreshold) return false;
+
+      final reason = clientBuysMaterials ? 'client_buys_materials' : 'under_12k';
+      final categoryName =
+          (data['category_name'] ?? data['categoryName'] ?? '').toString();
+      final categoryId =
+          (data['category_id'] ?? data['categoryId'] ?? '').toString();
+      final scheduledDate = (data['scheduled_date'] ?? '').toString();
+      final scheduledTime = (data['scheduled_time'] ?? '').toString();
+      final userLat =
+          (data['user_lat'] ?? data['latitude'] ?? '0').toString();
+      final userLng =
+          (data['user_lng'] ?? data['longitude'] ?? '0').toString();
+
+      List<String> artisanIds = [];
+      try {
+        artisanIds = await _findMultipleAvailableArtisans(
+          categoryId: categoryId.isNotEmpty ? categoryId : null,
+          categoryName: categoryName,
+          scheduledDate: scheduledDate,
+          scheduledTime: scheduledTime,
+          userLat: userLat,
+          userLng: userLng,
+          maxArtisans: 3,
+        );
+      } catch (e) {
+        print('[RFQ_AUTO_DISPATCH] Failed to find artisans: $e');
+      }
+
+      if (artisanIds.isEmpty) return false;
+
+      // Resolve artisan names
+      final Map<String, String> artisanNames = {};
+      for (final id in artisanIds) {
+        try {
+          final artDoc = await serviceProviderRef.doc(id).get();
+          if (artDoc.exists) {
+            final d = artDoc.data() ?? {};
+            artisanNames[id] =
+                (d['name'] ?? d['userName'] ?? d['full_name'] ?? id).toString();
+          }
+        } catch (_) {}
+      }
+
+      // Update futureBooking
+      await futureBookingsRef.doc(bookingId).update({
+        'rfq_status': 'pending_artisan_acceptance',
+        'status': 'pending_artisan_acceptance',
+        'rfq_submitted_to': 'artisan',
+        'rfq_assigned_artisan_ids': artisanIds,
+        'rfq_assigned_artisan_names': artisanNames,
+        'rfq_auto_assigned': true,
+        'rfq_auto_assign_reason': reason,
+        'rfq_artisan_rejection_count': 0,
+        'rfq_artisan_rejections': [],
+        if (artisanNames.isNotEmpty)
+          'artisan_name': artisanNames.values.first,
+      });
+
+      // Update tasksManagement bridge if it exists
+      try {
+        final tmDoc = await tasksManagementRef.doc(bookingId).get();
+        if (tmDoc.exists) {
+          await tasksManagementRef.doc(bookingId).update({
+            'status': 'pending_artisan_acceptance',
+            'rfq_assigned_artisan_ids': artisanIds,
+            'rfq_auto_assigned': true,
+            'rfq_auto_assign_reason': reason,
+          });
+        }
+      } catch (_) {}
+
+      // Notify each artisan
+      for (final artId in artisanIds) {
+        try {
+          await sendNotificationToArtisan(
+            artisanId: artId,
+            bookingId: bookingId,
+            message: 'New RFQ job available for $categoryName — '
+                'estimated R${price.toStringAsFixed(0)}. '
+                'Review and accept or decline.',
+          );
+        } catch (e) {
+          print('[RFQ_AUTO_DISPATCH] Failed to notify artisan $artId: $e');
+        }
+      }
+
+      // Notify user
+      final userId = (data['user_id'] ?? '').toString();
+      if (userId.isNotEmpty) {
+        try {
+          await sendNotificationToUser(
+            userId: userId,
+            message: 'Your accepted quote has been sent to '
+                '${artisanIds.length} available artisan(s). '
+                'You will be notified when an artisan accepts.',
+          );
+        } catch (_) {}
+      }
+
+      print('[RFQ_AUTO_DISPATCH] Dispatched $bookingId to ${artisanIds.length} artisans ($reason)');
+      return true;
+    } catch (e) {
+      print('[RFQ_AUTO_DISPATCH] Error: $e');
+      return false;
+    }
   }
 
   /// Find multiple available artisans for RFQ auto-assignment.
@@ -3066,6 +3229,86 @@ class FutureBookingService {
     }
   }
 
+  /// Artisan confirms that the client has paid the remaining balance.
+  /// Updates both futureBookings and tasksManagement documents.
+  static Future<bool> confirmBalanceReceived({
+    required String bookingId,
+    String? tasksManagementId,
+  }) async {
+    final id = bookingId.trim();
+    if (id.isEmpty) return false;
+
+    try {
+      final now = DateTime.now().toString();
+      final snap = await futureBookingsRef.doc(id).get();
+      if (!snap.exists) return false;
+      final data = snap.data() ?? <String, dynamic>{};
+
+      final tmId = (tasksManagementId ?? '').toString().trim().isNotEmpty
+          ? tasksManagementId!.trim()
+          : (data['tasks_management_id'] ?? '').toString().trim();
+
+      await futureBookingsRef.doc(id).set({
+        'balance_paid': true,
+        'balance_paid_at': now,
+        'payment_status': 'paid',
+        'balance_confirmed_by': 'artisan',
+        'updated_at': now,
+      }, SetOptions(merge: true));
+
+      if (tmId.isNotEmpty) {
+        await tasksManagementRef.doc(tmId).set({
+          'balance_paid': true,
+          'balance_paid_at': now,
+          'payment_status': 'paid',
+          'balance_confirmed_by': 'artisan',
+          'status': 'completed',
+          'updated_at': now,
+        }, SetOptions(merge: true));
+      }
+
+      // Notify WhatsApp client if booking from WhatsApp
+      try {
+        final source =
+            (data['source'] ?? '').toString().trim().toLowerCase();
+        if (source == 'whatsapp' || source == 'whatsapp_rfq') {
+          final resolvedTmId = tmId.isNotEmpty ? tmId : id;
+          await http.post(
+            Uri.parse(
+                'https://square15-whatsapp-bot.onrender.com/api/booking-status-update'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'bookingId': resolvedTmId,
+              'status': 'balance_confirmed',
+              'message':
+                  '\u2705 *Balance payment confirmed!*\n\nYour artisan has confirmed receipt of the remaining balance. Your booking is now fully paid.\n\nThank you for using Square 15! \uD83D\uDE4F',
+            }),
+          );
+        }
+      } catch (_) {}
+
+      // Notify client via push notification
+      final userId = (data['user_id'] ?? '').toString().trim();
+      if (userId.isNotEmpty) {
+        await sendNotificationToUser(
+          userId: userId,
+          title: 'Balance Confirmed',
+          message: 'Your artisan confirmed your balance payment. Job complete!',
+          type: 'balance_confirmed',
+          data: {
+            'booking_id': id,
+            'tasks_management_id': tmId,
+          },
+        );
+      }
+
+      return true;
+    } catch (e) {
+      debugPrint('confirmBalanceReceived error: $e');
+      return false;
+    }
+  }
+
   /// Mark a future booking as started (artisan is going to site / work begins).
   ///
   /// This updates BOTH:
@@ -3122,6 +3365,26 @@ class FutureBookingService {
             'tasks_management_id': resolvedTmId,
           },
         );
+      }
+
+      // Notify WhatsApp client if booking from WhatsApp
+      try {
+        final source =
+            (data['source'] ?? '').toString().trim().toLowerCase();
+        if (source == 'whatsapp' || source == 'whatsapp_rfq') {
+          final tmId = resolvedTmId.isNotEmpty ? resolvedTmId : id;
+          await http.post(
+            Uri.parse(
+                'https://square15-whatsapp-bot.onrender.com/api/job-status-update'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'bookingId': tmId,
+              'status': 'en_route',
+            }),
+          );
+        }
+      } catch (_) {
+        // Best-effort.
       }
 
       return true;

@@ -7711,7 +7711,17 @@ app.post('/api/payment/itn', async (req, res) => {
 
           // Notify WhatsApp customer if booking originated from WhatsApp
           if (source === 'whatsapp' || source === 'whatsapp_rfq') {
-            const phone = taskData.customerPhone || taskData.contact || '';
+            let phone = (taskData.phone || taskData.customer_phone || taskData.customerPhone || taskData.contact || '').toString().trim();
+            // Fallback: look up from users collection
+            if (!phone && (taskData.user_id || taskData.userId)) {
+              try {
+                const uid = (taskData.user_id || taskData.userId).toString().trim();
+                const userDoc = await admin.firestore().collection('users').doc(uid).get();
+                if (userDoc.exists) {
+                  phone = (userDoc.data()?.phone || userDoc.data()?.phoneNumber || '').toString().trim();
+                }
+              } catch (_) {}
+            }
             if (phone) {
               try {
                 const waBot = env('WHATSAPP_BOT_URL') || 'https://square15-whatsapp-bot.onrender.com';
@@ -7741,6 +7751,35 @@ app.post('/api/payment/itn', async (req, res) => {
           }
         }
       }
+
+
+          // Notify assigned artisan about payment via push notification
+          try {
+            const artisanId = (taskData.service_provider_id || '').toString().trim();
+            if (artisanId) {
+              const artisanDoc = await admin.firestore().collection('serviceProvider').doc(artisanId).get();
+              if (artisanDoc.exists) {
+                const artisanToken = (artisanDoc.data()?.deviceToken || '').toString().trim();
+                if (artisanToken) {
+                  const orderLabel = taskData.order_no || fbId;
+                  const title = isBalancePayment ? 'Balance Payment Received' : isDepositPayment ? 'Deposit Received' : 'Payment Received';
+                  const body = isBalancePayment
+                    ? `Client paid R${amountGross} balance for booking #${orderLabel}. Job fully paid.`
+                    : isDepositPayment
+                      ? `Client paid R${amountGross} deposit for booking #${orderLabel}. You may proceed.`
+                      : `Client paid R${amountGross} for booking #${orderLabel}. You may proceed.`;
+                  await admin.messaging().send({
+                    token: artisanToken,
+                    notification: { title, body },
+                    data: { type: 'payment_received', booking_id: fbId, tasks_management_id: customStr1 },
+                  });
+                  console.log(`[ITN] Artisan ${artisanId} notified of payment`);
+                }
+              }
+            }
+          } catch (artErr) {
+            console.warn(`[ITN] Artisan notification failed: ${artErr.message}`);
+          }
 
       // Create/update transaction log
       const txRef = admin.firestore().collection('transactionLogs');

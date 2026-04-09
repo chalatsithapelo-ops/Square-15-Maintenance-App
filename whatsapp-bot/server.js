@@ -1746,6 +1746,8 @@ async function executeWaTool(name, args, session) {
         }
         console.log(`[wa-tool] Found ${artisanSnap.docs.length} artisans to dispatch to`);
 
+        const photoUrls = booking.work_images || [];
+
         for (const artDoc of artisanSnap.docs) {
           const ad = artDoc.data() || {};
           if (ad.is_suspended === true) continue;
