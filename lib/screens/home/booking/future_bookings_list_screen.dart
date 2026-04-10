@@ -1,6 +1,8 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'dart:async';
+import 'dart:convert';
+import 'package:http/http.dart' as http;
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter_easyloading/flutter_easyloading.dart';
 import 'package:flutter_rating_bar/flutter_rating_bar.dart';
@@ -18,8 +20,8 @@ import 'package:maintenanceapp/screens/home/booking/payment_method_sheet.dart';
 import 'package:maintenanceapp/screens/home/rfq/client_rfq_response_screen.dart';
 import 'package:maintenanceapp/services/firestore_services/firebase_services.dart';
 import 'package:maintenanceapp/services/future_booking_service.dart';
-import 'package:maintenanceapp/services/refund_service.dart';
 import 'package:maintenanceapp/services/artisan_penalty_service.dart';
+import 'package:maintenanceapp/services/deposit_service.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 class FutureBookingsListScreen extends StatefulWidget {
@@ -356,16 +358,7 @@ class _FutureBookingsListScreenState extends State<FutureBookingsListScreen> {
                   GoogleFonts.roboto(fontSize: 14, color: Colors.grey.shade500),
             ),
             const SizedBox(height: 10),
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 24),
-              child: Text(
-                'Fetched $fetchedCount docs (user_id=${_docsUserId.length}, userId=${_docsUserIdCamel.length}, uid=${_docsUid.length}).\n'
-                'Searching ids: ${idsForUi.isEmpty ? '(none)' : idsForUi.join(', ')}',
-                textAlign: TextAlign.center,
-                style: GoogleFonts.roboto(
-                    fontSize: 11, color: Colors.grey.shade500),
-              ),
-            ),
+            // Debug info removed from production UI
           ],
         ),
       );
@@ -921,7 +914,7 @@ class _FutureBookingsListScreenState extends State<FutureBookingsListScreen> {
                           color: isRfq
                               ? (status == 'rfq_sent'
                                   ? Colors.blue.shade100
-                                  : (status == 'rfq_approved' || status == FutureBookingsListScreen._statusApprovedWaitingAssignment)
+                                  : status == 'rfq_approved'
                                       ? Colors.green.shade100
                                       : status == 'rfq_rejected'
                                           ? Colors.red.shade100
@@ -936,7 +929,7 @@ class _FutureBookingsListScreenState extends State<FutureBookingsListScreen> {
                             color: isRfq
                                 ? (status == 'rfq_sent'
                                     ? Colors.blue.shade900
-                                    : (status == 'rfq_approved' || status == FutureBookingsListScreen._statusApprovedWaitingAssignment)
+                                    : status == 'rfq_approved'
                                         ? Colors.green.shade900
                                         : status == 'rfq_rejected'
                                             ? Colors.red.shade900
@@ -954,7 +947,7 @@ class _FutureBookingsListScreenState extends State<FutureBookingsListScreen> {
                                   ? 'Awaiting Admin Quote'
                                   : status == 'rfq_sent'
                                       ? 'Quote Ready (Action Required)'
-                                      : (status == 'rfq_approved' || status == FutureBookingsListScreen._statusApprovedWaitingAssignment)
+                                      : status == 'rfq_approved'
                                           ? 'Approved waiting for artisan assignment'
                                           : status == 'rfq_rejected'
                                               ? 'Rejected'
@@ -972,7 +965,7 @@ class _FutureBookingsListScreenState extends State<FutureBookingsListScreen> {
                             color: isRfq
                                 ? (status == 'rfq_sent'
                                     ? Colors.blue.shade900
-                                    : (status == 'rfq_approved' || status == FutureBookingsListScreen._statusApprovedWaitingAssignment)
+                                    : status == 'rfq_approved'
                                         ? Colors.green.shade900
                                         : status == 'rfq_rejected'
                                             ? Colors.red.shade900
@@ -1435,7 +1428,7 @@ class _FutureBookingsListScreenState extends State<FutureBookingsListScreen> {
                                 payableAmount: adminTotal,
                               ),
                               icon: const Icon(Icons.lock_open),
-                              label: const Text('Pay to confirm order'),
+                              label: const Text('Pay to confirm booking'),
                               style: ElevatedButton.styleFrom(
                                 backgroundColor: const Color(0xff35540C),
                                 foregroundColor: Colors.white,
@@ -2094,6 +2087,8 @@ class _FutureBookingsListScreenState extends State<FutureBookingsListScreen> {
                     .doc(booking.id)
                     .update({
                   'status': 'cancelled',
+                  'cancelled_by_client': 'yes',
+                  'cancelled_by_client_at': DateTime.now().toString(),
                   'updated_at': DateTime.now().toString(),
                 });
 
@@ -2105,31 +2100,9 @@ class _FutureBookingsListScreenState extends State<FutureBookingsListScreen> {
                       .doc(tmId)
                       .update({
                     'status': 'cancelled',
+                    'closed_reason': 'client_cancelled',
                     'updated_at': DateTime.now().toString(),
                   });
-                }
-
-                // Restore wallet if it was already deducted
-                await FutureBookingService.refundWalletForBooking(
-                  bookingId: booking.id ?? '',
-                  reason: 'cancelled_by_customer',
-                );
-
-                // Handle card payment refunds (PayFast/BNPL)
-                try {
-                  final refundResult = await RefundService.refundFutureBooking(
-                    bookingId: booking.id ?? '',
-                    reason: 'cancelled_by_customer',
-                    initiatedBy: FirebaseAuth.instance.currentUser?.uid ?? '',
-                  );
-                  if (refundResult.success && refundResult.method == 'refund_request') {
-                    Get.snackbar('Refund Submitted',
-                      'Your card refund request has been submitted for admin review.',
-                      backgroundColor: Colors.blue, colorText: Colors.white,
-                      duration: const Duration(seconds: 4));
-                  }
-                } catch (_) {
-                  // Wallet refund already handled above; card refund is best-effort
                 }
 
                 // Notify artisan
@@ -2143,8 +2116,43 @@ class _FutureBookingsListScreenState extends State<FutureBookingsListScreen> {
                 }
 
                 EasyLoading.dismiss();
-                Get.snackbar('Success', 'Booking cancelled',
-                    backgroundColor: Colors.green, colorText: Colors.white);
+
+                // Determine if payment was made and what method
+                final bookingSnap = await FutureBookingService.futureBookingsRef
+                    .doc(booking.id)
+                    .get();
+                final bData = bookingSnap.data() ?? {};
+                final paymentStatus = (bData['payment_status'] ?? '').toString().toLowerCase();
+                final paymentMethod = (bData['payment_method'] ?? '').toString().toLowerCase();
+                final walletDeducted = (bData['wallet_deducted'] ?? '').toString().toLowerCase();
+                final alreadyRefunded = (bData['wallet_refunded'] ?? '').toString().toLowerCase() == 'yes'
+                    || (bData['refund_status'] ?? '').toString().toLowerCase() == 'refunded';
+
+                final wasPaid = paymentStatus == 'paid' || walletDeducted == 'yes';
+                final wasCardOrOzow = paymentMethod == 'ozow' || paymentMethod == 'payfast'
+                    || paymentMethod == 'card' || paymentMethod == 'bnpl';
+
+                if (wasPaid && !alreadyRefunded) {
+                  if (wasCardOrOzow) {
+                    // Show refund method choice for card/Ozow payments
+                    _showRefundMethodChoice(
+                      bookingId: booking.id ?? '',
+                      docType: 'futureBookings',
+                    );
+                  } else {
+                    // Wallet payment — automatic immediate refund
+                    await FutureBookingService.refundWalletForBooking(
+                      bookingId: booking.id ?? '',
+                      reason: 'cancelled_by_customer',
+                    );
+                    Get.snackbar('Booking Cancelled',
+                        'Your wallet has been refunded.',
+                        backgroundColor: Colors.green, colorText: Colors.white);
+                  }
+                } else {
+                  Get.snackbar('Success', 'Booking cancelled',
+                      backgroundColor: Colors.green, colorText: Colors.white);
+                }
               } catch (e) {
                 EasyLoading.dismiss();
                 Get.snackbar('Error', 'Failed to cancel booking',
@@ -2158,6 +2166,203 @@ class _FutureBookingsListScreenState extends State<FutureBookingsListScreen> {
         ],
       ),
     );
+  }
+
+  /// Shows a dialog letting the user choose between wallet refund (instant)
+  /// or card refund (3-5 business days) after cancelling a card/Ozow-paid booking.
+  void _showRefundMethodChoice({
+    required String bookingId,
+    required String docType,
+  }) {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: Row(
+          children: [
+            Icon(Icons.account_balance_wallet, color: Colors.green.shade700),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text('Choose Refund Method',
+                  style: GoogleFonts.roboto(fontWeight: FontWeight.bold, fontSize: 17)),
+            ),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              'How would you like to receive your refund?',
+              style: GoogleFonts.roboto(fontSize: 14, color: Colors.grey.shade700),
+            ),
+            const SizedBox(height: 18),
+
+            // Wallet refund option
+            InkWell(
+              borderRadius: BorderRadius.circular(12),
+              onTap: () {
+                Navigator.pop(ctx);
+                _processRefund(bookingId: bookingId, docType: docType, method: 'wallet');
+              },
+              child: Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(12),
+                  color: Colors.green.shade50,
+                  border: Border.all(color: Colors.green.shade400),
+                ),
+                child: Row(
+                  children: [
+                    Icon(Icons.bolt, color: Colors.green.shade700, size: 28),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text('Refund to Wallet',
+                              style: GoogleFonts.roboto(fontWeight: FontWeight.w700, fontSize: 15)),
+                          const SizedBox(height: 2),
+                          Text('Instant — use for future bookings',
+                              style: GoogleFonts.roboto(fontSize: 12, color: Colors.grey.shade600)),
+                        ],
+                      ),
+                    ),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                      decoration: BoxDecoration(
+                        color: Colors.green.shade700,
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: Text('INSTANT', style: GoogleFonts.roboto(
+                          fontSize: 10, fontWeight: FontWeight.w700, color: Colors.white)),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+
+            const SizedBox(height: 12),
+
+            // Card refund option
+            InkWell(
+              borderRadius: BorderRadius.circular(12),
+              onTap: () {
+                Navigator.pop(ctx);
+                _processRefund(bookingId: bookingId, docType: docType, method: 'card');
+              },
+              child: Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(12),
+                  color: Colors.blue.shade50,
+                  border: Border.all(color: Colors.blue.shade300),
+                ),
+                child: Row(
+                  children: [
+                    Icon(Icons.credit_card, color: Colors.blue.shade700, size: 28),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text('Refund to Card',
+                              style: GoogleFonts.roboto(fontWeight: FontWeight.w700, fontSize: 15)),
+                          const SizedBox(height: 2),
+                          Text('3–5 business days to reflect',
+                              style: GoogleFonts.roboto(fontSize: 12, color: Colors.grey.shade600)),
+                        ],
+                      ),
+                    ),
+                    Icon(Icons.schedule, color: Colors.blue.shade400, size: 20),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Calls the backend refund endpoint to process the chosen refund method.
+  Future<void> _processRefund({
+    required String bookingId,
+    required String docType,
+    required String method,
+  }) async {
+    EasyLoading.show(status: method == 'wallet' ? 'Refunding to wallet...' : 'Processing card refund...');
+    try {
+      final backendUrl = 'https://square15-livekit-backend.onrender.com';
+      final token = await FirebaseAuth.instance.currentUser?.getIdToken();
+      final response = await _sendRefundRequest(
+        backendUrl: backendUrl,
+        token: token,
+        bookingId: bookingId,
+        docType: docType,
+        method: method,
+      );
+
+      EasyLoading.dismiss();
+
+      if (response != null && response['ok'] == true) {
+        if (response['already_refunded'] == true) {
+          Get.snackbar('Already Refunded',
+              response['message'] ?? 'This booking was already refunded.',
+              backgroundColor: Colors.blue, colorText: Colors.white,
+              duration: const Duration(seconds: 4));
+        } else if (method == 'wallet') {
+          Get.snackbar('Refund Complete',
+              response['message'] ?? 'Refunded to your wallet instantly.',
+              backgroundColor: Colors.green, colorText: Colors.white,
+              duration: const Duration(seconds: 4));
+        } else {
+          Get.snackbar('Card Refund Initiated',
+              response['message'] ?? 'Your card refund will reflect in 3-5 business days.',
+              backgroundColor: Colors.blue, colorText: Colors.white,
+              duration: const Duration(seconds: 5));
+        }
+      } else {
+        final errorMsg = response?['error'] ?? 'Refund failed. Please contact support.';
+        Get.snackbar('Refund Error', errorMsg,
+            backgroundColor: Colors.red, colorText: Colors.white,
+            duration: const Duration(seconds: 5));
+      }
+    } catch (e) {
+      EasyLoading.dismiss();
+      Get.snackbar('Refund Error', 'An error occurred. Please contact support.',
+          backgroundColor: Colors.red, colorText: Colors.white);
+    }
+  }
+
+  Future<Map<String, dynamic>?> _sendRefundRequest({
+    required String backendUrl,
+    required String? token,
+    required String bookingId,
+    required String docType,
+    required String method,
+  }) async {
+    try {
+      final response = await http.post(
+        Uri.parse('$backendUrl/api/payment/refund'),
+        headers: {
+          'Content-Type': 'application/json',
+          if (token != null) 'Authorization': 'Bearer $token',
+        },
+        body: jsonEncode({
+          'booking_id': bookingId,
+          'doc_type': docType,
+          'method': method,
+          'reason': 'cancelled_by_customer',
+        }),
+      );
+      return Map<String, dynamic>.from(jsonDecode(response.body) as Map);
+    } catch (e) {
+      debugPrint('Refund request error: $e');
+      return null;
+    }
   }
 
   void _confirmAvailability(BuildContext context, FutureBookingModel booking) {
@@ -2304,6 +2509,28 @@ class _WorkCompletePanelState extends State<_WorkCompletePanel> {
       return;
     }
 
+    // ── Issue 2: Enforce balance payment before allowing rating ──
+    try {
+      final balanceDue =
+          await DepositService.isBalanceDue(widget.tasksManagementId);
+      if (balanceDue) {
+        final depositInfo =
+            await DepositService.getDepositInfo(widget.tasksManagementId);
+        final balanceAmt = depositInfo?['balance_amount'] ?? 0.0;
+        if (!mounted) return;
+        Get.snackbar(
+          'Balance Payment Required',
+          'Please pay the remaining balance of R${(balanceAmt as num).toStringAsFixed(2)} before submitting your rating.',
+          backgroundColor: Colors.orange,
+          colorText: Colors.white,
+          duration: const Duration(seconds: 5),
+        );
+        return;
+      }
+    } catch (_) {
+      // best-effort check — allow rating to proceed if check fails
+    }
+
     setState(() => _isSubmitting = true);
 
     try {
@@ -2354,23 +2581,86 @@ class _WorkCompletePanelState extends State<_WorkCompletePanel> {
         } catch (_) {
           // Best-effort penalty flagging
         }
-      }
 
-      // 5) Notify artisan that client marked order as complete
-      try {
-        final ratingText = _userRating > 0
-            ? ' Rating: ${_userRating.toStringAsFixed(1)}/5.'
-            : '';
-        await FutureBookingService.sendNotificationToArtisan(
-          artisanId: widget.serviceProviderId,
-          bookingId: futureBookingId.isNotEmpty
-              ? futureBookingId
-              : widget.tasksManagementId,
-          message:
-              'Client has marked the order as complete.$ratingText Thank you for your service!',
-        );
-      } catch (_) {
-        // Best-effort
+        // ── Issue 3: Send specific low-rating notification to artisan ──
+        try {
+          final ratingInt = _userRating.toInt();
+          final feedbackSnippet = feedback.isNotEmpty
+              ? ' Feedback: "$feedback"'
+              : '';
+          await FutureBookingService.sendNotificationToArtisan(
+            artisanId: widget.serviceProviderId,
+            bookingId: futureBookingId.isNotEmpty
+                ? futureBookingId
+                : widget.tasksManagementId,
+            message:
+                '⚠️ Low Rating Alert: Client rated your service $ratingInt/5.$feedbackSnippet Please review and resolve the issue to avoid penalties.',
+          );
+        } catch (_) {}
+
+        // ── Issue 3: Escalate to admin for very low ratings ──
+        try {
+          await FirebaseFirestore.instance.collection('notifications').add({
+            'title': '⚠️ Low Rating Escalation',
+            'body':
+                'Artisan ${widget.serviceProviderId} received a ${_userRating.toInt()}/5 rating. Task: ${widget.tasksManagementId}. ${feedback.isNotEmpty ? 'Feedback: $feedback' : 'No feedback provided.'}',
+            'type': 'admin',
+            'user_type': 'admin',
+            'time': DateTime.now().toString(),
+            'created_at': DateTime.now().toString(),
+            'view': false,
+            'data': {
+              'artisan_id': widget.serviceProviderId,
+              'task_id': widget.tasksManagementId,
+              'rating': _userRating,
+            },
+          });
+        } catch (_) {}
+
+        // ── Issue 3: Auto-suspend artisan after 3+ penalized records ──
+        try {
+          final penaltyCount = await ArtisanPenaltyService.getPenaltyCount(
+              widget.serviceProviderId);
+          if (penaltyCount >= 3) {
+            await FirebaseFirestore.instance
+                .collection('serviceProvider')
+                .doc(widget.serviceProviderId)
+                .update({
+              'is_suspended': true,
+              'suspended_at': DateTime.now().toString(),
+              'suspension_reason':
+                  'Auto-suspended: $penaltyCount penalty records',
+            });
+            // Notify admin of auto-suspension
+            await FirebaseFirestore.instance.collection('notifications').add({
+              'title': '🚫 Artisan Auto-Suspended',
+              'body':
+                  'Artisan ${widget.serviceProviderId} has been auto-suspended after $penaltyCount penalties.',
+              'type': 'admin',
+              'user_type': 'admin',
+              'time': DateTime.now().toString(),
+              'created_at': DateTime.now().toString(),
+              'view': false,
+            });
+          }
+        } catch (_) {}
+      } else {
+        // 5) Notify artisan that client marked order as complete (good rating)
+        try {
+          final ratingText = _userRating > 0
+              ? ' Rating: ${_userRating.toStringAsFixed(1)}/5.'
+              : '';
+          await FutureBookingService.sendNotificationToArtisan(
+            artisanId: widget.serviceProviderId,
+            bookingId: futureBookingId.isNotEmpty
+                ? futureBookingId
+                : widget.tasksManagementId,
+            message:
+                'Client has marked the order as complete.$ratingText Thank you for your service!',
+          );
+        } catch (_) {
+          // Best-effort
+        }
       }
 
       if (!mounted) return;

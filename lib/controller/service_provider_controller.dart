@@ -390,11 +390,8 @@ class ServiceProviderController extends GetxController {
               .doc(futureBookingId)
               .set(fbPatch, SetOptions(merge: true));
 
-          // Deduct wallet immediately once the booking is confirmed.
-          final paidViaWallet =
-              await FutureBookingService.deductWalletOnBookingConfirmation(
-            bookingId: futureBookingId,
-          );
+          // Do NOT auto-deduct wallet here — let the client pay explicitly
+          // so the artisan sees 'pending_payment' status until client pays.
 
           fireAndForget(
             FutureBookingService.sendNotificationToUser(
@@ -405,25 +402,36 @@ class ServiceProviderController extends GetxController {
             label: 'user_confirmed',
           );
 
-          if (!paidViaWallet) {
-            fireAndForget(
-              FutureBookingService.sendNotificationToUser(
-                userId: to,
-                title: 'Payment required',
-                type: 'future_booking_payment_required',
-                message:
-                    'Your booking is confirmed. Please pay to confirm the order. Note: funds will be immediately refunded if the work is not done or if the artisan cancels without going to site.',
-                data: {
-                  'booking_id': futureBookingId,
-                  'type': 'future_booking_payment_required',
-                },
-              ),
-              label: 'payment_required',
-            );
-          }
+          fireAndForget(
+            FutureBookingService.sendNotificationToUser(
+              userId: to,
+              title: 'Payment required',
+              type: 'future_booking_payment_required',
+              message:
+                  'Your booking is confirmed. Please pay to confirm the order. Note: funds will be immediately refunded if the work is not done or if the artisan cancels without going to site.',
+              data: {
+                'booking_id': futureBookingId,
+                'type': 'future_booking_payment_required',
+              },
+            ),
+            label: 'payment_required',
+          );
 
           // ── Notify WhatsApp client if booking originated from WhatsApp ──
           if (source == 'whatsapp' || source == 'whatsapp_rfq') {
+            // Update the MAIN tasksManagement doc directly so the payment
+            // handler can detect acceptance even if the webhook fails.
+            fireAndForget(
+              FirebaseService.tasksManagementRef.doc(futureBookingId).set({
+                'accept': '1',
+                'artisan_confirmed': 'yes',
+                'status': 'pending_payment',
+                'service_provider_id': from,
+                'service_provider_name': appController.userName.value,
+                'updated_at': DateTime.now().toString(),
+              }, SetOptions(merge: true)),
+              label: 'wa_main_doc_update',
+            );
             fireAndForget(
               _notifyWhatsAppClient(futureBookingId, appController.userName.value),
               label: 'wa_artisan_accepted',

@@ -7,6 +7,7 @@ import 'package:maintenanceapp/controller/app_controller.dart';
 import 'package:maintenanceapp/model/task_management_model.dart';
 import 'package:maintenanceapp/screens/home/payment_method_view.dart';
 import 'package:maintenanceapp/screens/home/bnpl_checkout_view.dart';
+import 'package:maintenanceapp/screens/home/bottomnavigationbar/bottombar.dart';
 import 'package:maintenanceapp/services/bnpl_service.dart';
 import 'package:maintenanceapp/services/deposit_service.dart';
 import 'package:maintenanceapp/services/promo_code_service.dart';
@@ -15,7 +16,7 @@ import 'package:uuid/uuid.dart';
 
 /// Shared payment method selector used by both normal bookings and future bookings.
 ///
-/// This must stay consistent across the app: wallet OR card (PayFast).
+/// This must stay consistent across the app: wallet OR Ozow (instant EFT).
 class ModelBottomSheet extends StatefulWidget {
   final TaskManagementModel record;
   const ModelBottomSheet({super.key, required this.record});
@@ -37,12 +38,21 @@ class _ModelBottomSheetState extends State<ModelBottomSheet> {
   String? _promoId;
   String _promoMessage = '';
   bool _promoValidating = false;
+  List<Map<String, dynamic>> _savedCards = [];
+  bool _loadingCards = true;
+  bool _saveCard = false;
 
   @override
   void initState() {
     super.initState();
     _checkBnplEligibility();
     _checkDepositStatus();
+    _loadSavedCards();
+  }
+
+  Future<void> _loadSavedCards() async {
+    final cards = await appController.getSavedCards();
+    if (mounted) setState(() { _savedCards = cards; _loadingCards = false; });
   }
 
   @override
@@ -312,6 +322,7 @@ class _ModelBottomSheetState extends State<ModelBottomSheet> {
                       );
                     }
                     EasyLoading.dismiss();
+                    if (mounted) setState(() => _paymentProcessing = false);
                     Future.delayed(const Duration(milliseconds: 600), () {
                       if (Navigator.of(context).canPop()) {
                         Navigator.of(context).pop();
@@ -323,12 +334,10 @@ class _ModelBottomSheetState extends State<ModelBottomSheet> {
                       duration: const Duration(seconds: 4),
                       snackPosition: SnackPosition.TOP,
                       title: 'Insufficient Wallet Balance',
-                      message: 'Your balance is R${bal?.toStringAsFixed(2) ?? "0.00"} but R${discountedCost.toStringAsFixed(2)} is required. Please top up your wallet or use PayFast or Buy Now Pay Later instead.',
+                      message: 'Your balance is R${bal?.toStringAsFixed(2) ?? "0.00"} but R${discountedCost.toStringAsFixed(2)} is required. Please top up your wallet or use Ozow or Buy Now Pay Later instead.',
                     ));
                     EasyLoading.dismiss();
-                    if (Navigator.of(context).canPop()) {
-                      Navigator.of(context).pop();
-                    }
+                    if (mounted) setState(() => _paymentProcessing = false);
                   }
                 } catch (_) {
                   EasyLoading.dismiss();
@@ -342,9 +351,11 @@ class _ModelBottomSheetState extends State<ModelBottomSheet> {
             const SizedBox(height: 20),
             PrimaryButton(
               onPressed: () async {
+                if (_paymentProcessing) return;
+                setState(() => _paymentProcessing = true);
                 appController.isPaymentUsingPayFast.value = true;
                 appController.isPaymentUsingBnpl.value = false;
-                appController.activePaymentMethod.value = 'payFast';
+                appController.activePaymentMethod.value = 'ozow';
                 EasyLoading.show(status: 'Please Wait...!');
                 try {
                   await appController.getUser(id: appController.userId.value);
@@ -367,8 +378,9 @@ class _ModelBottomSheetState extends State<ModelBottomSheet> {
                         duration: const Duration(seconds: 4),
                         snackPosition: SnackPosition.TOP,
                         title: 'Payment Error',
-                        message: 'Could not connect to PayFast. Please try again or use wallet payment.',
+                        message: 'Could not connect to Ozow. Please try again or use wallet payment.',
                       ));
+                      if (mounted) setState(() => _paymentProcessing = false);
                       return;
                     }
                     Get.to(() => PaymentMethodView(
@@ -378,11 +390,145 @@ class _ModelBottomSheetState extends State<ModelBottomSheet> {
                   }
                 } finally {
                   EasyLoading.dismiss();
+                  if (mounted) setState(() => _paymentProcessing = false);
                 }
               },
               title: _isDepositTask
-                  ? 'Pay Deposit R${_depositAmount.toStringAsFixed(2)} Via PayFast'
-                  : 'Pay Via PayFast (credit or debit card)',
+                  ? 'Pay Deposit R${_depositAmount.toStringAsFixed(2)} Via Ozow'
+                  : 'Pay Via Ozow (instant EFT)',
+            ),
+
+            // --- Card Payment ---
+            const SizedBox(height: 20),
+            Text('Debit / Credit Card',
+                style: GoogleFonts.lato(
+                    fontWeight: FontWeight.w700, fontSize: 14)),
+            const SizedBox(height: 8),
+
+            // Saved cards list
+            if (_loadingCards)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 8),
+                child: Center(child: SizedBox(
+                  width: 20, height: 20,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )),
+              )
+            else if (_savedCards.isNotEmpty) ...[
+              ..._savedCards.map((card) {
+                final last4 = card['last4'] ?? '****';
+                final cardType = (card['card_type'] ?? 'card').toString().toUpperCase();
+                return Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: Container(
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: Colors.grey.shade300),
+                    ),
+                    child: Material(
+                      color: Colors.transparent,
+                      borderRadius: BorderRadius.circular(12),
+                      child: InkWell(
+                        borderRadius: BorderRadius.circular(12),
+                        onTap: () => _payWithSavedCard(card),
+                        child: Padding(
+                          padding: const EdgeInsets.all(14),
+                          child: Row(
+                            children: [
+                              Icon(Icons.credit_card, color: Colors.blue.shade700, size: 28),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text('$cardType •••• $last4',
+                                        style: GoogleFonts.lato(
+                                            fontWeight: FontWeight.w600, fontSize: 15)),
+                                    Text('Tap to pay with saved card',
+                                        style: GoogleFonts.lato(
+                                            color: Colors.grey.shade600, fontSize: 12)),
+                                  ],
+                                ),
+                              ),
+                              IconButton(
+                                icon: Icon(Icons.delete_outline, color: Colors.red.shade400, size: 20),
+                                onPressed: () => _deleteSavedCard(card),
+                                tooltip: 'Remove card',
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                );
+              }),
+              const SizedBox(height: 4),
+            ],
+
+            // New card payment button
+            Container(
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(12),
+                gradient: LinearGradient(
+                  colors: [Colors.indigo.shade50, Colors.indigo.shade100],
+                ),
+                border: Border.all(color: Colors.indigo.shade300),
+              ),
+              child: Material(
+                color: Colors.transparent,
+                borderRadius: BorderRadius.circular(12),
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(12),
+                  onTap: () => _payWithNewCard(),
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Row(
+                      children: [
+                        Icon(Icons.add_card, color: Colors.indigo.shade700, size: 28),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                _isDepositTask
+                                    ? 'Pay Deposit R${_depositAmount.toStringAsFixed(2)} with Card'
+                                    : 'Pay with New Card',
+                                style: GoogleFonts.lato(
+                                    fontWeight: FontWeight.w700, fontSize: 15),
+                              ),
+                              Text('Visa, Mastercard — secure via PayFast',
+                                  style: GoogleFonts.lato(
+                                      color: Colors.grey.shade600, fontSize: 12)),
+                            ],
+                          ),
+                        ),
+                        Icon(Icons.lock, color: Colors.indigo.shade400, size: 18),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+
+            // Save card checkbox
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Row(
+                children: [
+                  Checkbox(
+                    value: _saveCard,
+                    onChanged: (v) => setState(() => _saveCard = v ?? false),
+                    materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    visualDensity: VisualDensity.compact,
+                  ),
+                  Flexible(
+                    child: Text('Save card for future payments',
+                        style: GoogleFonts.lato(fontSize: 13, color: Colors.grey.shade700)),
+                  ),
+                ],
+              ),
             ),
 
             // --- Buy-Now-Pay-Later Options ---
@@ -529,6 +675,153 @@ class _ModelBottomSheetState extends State<ModelBottomSheet> {
     );
   }
 
+  Future<void> _payWithNewCard() async {
+    appController.isPaymentUsingPayFast.value = true;
+    appController.isPaymentUsingBnpl.value = false;
+    appController.activePaymentMethod.value = 'card';
+    EasyLoading.show(status: 'Connecting to card payment...');
+    try {
+      await appController.getUser(id: appController.userId.value);
+      final rawPayCost = _isDepositTask
+          ? _depositAmount
+          : double.tryParse(widget.record.cost?.toString() ?? '0') ?? 0;
+      final discountedPayCost = _promoDiscount > 0
+          ? (rawPayCost - _promoDiscount).clamp(0.0, double.infinity)
+          : rawPayCost;
+      final payFastCost = discountedPayCost.toStringAsFixed(2);
+      if (discountedPayCost > 0) {
+        appController.webUrl.value = await appController.initiatePayment(
+          cost: payFastCost,
+          taskManagementId: widget.record.id,
+          paymentMethod: 'cc',
+          saveCard: _saveCard,
+        );
+        if (appController.webUrl.value.isEmpty) {
+          EasyLoading.dismiss();
+          Get.showSnackbar(GetSnackBar(
+            backgroundColor: Colors.red.shade900,
+            duration: const Duration(seconds: 4),
+            snackPosition: SnackPosition.TOP,
+            title: 'Payment Error',
+            message: 'Could not connect to card payment. Please try again.',
+          ));
+          return;
+        }
+        Get.to(() => PaymentMethodView(
+            taskManagementModel: widget.record,
+            chargeAmount: payFastCost),
+            transition: Transition.fadeIn);
+      }
+    } finally {
+      EasyLoading.dismiss();
+    }
+  }
+
+  Future<void> _payWithSavedCard(Map<String, dynamic> card) async {
+    final cardId = card['id'] as String;
+    final last4 = card['last4'] ?? '****';
+    final confirmed = await Get.dialog<bool>(
+      AlertDialog(
+        title: const Text('Confirm Card Payment'),
+        content: Text('Pay with card ending in $last4?'),
+        actions: [
+          TextButton(onPressed: () => Get.back(result: false), child: const Text('Cancel')),
+          ElevatedButton(onPressed: () => Get.back(result: true), child: const Text('Pay Now')),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+
+    appController.isPaymentUsingPayFast.value = true;
+    appController.isPaymentUsingBnpl.value = false;
+    appController.activePaymentMethod.value = 'card';
+    EasyLoading.show(status: 'Charging card...');
+    try {
+      final rawPayCost = _isDepositTask
+          ? _depositAmount
+          : double.tryParse(widget.record.cost?.toString() ?? '0') ?? 0;
+      final discountedPayCost = _promoDiscount > 0
+          ? (rawPayCost - _promoDiscount).clamp(0.0, double.infinity)
+          : rawPayCost;
+      final payFastCost = discountedPayCost.toStringAsFixed(2);
+
+      final success = await appController.chargeWithSavedCard(
+        cardId: cardId,
+        cost: payFastCost,
+        taskManagementId: widget.record.id ?? '',
+      );
+
+      EasyLoading.dismiss();
+      if (success) {
+        await appController.savePaymentStatus(
+          cost: payFastCost,
+          taskManagementId: widget.record.id ?? '',
+          status: 'success',
+        );
+        Get.showSnackbar(GetSnackBar(
+          backgroundColor: Colors.green.shade700,
+          duration: const Duration(seconds: 3),
+          snackPosition: SnackPosition.TOP,
+          title: 'Payment Successful',
+          message: 'R$payFastCost charged to card ending in $last4',
+        ));
+        Future.delayed(const Duration(seconds: 2), () {
+          appController.currentIndex.value = 2;
+          Get.offAll(() => const BottomNavigatorExample());
+        });
+      } else {
+        Get.showSnackbar(GetSnackBar(
+          backgroundColor: Colors.red.shade900,
+          duration: const Duration(seconds: 4),
+          snackPosition: SnackPosition.TOP,
+          title: 'Payment Failed',
+          message: 'Card charge failed. Please try again or use another method.',
+        ));
+      }
+    } catch (e) {
+      EasyLoading.dismiss();
+      Get.showSnackbar(GetSnackBar(
+        backgroundColor: Colors.red.shade900,
+        duration: const Duration(seconds: 4),
+        snackPosition: SnackPosition.TOP,
+        title: 'Payment Error',
+        message: 'An error occurred. Please try again.',
+      ));
+    }
+  }
+
+  Future<void> _deleteSavedCard(Map<String, dynamic> card) async {
+    final cardId = card['id'] as String;
+    final last4 = card['last4'] ?? '****';
+    final confirmed = await Get.dialog<bool>(
+      AlertDialog(
+        title: const Text('Remove Saved Card'),
+        content: Text('Remove card ending in $last4? You can always add it again later.'),
+        actions: [
+          TextButton(onPressed: () => Get.back(result: false), child: const Text('Cancel')),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+            onPressed: () => Get.back(result: true),
+            child: const Text('Remove'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+
+    final success = await appController.deleteSavedCard(cardId);
+    if (success) {
+      setState(() => _savedCards.removeWhere((c) => c['id'] == cardId));
+      Get.showSnackbar(GetSnackBar(
+        backgroundColor: Colors.green.shade700,
+        duration: const Duration(seconds: 2),
+        snackPosition: SnackPosition.TOP,
+        title: 'Card Removed',
+        message: 'Card ending in $last4 has been removed.',
+      ));
+    }
+  }
+
   Future<void> _initiateBnpl(BnplProvider provider) async {
     final info = BnplService.providerInfo[provider]!;
     EasyLoading.show(status: 'Setting up ${info.name}...');
@@ -598,6 +891,7 @@ class _ModelBottomSheetState extends State<ModelBottomSheet> {
           orderId: result.orderId,
           provider: provider,
           taskManagementModel: widget.record,
+          finalAmount: amount,
         ),
         transition: Transition.fadeIn,
       );

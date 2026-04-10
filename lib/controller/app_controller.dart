@@ -131,10 +131,10 @@ class AppController extends GetxController {
   //payment Integration
   var webUrl = "".obs;
   // var isWithdraw = false.obs;
-  var isPaymentUsingPayFast = false.obs;
+  var isPaymentUsingPayFast = false.obs; // Now represents Ozow payment
   // isPaymentUsingPayFlex removed — replaced by isPaymentUsingBnpl (multi-provider)
   var isPaymentUsingBnpl = false.obs;
-  /// Tracks the active payment method: 'wallet', 'payFast', or 'bnpl'.
+  /// Tracks the active payment method: 'wallet', 'ozow', or 'bnpl'.
   var activePaymentMethod = 'wallet'.obs;
 
   var newTaskIdForOrder = "".obs;
@@ -352,19 +352,18 @@ class AppController extends GetxController {
         ).timeout(
           const Duration(seconds: 60),
           onTimeout: () {
+            ErrorReportingService.reportError(
+              errorType: 'image_upload_error',
+              description: 'Image upload timed out after 60 seconds during deposit request.',
+              source: 'client_app',
+              severity: 'medium',
+            );
             throw Exception('Upload timed out after 60 seconds. Please check your internet connection and try again.');
           },
         );
       } catch (uploadError) {
         debugPrint('[sendDepositRequest] Storage upload error: $uploadError');
         debugPrint('[sendDepositRequest] Error type: ${uploadError.runtimeType}');
-        ErrorReportingService.reportError(
-          errorType: 'image_upload_error',
-          description: 'Deposit request image upload failed',
-          source: 'client_app',
-          errorDetails: uploadError.toString(),
-          severity: 'medium',
-        );
         // Provide more specific error messages
         final errStr = uploadError.toString();
         if (errStr.contains('permission') || errStr.contains('unauthorized')) {
@@ -820,6 +819,9 @@ class AppController extends GetxController {
         subCategoryList.assignAll(data);
         isLoading.value = false;
         debugPrint("sub category ${subCategoryList.length}");
+      }, onError: (e) {
+        isLoading.value = false;
+        debugPrint("subCategoryQuery stream error: $e");
       });
     } catch (e) {
       isLoading.value = false;
@@ -1089,46 +1091,15 @@ class AppController extends GetxController {
     // }
   }
 
-  //Payment
+  //Payment — PayFast integration (Ozow EFT + Card)
   Future<String> initiatePayment(
-      {required String cost, String? id, String? key, String? taskManagementId}) async {
-    debugPrint("payment");
+      {required String cost, String? id, String? key, String? taskManagementId,
+       String? paymentMethod, bool saveCard = false}) async {
+    debugPrint("payment — initiating ${paymentMethod ?? 'eft'} via backend");
     webUrl.value = "";
     String web = '';
 
-    // If credentials are provided explicitly, use direct PayFast call
-    final mId = id ?? PaymentCredential.merchantId;
-    final mKey = key ?? PaymentCredential.merchantKey;
-
-    if (mId.isNotEmpty && mKey.isNotEmpty) {
-      var body = <String, String>{
-        'merchant_id': mId,
-        'merchant_key': mKey,
-        'amount': cost,
-        'item_name': "Payment (PayFast)",
-        if (taskManagementId != null && taskManagementId.isNotEmpty)
-          'custom_str1': taskManagementId,
-      };
-
-      final url = Uri.parse('https://www.payfast.co.za/eng/process');
-      final response = await http.post(
-        url,
-        body: body,
-        headers: {
-          'Accept': 'application/json',
-        },
-      );
-
-      if (response.statusCode == 302) {
-        final redirectedUrl = response.headers['location'];
-        if (redirectedUrl != null) {
-          debugPrint("PayFast redirect received");
-          return redirectedUrl;
-        }
-      }
-    }
-
-    // Fallback: use backend server to initiate payment (avoids empty credentials)
+    // All payments go through the backend which has PayFast credentials
     try {
       final backendUrl = 'https://square15-livekit-backend.onrender.com';
       final token = await FirebaseAuth.instance.currentUser?.getIdToken();
@@ -1140,46 +1111,110 @@ class AppController extends GetxController {
         },
         body: jsonEncode({
           'amount': cost,
-          'item_name': 'Payment (PayFast)',
+          'item_name': 'Square 15 Payment',
           if (taskManagementId != null && taskManagementId.isNotEmpty)
             'custom_str1': taskManagementId,
+          if (paymentMethod != null) 'payment_method': paymentMethod,
+          if (saveCard) 'save_card': true,
         }),
       );
 
-      if (response.statusCode == 200) {
-        final data = jsonDecode(response.body);
-        if (data['ok'] == true && data['payfast_url'] != null) {
-          final payfastUrl = data['payfast_url'];
-          final paymentData = data['payment_data'] as Map<String, dynamic>;
-          // Post to PayFast with server-provided credentials
-          final pfResponse = await http.post(
-            Uri.parse(payfastUrl),
-            body: paymentData.map((k, v) => MapEntry(k, v.toString())),
-            headers: {'Accept': 'application/json'},
-          );
-          if (pfResponse.statusCode == 302) {
-            final redirectedUrl = pfResponse.headers['location'];
-            if (redirectedUrl != null) {
-              debugPrint("PayFast redirect received (via backend)");
-              return redirectedUrl;
-            }
-          }
-        }
+      final data = jsonDecode(response.body);
+      if (response.statusCode == 200 && data['ok'] == true && data['payment_url'] != null) {
+        final paymentUrl = data['payment_url'] as String;
+        debugPrint("Ozow payment URL received");
+        return paymentUrl;
       }
-      debugPrint("Backend payment initiation failed: ${response.statusCode}");
+      debugPrint("Backend payment initiation failed: ${response.statusCode} ${response.body}");
     } catch (e) {
       debugPrint("Backend payment error: $e");
       ErrorReportingService.reportError(
         errorType: 'payment_error',
-        description: 'Payment initiation failed via backend',
+        description: 'Payment initiation failed. Customer could not start payment process.',
         source: 'client_app',
         errorDetails: e.toString(),
-        bookingId: taskManagementId,
         severity: 'high',
       );
     }
 
     return web;
+  }
+
+  /// Fetch saved cards from backend (tokens stay server-side, only masked info returned)
+  Future<List<Map<String, dynamic>>> getSavedCards() async {
+    try {
+      final backendUrl = 'https://square15-livekit-backend.onrender.com';
+      final token = await FirebaseAuth.instance.currentUser?.getIdToken();
+      final response = await http.get(
+        Uri.parse('$backendUrl/api/payment/saved-cards'),
+        headers: {
+          'Content-Type': 'application/json',
+          if (token != null) 'Authorization': 'Bearer $token',
+        },
+      );
+      final data = jsonDecode(response.body);
+      if (response.statusCode == 200 && data['ok'] == true) {
+        return List<Map<String, dynamic>>.from(data['cards'] ?? []);
+      }
+    } catch (e) {
+      debugPrint('Error fetching saved cards: $e');
+    }
+    return [];
+  }
+
+  /// Charge a saved card using its server-side token
+  Future<bool> chargeWithSavedCard({
+    required String cardId,
+    required String cost,
+    required String taskManagementId,
+  }) async {
+    try {
+      final backendUrl = 'https://square15-livekit-backend.onrender.com';
+      final token = await FirebaseAuth.instance.currentUser?.getIdToken();
+      // Get the card token from Firestore (server-side only)
+      final response = await http.post(
+        Uri.parse('$backendUrl/api/payment/charge-token'),
+        headers: {
+          'Content-Type': 'application/json',
+          if (token != null) 'Authorization': 'Bearer $token',
+        },
+        body: jsonEncode({
+          'card_id': cardId,
+          'amount': cost,
+          'item_name': 'Square 15 Payment',
+          'custom_str1': taskManagementId,
+        }),
+      );
+      final data = jsonDecode(response.body);
+      if (response.statusCode == 200 && data['ok'] == true) {
+        debugPrint('Saved card charge successful');
+        return true;
+      }
+      debugPrint('Saved card charge failed: ${response.body}');
+    } catch (e) {
+      debugPrint('Error charging saved card: $e');
+    }
+    return false;
+  }
+
+  /// Delete a saved card
+  Future<bool> deleteSavedCard(String cardId) async {
+    try {
+      final backendUrl = 'https://square15-livekit-backend.onrender.com';
+      final token = await FirebaseAuth.instance.currentUser?.getIdToken();
+      final response = await http.delete(
+        Uri.parse('$backendUrl/api/payment/saved-cards/$cardId'),
+        headers: {
+          'Content-Type': 'application/json',
+          if (token != null) 'Authorization': 'Bearer $token',
+        },
+      );
+      final data = jsonDecode(response.body);
+      return response.statusCode == 200 && data['ok'] == true;
+    } catch (e) {
+      debugPrint('Error deleting saved card: $e');
+    }
+    return false;
   }
 
   Future<void> savePaymentStatus(
@@ -1225,14 +1260,17 @@ class AppController extends GetxController {
     final futureBookingId =
         (tmData['future_booking_id'] ?? '').toString().trim();
     final isFutureBookingBridge =
-        source == 'future_booking' && futureBookingId.isNotEmpty;
+        futureBookingId.isNotEmpty ||
+        source == 'future_booking' ||
+        source == 'ai_text_chat' ||
+        source == 'whatsapp';
 
     final now = DateTime.now().toString();
     final String paymentMethod;
     if (isPaymentUsingBnpl.value) {
       paymentMethod = 'bnpl';
     } else if (isPaymentUsingPayFast.value) {
-      paymentMethod = 'payFast';
+      paymentMethod = activePaymentMethod.value == 'card' ? 'card' : 'ozow';
     } else {
       paymentMethod = 'wallet';
     }
@@ -1429,8 +1467,10 @@ class AppController extends GetxController {
       }
 
       if (isFutureBookingBridge) {
+        // Use future_booking_id if set; otherwise the task ID itself is the futureBookings doc ID
+        final fbDocId = futureBookingId.isNotEmpty ? futureBookingId : taskManagementId;
         try {
-          await FutureBookingService.futureBookingsRef.doc(futureBookingId).update({
+          await FutureBookingService.futureBookingsRef.doc(fbDocId).update({
             'payment_status': 'paid',
             'payment_amount': cost,
             'payment_method': paymentMethod,
@@ -1443,7 +1483,7 @@ class AppController extends GetxController {
           // If this is an RFQ booking, set the correct rfq_status.
           try {
             final fbSnap = await FutureBookingService.futureBookingsRef
-                .doc(futureBookingId)
+                .doc(fbDocId)
                 .get();
             final fb = fbSnap.data() ?? <String, dynamic>{};
             final isRfq = (fb['is_rfq'] ?? '').toString().toLowerCase() == 'yes' ||
@@ -1460,7 +1500,7 @@ class AppController extends GetxController {
                   oldRfqStatus == 'accepted_converted';
 
               await FutureBookingService.futureBookingsRef
-                  .doc(futureBookingId)
+                  .doc(fbDocId)
                   .set({
                 'rfq_status': artisanAccepted
                     ? 'rfq_order_active'
@@ -1475,7 +1515,7 @@ class AppController extends GetxController {
           // Notify the artisan that payment was received so they can start work.
           try {
             final fb = (await FutureBookingService.futureBookingsRef
-                    .doc(futureBookingId)
+                    .doc(fbDocId)
                     .get())
                 .data() ?? <String, dynamic>{};
             final artisanId =
@@ -1483,10 +1523,34 @@ class AppController extends GetxController {
             if (artisanId.isNotEmpty) {
               await FutureBookingService.sendNotificationToArtisan(
                 artisanId: artisanId,
-                bookingId: futureBookingId,
+                bookingId: fbDocId,
                 message:
                     'The client has completed payment for your accepted job. '
                     'You can now proceed with the booking.',
+              );
+            }
+          } catch (_) {
+            // Best-effort.
+          }
+
+          // ── Notify WhatsApp client if booking from WhatsApp ──
+          try {
+            final fb = (await FutureBookingService.futureBookingsRef
+                    .doc(fbDocId)
+                    .get())
+                .data() ?? <String, dynamic>{};
+            final bookingSource =
+                (fb['source'] ?? tmData['source'] ?? '').toString().trim().toLowerCase();
+            if (bookingSource == 'whatsapp' || bookingSource == 'whatsapp_rfq') {
+              final tmId = taskManagementId.isNotEmpty ? taskManagementId : fbDocId;
+              await http.post(
+                Uri.parse('https://square15-whatsapp-bot.onrender.com/api/payment-confirmed'),
+                headers: {'Content-Type': 'application/json'},
+                body: jsonEncode({
+                  'bookingId': tmId,
+                  'paymentType': isDepositPayment ? 'deposit' : 'full',
+                  'amount': cost,
+                }),
               );
             }
           } catch (_) {
@@ -1521,15 +1585,15 @@ class AppController extends GetxController {
 
       Get.showSnackbar(const GetSnackBar(
           backgroundColor: Colors.green,
-          duration: Duration(seconds: 1),
+          duration: Duration(seconds: 3),
           snackPosition: SnackPosition.TOP,
-          title: 'Success',
-          message: 'Transaction Successful'));
+          title: 'Payment Successful',
+          message: 'Your payment has been recorded. Thank you!'));
     } catch (e) {
       debugPrint("savePaymentStatus $e");
       ErrorReportingService.reportErrorAsSupportCase(
         errorType: 'payment_error',
-        description: 'Payment save failed for task $taskManagementId (R$cost, $status)',
+        description: 'Payment was processed but could not be fully saved for booking $taskManagementId (R$cost). Requires admin verification.',
         source: 'client_app',
         errorDetails: e.toString(),
         bookingId: taskManagementId,
@@ -1563,10 +1627,10 @@ class AppController extends GetxController {
             .set(transactionData);
         Get.showSnackbar(const GetSnackBar(
             backgroundColor: Colors.red,
-            duration: Duration(seconds: 2),
+            duration: Duration(seconds: 6),
             snackPosition: SnackPosition.TOP,
-            title: 'Failed',
-            message: 'Transaction Record Not Saved'));
+            title: 'Payment Sync Error',
+            message: 'Your payment was processed but could not be fully saved. It will be verified automatically. Contact support if your booking is not updated within a few minutes.'));
       }
     }
   }
@@ -1870,10 +1934,10 @@ class AppController extends GetxController {
       toDeviceToken = (dc.data() as Map<String, dynamic>?)?['deviceToken']?.toString() ?? '';
       if (toDeviceToken.trim().isEmpty) return;
       var body = (accept == "1")
-          ? "${userName.value} has accepted your order, please clear your payment to start."
-          : "${userName.value} has rejected your order";
+          ? "${userName.value} has accepted your booking, please clear your payment to start."
+          : "${userName.value} has rejected your booking";
 
-      var title = "Order ${accept == "1" ? "Accepted" : "Rejected"}";
+      var title = "Booking ${accept == "1" ? "Accepted" : "Rejected"}";
       var type = title;
 
       message = {
@@ -2201,7 +2265,7 @@ class AppController extends GetxController {
       'task_id': '',
       'task_name': taskName,
       'transaction_by': userId.value,
-      'type': 'payFast'
+      'type': 'ozow'
     };
     final Map<String, dynamic> providerData = {
       'balance': remainingBalance,
@@ -2243,7 +2307,7 @@ class AppController extends GetxController {
           'task_id': '',
           'task_name': taskName,
           'transaction_by': userId.value,
-          'type': 'payFast'
+          'type': 'ozow'
         };
         FirebaseService.transactionRef
             .doc(transactionId)

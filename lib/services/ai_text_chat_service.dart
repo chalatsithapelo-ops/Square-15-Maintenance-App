@@ -51,12 +51,16 @@ class AITextChatService {
   String? _sessionId;
   String? _userRole; // 'client' or 'artisan'
 
-  final _messageController = StreamController<ChatMessage>.broadcast();
+  StreamController<ChatMessage> _messageController = StreamController<ChatMessage>.broadcast();
   Stream<ChatMessage> get messageStream => _messageController.stream;
 
   final List<ChatMessage> messages = [];
 
   void startSession({required String userRole}) {
+    // Re-create the stream controller if it was closed by a previous dispose()
+    if (_messageController.isClosed) {
+      _messageController = StreamController<ChatMessage>.broadcast();
+    }
     _sessionId = DateTime.now().millisecondsSinceEpoch.toString();
     _userRole = userRole;
     _conversationHistory.clear();
@@ -2012,28 +2016,41 @@ KEY GUIDELINES:
 - After an RFQ quote is accepted, payment happens AFTER an artisan accepts (same as regular bookings)
 - For emergencies (burst pipes, electrical hazards, flooding), treat as urgent
 
+PRICE CONFIRMATION (CRITICAL — NEVER SKIP):
+- After calling lookup_service_pricing, you MUST present the price to the customer and WAIT for their explicit confirmation BEFORE calling create_booking.
+- Say something like: "The cost for [service] is R[price]. Shall I go ahead and create the booking?"
+- Do NOT call create_booking in the same response as lookup_service_pricing. You must STOP and wait for the customer to say yes/confirm.
+- Only after the customer confirms (e.g. "yes", "ok", "go ahead", "book it") should you call create_booking.
+- If the customer questions the price or wants to negotiate, do NOT create the booking — explain the pricing and wait.
+- This applies even if you already have all other details (category, address, description, photo). The price MUST be confirmed first.
+
+PAYMENT FLOW (CRITICAL):
+- When the customer asks to pay, says "pay", or wants to make payment, you MUST first ask: "Would you like to pay the full amount of R[X] or a 35% deposit of R[Y] (with R[Z] balance due after the job is completed)?"
+- WAIT for the customer to choose "full" or "deposit" before calling request_payment_link.
+- Pass the customer's choice as the payment_type parameter ("full" or "deposit").
+- Do NOT call request_payment_link without first asking and getting the customer's payment type choice.
+- Only offer payment AFTER an artisan has accepted the job. NEVER offer payment immediately after booking creation.
+- If customer says deposit or 35 percent, call request_payment_link with payment_type=deposit
+- If customer says full or pay everything, call request_payment_link with payment_type=full
+
 BOOKING FLOW (follow this for EVERY booking — CRITICAL):
 1. Customer describes their need → identify the category
 2. Ask for a photo of the issue (PHOTO REQUIREMENT)
 3. Call lookup_service_pricing → get the service price
 4. If lookup_service_pricing returned matched=true with a fixedPrice:
-   → Tell the customer the fixed price
-   → Confirm they want to proceed
-   → Call create_booking with the fixedPrice as cost parameter
+   → Tell the customer the fixed price and WAIT for confirmation (PRICE CONFIRMATION above)
+   → Only after they confirm, call create_booking with the fixedPrice as cost parameter
 5. If lookup_service_pricing returned matched=false (no fixed price):
    → Tell the customer: "This job needs a detailed quote"
    → Call create_booking anyway — it will auto-generate an RFQ
 6. After booking is created, tell the customer an artisan needs to accept first
-7. When artisan accepts, ask customer: "Would you like to pay the full amount or a 35% deposit?"
+7. When artisan accepts, follow the PAYMENT FLOW above (ask full or deposit)
 8. Generate payment link using request_payment_link with their choice
 9. After payment, confirm escrow protection
 
 - After a completed booking, ask if they'd like to rate their artisan
 - Never share other users' personal information
 - Always confirm before cancelling a booking
-- PAYMENT: Only offer payment AFTER an artisan has accepted the job. NEVER offer payment immediately after booking creation. When customer wants to pay, ALWAYS ask "Would you like to pay the full amount or a 35% deposit?" before calling request_payment_link.
-- If customer says deposit or 35 percent, call request_payment_link with payment_type=deposit
-- If customer says full or pay everything, call request_payment_link with payment_type=full
 - Money is held in escrow until customer is satisfied. 100% money-back guarantee.
 - If you can't help, suggest contacting Square 15 support''';
   }

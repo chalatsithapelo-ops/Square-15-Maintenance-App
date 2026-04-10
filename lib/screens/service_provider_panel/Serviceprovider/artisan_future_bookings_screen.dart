@@ -1,7 +1,9 @@
+import 'dart:convert';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'package:http/http.dart' as http;
 import 'package:intl/intl.dart';
 import 'package:maintenanceapp/controller/app_controller.dart';
 import 'package:maintenanceapp/model/future_booking_model.dart';
@@ -77,7 +79,7 @@ class ArtisanFutureBookingsScreen extends StatelessWidget {
               final depositPaid = data['deposit_paid'] == true;
               final balancePaid = data['balance_paid'] == true;
               final canStart = status != 'in_progress' &&
-                  (paymentStatus == 'paid' || paymentStatus == 'deposit_paid' || depositPaid || status == 'accepted');
+                  (paymentStatus == 'paid' || paymentStatus == 'deposit_paid' || depositPaid);
               final canCancel = status != 'in_progress';
 
               FutureBookingModel booking =
@@ -239,7 +241,7 @@ class ArtisanFutureBookingsScreen extends StatelessWidget {
                             child: Text(
                               booking.isServiceOnCurrentLocation == 'yes'
                                   ? 'Location: Client\'s current location'
-                                  : 'Location: ${booking.userProvidedAddress ?? "Address not provided"}',
+                                  : 'Location: ${(booking.userProvidedAddress?.isNotEmpty == true) ? booking.userProvidedAddress! : "Address not provided"}',
                               style: GoogleFonts.roboto(
                                   fontSize: 13,
                                   color: Colors.black87,
@@ -279,7 +281,13 @@ class ArtisanFutureBookingsScreen extends StatelessWidget {
                               : (paymentStatus == 'paid' || balancePaid)
                                   ? 'Fully Paid \u2705'
                                   : (paymentStatus == 'deposit_paid' || depositPaid)
-                                      ? 'Deposit Paid \u2705 (Balance due after job)'
+                                      ? () {
+                                          final bal = double.tryParse((data['balance_amount'] ?? '').toString()) ??
+                                              ((double.tryParse(booking.cost ?? '0') ?? 0) * 0.65);
+                                          return bal > 0
+                                              ? 'Deposit Paid \u2705 (Balance: R${bal.toStringAsFixed(0)})'
+                                              : 'Deposit Paid \u2705 (Balance due after job)';
+                                        }()
                                       : (status == 'accepted'
                                           ? 'Accepted & Paid'
                                           : (booking.artisanConfirmed == 'yes'
@@ -593,6 +601,7 @@ class ArtisanFutureBookingsScreen extends StatelessWidget {
           ),
           ElevatedButton(
             onPressed: () async {
+              final appController = Get.find<AppController>();
               if (tasksManagementId.trim().isNotEmpty) {
                 await FutureBookingService.tasksManagementRef
                     .doc(tasksManagementId.trim())
@@ -600,6 +609,8 @@ class ArtisanFutureBookingsScreen extends StatelessWidget {
                   {
                     'accept': '1',
                     'status': 'pending_payment',
+                    'service_provider_id': appController.userId.value,
+                    'service_provider_name': appController.userName.value,
                     'updated_at': DateTime.now().toString(),
                   },
                   SetOptions(merge: true),
@@ -612,15 +623,61 @@ class ArtisanFutureBookingsScreen extends StatelessWidget {
                 'artisan_confirmed': 'yes',
                 // After artisan confirms, client must complete payment.
                 'status': 'pending_payment',
+                'service_provider_id': appController.userId.value,
                 'updated_at': DateTime.now().toString(),
               });
 
-              // Deduct wallet immediately once the booking is confirmed.
-              await FutureBookingService.deductWalletOnBookingConfirmation(
-                bookingId: booking.id ?? '',
-              );
+              // For WhatsApp bookings: also update the MAIN tasksManagement
+              // doc and notify the client via WhatsApp.
+              final fbSnap = await FutureBookingService.futureBookingsRef
+                  .doc(booking.id)
+                  .get();
+              final source = (fbSnap.data()?['source'] ?? '')
+                  .toString()
+                  .trim()
+                  .toLowerCase();
+              if (source == 'whatsapp' || source == 'whatsapp_rfq') {
+                // Update main doc so payment handler detects acceptance
+                FutureBookingService.tasksManagementRef
+                    .doc(booking.id)
+                    .set({
+                  'accept': '1',
+                  'artisan_confirmed': 'yes',
+                  'status': 'pending_payment',
+                  'service_provider_id': appController.userId.value,
+                  'service_provider_name': appController.userName.value,
+                  'updated_at': DateTime.now().toString(),
+                }, SetOptions(merge: true));
+                // Notify WhatsApp client
+                try {
+                  http.post(
+                    Uri.parse(
+                        'https://square15-whatsapp-bot.onrender.com/api/artisan-accepted'),
+                    headers: {'Content-Type': 'application/json'},
+                    body: jsonEncode({
+                      'bookingId': booking.id,
+                      'artisanName': appController.userName.value,
+                    }),
+                  );
+                } catch (_) {}
+              }
+
+              // Do NOT auto-deduct wallet here — let the client pay explicitly
+              // so the artisan sees 'pending_payment' status until client pays.
 
               // Notify customer
+              await FutureBookingService.sendNotificationToUser(
+                userId: booking.userId!,
+                title: 'Payment required',
+                type: 'future_booking_payment_required',
+                message:
+                    'Your booking is confirmed. Please pay to confirm the order. Note: funds will be immediately refunded if the work is not done or if the artisan cancels without going to site.',
+                data: {
+                  'booking_id': booking.id ?? '',
+                  'type': 'future_booking_payment_required',
+                },
+              );
+
               await FutureBookingService.sendNotificationToUser(
                 userId: booking.userId!,
                 message:

@@ -517,7 +517,16 @@ class GeneralMaintenancePage extends StatelessWidget {
 
                   // Future booking bridge tasksManagement docs exist for scheduled bookings.
                   // Keep them in Future tab until they transition to in-progress/closed.
-                  if (!includeFutureBookingBridges && source == 'future_booking') {
+                  // For 'future_booking' source, require future_booking_id.
+                  // For 'whatsapp'/'whatsapp_rfq' source, ALWAYS treat as bridge
+                  // (the main WA doc has no future_booking_id but is managed via futureBookings).
+                  final futureBookingId =
+                      (record.futureBookingId ?? '').toString().trim();
+                  final isBridgeRecord =
+                      (source == 'future_booking' && futureBookingId.isNotEmpty) ||
+                      source == 'whatsapp' ||
+                      source == 'whatsapp_rfq';
+                  if (!includeFutureBookingBridges && isBridgeRecord) {
                     final isNowActive = statusLower == 'progress' ||
                         statusLower == 'in_progress' ||
                         statusLower == 'in progress' ||
@@ -1031,9 +1040,10 @@ class GeneralMaintenancePage extends StatelessWidget {
                                     Row(
                                       children: [
                                         const Text("Created at: "),
-                                        Text(DateFormat('dd/MMM/yyyy hh:mm a')
-                                            .format(DateTime.parse(
-                                                record.creationDate!))),
+                                        Text(record.creationDate != null && record.creationDate!.isNotEmpty
+                                            ? DateFormat('dd/MMM/yyyy hh:mm a')
+                                                .format(DateTime.parse(record.creationDate!))
+                                            : 'N/A'),
                                       ],
                                     ),
                                     // Text(record.description == "" ? "" : "\"${record.description}\"",
@@ -1471,7 +1481,71 @@ class GeneralMaintenancePage extends StatelessWidget {
                                                   ),
                                                 ],
                                               )
-                                            : const SizedBox(),
+                                            : (record.status == "completed" || record.status == "closed") &&
+                                                    (record.rating == null || record.rating == "")
+                                                ? GestureDetector(
+                                                    onTap: () async {
+                                                      double userRating = 0.0;
+                                                      showDialog(
+                                                        context: context,
+                                                        builder: (context) {
+                                                          return AlertDialog(
+                                                            title: const Text('Rate Artisan'),
+                                                            content: Column(
+                                                              mainAxisSize: MainAxisSize.min,
+                                                              children: <Widget>[
+                                                                const Text('How was the service?'),
+                                                                const SizedBox(height: 20),
+                                                                RatingBar.builder(
+                                                                  initialRating: 0,
+                                                                  minRating: 1,
+                                                                  direction: Axis.horizontal,
+                                                                  itemCount: 5,
+                                                                  itemPadding: const EdgeInsets.symmetric(horizontal: 1.0),
+                                                                  itemBuilder: (context, _) => const Icon(Icons.star, color: Colors.amber),
+                                                                  onRatingUpdate: (rating) { userRating = rating; },
+                                                                ),
+                                                              ],
+                                                            ),
+                                                            actions: <Widget>[
+                                                              TextButton(
+                                                                onPressed: () => Navigator.of(context).pop(),
+                                                                child: const Text('Cancel'),
+                                                              ),
+                                                              TextButton(
+                                                                onPressed: () {
+                                                                  Navigator.of(context).pop();
+                                                                  EasyLoading.show(status: 'Submitting...');
+                                                                  appController.markOrderAsCompleted(
+                                                                    rating: userRating.toString(),
+                                                                    feedback: '',
+                                                                    taskManagementId: record.id!,
+                                                                  ).then((_) => EasyLoading.dismiss());
+                                                                },
+                                                                child: const Text('Submit'),
+                                                              ),
+                                                            ],
+                                                          );
+                                                        },
+                                                      );
+                                                    },
+                                                    child: Container(
+                                                      padding: const EdgeInsets.all(6),
+                                                      decoration: BoxDecoration(
+                                                        color: const Color(0xFFc5a520).withOpacity(0.2),
+                                                        borderRadius: BorderRadius.circular(5),
+                                                        border: Border.all(color: const Color(0xFFc5a520)),
+                                                      ),
+                                                      child: const Row(
+                                                        children: [
+                                                          Text('Rate this Artisan', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w500, color: Color(0xFFc5a520))),
+                                                          SizedBox(width: 5),
+                                                          Icon(Icons.star_outline, color: Color(0xFFc5a520)),
+                                                        ],
+                                                      ),
+                                                    ),
+                                                  )
+                                                : const SizedBox(),
                                     const SizedBox(height: 10),
                                     CustomPaint(
                                       size: Size(width, height * 0.01),
@@ -1874,7 +1948,7 @@ class _BalancePaymentSheet extends StatelessWidget {
                 onPressed: () async {
                   appController.isPaymentUsingPayFast.value = true;
                   appController.isPaymentUsingBnpl.value = false;
-                  appController.activePaymentMethod.value = 'payFast';
+                  appController.activePaymentMethod.value = 'ozow';
                   EasyLoading.show(status: 'Please Wait...!');
                   try {
                     await appController.getUser(id: appController.userId.value);
@@ -1883,7 +1957,18 @@ class _BalancePaymentSheet extends StatelessWidget {
                         await appController.initiatePayment(
                             cost: costStr,
                             taskManagementId: record.id);
-                    // markBalancePaid is called by PaymentMethodView on PayFast
+                    if (appController.webUrl.value.isEmpty) {
+                      EasyLoading.dismiss();
+                      Get.showSnackbar(GetSnackBar(
+                        backgroundColor: Colors.red.shade900,
+                        duration: const Duration(seconds: 4),
+                        snackPosition: SnackPosition.TOP,
+                        title: 'Payment Error',
+                        message: 'Could not connect to Ozow. Please try again or use wallet payment.',
+                      ));
+                      return;
+                    }
+                    // markBalancePaid is called by PaymentMethodView on Ozow
                     // success callback — not here, to avoid marking paid before
                     // user completes the external payment.
                     Get.to(
@@ -1897,7 +1982,7 @@ class _BalancePaymentSheet extends StatelessWidget {
                     EasyLoading.dismiss();
                   }
                 },
-                child: Text('Pay R${balanceAmount.toStringAsFixed(2)} Via PayFast',
+                child: Text('Pay R${balanceAmount.toStringAsFixed(2)} Via Ozow',
                     style: GoogleFonts.lato(
                         fontWeight: FontWeight.bold,
                         color: Colors.white,
