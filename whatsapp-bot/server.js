@@ -493,13 +493,14 @@ const waTools = [
     type: 'function',
     function: {
       name: 'request_payment_link',
-      description: 'Generate a payment link for an unpaid booking so the customer can pay via card. Use when customer asks to pay.',
+      description: 'Generate a payment link for an unpaid booking so the customer can pay via card. MUST ask the customer whether they want to pay the full amount or a 35% deposit first, then pass their choice as paymentType.',
       parameters: {
         type: 'object',
         properties: {
           bookingId: { type: 'string', description: 'The booking ID to generate payment for' },
+          paymentType: { type: 'string', enum: ['full', 'deposit'], description: 'Whether the customer is paying the full amount or a 35% deposit. MUST ask the customer before calling.' },
         },
-        required: ['bookingId'],
+        required: ['bookingId', 'paymentType'],
       },
     },
   },
@@ -2026,12 +2027,18 @@ async function executeWaTool(name, args, session) {
       if (!doc.exists) return { error: `Booking "${bid}" not found.` };
 
       const d = doc.data();
-      const cost = parseFloat(d.cost || '0');
-      if (cost <= 0) return { error: 'This booking does not have a confirmed price yet.' };
+      const totalCost = parseFloat(d.cost || '0');
+      if (totalCost <= 0) return { error: 'This booking does not have a confirmed price yet.' };
 
       if (d.payment_status === 'paid' || d.paymentStatus === 'paid') {
         return { message: 'This booking is already paid!', bookingId: bid };
       }
+
+      // Calculate amount based on payment type (full or 35% deposit)
+      const paymentType = (args.paymentType || 'full').toLowerCase();
+      const isDeposit = paymentType === 'deposit';
+      const cost = isDeposit ? Math.round(totalCost * 0.35 * 100) / 100 : totalCost;
+      const balanceAfterDeposit = isDeposit ? Math.round((totalCost - cost) * 100) / 100 : 0;
 
       // Check real-time acceptance status from Firestore
       let artisanAccepted = d.accept === '1' || d.accept === 1 ||
@@ -2086,10 +2093,27 @@ async function executeWaTool(name, args, session) {
         console.warn('[wa-tool] payment link generation failed:', e.message);
       }
 
+      // Update Firestore with payment type choice
+      if (isDeposit) {
+        try {
+          await doc.ref.set({
+            payment_type: 'deposit',
+            deposit_amount: cost,
+            balance_remaining: balanceAfterDeposit,
+            updated_at: new Date().toISOString(),
+          }, { merge: true });
+        } catch (_) {}
+      }
+
+      const amountLabel = isDeposit
+        ? `R${cost.toFixed(2)} (35% deposit — R${balanceAfterDeposit.toFixed(2)} balance due after job)`
+        : `R${cost.toFixed(2)} (full amount)`;
+
       if (paymentUrl) {
         return {
-          message: `Here is your secure payment link for R${cost.toFixed(2)}:\n\n${paymentUrl}\n\nClick the link above to pay securely. Your payment is protected and held in escrow until you confirm satisfaction with the work.`,
+          message: `Here is your secure payment link for ${amountLabel}:\n\n${paymentUrl}\n\nClick the link above to pay securely. Your payment is protected and held in escrow until you confirm satisfaction with the work.`,
           amount: `R${cost.toFixed(2)}`,
+          paymentType: isDeposit ? 'deposit' : 'full',
           payment_url: paymentUrl,
           bookingId: bid,
         };
@@ -2097,7 +2121,7 @@ async function executeWaTool(name, args, session) {
         // Fallback: notify admin to send payment link manually
         await firestore.collection('notifications').add({
           title: 'WhatsApp Payment Request',
-          body: `Customer requests payment link for booking ${bid} (R${cost.toFixed(2)})`,
+          body: `Customer requests ${isDeposit ? 'deposit' : 'full'} payment link for booking ${bid} (R${cost.toFixed(2)})`,
           type: 'payment_request',
           user_type: 'admin',
           booking_id: bid,
@@ -2105,8 +2129,9 @@ async function executeWaTool(name, args, session) {
           created_at: admin.firestore.FieldValue.serverTimestamp(),
         });
         return {
-          message: `We're preparing your payment link for R${cost.toFixed(2)}. Our team will send it to you shortly. You can also pay via the Square 15 app.`,
+          message: `We're preparing your payment link for ${amountLabel}. Our team will send it to you shortly. You can also pay via the Square 15 app.`,
           amount: `R${cost.toFixed(2)}`,
+          paymentType: isDeposit ? 'deposit' : 'full',
           bookingId: bid,
         };
       }
@@ -3376,7 +3401,10 @@ PRICE CONFIRMATION (CRITICAL — NEVER SKIP):
 - This applies even if you already have all other details (category, address, name, photo). The price MUST be confirmed first.
 
 PAYMENT FLOW (CRITICAL):
-- When the customer asks to pay, says "pay", or wants to make payment, ALWAYS call request_payment_link immediately.
+- When the customer asks to pay, says "pay", or wants to make payment, you MUST first ask: "Would you like to pay the full amount of R[X] or a 35% deposit of R[Y] (with R[Z] balance due after the job is completed)?"
+- WAIT for the customer to choose "full" or "deposit" before calling request_payment_link.
+- Pass the customer's choice as the paymentType parameter ("full" or "deposit").
+- Do NOT call request_payment_link without first asking and getting the customer's payment type choice.
 - Do NOT refuse or block payment based on conversation history alone. The function checks real-time booking status in the database.
 - If an artisan hasn't accepted yet, the function itself will return an appropriate message.
 - NEVER tell the customer "the artisan hasn't accepted yet" without first calling request_payment_link to verify.
@@ -3808,31 +3836,7 @@ app.post('/api/artisan-accepted', async (req, res) => {
     let to = customerPhone.replace(/[^0-9]/g, '');
     if (to.startsWith('0')) to = '27' + to.slice(1);
 
-    // Generate payment link for WhatsApp customer
-    let paymentUrl = '';
-    if (bookingCost && parseFloat(bookingCost) > 0) {
-      try {
-        const backendUrl = process.env.LIVEKIT_BACKEND_URL || 'https://square15-livekit-backend.onrender.com';
-        const resp = await fetch(`${backendUrl}/api/payment/whatsapp-initiate`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            amount: parseFloat(bookingCost).toFixed(2),
-            booking_id: mainBookingId,
-            customer_name: artisanName ? '' : '',
-            customer_phone: to,
-            description: bookingDescription || `Booking ${mainBookingId}`,
-          }),
-          signal: AbortSignal.timeout(15000),
-        });
-        const result = await resp.json();
-        if (result.ok && result.payment_url) paymentUrl = result.payment_url;
-      } catch (e) {
-        console.warn('[api/artisan-accepted] payment link generation failed:', e.message);
-      }
-    }
-
-    // Send artisan acceptance message with payment link
+    // Send artisan acceptance message (no payment link yet — customer chooses full/deposit first)
     const name = artisanName || 'Your artisan';
     const costStr = bookingCost ? `R${parseFloat(bookingCost).toFixed(2)}` : '';
     const descStr = bookingDescription || 'your maintenance request';
@@ -3844,14 +3848,13 @@ app.post('/api/artisan-accepted', async (req, res) => {
     if (costStr) msg += `💰 *Cost:* ${costStr}\n`;
     msg += `\n${name} will contact you to confirm the schedule and arrive at your location.\n`;
 
-    // Payment section with link
-    msg += `\n💳 *Payment Options:*\n`;
-    if (paymentUrl) {
-      msg += `1️⃣ *Pay now securely:* ${paymentUrl}\n`;
-      msg += `2️⃣ Pay via the Square 15 app\n`;
-    } else {
-      msg += `Pay via the Square 15 app or reply "pay" to get a payment link.\n`;
-    }
+    // Payment section — ask customer to choose full or deposit
+    const depositAmt = bookingCost ? (Math.round(parseFloat(bookingCost) * 0.35 * 100) / 100).toFixed(2) : '0.00';
+    const balanceAmt = bookingCost ? (parseFloat(bookingCost) - parseFloat(depositAmt)).toFixed(2) : '0.00';
+    msg += `\n💳 *Ready to pay? Choose an option:*\n`;
+    msg += `1️⃣ *Full amount:* ${costStr}\n`;
+    msg += `2️⃣ *Deposit (35%):* R${depositAmt} now (R${balanceAmt} due after job)\n`;
+    msg += `\nReply *"pay full"* or *"pay deposit"* to get your secure payment link.\n`;
     msg += `\n🔒 Your payment is held in escrow until you confirm satisfaction with the completed work.\n`;
     msg += `\nReply anytime if you have questions! 😊`;
 
