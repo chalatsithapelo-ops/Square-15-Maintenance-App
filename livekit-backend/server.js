@@ -7500,10 +7500,237 @@ app.post('/api/admin/save-card', authMiddleware, async (req, res) => {
   }
 });
 
+// ── Shared payment processing helper (used by both ozow-result and ITN) ──
+// Idempotent: checks if already processed before updating.
+async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, itemName, source: calledFrom }) {
+  if (!bookingId) return { processed: false, reason: 'no booking ID' };
+
+  const now = new Date().toISOString();
+  const taskRef = admin.firestore().collection('tasksManagement').doc(bookingId);
+  const taskSnap = await taskRef.get();
+
+  if (!taskSnap.exists) {
+    // ── SAFETY NET: If doc doesn't exist, create a minimal one so payment is not lost ──
+    console.warn(`[processPayment] tasksManagement/${bookingId} not found — creating minimal doc to preserve payment`);
+    const isWA = bookingId.startsWith('WA-');
+    const minimalDoc = {
+      id: bookingId,
+      order_no: `SQ15-${bookingId}`,
+      source: isWA ? 'whatsapp' : 'unknown',
+      payment_verified: true,
+      payment_verified_at: now,
+      payment_verified_via: calledFrom || 'payment_callback',
+      payment_status: 'paid',
+      payment_method: 'payfast',
+      created_at: now,
+      updated_at: now,
+      _auto_created: true,
+      _auto_created_reason: 'processSuccessfulPayment: original doc missing at payment time',
+    };
+    if (amountGross) minimalDoc.payfast_itn_amount = amountGross;
+    if (pfPaymentId) minimalDoc.payfast_payment_id = pfPaymentId;
+    await taskRef.set(minimalDoc);
+    console.log(`[processPayment] Created minimal tasksManagement/${bookingId}`);
+    return { processed: true, paymentStatus: 'paid', autoCreated: true };
+  }
+
+  const taskData = taskSnap.data() || {};
+
+  // ── Idempotency: skip if already verified ──
+  if (taskData.payment_verified === true) {
+    console.log(`[processPayment] ${bookingId} already verified (by ${taskData.payment_verified_via || 'unknown'}), skipping`);
+    return { processed: false, reason: 'already verified' };
+  }
+
+  // ── Determine payment type ──
+  const isDepositBooking = taskData.payment_type === 'deposit';
+  const depositAlreadyPaid = taskData.deposit_paid === true;
+  const balanceAlreadyPaid = taskData.balance_paid === true;
+
+  const updateData = {
+    payment_verified: true,
+    payment_verified_at: now,
+    payment_verified_via: calledFrom || 'payment_callback',
+    updated_at: now,
+  };
+  if (pfPaymentId) {
+    updateData.payfast_payment_id = pfPaymentId;
+    updateData.payfast_itn_status = 'COMPLETE';
+    updateData.payfast_itn_amount = amountGross || '0';
+    updateData.payfast_itn_received_at = now;
+  }
+
+  let isDepositPayment = false;
+  let isBalancePayment = false;
+
+  if (isDepositBooking && !depositAlreadyPaid) {
+    updateData.deposit_paid = true;
+    updateData.deposit_paid_at = now;
+    updateData.payment_status = 'deposit_paid';
+    isDepositPayment = true;
+    console.log(`[processPayment] Deposit received for ${bookingId}`);
+  } else if (isDepositBooking && depositAlreadyPaid && !balanceAlreadyPaid) {
+    updateData.balance_paid = true;
+    updateData.balance_paid_at = now;
+    updateData.payment_status = 'paid';
+    isBalancePayment = true;
+    console.log(`[processPayment] Balance received for ${bookingId}`);
+  } else {
+    updateData.payment_status = 'paid';
+    console.log(`[processPayment] Full payment received for ${bookingId}`);
+  }
+
+  await taskRef.update(updateData);
+  console.log(`✅ [processPayment] Updated tasksManagement/${bookingId}: payment_status=${updateData.payment_status}`);
+
+  // ── Update futureBookings ──
+  const futureBookingId = taskData.future_booking_id || '';
+  const fbId = futureBookingId || bookingId;
+
+  try {
+    const fbRef = admin.firestore().collection('futureBookings').doc(fbId);
+    const fbSnap = await fbRef.get();
+    if (fbSnap.exists) {
+      const fbUpdate = {
+        payment_method: 'payfast',
+        payment_paid_at: now,
+        updated_at: now,
+      };
+      if (isBalancePayment) {
+        fbUpdate.balance_paid = true;
+        fbUpdate.balance_paid_at = now;
+        fbUpdate.payment_status = 'paid';
+        fbUpdate.status = 'accepted';
+      } else if (isDepositPayment) {
+        fbUpdate.deposit_paid = true;
+        fbUpdate.deposit_paid_at = now;
+        fbUpdate.payment_status = 'deposit_paid';
+        fbUpdate.status = 'accepted';
+      } else {
+        fbUpdate.payment_status = 'paid';
+        fbUpdate.status = 'accepted';
+      }
+      await fbRef.update(fbUpdate);
+      console.log(`✅ [processPayment] Updated futureBookings/${fbId}: payment_status=${fbUpdate.payment_status}`);
+    }
+  } catch (fbErr) {
+    console.warn(`[processPayment] futureBookings update failed: ${fbErr.message}`);
+  }
+
+  // ── Send WhatsApp notification to customer ──
+  const taskSource = (taskData.source || '').toString().toLowerCase();
+  if (taskSource === 'whatsapp' || taskSource === 'whatsapp_rfq' || bookingId.startsWith('WA-')) {
+    let phone = (taskData.phone || taskData.customer_phone || taskData.customerPhone || taskData.contact || '').toString().trim();
+    if (!phone && (taskData.user_id || taskData.userId)) {
+      try {
+        const uid = (taskData.user_id || taskData.userId).toString().trim();
+        const userDoc = await admin.firestore().collection('users').doc(uid).get();
+        if (userDoc.exists) {
+          phone = (userDoc.data()?.phone || userDoc.data()?.phoneNumber || '').toString().trim();
+        }
+      } catch (_) {}
+    }
+    if (phone) {
+      try {
+        const waBot = env('WHATSAPP_BOT_URL') || 'https://square15-whatsapp-bot.onrender.com';
+        const displayAmount = amountGross || taskData.total_cost || taskData.deposit_amount || '0';
+        let waMessage;
+        if (isBalancePayment) {
+          waMessage = `💳 *Balance payment received!* R${displayAmount} for booking #${taskData.order_no || fbId}.\n\n✅ Your booking is now fully paid. You can now rate your artisan.\n\nThank you for choosing Square 15! 🙏`;
+        } else if (isDepositPayment) {
+          const balAmount = parseFloat(taskData.balance_amount || 0).toFixed(2);
+          waMessage = `💳 *Deposit received!* R${displayAmount} for booking #${taskData.order_no || fbId}.\n\n✅ Your booking is confirmed. The remaining balance of R${balAmount} will be due after job completion.\n\nYour artisan will contact you to arrange the visit. 🙏`;
+        } else {
+          waMessage = `💳 *Payment received!* R${displayAmount} for booking #${taskData.order_no || fbId}.\n\n✅ Your booking is confirmed. Your artisan will contact you to arrange the visit.\n\nThank you for choosing Square 15! 🙏`;
+        }
+        await fetch(`${waBot}/api/booking-status-update`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            bookingId: fbId,
+            status: isBalancePayment ? 'balance_received' : 'payment_received',
+            message: waMessage,
+          }),
+          signal: AbortSignal.timeout(10000),
+        });
+        console.log(`✅ [processPayment] WhatsApp notification sent for ${bookingId}`);
+      } catch (waErr) {
+        console.warn(`[processPayment] WhatsApp notification failed: ${waErr.message}`);
+      }
+    } else {
+      console.warn(`[processPayment] No phone number found for WhatsApp notification (${bookingId})`);
+    }
+  }
+
+  // ── Notify artisan via push notification ──
+  try {
+    const artisanId = (taskData.service_provider_id || '').toString().trim();
+    if (artisanId) {
+      const artisanDoc = await admin.firestore().collection('serviceProvider').doc(artisanId).get();
+      if (artisanDoc.exists) {
+        const artisanToken = (artisanDoc.data()?.deviceToken || '').toString().trim();
+        if (artisanToken) {
+          const orderLabel = taskData.order_no || fbId;
+          const title = isBalancePayment ? 'Balance Payment Received' : isDepositPayment ? 'Deposit Received' : 'Payment Received';
+          const body = isBalancePayment
+            ? `Client paid R${amountGross || '?'} balance for booking #${orderLabel}. Job fully paid.`
+            : isDepositPayment
+              ? `Client paid R${amountGross || '?'} deposit for booking #${orderLabel}. You may proceed.`
+              : `Client paid R${amountGross || '?'} for booking #${orderLabel}. You may proceed.`;
+          await admin.messaging().send({
+            token: artisanToken,
+            notification: { title, body },
+            data: { type: 'payment_received', booking_id: fbId, tasks_management_id: bookingId },
+          });
+          console.log(`✅ [processPayment] Artisan ${artisanId} notified`);
+        }
+      }
+    }
+  } catch (artErr) {
+    console.warn(`[processPayment] Artisan notification failed: ${artErr.message}`);
+  }
+
+  // ── Create transaction log ──
+  try {
+    const txRef = admin.firestore().collection('transactionLogs');
+    const txQuery = pfPaymentId
+      ? txRef.where('payfast_payment_id', '==', pfPaymentId).limit(1)
+      : txRef.where('tasks_management_id', '==', bookingId).where('status', '==', 'success').limit(1);
+    const existingTx = await txQuery.get();
+
+    if (existingTx.empty) {
+      const txId = crypto.randomUUID();
+      await txRef.doc(txId).set({
+        id: txId,
+        amount: amountGross || taskData.total_cost || '0',
+        transaction_at: now,
+        status: 'success',
+        user_id: taskData.user_id || taskData.userId || '',
+        type: 'payfast',
+        subtype: 'payment',
+        direction: 'in',
+        cash_movement: true,
+        schema_version: 2,
+        tasks_management_id: bookingId,
+        payfast_payment_id: pfPaymentId || '',
+        payfast_itn_status: 'COMPLETE',
+        verified_via: calledFrom || 'payment_callback',
+        item_name: itemName || taskData.item_name || taskData.service_type || '',
+        payment_type: isBalancePayment ? 'balance' : isDepositPayment ? 'deposit' : 'full',
+      });
+      console.log(`✅ [processPayment] Created transactionLog: ${txId}`);
+    }
+  } catch (txErr) {
+    console.warn(`[processPayment] Transaction log failed: ${txErr.message}`);
+  }
+
+  return { processed: true, paymentStatus: updateData.payment_status };
+}
+
 // ── Payment Result Page (return URL after PayFast payment) ──
-// Shows a simple HTML page for WhatsApp customers after payment completes/cancels.
-// Also used by the Flutter WebView to detect payment result.
-app.get('/api/payment/ozow-result', (req, res) => {
+// Shows a success/cancel page AND triggers Firestore + WhatsApp update as fallback.
+// The ITN webhook may not reach Render (free tier sleep), so this is the reliable path.
+app.get('/api/payment/ozow-result', async (req, res) => {
   const { status, booking_id } = req.query;
   const isSuccess = status === 'success';
   const title = isSuccess ? 'Payment Successful!' : 'Payment Cancelled';
@@ -7513,6 +7740,7 @@ app.get('/api/payment/ozow-result', (req, res) => {
     : `Your payment was cancelled. You can try again from WhatsApp or the Square 15 app.`;
   const color = isSuccess ? '#22c55e' : '#ef4444';
 
+  // Send the HTML page immediately so the customer sees it
   res.type('html').send(`<!DOCTYPE html><html><head>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${title}</title>
@@ -7525,6 +7753,19 @@ h1{color:${color};margin:0 0 16px}p{color:#555;line-height:1.6;margin:0}</style>
 <p>${message}</p>
 <p style="margin-top:20px;color:#999;font-size:14px">You can close this page.</p>
 </div></body></html>`);
+
+  // ── CRITICAL FALLBACK: Process payment in background after sending page ──
+  // This ensures Firestore + WhatsApp are updated even if PayFast ITN never arrives
+  if (isSuccess && booking_id) {
+    try {
+      const result = await processSuccessfulPayment(booking_id, {
+        source: 'ozow-result-fallback',
+      });
+      console.log(`[ozow-result] Fallback processing for ${booking_id}: ${JSON.stringify(result)}`);
+    } catch (err) {
+      console.error(`[ozow-result] Fallback processing error for ${booking_id}:`, err.message);
+    }
+  }
 });
 
 // ── PayFast ITN (Instant Transaction Notification) Webhook ──
@@ -7554,10 +7795,14 @@ app.post('/api/payment/itn', async (req, res) => {
       .map(key => `${key}=${encodeURIComponent(String(data[key] || '')).replace(/%20/g, '+')}`)
       .join('&');
 
-    const passphrase = env('PAYFAST_PASSPHRASE') || merchantKey;
+    const passphrase = env('PAYFAST_PASSPHRASE') || '';
+    let sigInput = paramString;
+    if (passphrase) {
+      sigInput += `&passphrase=${encodeURIComponent(passphrase)}`;
+    }
     const expectedSignature = crypto
       .createHash('md5')
-      .update(paramString + `&passphrase=${encodeURIComponent(passphrase)}`)
+      .update(sigInput)
       .digest('hex');
 
     if (receivedSignature !== expectedSignature) {
@@ -7615,210 +7860,30 @@ app.post('/api/payment/itn', async (req, res) => {
       }
     }
 
-    // 3. Update Firestore
-    const now = new Date().toISOString();
-
-    if (customStr1) {
-      // Update tasksManagement if we have a task ID
+    // 3. Process payment using shared helper (handles Firestore + WhatsApp + artisan + tx log)
+    if (paymentStatus === 'COMPLETE' && customStr1) {
+      const result = await processSuccessfulPayment(customStr1, {
+        amountGross,
+        pfPaymentId,
+        itemName,
+        source: 'payfast_itn',
+      });
+      console.log(`[ITN] processSuccessfulPayment result: ${JSON.stringify(result)}`);
+    } else if (customStr1 && (paymentStatus === 'CANCELLED' || paymentStatus === 'FAILED')) {
+      // Mark as cancelled/failed
+      const now = new Date().toISOString();
       const taskRef = admin.firestore().collection('tasksManagement').doc(customStr1);
       const taskSnap = await taskRef.get();
-
       if (taskSnap.exists) {
-        const taskData = taskSnap.data() || {};
-        const updateData = {
+        await taskRef.update({
           payfast_payment_id: pfPaymentId,
           payfast_itn_status: paymentStatus,
           payfast_itn_amount: amountGross,
           payfast_itn_received_at: now,
+          payment_status: paymentStatus === 'CANCELLED' ? 'cancelled' : 'failed',
           updated_at: now,
-        };
-
-        if (paymentStatus === 'COMPLETE') {
-          updateData.payment_verified = true;
-          updateData.payment_verified_at = now;
-          updateData.payment_verified_via = 'payfast_itn';
-
-          // Determine if this is a deposit or balance payment
-          const isDepositBooking = taskData.payment_type === 'deposit';
-          const depositAlreadyPaid = taskData.deposit_paid === true;
-          const balanceAlreadyPaid = taskData.balance_paid === true;
-
-          if (isDepositBooking && !depositAlreadyPaid) {
-            // First payment on a deposit booking → this is the deposit
-            updateData.deposit_paid = true;
-            updateData.deposit_paid_at = now;
-            updateData.payment_status = 'deposit_paid';
-            console.log(`📝 ITN: Deposit payment received for ${customStr1}`);
-          } else if (isDepositBooking && depositAlreadyPaid && !balanceAlreadyPaid) {
-            // Deposit already paid, this is the balance payment
-            updateData.balance_paid = true;
-            updateData.balance_paid_at = now;
-            updateData.payment_status = 'paid';
-            console.log(`📝 ITN: Balance payment received for ${customStr1}`);
-          } else {
-            // Full payment or non-deposit booking
-            updateData.payment_status = 'paid';
-          }
-        } else if (paymentStatus === 'CANCELLED') {
-          updateData.payment_status = 'cancelled';
-        } else if (paymentStatus === 'FAILED') {
-          updateData.payment_status = 'failed';
-        }
-
-        await taskRef.update(updateData);
-        console.log(`📝 Updated tasksManagement/${customStr1}: payment_status=${updateData.payment_status || paymentStatus}`);
-
-        // Also update futureBookings if this is a WA booking
-        if (paymentStatus === 'COMPLETE') {
-          const source = (taskData.source || '').toString().toLowerCase();
-          const futureBookingId = taskData.future_booking_id || '';
-          // For WA bookings, customStr1 IS the main booking ID
-          const fbId = futureBookingId || customStr1;
-
-          // Determine what was just paid for futureBookings update
-          const isBalancePayment = updateData.balance_paid === true;
-          const isDepositPayment = updateData.deposit_paid === true;
-
-          try {
-            const fbRef = admin.firestore().collection('futureBookings').doc(fbId);
-            const fbSnap = await fbRef.get();
-            if (fbSnap.exists) {
-              const fbUpdate = {
-                payment_method: 'payfast',
-                payment_paid_at: now,
-                updated_at: now,
-              };
-              if (isBalancePayment) {
-                fbUpdate.balance_paid = true;
-                fbUpdate.balance_paid_at = now;
-                fbUpdate.payment_status = 'paid';
-                fbUpdate.status = 'accepted';
-              } else if (isDepositPayment) {
-                fbUpdate.deposit_paid = true;
-                fbUpdate.deposit_paid_at = now;
-                fbUpdate.payment_status = 'deposit_paid';
-                fbUpdate.status = 'accepted';
-              } else {
-                fbUpdate.payment_status = 'paid';
-                fbUpdate.status = 'accepted';
-              }
-              await fbRef.update(fbUpdate);
-              console.log(`📝 Updated futureBookings/${fbId}: payment_status=${fbUpdate.payment_status}`);
-            }
-          } catch (fbErr) {
-            console.warn(`[ITN] futureBookings update failed: ${fbErr.message}`);
-          }
-
-          // Notify WhatsApp customer if booking originated from WhatsApp
-          if (source === 'whatsapp' || source === 'whatsapp_rfq') {
-            let phone = (taskData.phone || taskData.customer_phone || taskData.customerPhone || taskData.contact || '').toString().trim();
-            // Fallback: look up from users collection
-            if (!phone && (taskData.user_id || taskData.userId)) {
-              try {
-                const uid = (taskData.user_id || taskData.userId).toString().trim();
-                const userDoc = await admin.firestore().collection('users').doc(uid).get();
-                if (userDoc.exists) {
-                  phone = (userDoc.data()?.phone || userDoc.data()?.phoneNumber || '').toString().trim();
-                }
-              } catch (_) {}
-            }
-            if (phone) {
-              try {
-                const waBot = env('WHATSAPP_BOT_URL') || 'https://square15-whatsapp-bot.onrender.com';
-                let waMessage;
-                if (isBalancePayment) {
-                  waMessage = `💳 *Balance payment received!* R${amountGross} for booking #${taskData.order_no || fbId}.\n\n✅ Your booking is now fully paid. You can now rate your artisan.\n\nThank you for choosing Square 15! 🙏`;
-                } else if (isDepositPayment) {
-                  const balAmount = parseFloat(taskData.balance_amount || 0).toFixed(2);
-                  waMessage = `💳 *Deposit received!* R${amountGross} for booking #${taskData.order_no || fbId}.\n\n✅ Your booking is confirmed. The remaining balance of R${balAmount} will be due after job completion.\n\nYour artisan will contact you to arrange the visit. 🙏`;
-                } else {
-                  waMessage = `💳 *Payment received!* R${amountGross} for booking #${taskData.order_no || fbId}.\n\n✅ Your booking is confirmed. Your artisan will contact you to arrange the visit.\n\nThank you for choosing Square 15! 🙏`;
-                }
-                await fetch(`${waBot}/api/booking-status-update`, {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({
-                    bookingId: fbId,
-                    status: isBalancePayment ? 'balance_received' : 'payment_received',
-                    message: waMessage,
-                  }),
-                  signal: AbortSignal.timeout(10000),
-                });
-              } catch (waErr) {
-                console.warn(`[ITN] WhatsApp notification failed: ${waErr.message}`);
-              }
-            }
-          }
-        }
-      }
-
-
-          // Notify assigned artisan about payment via push notification
-          try {
-            const artisanId = (taskData.service_provider_id || '').toString().trim();
-            if (artisanId) {
-              const artisanDoc = await admin.firestore().collection('serviceProvider').doc(artisanId).get();
-              if (artisanDoc.exists) {
-                const artisanToken = (artisanDoc.data()?.deviceToken || '').toString().trim();
-                if (artisanToken) {
-                  const orderLabel = taskData.order_no || fbId;
-                  const title = isBalancePayment ? 'Balance Payment Received' : isDepositPayment ? 'Deposit Received' : 'Payment Received';
-                  const body = isBalancePayment
-                    ? `Client paid R${amountGross} balance for booking #${orderLabel}. Job fully paid.`
-                    : isDepositPayment
-                      ? `Client paid R${amountGross} deposit for booking #${orderLabel}. You may proceed.`
-                      : `Client paid R${amountGross} for booking #${orderLabel}. You may proceed.`;
-                  await admin.messaging().send({
-                    token: artisanToken,
-                    notification: { title, body },
-                    data: { type: 'payment_received', booking_id: fbId, tasks_management_id: customStr1 },
-                  });
-                  console.log(`[ITN] Artisan ${artisanId} notified of payment`);
-                }
-              }
-            }
-          } catch (artErr) {
-            console.warn(`[ITN] Artisan notification failed: ${artErr.message}`);
-          }
-
-      // Create/update transaction log
-      const txRef = admin.firestore().collection('transactionLogs');
-      const existingTx = await txRef
-        .where('payfast_payment_id', '==', pfPaymentId)
-        .limit(1)
-        .get();
-
-      if (existingTx.empty) {
-        const txId = crypto.randomUUID();
-        await txRef.doc(txId).set({
-          id: txId,
-          amount: amountGross,
-          transaction_at: now,
-          status: paymentStatus === 'COMPLETE' ? 'success' : paymentStatus.toLowerCase(),
-          user_id: taskData.user_id || taskData.userId || '',
-          type: 'payfast',
-          subtype: 'payment',
-          direction: 'in',
-          cash_movement: true,
-          schema_version: 2,
-          tasks_management_id: customStr1,
-          payfast_payment_id: pfPaymentId,
-          payfast_itn_status: paymentStatus,
-          verified_via: 'payfast_itn',
-          item_name: itemName,
-          payment_type: updateData.balance_paid ? 'balance' : updateData.deposit_paid ? 'deposit' : 'full',
         });
-        console.log(`📝 Created transactionLog for ITN: ${txId}`);
-      } else {
-        // Update existing transaction log
-        const existingDoc = existingTx.docs[0];
-        await existingDoc.ref.update({
-          payfast_itn_status: paymentStatus,
-          payfast_itn_received_at: now,
-          status: paymentStatus === 'COMPLETE' ? 'success' : paymentStatus.toLowerCase(),
-          verified_via: 'payfast_itn',
-        });
-        console.log(`📝 Updated existing transactionLog: ${existingDoc.id}`);
+        console.log(`📝 ITN: ${paymentStatus} for ${customStr1}`);
       }
     }
 
