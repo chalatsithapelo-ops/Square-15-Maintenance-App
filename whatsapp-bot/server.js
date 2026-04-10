@@ -3367,6 +3367,14 @@ CRITICAL PRICING RULES:
 - NEVER guess or make up a price. Only use prices returned by lookup_pricing.
 - If create_booking returns an estimated cost of R0.00, it means no fixed price was found — inform the customer and suggest an RFQ.
 
+PRICE CONFIRMATION (CRITICAL — NEVER SKIP):
+- After calling lookup_pricing, you MUST present the price to the customer and WAIT for their explicit confirmation BEFORE calling create_booking.
+- Say something like: "The cost for [service] is R[price]. Shall I go ahead and create the booking?"
+- Do NOT call create_booking in the same response as lookup_pricing. You must STOP and wait for the customer to say yes/confirm.
+- Only after the customer confirms (e.g. "yes", "ok", "go ahead", "book it") should you call create_booking.
+- If the customer questions the price or wants to negotiate, do NOT create the booking — explain the pricing and wait.
+- This applies even if you already have all other details (category, address, name, photo). The price MUST be confirmed first.
+
 PAYMENT FLOW (CRITICAL):
 - When the customer asks to pay, says "pay", or wants to make payment, ALWAYS call request_payment_link immediately.
 - Do NOT refuse or block payment based on conversation history alone. The function checks real-time booking status in the database.
@@ -3387,7 +3395,7 @@ GUIDELINES:
 - SERVICE ADDRESS: The customer might already include the address in their first message (e.g. "I need a plumber at 15 Main Rd, Sandton"). If so, use that address — do NOT ask again. Only ask "Where does the service need to be done?" if no address was mentioned yet. Remember: the service location may differ from where the customer is right now. Do NOT ask for a location pin — just the text address is enough.
 - For complex jobs (renovations, full installations), suggest submitting an RFQ instead of a regular booking
 - Use South African Rands (R) for all pricing
-- When a customer sends a photo, ANALYSE the image using your vision capabilities. Identify the maintenance issue (e.g. leaking pipe, broken socket, cracked wall), suggest the correct service category, and offer to create a booking or RFQ
+- When a customer sends a photo, ANALYSE the image using your vision capabilities. Identify the maintenance issue (e.g. leaking pipe, broken socket, cracked wall), suggest the correct service category, call lookup_pricing to get the price, and present the price to the customer for confirmation. Do NOT create a booking until the customer confirms the price.
 - For emergencies, emphasise urgency and prioritise booking creation (still ask for photo but don't delay)
 - When a booking is created, always mention the estimated cost and payment options
 - After job completion, encourage rating
@@ -3609,8 +3617,8 @@ app.post('/webhook', async (req, res) => {
               console.log(`[msg] ${from}: [IMAGE uploaded to Storage, ${session.photoUrls.length} total]`);
             }
             userText = caption
-              ? `[Customer sent a photo with caption: "${caption}"] Analyse this image of a maintenance/repair issue. Identify the problem, suggest the service category, and offer to create a booking or RFQ.`
-              : '[Customer sent a photo of a maintenance issue] Analyse this image. Identify what repair or maintenance is needed, suggest the service category (plumbing, electrical, painting, etc.), estimate the scope, and offer to create a booking or submit an RFQ.';
+              ? `[Customer sent a photo with caption: "${caption}"] Analyse this image of a maintenance/repair issue. Identify the problem and suggest the service category. Then call lookup_pricing to get the price, present it to the customer, and WAIT for their confirmation before creating any booking.`
+              : '[Customer sent a photo of a maintenance issue] Analyse this image. Identify what repair or maintenance is needed and suggest the service category (plumbing, electrical, painting, etc.). Then call lookup_pricing to get the price, present it to the customer, and WAIT for their confirmation before creating any booking. Do NOT create a booking until the customer confirms the price.';
             console.log(`[msg] ${from}: [IMAGE received, ${(imageMedia.base64.length / 1024).toFixed(0)}KB]`);
             const reply = await handleMessage(session, userText, imageMedia.dataUrl);
             const chunks = reply.match(/.{1,4000}/gs) || [reply];
