@@ -7554,6 +7554,10 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
     payment_verified_at: now,
     payment_verified_via: calledFrom || 'payment_callback',
     updated_at: now,
+    status: 'accepted',
+    accept: '1',
+    artisan_confirmed: 'yes',
+    payment_method: 'payfast',
   };
   if (pfPaymentId) {
     updateData.payfast_payment_id = pfPaymentId;
@@ -7600,19 +7604,31 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
         payment_method: 'payfast',
         payment_paid_at: now,
         updated_at: now,
+        artisan_confirmed: 'yes',
       };
+      // Propagate linking fields from tasksManagement if missing on futureBookings
+      const fbData = fbSnap.data() || {};
+      if (!fbData.user_id && taskData.user_id) fbUpdate.user_id = taskData.user_id;
+      if (!fbData.userId && taskData.user_id) fbUpdate.userId = taskData.user_id;
+      if (!fbData.uid && taskData.user_id) fbUpdate.uid = taskData.user_id;
+      if (!fbData.service_provider_id && taskData.service_provider_id) fbUpdate.service_provider_id = taskData.service_provider_id;
+      if (!fbData.tasks_management_id) fbUpdate.tasks_management_id = bookingId;
+
       if (isBalancePayment) {
         fbUpdate.balance_paid = true;
         fbUpdate.balance_paid_at = now;
         fbUpdate.payment_status = 'paid';
+        fbUpdate.paymentStatus = 'paid';
         fbUpdate.status = 'accepted';
       } else if (isDepositPayment) {
         fbUpdate.deposit_paid = true;
         fbUpdate.deposit_paid_at = now;
         fbUpdate.payment_status = 'deposit_paid';
+        fbUpdate.paymentStatus = 'deposit_paid';
         fbUpdate.status = 'accepted';
       } else {
         fbUpdate.payment_status = 'paid';
+        fbUpdate.paymentStatus = 'paid';
         fbUpdate.status = 'accepted';
       }
       await fbRef.update(fbUpdate);
