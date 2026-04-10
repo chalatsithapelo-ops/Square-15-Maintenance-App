@@ -1452,6 +1452,10 @@ async function executeWaTool(name, args, session) {
         subcategory: args.subcategory || '',
         description: args.description || '',
         address: args.address || '',
+        provided_address: args.address || session.sharedAddress || '',
+        user_lat: session.sharedLatitude ? String(session.sharedLatitude) : '',
+        user_lng: session.sharedLongitude ? String(session.sharedLongitude) : '',
+        service_on_location: (session.sharedLatitude && session.sharedLongitude) ? 'yes' : '',
         urgency: args.urgency || 'normal',
         name: args.customerName || '',
         customerName: args.customerName || '',
@@ -1495,6 +1499,10 @@ async function executeWaTool(name, args, session) {
         subcategory: args.subcategory || '',
         description: args.description || '',
         address: args.address || '',
+        provided_address: args.address || session.sharedAddress || '',
+        user_lat: session.sharedLatitude ? String(session.sharedLatitude) : '',
+        user_lng: session.sharedLongitude ? String(session.sharedLongitude) : '',
+        service_on_location: (session.sharedLatitude && session.sharedLongitude) ? 'yes' : '',
         urgency: args.urgency || 'normal',
         cost: finalCost.toFixed(2),
         status: 'pending',
@@ -3376,6 +3384,7 @@ PHOTO REQUIREMENT (CRITICAL):
 GUIDELINES:
 - Be warm, professional, and concise (WhatsApp messages should be short)
 - Always collect: category, description, address, customer name, AND photos BEFORE creating a booking
+- LOCATION (CRITICAL): Always ask the customer to share their location pin via WhatsApp (tap the + or 📎 icon → Location → Send Your Current Location). The GPS coordinates are needed so the artisan can navigate to the site. If the customer provides only a text address without sharing a location pin, still proceed but encourage them to share the pin.
 - For complex jobs (renovations, full installations), suggest submitting an RFQ instead of a regular booking
 - Use South African Rands (R) for all pricing
 - When a customer sends a photo, ANALYSE the image using your vision capabilities. Identify the maintenance issue (e.g. leaking pipe, broken socket, cracked wall), suggest the correct service category, and offer to create a booking or RFQ
@@ -3631,6 +3640,11 @@ app.post('/webhook', async (req, res) => {
         case 'location':
           userText = `[Customer shared location: ${msg.location.latitude}, ${msg.location.longitude}]`;
           if (msg.location.address) userText += ` Address: ${msg.location.address}`;
+          // Persist GPS coordinates on the session so create_booking can store them
+          session.sharedLatitude = msg.location.latitude;
+          session.sharedLongitude = msg.location.longitude;
+          if (msg.location.address) session.sharedAddress = msg.location.address;
+          console.log(`[location] ${from}: saved lat=${session.sharedLatitude} lng=${session.sharedLongitude} addr=${session.sharedAddress || 'none'}`);
           break;
         case 'sticker':
           continue; // Ignore stickers
