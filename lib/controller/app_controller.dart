@@ -1263,7 +1263,10 @@ class AppController extends GetxController {
         futureBookingId.isNotEmpty ||
         source == 'future_booking' ||
         source == 'ai_text_chat' ||
-        source == 'whatsapp';
+        source == 'whatsapp' ||
+        source == 'whatsapp_rfq';
+
+    debugPrint('[savePaymentStatus] taskId=$taskManagementId source=$source futureBookingId=$futureBookingId isBridge=$isFutureBookingBridge');
 
     final now = DateTime.now().toString();
     final String paymentMethod;
@@ -1518,8 +1521,13 @@ class AppController extends GetxController {
                     .doc(fbDocId)
                     .get())
                 .data() ?? <String, dynamic>{};
-            final artisanId =
+            var artisanId =
                 (fb['service_provider_id'] ?? '').toString().trim();
+            // Fallback: read artisan ID from tasksManagement if missing in futureBookings
+            if (artisanId.isEmpty) {
+              artisanId = (tmData['service_provider_id'] ?? '').toString().trim();
+            }
+            debugPrint('[savePaymentStatus] artisanId=$artisanId fbDocId=$fbDocId');
             if (artisanId.isNotEmpty) {
               await FutureBookingService.sendNotificationToArtisan(
                 artisanId: artisanId,
@@ -1528,9 +1536,12 @@ class AppController extends GetxController {
                     'The client has completed payment for your accepted job. '
                     'You can now proceed with the booking.',
               );
+              debugPrint('[savePaymentStatus] FCM sent to artisan $artisanId');
+            } else {
+              debugPrint('[savePaymentStatus] WARNING: no artisan ID found — FCM skipped');
             }
-          } catch (_) {
-            // Best-effort.
+          } catch (e) {
+            debugPrint('[savePaymentStatus] artisan notification failed: $e');
           }
 
           // ── Notify WhatsApp client if booking from WhatsApp ──
@@ -1561,6 +1572,7 @@ class AppController extends GetxController {
         }
       } else {
         // Regular (non-future-booking) payment — notify the artisan.
+        debugPrint('[savePaymentStatus] non-bridge path — source=$source');
         try {
           final artisanId =
               (tmData['service_provider_id'] ?? '').toString().trim();
@@ -1572,9 +1584,29 @@ class AppController extends GetxController {
                   'The client has completed payment. '
                   'You can now proceed with the job.',
             );
+            debugPrint('[savePaymentStatus] FCM sent to artisan $artisanId (non-bridge)');
           }
-        } catch (_) {
-          // Best-effort.
+        } catch (e) {
+          debugPrint('[savePaymentStatus] non-bridge artisan notification failed: $e');
+        }
+
+        // Also notify via WhatsApp if this was a WhatsApp-originated booking
+        try {
+          final bookingSource = source;
+          if (bookingSource == 'whatsapp' || bookingSource == 'whatsapp_rfq') {
+            await http.post(
+              Uri.parse('https://square15-whatsapp-bot.onrender.com/api/payment-confirmed'),
+              headers: {'Content-Type': 'application/json'},
+              body: jsonEncode({
+                'bookingId': taskManagementId,
+                'paymentType': isDepositPayment ? 'deposit' : 'full',
+                'amount': cost,
+              }),
+            );
+            debugPrint('[savePaymentStatus] WhatsApp payment-confirmed sent (non-bridge)');
+          }
+        } catch (e) {
+          debugPrint('[savePaymentStatus] WhatsApp notification failed (non-bridge): $e');
         }
       }
 
