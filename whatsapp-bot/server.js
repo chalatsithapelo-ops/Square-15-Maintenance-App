@@ -3918,6 +3918,62 @@ app.post('/api/booking-status-update', async (req, res) => {
   }
 });
 
+// ─── App → WhatsApp: Notify client that payment was received ───
+app.post('/api/payment-confirmed', async (req, res) => {
+  try {
+    const { bookingId, paymentType, amount } = req.body || {};
+    if (!bookingId) return res.status(400).json({ error: 'bookingId required' });
+
+    const firestore = db();
+    if (!firestore) return res.status(503).json({ error: 'Database unavailable' });
+
+    const mainBookingId = bookingId.includes('_') ? bookingId.split('_')[0] : bookingId;
+
+    // Look up customer phone + booking details
+    let customerPhone = '', orderNo = '', cost = 0, balanceAmount = 0;
+    const fbDoc = await firestore.collection('futureBookings').doc(mainBookingId).get();
+    if (fbDoc.exists) {
+      const d = fbDoc.data();
+      customerPhone = d.user_phone || d.customerPhone || d.contact || '';
+      orderNo = d.order_no || d.orderNumber || mainBookingId;
+      cost = parseFloat(d.cost || d.price || '0') || 0;
+      balanceAmount = parseFloat(d.balance_amount || '0') || 0;
+    }
+    if (!customerPhone) {
+      const tmDoc = await firestore.collection('tasksManagement').doc(mainBookingId).get();
+      if (tmDoc.exists) {
+        const d = tmDoc.data();
+        customerPhone = d.customerPhone || d.contact || '';
+        if (!orderNo) orderNo = d.order_no || d.orderNumber || mainBookingId;
+        if (!cost) cost = parseFloat(d.cost || d.price || '0') || 0;
+        if (!balanceAmount) balanceAmount = parseFloat(d.balance_amount || '0') || 0;
+      }
+    }
+    if (!customerPhone) return res.status(404).json({ error: 'No customer phone found' });
+
+    let to = customerPhone.replace(/[^0-9]/g, '');
+    if (to.startsWith('0')) to = '27' + to.slice(1);
+
+    const paidAmt = parseFloat(amount || cost || '0');
+    const isDeposit = (paymentType || '').toLowerCase() === 'deposit';
+
+    let msg = `✅ *Payment Received!* R${paidAmt.toFixed(2)} for booking ${orderNo}.\n\n`;
+    if (isDeposit) {
+      const balance = balanceAmount > 0 ? balanceAmount : (cost * 0.65);
+      msg += `💰 Deposit secured. Remaining balance: R${balance.toFixed(2)} (due after job completion).\n\n`;
+    }
+    msg += `🔧 Your artisan will be in touch shortly. Thank you for using Square 15!`;
+
+    await sendWhatsAppMessage(to, msg);
+    console.log(`[api/payment-confirmed] Payment confirmation sent to ${to} for ${mainBookingId} (${paymentType || 'full'})`);
+
+    res.json({ success: true, to, bookingId: mainBookingId });
+  } catch (err) {
+    console.error('[api/payment-confirmed] error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ─── Admin → WhatsApp: Send RFQ response back to client ───
 app.post('/api/send-rfq-response', async (req, res) => {
   try {

@@ -1553,11 +1553,11 @@ class AppController extends GetxController {
                 }),
               );
             }
-          } catch (_) {
-            // Best-effort.
+          } catch (e) {
+            debugPrint('[savePaymentStatus] WhatsApp payment-confirmed failed: $e');
           }
-        } catch (_) {
-          // Best-effort; do not block the UI if this update fails.
+        } catch (e) {
+          debugPrint('[savePaymentStatus] futureBookings sync failed: $e');
         }
       } else {
         // Regular (non-future-booking) payment — notify the artisan.
