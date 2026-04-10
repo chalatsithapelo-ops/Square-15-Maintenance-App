@@ -7521,6 +7521,8 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
       payment_verified_at: now,
       payment_verified_via: calledFrom || 'payment_callback',
       payment_status: 'paid',
+      paymentStatus: 'paid',
+      accept: '1',
       payment_method: 'payfast',
       created_at: now,
       updated_at: now,
@@ -7567,16 +7569,19 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
     updateData.deposit_paid = true;
     updateData.deposit_paid_at = now;
     updateData.payment_status = 'deposit_paid';
+    updateData.paymentStatus = 'deposit_paid';
     isDepositPayment = true;
     console.log(`[processPayment] Deposit received for ${bookingId}`);
   } else if (isDepositBooking && depositAlreadyPaid && !balanceAlreadyPaid) {
     updateData.balance_paid = true;
     updateData.balance_paid_at = now;
     updateData.payment_status = 'paid';
+    updateData.paymentStatus = 'paid';
     isBalancePayment = true;
     console.log(`[processPayment] Balance received for ${bookingId}`);
   } else {
     updateData.payment_status = 'paid';
+    updateData.paymentStatus = 'paid';
     console.log(`[processPayment] Full payment received for ${bookingId}`);
   }
 

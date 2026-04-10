@@ -5,8 +5,6 @@
  * OpenAI GPT-4o, and creates/manages bookings in the same Firestore
  * collections used by the Flutter apps.
  *
- * Deploy: 2026-04-10T20:10Z – force redeploy with /api/payment-confirmed endpoint
- *
  * Endpoints:
  *   GET  /webhook       – Meta verification handshake
  *   POST /webhook       – Incoming messages
