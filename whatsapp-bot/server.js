@@ -3861,7 +3861,7 @@ app.post('/api/artisan-accepted', async (req, res) => {
     await sendWhatsAppMessage(to, msg);
     console.log(`[api/artisan-accepted] Sent acceptance notification to ${to} for booking ${mainBookingId}`);
 
-    res.json({ success: true, to, bookingId: mainBookingId, hasPaymentLink: !!paymentUrl });
+    res.json({ success: true, to, bookingId: mainBookingId });
   } catch (err) {
     console.error('[api/artisan-accepted] error:', err.message);
     res.status(500).json({ error: err.message });
