@@ -38,6 +38,17 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
+    // App config (BNPL API keys, etc.): admin-only access.
+    match /app_config/{id} {
+      allow read, write: if isSignedIn() && isAdmin();
+    }
+
+    // Admin invite codes: admin-only write, anyone can read to verify.
+    match /admin_invite_codes/{id} {
+      allow read: if isSignedIn();
+      allow write: if isSignedIn() && isAdmin();
+    }
+
     // Bookings: proposal (adjust field names to match your schema).
     // Intention: clients can read/write only their own bookings; admins can read all.
     match /futureBookings/{id} {
