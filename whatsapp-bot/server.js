@@ -3967,7 +3967,7 @@ app.post('/api/payment-confirmed', async (req, res) => {
       const d = fbDoc.data();
       customerPhone = d.user_phone || d.customerPhone || d.contact || d.client_phone || d.phone || '';
       orderNo = d.order_no || d.orderNumber || mainBookingId;
-      cost = parseFloat(d.cost || d.price || '0') || 0;
+      cost = parseFloat(d.cost || d.total_cost || d.price || d.deposit_amount || '0') || 0;
       balanceAmount = parseFloat(d.balance_amount || '0') || 0;
     }
     if (!customerPhone) {
@@ -3976,7 +3976,7 @@ app.post('/api/payment-confirmed', async (req, res) => {
         const d = tmDoc.data();
         customerPhone = d.customerPhone || d.contact || d.user_phone || d.client_phone || d.phone || '';
         if (!orderNo) orderNo = d.order_no || d.orderNumber || mainBookingId;
-        if (!cost) cost = parseFloat(d.cost || d.price || '0') || 0;
+        if (!cost) cost = parseFloat(d.cost || d.total_cost || d.price || d.deposit_amount || '0') || 0;
         if (!balanceAmount) balanceAmount = parseFloat(d.balance_amount || '0') || 0;
       }
     }
@@ -4019,6 +4019,60 @@ app.post('/api/send-rfq-response', async (req, res) => {
     res.json({ success: true, to, rfqNo });
   } catch (err) {
     console.error('[send-rfq-response] error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── App → WhatsApp: Notify client of artisan job lifecycle events ───
+app.post('/api/job-status-update', async (req, res) => {
+  try {
+    const { bookingId, status, artisanName, imageUrl } = req.body || {};
+    if (!bookingId || !status) return res.status(400).json({ error: 'bookingId and status required' });
+
+    const firestore = db();
+    if (!firestore) return res.status(503).json({ error: 'Database unavailable' });
+
+    const mainBookingId = bookingId.includes('_') ? bookingId.split('_')[0] : bookingId;
+
+    // Resolve customer phone
+    let customerPhone = '', orderNo = '';
+    const fbDoc = await firestore.collection('futureBookings').doc(mainBookingId).get();
+    if (fbDoc.exists) {
+      const d = fbDoc.data();
+      customerPhone = d.user_phone || d.customerPhone || d.contact || d.client_phone || d.phone || '';
+      orderNo = d.order_no || d.orderNumber || mainBookingId;
+    }
+    if (!customerPhone) {
+      const tmDoc = await firestore.collection('tasksManagement').doc(mainBookingId).get();
+      if (tmDoc.exists) {
+        const d = tmDoc.data();
+        customerPhone = d.customerPhone || d.contact || d.user_phone || d.client_phone || d.phone || '';
+        if (!orderNo) orderNo = d.order_no || d.orderNumber || mainBookingId;
+      }
+    }
+    if (!customerPhone) return res.status(404).json({ error: 'No customer phone found' });
+
+    let to = customerPhone.replace(/[^0-9]/g, '');
+    if (to.startsWith('0')) to = '27' + to.slice(1);
+
+    const name = artisanName || 'Your artisan';
+    const ref = orderNo || mainBookingId;
+
+    const statusMessages = {
+      'progress':     `🚗 *${name} is on the way!*\n\nYour artisan is heading to your location for booking #${ref}. You can track their location in the Square 15 app.\n\nPlease ensure access to the site is available. 🏠`,
+      'before_photo': `📸 *${name} has arrived!*\n\nYour artisan has arrived at the site and taken a before-work photo for booking #${ref}. Work is about to begin.\n\nWe'll keep you updated on progress. 🔧`,
+      'after_photo':  `📸 *Work completed!*\n\nYour artisan has finished the job and uploaded an after-work photo for booking #${ref}.\n\nPlease review the work in the Square 15 app. ✅`,
+      'completed':    `✅ *Job completed!*\n\nThe work for booking #${ref} has been completed by ${name}.\n\nPlease open the Square 15 app to review the work, confirm satisfaction, and rate your artisan. ⭐`,
+      'balance_due':  `💰 *Balance payment due!*\n\nThe work for booking #${ref} has been completed. Please pay the remaining balance to finalise your booking.\n\nOpen the Square 15 app to make payment. 💳`,
+    };
+
+    const msg = statusMessages[status] || `📋 Your booking #${ref} status has been updated to: *${status}*`;
+    await sendWhatsAppMessage(to, msg);
+    console.log(`[api/job-status-update] Status "${status}" sent to ${to} for ${mainBookingId}`);
+
+    res.json({ success: true, to, status });
+  } catch (err) {
+    console.error('[api/job-status-update] error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });

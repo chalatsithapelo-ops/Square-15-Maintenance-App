@@ -7672,7 +7672,9 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
     if (phone) {
       try {
         const waBot = env('WHATSAPP_BOT_URL') || 'https://square15-whatsapp-bot.onrender.com';
-        const displayAmount = amountGross || taskData.total_cost || taskData.deposit_amount || '0';
+        // Use parseFloat to skip '0' strings and fall through to real cost fields
+        const rawPayAmt = parseFloat(amountGross) || parseFloat(taskData.total_cost) || parseFloat(taskData.cost) || parseFloat(taskData.deposit_amount) || parseFloat(taskData.price) || 0;
+        const displayAmount = rawPayAmt > 0 ? rawPayAmt.toFixed(2) : '0.00';
         let waMessage;
         if (isBalancePayment) {
           waMessage = `💳 *Balance payment received!* R${displayAmount} for booking #${taskData.order_no || fbId}.\n\n✅ Your booking is now fully paid. You can now rate your artisan.\n\nThank you for choosing Square 15! 🙏`;
@@ -7720,12 +7722,14 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
           }
         }
         const orderLabel = taskData.order_no || fbId;
+        const artisanPayAmt = parseFloat(amountGross) || parseFloat(taskData.total_cost) || parseFloat(taskData.cost) || parseFloat(taskData.deposit_amount) || 0;
+        const artisanDisplayAmt = artisanPayAmt > 0 ? artisanPayAmt.toFixed(2) : '?';
         const title = isBalancePayment ? 'Balance Payment Received' : isDepositPayment ? 'Deposit Received' : 'Payment Received';
         const body = isBalancePayment
-          ? `Client paid R${amountGross || '?'} balance for booking #${orderLabel}. Job fully paid.`
+          ? `Client paid R${artisanDisplayAmt} balance for booking #${orderLabel}. Job fully paid.`
           : isDepositPayment
-            ? `Client paid R${amountGross || '?'} deposit for booking #${orderLabel}. You may proceed.`
-            : `Client paid R${amountGross || '?'} for booking #${orderLabel}. You may proceed.`;
+            ? `Client paid R${artisanDisplayAmt} deposit for booking #${orderLabel}. You may proceed.`
+            : `Client paid R${artisanDisplayAmt} for booking #${orderLabel}. You may proceed.`;
         for (const tok of artisanTokens) {
           try {
             await admin.messaging().send({
