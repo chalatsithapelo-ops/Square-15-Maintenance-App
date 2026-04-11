@@ -348,6 +348,16 @@ function getSession(phone) {
   return s;
 }
 
+// Periodic session cleanup to prevent memory leaks from abandoned sessions
+setInterval(() => {
+  const now = Date.now();
+  for (const [phone, s] of sessions) {
+    if (now - s.lastActivity > SESSION_TTL_MS) {
+      sessions.delete(phone);
+    }
+  }
+}, 10 * 60 * 1000); // every 10 minutes
+
 /** Restore session context from Firestore when server restarts (best-effort). */
 async function restoreSessionFromFirestore(session) {
   if (session._restored) return;
@@ -2193,6 +2203,12 @@ async function executeWaTool(name, args, session) {
 
       if (bookData.payment_status === 'paid') return { message: 'This booking is already paid!' };
 
+      // Ensure an artisan has accepted before allowing payment
+      const acceptStatus = (bookData.accept || '').toString().trim();
+      if (acceptStatus !== '1' && acceptStatus !== 'true') {
+        return { error: 'No artisan has accepted this booking yet. Please wait for an artisan to accept before paying.' };
+      }
+
       const cost = parseFloat(bookData.cost || '0');
       if (cost <= 0) return { error: 'This booking does not have a confirmed price yet.' };
 
@@ -3546,7 +3562,16 @@ async function handleMessage(session, userMessage, imageDataUrl) {
       firestore.collection('wa_sessions').doc(session.phone).set({
         phone: session.phone,
         linkedUserId: session.linkedUserId || null,
-        messages: session.messages.slice(-10),
+        messages: session.messages.slice(-10).map(m => {
+          // Truncate base64 image data to prevent exceeding Firestore 1MB doc limit
+          if (typeof m.content === 'string' && m.content.length > 50000) {
+            return { ...m, content: m.content.substring(0, 500) + '...[truncated]' };
+          }
+          if (Array.isArray(m.content)) {
+            return { ...m, content: m.content.map(c => c.type === 'image_url' ? { type: 'text', text: '[image sent]' } : c) };
+          }
+          return m;
+        }),
         photoUrls: session.photoUrls || [],
         lastBookingId: session.lastBookingId || null,
         lastBookingCost: session.lastBookingCost || null,
@@ -3557,6 +3582,7 @@ async function handleMessage(session, userMessage, imageDataUrl) {
         promoCode: session.promoCode || null,
         promoDiscount: session.promoDiscount || 0,
         promoDiscountType: session.promoDiscountType || null,
+        promoId: session.promoId || null,
         lastActivity: admin.firestore.FieldValue.serverTimestamp(),
       }).catch(() => {});
     }
@@ -3611,6 +3637,18 @@ app.get('/webhook', (req, res) => {
 
 // Incoming messages
 app.post('/webhook', async (req, res) => {
+  // Verify Meta webhook signature (X-Hub-Signature-256)
+  const appSecret = process.env.WHATSAPP_APP_SECRET || process.env.META_APP_SECRET || '';
+  if (appSecret) {
+    const signature = req.headers['x-hub-signature-256'] || '';
+    const rawBody = JSON.stringify(req.body);
+    const expected = 'sha256=' + require('crypto').createHmac('sha256', appSecret).update(rawBody).digest('hex');
+    if (signature !== expected) {
+      console.warn('[webhook] Invalid signature — rejecting');
+      return res.sendStatus(403);
+    }
+  }
+
   // Always respond 200 quickly to Meta
   res.sendStatus(200);
 

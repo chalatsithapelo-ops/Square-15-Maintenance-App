@@ -3830,6 +3830,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         const matchedArtisans = [];
         for (const artDoc of artisanSnap.docs) {
           const ad = artDoc.data() || {};
+          if (!isArtisanActive(ad)) continue;
           const st = (ad.status || '').toString().toLowerCase();
           if (st && st !== 'publish' && st !== 'published' && st !== 'approved' && st !== 'approve') continue;
           if (ad.is_suspended === true) continue;
@@ -6351,7 +6352,7 @@ app.post('/api/payment/charge-token', authMiddleware, assistantLimiter, async (r
   try {
     const merchantId = env('PAYFAST_MERCHANT_ID');
     const merchantKey = env('PAYFAST_MERCHANT_KEY');
-    const passphrase = env('PAYFAST_PASSPHRASE') || merchantKey;
+    const passphrase = env('PAYFAST_PASSPHRASE') || '';
 
     if (!merchantId || !merchantKey) {
       return res.status(503).json({ error: 'Payment credentials not configured' });
@@ -6386,7 +6387,7 @@ app.post('/api/payment/charge-token', authMiddleware, assistantLimiter, async (r
       'merchant-id': merchantId,
       'version': 'v1',
       'timestamp': new Date().toISOString().replace('T', ' ').slice(0, 19),
-      'amount': String(parseFloat(amount).toFixed(2) * 100), // amount in cents
+      'amount': String(Math.round(parseFloat(amount) * 100)), // amount in cents
       'item_name': String(item_name),
       ...(custom_str1 ? { custom_str1 } : {}),
     };
@@ -6412,7 +6413,7 @@ app.post('/api/payment/charge-token', authMiddleware, assistantLimiter, async (r
         'signature': signature,
       },
       body: JSON.stringify({
-        amount: parseInt(parseFloat(amount).toFixed(2) * 100), // cents
+        amount: Math.round(parseFloat(amount) * 100), // cents
         item_name: String(item_name),
         ...(custom_str1 ? { custom_str1 } : {}),
       }),
@@ -6665,7 +6666,7 @@ app.post('/api/payment/refund', authMiddleware, assistantLimiter, async (req, re
     if (method === 'card') {
       const merchantId = env('PAYFAST_MERCHANT_ID');
       const merchantKey = env('PAYFAST_MERCHANT_KEY');
-      const passphrase = env('PAYFAST_PASSPHRASE') || merchantKey;
+      const passphrase = env('PAYFAST_PASSPHRASE') || '';
 
       if (!merchantId || !merchantKey) {
         return res.status(503).json({ error: 'Payment credentials not configured.' });
@@ -6886,7 +6887,7 @@ app.post('/api/admin/payout', authMiddleware, assistantLimiter, async (req, res)
     // ── Charge admin's card via PayFast ad-hoc tokenization ──
     const merchantId = env('PAYFAST_MERCHANT_ID');
     const merchantKey = env('PAYFAST_MERCHANT_KEY');
-    const passphrase = env('PAYFAST_PASSPHRASE') || merchantKey;
+    const passphrase = env('PAYFAST_PASSPHRASE') || '';
 
     if (!merchantId || !merchantKey) {
       return res.status(503).json({ error: 'Payment credentials not configured.' });
@@ -7346,6 +7347,12 @@ app.post('/api/ozow-payout-notify', async (req, res) => {
     const payoutDoc = payoutSnap.docs[0];
     const payoutData = payoutDoc.data();
     const now = new Date().toISOString();
+
+    // Idempotency: don't re-process already-finalized payouts
+    if (payoutData.status === 'completed' || payoutData.status === 'failed') {
+      console.log(`[ozow-payout-notify] Payout ${payoutId} already finalized as '${payoutData.status}', ignoring duplicate`);
+      return res.json({ ok: true, status: payoutData.status, duplicate: true });
+    }
 
     const normalizedStatus = (status || '').toLowerCase();
     let finalStatus = 'pending';
@@ -7918,13 +7925,14 @@ app.post('/api/payment/itn', async (req, res) => {
 
           // Store token in user's saved_cards subcollection
           const cardId = crypto.randomUUID();
+          const cardSavedAt = new Date().toISOString();
           await admin.firestore().collection('users').doc(userId).collection('saved_cards').doc(cardId).set({
             id: cardId,
             token: token,
             last4: cardLast4,
             card_type: cardType,
-            created_at: now,
-            last_used_at: now,
+            created_at: cardSavedAt,
+            last_used_at: cardSavedAt,
             payfast_payment_id: pfPaymentId,
             is_active: true,
           });
