@@ -13,6 +13,15 @@
 
 'use strict';
 
+// ─── Truthy check for artisan active field ───
+function isTruthyValue(v) {
+  if (v === true) return true;
+  if (v === false) return false;
+  if (v == null) return false;
+  const s = String(v).trim().toLowerCase();
+  return ['true', 'yes', 'y', '1', 'active', 'online', 'available', 'on'].includes(s);
+}
+
 // ─── Prompt sanitization (prevent injection via user-supplied text) ───
 function sanitizeForPrompt(text, maxLen = 500) {
   if (!text || typeof text !== 'string') return '';
@@ -2976,14 +2985,20 @@ async function executeWaTool(name, args, session) {
         const autoReason = clientBuysMaterials ? 'client_buys_materials' : 'under_12k';
         const cat = (data.category || data.category_name || '').toLowerCase().replace(/\s+/g, '_');
         try {
+          // Query without inequality filter — Firestore != excludes docs
+          // where the field doesn't exist, hiding most artisans.
           const artisanSnap = await firestore.collection('serviceProvider')
-            .where('status', '==', 'approved')
-            .where('is_suspended', '!=', true)
-            .limit(20)
+            .where('status', 'in', ['publish', 'published', 'approved', 'approve'])
+            .limit(50)
             .get();
           const matchedArtisans = [];
           for (const artDoc of artisanSnap.docs) {
             const ad = artDoc.data() || {};
+            // Skip suspended artisans (checked in code, not query)
+            if (ad.is_suspended === true) continue;
+            // Check active status — only the manual toggle gates dispatch
+            const activeField = ad.active;
+            if (activeField != null && !isTruthyValue(activeField)) continue;
             const cats = (ad.categories || ad.category || '').toString().toLowerCase();
             if (cats && cat && !cats.includes(cat) && cat !== 'general_maintenance') continue;
             const aName = ad.name || ad.userName || ad.full_name || artDoc.id;

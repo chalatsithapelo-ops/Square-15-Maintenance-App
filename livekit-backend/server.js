@@ -1060,34 +1060,18 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
   }
 
   function isArtisanActive(artisanData) {
-    const candidates = [
-      artisanData && artisanData.isActive,
-      artisanData && artisanData.active,
-      artisanData && artisanData.is_active,
-      artisanData && artisanData.online,
-      artisanData && artisanData.is_online,
-      artisanData && artisanData.availability,
-      artisanData && artisanData.available,
-      artisanData && artisanData.isAvailable,
-      artisanData && artisanData.is_available,
-      artisanData && artisanData.availability_status,
-      artisanData && artisanData.status_online,
-    ];
-
-    let anyPresent = false;
-    let anyTruthy = false;
-    for (const v of candidates) {
-      if (v == null) continue;
-      const s = String(v).trim();
-      if (!s) continue;
-      anyPresent = true;
-      if (isTruthyExtended(v)) {
-        anyTruthy = true;
-        break;
-      }
-    }
-    if (!anyPresent) return true;
-    return anyTruthy;
+    // ── IMPORTANT ──────────────────────────────────────────────────────
+    // Only the manual "Status" toggle (the `active` field, stored as
+    // 'y'/'n') should gate dispatch.  Presence fields like `is_online`,
+    // `online`, `status_online` etc. must NOT be checked here because
+    // PresenceService sets `is_online = false` whenever the app is
+    // backgrounded / closed.  Artisans who simply close the app (without
+    // signing out or turning Status off) must still receive requests and
+    // push notifications.
+    // ────────────────────────────────────────────────────────────────────
+    const active = artisanData && artisanData.active;
+    if (active == null) return true; // field missing → default to active
+    return isTruthyExtended(active);
   }
 
   function extractLatLng(artisanData) {
