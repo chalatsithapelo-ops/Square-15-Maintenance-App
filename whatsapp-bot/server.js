@@ -319,6 +319,30 @@ async function logErrorToAdmin(errorType, description, source, errorDetails, boo
   }
 }
 
+async function notifyWebhookProcessingFailure(phone, err, userText = '') {
+  const detail = err?.message || String(err || 'unknown_error');
+  try {
+    await logErrorToAdmin(
+      'network_error',
+      'WhatsApp webhook processing failed',
+      'whatsapp_bot',
+      `phone=${phone || 'unknown'}; userText=${String(userText || '').slice(0, 200)}; error=${detail}`,
+      '',
+      'high'
+    );
+  } catch (_) {}
+
+  if (!phone) return;
+  try {
+    await sendWhatsAppMessage(
+      phone,
+      'I hit a temporary problem while processing that message. Please try again, or send Hi to restart the chat.'
+    );
+  } catch (sendErr) {
+    console.error('[webhook] failed to send fallback message:', sendErr?.message || sendErr);
+  }
+}
+
 // ─── Session management (in-memory + Firestore backup) ───
 
 const sessions = new Map();
@@ -3661,6 +3685,9 @@ app.post('/webhook', async (req, res) => {
 
     for (const msg of value.messages) {
       const from = msg.from; // phone number
+      let userText = '';
+
+      try {
 
       // Rate-limit check (prevents abuse / runaway OpenAI costs)
       if (isRateLimited(from)) {
@@ -3685,8 +3712,6 @@ app.post('/webhook', async (req, res) => {
           console.warn('[auto-link] Phone lookup failed:', e.message);
         }
       }
-
-      let userText = '';
 
       switch (msg.type) {
         case 'text':
@@ -3724,7 +3749,11 @@ app.post('/webhook', async (req, res) => {
             }
             continue; // Skip normal handleMessage below — already handled
           } else {
-            userText = '[Customer sent a photo but it could not be downloaded] ' + (caption || 'Please describe the maintenance issue you need help with.');
+            await sendWhatsAppMessage(
+              from,
+              'I could not download your photo. Please send the photo again, or describe the issue in text.'
+            );
+            continue;
           }
           break;
         }
@@ -3738,7 +3767,11 @@ app.post('/webhook', async (req, res) => {
             userText = audioTranscript.trim();
             console.log(`[msg] ${from}: [VOICE NOTE transcribed: "${userText.substring(0, 80)}"]`);
           } else {
-            userText = '[Customer sent a voice note but it could not be transcribed] Please ask them to type their question instead, or try sending the voice note again.';
+            await sendWhatsAppMessage(
+              from,
+              'I could not transcribe that voice note. Please try sending it again, or type your request in text.'
+            );
+            continue;
           }
           break;
         }
@@ -3762,11 +3795,22 @@ app.post('/webhook', async (req, res) => {
       console.log(`[msg] ${from}: ${userText.substring(0, 100)}`);
 
       const reply = await handleMessage(session, userText);
+      if (!reply || !reply.trim()) {
+        await sendWhatsAppMessage(
+          from,
+          'I could not generate a reply for that yet. Please rephrase your request, or send Hi to restart.'
+        );
+        continue;
+      }
 
       // Split long replies into chunks (WhatsApp has ~4096 char limit)
       const chunks = reply.match(/.{1,4000}/gs) || [reply];
       for (const chunk of chunks) {
         await sendWhatsAppMessage(from, chunk);
+      }
+      } catch (msgErr) {
+        console.error(`[webhook] Message processing failed for ${from}:`, msgErr);
+        await notifyWebhookProcessingFailure(from, msgErr, userText);
       }
     }
   } catch (err) {

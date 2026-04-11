@@ -4990,6 +4990,7 @@ app.post('/api/voice/start', assistantLimiter, async (req, res) => {
 
     const requireAppCheck = isEnvTruthy('APP_CHECK_REQUIRED');
     const requireSessionBinding = isEnvTruthy('ASSISTANT_SESSION_BINDING_REQUIRED');
+    const allowVoiceStartWithoutAuth = isEnvTruthy('ALLOW_VOICE_START_WITHOUT_AUTH');
     const voiceSessionTtlMinutes = parseIntEnv('VOICE_SESSION_TTL_MINUTES', 60);
 
     if (requireSessionBinding) {
@@ -5021,6 +5022,16 @@ app.post('/api/voice/start', assistantLimiter, async (req, res) => {
 
     // Extract idToken BEFORE the try block so it's accessible in the metadata enrichment below
     const idToken = getBearerToken(req);
+
+    // Default-secure behavior: require Firebase auth for voice start.
+    // Set ALLOW_VOICE_START_WITHOUT_AUTH=true only for controlled testing environments.
+    if (!idToken && !allowVoiceStartWithoutAuth) {
+      return res.status(401).json({
+        error: 'Unauthorized',
+        message: 'Missing Authorization: Bearer <Firebase ID token>',
+        request_id: req.requestId || null,
+      });
+    }
 
     try {
       initFirebaseIfPossible();
