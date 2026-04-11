@@ -3914,13 +3914,13 @@ app.post('/api/booking-status-update', async (req, res) => {
     const fbDoc = await firestore.collection('futureBookings').doc(mainBookingId).get();
     if (fbDoc.exists) {
       const d = fbDoc.data();
-      customerPhone = d.user_phone || d.customerPhone || d.contact || '';
+      customerPhone = d.user_phone || d.customerPhone || d.contact || d.client_phone || d.phone || '';
     }
     if (!customerPhone) {
       const tmDoc = await firestore.collection('tasksManagement').doc(mainBookingId).get();
       if (tmDoc.exists) {
         const d = tmDoc.data();
-        customerPhone = d.customerPhone || d.contact || '';
+        customerPhone = d.customerPhone || d.contact || d.user_phone || d.client_phone || d.phone || '';
       }
     }
     if (!customerPhone) return res.status(404).json({ error: 'No customer phone found' });
@@ -3965,7 +3965,7 @@ app.post('/api/payment-confirmed', async (req, res) => {
     const fbDoc = await firestore.collection('futureBookings').doc(mainBookingId).get();
     if (fbDoc.exists) {
       const d = fbDoc.data();
-      customerPhone = d.user_phone || d.customerPhone || d.contact || '';
+      customerPhone = d.user_phone || d.customerPhone || d.contact || d.client_phone || d.phone || '';
       orderNo = d.order_no || d.orderNumber || mainBookingId;
       cost = parseFloat(d.cost || d.price || '0') || 0;
       balanceAmount = parseFloat(d.balance_amount || '0') || 0;
@@ -3974,7 +3974,7 @@ app.post('/api/payment-confirmed', async (req, res) => {
       const tmDoc = await firestore.collection('tasksManagement').doc(mainBookingId).get();
       if (tmDoc.exists) {
         const d = tmDoc.data();
-        customerPhone = d.customerPhone || d.contact || '';
+        customerPhone = d.customerPhone || d.contact || d.user_phone || d.client_phone || d.phone || '';
         if (!orderNo) orderNo = d.order_no || d.orderNumber || mainBookingId;
         if (!cost) cost = parseFloat(d.cost || d.price || '0') || 0;
         if (!balanceAmount) balanceAmount = parseFloat(d.balance_amount || '0') || 0;

@@ -7659,7 +7659,7 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
   // ── Send WhatsApp notification to customer ──
   const taskSource = (taskData.source || '').toString().toLowerCase();
   if (taskSource === 'whatsapp' || taskSource === 'whatsapp_rfq' || bookingId.startsWith('WA-')) {
-    let phone = (taskData.phone || taskData.customer_phone || taskData.customerPhone || taskData.contact || '').toString().trim();
+    let phone = (taskData.phone || taskData.customer_phone || taskData.customerPhone || taskData.contact || taskData.user_phone || taskData.client_phone || '').toString().trim();
     if (!phone && (taskData.user_id || taskData.userId)) {
       try {
         const uid = (taskData.user_id || taskData.userId).toString().trim();
@@ -7707,22 +7707,54 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
     if (artisanId) {
       const artisanDoc = await admin.firestore().collection('serviceProvider').doc(artisanId).get();
       if (artisanDoc.exists) {
-        const artisanToken = (artisanDoc.data()?.deviceToken || '').toString().trim();
-        if (artisanToken) {
-          const orderLabel = taskData.order_no || fbId;
-          const title = isBalancePayment ? 'Balance Payment Received' : isDepositPayment ? 'Deposit Received' : 'Payment Received';
-          const body = isBalancePayment
-            ? `Client paid R${amountGross || '?'} balance for booking #${orderLabel}. Job fully paid.`
-            : isDepositPayment
-              ? `Client paid R${amountGross || '?'} deposit for booking #${orderLabel}. You may proceed.`
-              : `Client paid R${amountGross || '?'} for booking #${orderLabel}. You may proceed.`;
-          await admin.messaging().send({
-            token: artisanToken,
-            notification: { title, body },
-            data: { type: 'payment_received', booking_id: fbId, tasks_management_id: bookingId },
-          });
-          console.log(`✅ [processPayment] Artisan ${artisanId} notified`);
+        const ad = artisanDoc.data() || {};
+        // Collect all possible FCM token fields
+        const tokenCandidates = [ad.deviceToken, ad.device_token, ad.fcm_token, ad.fcmToken, ad.token, ad.push_token];
+        const tokensSeen = new Set();
+        const artisanTokens = [];
+        for (const c of tokenCandidates) {
+          const t = String(c || '').trim();
+          if (t && !tokensSeen.has(t)) {
+            tokensSeen.add(t);
+            artisanTokens.push(t);
+          }
         }
+        const orderLabel = taskData.order_no || fbId;
+        const title = isBalancePayment ? 'Balance Payment Received' : isDepositPayment ? 'Deposit Received' : 'Payment Received';
+        const body = isBalancePayment
+          ? `Client paid R${amountGross || '?'} balance for booking #${orderLabel}. Job fully paid.`
+          : isDepositPayment
+            ? `Client paid R${amountGross || '?'} deposit for booking #${orderLabel}. You may proceed.`
+            : `Client paid R${amountGross || '?'} for booking #${orderLabel}. You may proceed.`;
+        for (const tok of artisanTokens) {
+          try {
+            await admin.messaging().send({
+              token: tok,
+              notification: { title, body },
+              data: { type: 'payment_received', booking_id: fbId, tasks_management_id: bookingId, user_type: 'artisan' },
+              android: { priority: 'high', notification: { channelId: 'order_request_channel', sound: 'sound' } },
+            });
+            console.log(`✅ [processPayment] Artisan ${artisanId} notified via token ${tok.substring(0, 15)}...`);
+            break; // one successful send is enough
+          } catch (singleErr) {
+            console.warn(`[processPayment] FCM token failed for artisan ${artisanId}: ${singleErr.message}`);
+          }
+        }
+        // Also write in-app notification for artisan
+        try {
+          await admin.firestore().collection('notifications').add({
+            user_id: artisanId,
+            user_type: 'artisan',
+            title,
+            message: body,
+            booking_id: fbId,
+            tasks_management_id: bookingId,
+            type: 'payment_received',
+            read: false,
+            view: false,
+            created_at: now,
+          });
+        } catch (_) {}
       }
     }
   } catch (artErr) {
