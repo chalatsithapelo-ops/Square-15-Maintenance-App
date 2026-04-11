@@ -364,6 +364,15 @@ async function restoreSessionFromFirestore(session) {
     }
     if (data.lastBookingId) session.lastBookingId = data.lastBookingId;
     if (data.lastBookingCost) session.lastBookingCost = data.lastBookingCost;
+    if (data.lastRfqId) session.lastRfqId = data.lastRfqId;
+    if (data.sharedAddress) session.sharedAddress = data.sharedAddress;
+    if (data.sharedLatitude) session.sharedLatitude = data.sharedLatitude;
+    if (data.sharedLongitude) session.sharedLongitude = data.sharedLongitude;
+    if (data.promoCode) {
+      session.promoCode = data.promoCode;
+      session.promoDiscount = data.promoDiscount || 0;
+      session.promoDiscountType = data.promoDiscountType || 'fixed';
+    }
     console.log(`[session] Restored ${session.phone} from Firestore (${session.messages.length} msgs, ${session.photoUrls.length} photos)`);
   } catch (e) {
     console.warn('[session] Firestore restore failed:', e.message);
@@ -3526,6 +3535,13 @@ async function handleMessage(session, userMessage, imageDataUrl) {
         photoUrls: session.photoUrls || [],
         lastBookingId: session.lastBookingId || null,
         lastBookingCost: session.lastBookingCost || null,
+        lastRfqId: session.lastRfqId || null,
+        sharedAddress: session.sharedAddress || null,
+        sharedLatitude: session.sharedLatitude || null,
+        sharedLongitude: session.sharedLongitude || null,
+        promoCode: session.promoCode || null,
+        promoDiscount: session.promoDiscount || 0,
+        promoDiscountType: session.promoDiscountType || null,
         lastActivity: admin.firestore.FieldValue.serverTimestamp(),
       }).catch(() => {});
     }

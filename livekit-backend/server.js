@@ -3234,6 +3234,19 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       const bData = await loadBooking();
       if (!bData) return { ok: false, status: 404, error: 'booking_not_found' };
 
+      // Prevent duplicate payment links
+      const existingLinks = await firestore.collection('payment_links')
+        .where('booking_id', '==', bid)
+        .where('status', '==', 'pending')
+        .limit(1).get();
+      if (!existingLinks.empty) {
+        const existing = existingLinks.docs[0].data();
+        return { ok: true, status: 200, data: {
+          message: `Payment link already exists. Amount: R${parseFloat(existing.amount || 0).toFixed(2)}`,
+          paymentUrl: existing.payment_url || '', bookingId: bid, amount: existing.amount,
+        }};
+      }
+
       // Enforce artisan acceptance before payment
       const artisanAccepted = bData.accept === '1' || bData.accept === 1 || bData.artisan_confirmed === 'yes';
       if (!artisanAccepted) {
@@ -7513,6 +7526,26 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
     // ── SAFETY NET: If doc doesn't exist, create a minimal one so payment is not lost ──
     console.warn(`[processPayment] tasksManagement/${bookingId} not found — creating minimal doc to preserve payment`);
     const isWA = bookingId.startsWith('WA-');
+    // Pull critical fields from futureBookings so the doc isn't orphaned
+    let fbFields = {};
+    try {
+      const fbSnap = await admin.firestore().collection('futureBookings').doc(bookingId).get();
+      if (fbSnap.exists) {
+        const fb = fbSnap.data() || {};
+        fbFields = {
+          ...(fb.user_id && { user_id: fb.user_id, userId: fb.user_id, uid: fb.user_id }),
+          ...(fb.service_provider_id && { service_provider_id: fb.service_provider_id }),
+          ...(fb.description && { description: fb.description }),
+          ...(fb.total_cost && { total_cost: fb.total_cost, cost: fb.total_cost }),
+          ...(fb.category && { category: fb.category }),
+          ...(fb.order_no && { order_no: fb.order_no }),
+          ...(fb.phone && { phone: fb.phone }),
+          ...(fb.provided_address && { provided_address: fb.provided_address }),
+        };
+      }
+    } catch (fbErr) {
+      console.warn(`[processPayment] futureBookings lookup failed: ${fbErr.message}`);
+    }
     const minimalDoc = {
       id: bookingId,
       order_no: `SQ15-${bookingId}`,
@@ -7528,11 +7561,12 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
       updated_at: now,
       _auto_created: true,
       _auto_created_reason: 'processSuccessfulPayment: original doc missing at payment time',
+      ...fbFields,
     };
     if (amountGross) minimalDoc.payfast_itn_amount = amountGross;
     if (pfPaymentId) minimalDoc.payfast_payment_id = pfPaymentId;
     await taskRef.set(minimalDoc);
-    console.log(`[processPayment] Created minimal tasksManagement/${bookingId}`);
+    console.log(`[processPayment] Created minimal tasksManagement/${bookingId} with ${Object.keys(fbFields).length} fields from futureBookings`);
     return { processed: true, paymentStatus: 'paid', autoCreated: true };
   }
 
