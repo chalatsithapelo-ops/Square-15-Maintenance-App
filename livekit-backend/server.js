@@ -3323,6 +3323,17 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         await taskRef.update({ payment_type: paymentType, updated_at: new Date().toISOString() });
       }
 
+      // Generate PayFast signature (required for payment page)
+      const passphrase = env('PAYFAST_PASSPHRASE') || '';
+      const pfParamString = Object.entries(paymentData)
+        .map(([k, v]) => `${encodeURIComponent(k).replace(/%20/g, '+')}=${encodeURIComponent(String(v || '')).replace(/%20/g, '+')}`)
+        .join('&');
+      let sigInput = pfParamString;
+      if (passphrase) {
+        sigInput += `&passphrase=${encodeURIComponent(passphrase).replace(/%20/g, '+')}`;
+      }
+      paymentData.signature = crypto.createHash('md5').update(sigInput).digest('hex');
+
       const qs = Object.entries(paymentData)
         .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
         .join('&');
@@ -3409,11 +3420,22 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         return { ok: false, status: 400, error: `Insufficient wallet balance. You have R${walletBalance.toFixed(2)} but need R${payAmount.toFixed(2)}.` };
       }
 
-      // Deduct from wallet
-      const newBalance = walletBalance - payAmount;
-      await firestore.collection('users').doc(actorUid).update({
-        balance: newBalance.toFixed(2),
-        updated_at: new Date().toISOString(),
+      // Deduct from wallet using Firestore transaction to prevent race conditions
+      let newBalance;
+      await firestore.runTransaction(async (transaction) => {
+        const userRef = firestore.collection('users').doc(actorUid);
+        const freshSnap = await transaction.get(userRef);
+        if (!freshSnap.exists) throw new Error('user_not_found');
+        const freshData = freshSnap.data() || {};
+        const currentBalance = parseFloat(freshData.balance || freshData.wallet_balance || '0');
+        if (currentBalance < payAmount) {
+          throw new Error(`Insufficient wallet balance. You have R${currentBalance.toFixed(2)} but need R${payAmount.toFixed(2)}.`);
+        }
+        newBalance = currentBalance - payAmount;
+        transaction.update(userRef, {
+          balance: newBalance.toFixed(2),
+          updated_at: new Date().toISOString(),
+        });
       });
 
       // Determine deposit vs balance vs full
@@ -6329,7 +6351,7 @@ app.post('/api/payment/initiate', authMiddleware, assistantLimiter, async (req, 
     const paymentData = {
       merchant_id: merchantId,
       merchant_key: merchantKey,
-      amount: String(amount),
+      amount: String(parseFloat(amount).toFixed(2)),
       item_name: String(item_name),
       return_url: return_url || defaultReturn,
       cancel_url: cancel_url || defaultCancel,
@@ -7861,10 +7883,12 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
 app.get('/api/payment/ozow-result', async (req, res) => {
   const { status, booking_id } = req.query;
   const isSuccess = status === 'success';
+  // Sanitise user-controlled booking_id to prevent XSS
+  const safeBookingId = String(booking_id || '').replace(/[<>"'&]/g, '');
   const title = isSuccess ? 'Payment Successful!' : 'Payment Cancelled';
   const emoji = isSuccess ? '✅' : '❌';
   const message = isSuccess
-    ? `Your payment for booking ${booking_id || ''} has been received. You will receive a confirmation on WhatsApp shortly.`
+    ? `Your payment for booking ${safeBookingId} has been received. You will receive a confirmation on WhatsApp shortly.`
     : `Your payment was cancelled. You can try again from WhatsApp or the Square 15 app.`;
   const color = isSuccess ? '#22c55e' : '#ef4444';
 
