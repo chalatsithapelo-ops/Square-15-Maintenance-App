@@ -6269,6 +6269,17 @@ app.post('/api/payment/whatsapp-initiate', assistantLimiter, async (req, res) =>
       ...(payment_method === 'cc' ? { payment_method: 'cc' } : {}),
     };
 
+    // Generate PayFast signature
+    const passphrase = env('PAYFAST_PASSPHRASE') || '';
+    const pfParamString = Object.entries(paymentData)
+      .map(([k, v]) => `${encodeURIComponent(k).replace(/%20/g, '+')}=${encodeURIComponent(String(v || '')).replace(/%20/g, '+')}`)
+      .join('&');
+    let sigInput = pfParamString;
+    if (passphrase) {
+      sigInput += `&passphrase=${encodeURIComponent(passphrase).replace(/%20/g, '+')}`;
+    }
+    paymentData.signature = crypto.createHash('md5').update(sigInput).digest('hex');
+
     const queryString = Object.entries(paymentData)
       .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
       .join('&');
@@ -6336,6 +6347,19 @@ app.post('/api/payment/initiate', authMiddleware, assistantLimiter, async (req, 
     if (save_card === true && payment_method === 'cc') {
       paymentData.subscription_type = '2';
     }
+
+    // Generate PayFast signature (MD5 of param string + passphrase)
+    // PayFast REQUIRES a valid signature for payment page requests
+    const passphrase = env('PAYFAST_PASSPHRASE') || '';
+    const pfParamString = Object.entries(paymentData)
+      .map(([k, v]) => `${encodeURIComponent(k).replace(/%20/g, '+')}=${encodeURIComponent(String(v || '')).replace(/%20/g, '+')}`)
+      .join('&');
+    let sigInput = pfParamString;
+    if (passphrase) {
+      sigInput += `&passphrase=${encodeURIComponent(passphrase).replace(/%20/g, '+')}`;
+    }
+    const signature = crypto.createHash('md5').update(sigInput).digest('hex');
+    paymentData.signature = signature;
 
     // Build full payment URL with query params so WebView can load it directly
     const queryString = Object.entries(paymentData)
@@ -7501,6 +7525,17 @@ app.post('/api/admin/save-card', authMiddleware, async (req, res) => {
       payment_method: 'cc',
       subscription_type: '2', // Enable tokenization
     };
+
+    // Generate PayFast signature
+    const passphrase = env('PAYFAST_PASSPHRASE') || '';
+    const pfParamString = Object.entries(paymentData)
+      .map(([k, v]) => `${encodeURIComponent(k).replace(/%20/g, '+')}=${encodeURIComponent(String(v || '')).replace(/%20/g, '+')}`)
+      .join('&');
+    let sigInput = pfParamString;
+    if (passphrase) {
+      sigInput += `&passphrase=${encodeURIComponent(passphrase).replace(/%20/g, '+')}`;
+    }
+    paymentData.signature = crypto.createHash('md5').update(sigInput).digest('hex');
 
     const queryString = Object.entries(paymentData)
       .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)

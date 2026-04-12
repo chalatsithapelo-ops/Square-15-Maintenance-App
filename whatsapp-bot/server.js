@@ -111,6 +111,35 @@ async function sendWhatsAppMessage(to, text) {
   if (!res.ok) console.error('[wa] send failed:', await res.text());
 }
 
+async function sendWhatsAppImage(to, imageUrl, caption) {
+  const phoneId = process.env.WHATSAPP_PHONE_NUMBER_ID;
+  const token   = process.env.WHATSAPP_ACCESS_TOKEN;
+  if (!phoneId || !token) { console.error('[wa-image] Missing credentials'); return; }
+
+  try {
+    const res = await fetch(`${WA_API}/${phoneId}/messages`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        messaging_product: 'whatsapp',
+        to,
+        type: 'image',
+        image: {
+          link: imageUrl,
+          ...(caption ? { caption } : {}),
+        },
+      }),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) console.error('[wa-image] send failed:', res.status, await res.text().catch(() => ''));
+  } catch (e) {
+    console.error('[wa-image] error:', e.message);
+  }
+}
+
 async function sendWhatsAppInteractive(to, header, body, buttons) {
   const phoneId = process.env.WHATSAPP_PHONE_NUMBER_ID;
   const token   = process.env.WHATSAPP_ACCESS_TOKEN;
@@ -1793,14 +1822,25 @@ async function executeWaTool(name, args, session) {
       }
 
       const d = doc.data();
+      const paymentStatus = d.payment_status || d.paymentStatus || 'unknown';
+      const totalCost = parseFloat(d.cost || d.total_cost || '0');
+      const isDeposit = d.payment_type === 'deposit' || paymentStatus === 'deposit_paid';
+      const depositAmount = isDeposit ? (parseFloat(d.deposit_amount || '0') || Math.round(totalCost * 0.35 * 100) / 100) : 0;
+      const balanceRemaining = isDeposit ? (parseFloat(d.balance_remaining || d.balance_amount || '0') || Math.round((totalCost - depositAmount) * 100) / 100) : 0;
+      const balancePaid = d.balance_paid === true;
+
       return {
         bookingId: doc.id,
         orderNo: d.order_no || doc.id,
         status: d.status || 'unknown',
         category: d.category_name || d.category || '',
         artisan: d.service_provider_name || d.artisanName || 'Not assigned yet',
-        cost: d.cost ? `R${d.cost}` : 'Pending quote',
-        paymentStatus: d.payment_status || d.paymentStatus || 'unknown',
+        cost: totalCost > 0 ? `R${totalCost.toFixed(2)}` : 'Pending quote',
+        paymentStatus,
+        paymentType: isDeposit ? 'deposit' : 'full',
+        depositPaid: isDeposit ? `R${depositAmount.toFixed(2)}` : null,
+        balanceRemaining: isDeposit && !balancePaid ? `R${balanceRemaining.toFixed(2)}` : null,
+        balancePaid: isDeposit ? balancePaid : null,
         scheduledDate: d.scheduled_date || 'Not scheduled',
         scheduledTime: d.scheduled_time || '',
         isRFQ: d.is_rfq === 'yes',
@@ -2083,14 +2123,30 @@ async function executeWaTool(name, args, session) {
       if (totalCost <= 0) return { error: 'This booking does not have a confirmed price yet.' };
 
       if (d.payment_status === 'paid' || d.paymentStatus === 'paid') {
-        return { message: 'This booking is already paid!', bookingId: bid };
+        return { message: 'This booking is already paid in full!', bookingId: bid };
       }
 
-      // Calculate amount based on payment type (full or 35% deposit)
-      const paymentType = (args.paymentType || 'full').toLowerCase();
-      const isDeposit = paymentType === 'deposit';
-      const cost = isDeposit ? Math.round(totalCost * 0.35 * 100) / 100 : totalCost;
-      const balanceAfterDeposit = isDeposit ? Math.round((totalCost - cost) * 100) / 100 : 0;
+      // Handle balance payment for deposit bookings
+      const isDepositPaid = d.payment_status === 'deposit_paid';
+      const balanceDone = d.balance_paid === true;
+      if (isDepositPaid && balanceDone) {
+        return { message: 'This booking is fully paid (deposit + balance)!', bookingId: bid };
+      }
+
+      let cost, isDeposit, balanceAfterDeposit;
+      if (isDepositPaid && !balanceDone) {
+        // Deposit already paid — charge the remaining balance
+        const depositAmt = parseFloat(d.deposit_amount || '0') || Math.round(totalCost * 0.35 * 100) / 100;
+        cost = parseFloat(d.balance_remaining || d.balance_amount || '0') || Math.round((totalCost - depositAmt) * 100) / 100;
+        isDeposit = false;
+        balanceAfterDeposit = 0;
+      } else {
+        // Calculate amount based on payment type (full or 35% deposit)
+        const paymentType = (args.paymentType || 'full').toLowerCase();
+        isDeposit = paymentType === 'deposit';
+        cost = isDeposit ? Math.round(totalCost * 0.35 * 100) / 100 : totalCost;
+        balanceAfterDeposit = isDeposit ? Math.round((totalCost - cost) * 100) / 100 : 0;
+      }
 
       // Check real-time acceptance status from Firestore
       let artisanAccepted = d.accept === '1' || d.accept === 1 ||
@@ -2157,9 +2213,11 @@ async function executeWaTool(name, args, session) {
         } catch (_) {}
       }
 
-      const amountLabel = isDeposit
-        ? `R${cost.toFixed(2)} (35% deposit — R${balanceAfterDeposit.toFixed(2)} balance due after job)`
-        : `R${cost.toFixed(2)} (full amount)`;
+      const amountLabel = isDepositPaid
+        ? `R${cost.toFixed(2)} (remaining balance after deposit)`
+        : isDeposit
+          ? `R${cost.toFixed(2)} (35% deposit — R${balanceAfterDeposit.toFixed(2)} balance due after job)`
+          : `R${cost.toFixed(2)} (full amount)`;
 
       if (paymentUrl) {
         return {
@@ -3181,11 +3239,21 @@ async function executeWaTool(name, args, session) {
       if (!doc.exists) return { error: `Booking "${bid}" not found.` };
 
       const data = doc.data();
+      const paymentStatus = data.payment_status || 'unpaid';
+      const totalCost = parseFloat(data.cost || data.total_cost || '0');
+      const isDeposit = data.payment_type === 'deposit' || paymentStatus === 'deposit_paid';
+      const depositAmount = isDeposit ? (parseFloat(data.deposit_amount || '0') || Math.round(totalCost * 0.35 * 100) / 100) : 0;
+      const balanceRemaining = isDeposit ? (parseFloat(data.balance_remaining || data.balance_amount || '0') || Math.round((totalCost - depositAmount) * 100) / 100) : 0;
+
       return {
         booking_id: bid,
-        payment_status: data.payment_status || 'unpaid',
+        payment_status: paymentStatus,
+        payment_type: isDeposit ? 'deposit' : 'full',
         payment_method: data.payment_method || 'N/A',
-        amount: data.cost || data.total_cost || 'N/A',
+        total_amount: totalCost > 0 ? `R${totalCost.toFixed(2)}` : 'N/A',
+        deposit_paid: isDeposit ? `R${depositAmount.toFixed(2)}` : null,
+        balance_remaining: isDeposit && data.balance_paid !== true ? `R${balanceRemaining.toFixed(2)}` : null,
+        balance_paid: isDeposit ? (data.balance_paid === true) : null,
         paid_at: data.paid_at || null,
       };
     }
@@ -3472,6 +3540,14 @@ PAYMENT FLOW (CRITICAL):
 - Do NOT refuse or block payment based on conversation history alone. The function checks real-time booking status in the database.
 - If an artisan hasn't accepted yet, the function itself will return an appropriate message.
 - NEVER tell the customer "the artisan hasn't accepted yet" without first calling request_payment_link to verify.
+
+DEPOSIT vs BALANCE PAYMENTS (CRITICAL):
+- "deposit_paid" means ONLY the 35% deposit has been paid. There is STILL a remaining balance the customer owes.
+- "paid" means the booking is fully paid. No further payment needed.
+- When check_booking_status or check_payment shows paymentStatus="deposit_paid" with balanceRemaining, the customer STILL NEEDS to pay the balance.
+- NEVER tell a customer "everything is paid" or "no balance to pay" when the status is "deposit_paid". They owe the remaining 65%.
+- When a customer with deposit_paid asks to pay, call request_payment_link with paymentType="full" — the system will automatically calculate the correct balance amount.
+- If check_booking_status returns balanceRemaining, always mention it: "You have a remaining balance of R[X] to pay."
 
 PHOTO REQUIREMENT (CRITICAL):
 - ALWAYS ask the customer to send a photo of the issue BEFORE creating a booking or RFQ.
@@ -4151,7 +4227,16 @@ app.post('/api/job-status-update', async (req, res) => {
 
     const msg = statusMessages[status] || `📋 Your booking #${ref} status has been updated to: *${status}*`;
     await sendWhatsAppMessage(to, msg);
-    console.log(`[api/job-status-update] Status "${status}" sent to ${to} for ${mainBookingId}`);
+
+    // Send the before/after photo as an image message if provided
+    if (imageUrl && (status === 'before_photo' || status === 'after_photo')) {
+      const caption = status === 'before_photo'
+        ? `📸 Before-work photo for booking #${ref}`
+        : `📸 After-work photo for booking #${ref}`;
+      await sendWhatsAppImage(to, imageUrl, caption);
+    }
+
+    console.log(`[api/job-status-update] Status "${status}" sent to ${to} for ${mainBookingId}${imageUrl ? ' (with image)' : ''}`);
 
     res.json({ success: true, to, status });
   } catch (err) {
