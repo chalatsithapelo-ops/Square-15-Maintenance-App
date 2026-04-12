@@ -79,6 +79,9 @@ services:
     autoDeploy: true
     healthCheckPath: /health
     envVars:
+      - key: NODE_VERSION
+        value: "20"
+    envVars:
       - key: NODE_ENV
         value: production
       - key: NODE_VERSION
