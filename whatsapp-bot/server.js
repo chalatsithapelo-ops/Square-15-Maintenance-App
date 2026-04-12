@@ -3910,7 +3910,7 @@ app.post('/webhook', async (req, res) => {
 });
 
 // Health check
-app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot' }));
+app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: '38114bd-apr12' }));
 
 // ─── Diagnostic: test Firebase read/write ───
 app.get('/debug/firebase-test', async (req, res) => {
