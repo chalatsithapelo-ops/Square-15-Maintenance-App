@@ -235,6 +235,11 @@ async function downloadWhatsAppMedia(mediaId) {
     });
     if (!dlRes.ok) { console.error('[wa-media] download failed:', dlRes.status); return null; }
     const buffer = Buffer.from(await dlRes.arrayBuffer());
+    // Reject files larger than 10MB to prevent memory exhaustion
+    if (buffer.length > 10 * 1024 * 1024) {
+      console.warn(`[wa-media] Buffer too large (${(buffer.length / 1024 / 1024).toFixed(1)}MB), skipping`);
+      return null;
+    }
     const mimeType = meta.mime_type || 'image/jpeg';
     const base64 = buffer.toString('base64');
     return { base64, mimeType, dataUrl: `data:${mimeType};base64,${base64}`, buffer };
@@ -1686,7 +1691,7 @@ async function executeWaTool(name, args, session) {
       // appears in their "New Requests" screen. When one accepts, others get cancelled.
       let dispatchedCount = 0;
       try {
-        const catSlug = (args.category || '').toLowerCase().replace(/\s+/g, '_');
+        const catSlug = (args.category || '').toLowerCase().replace(/\s+/g, '_') || 'general_maintenance';
         // Fetch all service providers and filter in-code to avoid Firestore
         // compound-inequality index issues and the != gotcha (docs without
         // the is_suspended field are excluded by Firestore != queries).
@@ -2211,7 +2216,9 @@ async function executeWaTool(name, args, session) {
             balance_remaining: balanceAfterDeposit,
             updated_at: new Date().toISOString(),
           }, { merge: true });
-        } catch (_) {}
+        } catch (e) {
+          console.error('[wa-tool] Failed to persist payment type:', e.message);
+        }
       }
 
       const amountLabel = isDepositPaid
@@ -2360,7 +2367,7 @@ async function executeWaTool(name, args, session) {
         rfq_no: rfqNo,
         is_rfq: 'yes',
         rfq_status: 'pending_admin_review',
-        user_id: session.linkedUserId || '',
+        user_id: session.linkedUserId || `wa_${session.phone}`,
         user_name: args.customerName || '',
         user_phone: session.phone,
         category_name: args.category || '',
@@ -3748,6 +3755,8 @@ app.post('/webhook', async (req, res) => {
       console.warn('[webhook] Invalid signature — rejecting');
       return res.sendStatus(403);
     }
+  } else {
+    console.warn('[webhook] No WHATSAPP_APP_SECRET configured — signature verification disabled');
   }
 
   // Always respond 200 quickly to Meta
@@ -3868,6 +3877,11 @@ app.post('/webhook', async (req, res) => {
       }
 
       if (!userText.trim()) continue;
+
+      // Truncate excessively long messages to prevent OpenAI token abuse
+      if (userText.length > 10000) {
+        userText = userText.substring(0, 10000) + '...[message truncated]';
+      }
 
       console.log(`[msg] ${from}: ${userText.substring(0, 100)}`);
 
