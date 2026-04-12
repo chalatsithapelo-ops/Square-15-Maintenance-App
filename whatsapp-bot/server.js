@@ -4141,11 +4141,12 @@ app.post('/api/job-status-update', async (req, res) => {
     const ref = orderNo || mainBookingId;
 
     const statusMessages = {
-      'progress':     `🚗 *${name} is on the way!*\n\nYour artisan is heading to your location for booking #${ref}. You can track their location in the Square 15 app.\n\nPlease ensure access to the site is available. 🏠`,
-      'before_photo': `📸 *${name} has arrived!*\n\nYour artisan has arrived at the site and taken a before-work photo for booking #${ref}. Work is about to begin.\n\nWe'll keep you updated on progress. 🔧`,
-      'after_photo':  `📸 *Work completed!*\n\nYour artisan has finished the job and uploaded an after-work photo for booking #${ref}.\n\nPlease review the work in the Square 15 app. ✅`,
-      'completed':    `✅ *Job completed!*\n\nThe work for booking #${ref} has been completed by ${name}.\n\nPlease open the Square 15 app to review the work, confirm satisfaction, and rate your artisan. ⭐`,
-      'balance_due':  `💰 *Balance payment due!*\n\nThe work for booking #${ref} has been completed. Please pay the remaining balance to finalise your booking.\n\nOpen the Square 15 app to make payment. 💳`,
+      'progress':         `🚗 *${name} is on the way!*\n\nYour artisan is heading to your location for booking #${ref}. You can track their location in the Square 15 app.\n\nPlease ensure access to the site is available. 🏠`,
+      'buying_material':  `🛒 *${name} is buying materials!*\n\nYour artisan is purchasing the materials needed for booking #${ref}. They will head to your site once ready.\n\nWe'll keep you updated on progress. 🔧`,
+      'before_photo':     `📸 *${name} has arrived!*\n\nYour artisan has arrived at the site and taken a before-work photo for booking #${ref}. Work is about to begin.\n\nWe'll keep you updated on progress. 🔧`,
+      'after_photo':      `📸 *Work completed!*\n\nYour artisan has finished the job and uploaded an after-work photo for booking #${ref}.\n\nPlease review the work in the Square 15 app. ✅`,
+      'completed':        `✅ *Job completed!*\n\nThe work for booking #${ref} has been completed by ${name}.\n\nPlease open the Square 15 app to review the work, confirm satisfaction, and rate your artisan. ⭐`,
+      'balance_due':      `💰 *Balance payment due!*\n\nThe work for booking #${ref} has been completed. Please pay the remaining balance to finalise your booking.\n\nOpen the Square 15 app to make payment. 💳`,
     };
 
     const msg = statusMessages[status] || `📋 Your booking #${ref} status has been updated to: *${status}*`;
