@@ -1,4 +1,4 @@
-import 'dart:async';
+﻿import 'dart:async';
 import 'dart:convert';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -134,12 +134,12 @@ class AITextChatService {
 
   Future<String> _callOpenAI({int depth = 0}) async {
     if (depth > 3) {
-      return 'I\'ve processed several steps. Let me summarize what I found so far.';
+      return 'I\'ve reached my step limit for this request. Please tell me the next step you want, like "check booking status", "show payment options", or "create booking".';
     }
 
     final apiKey = await _getApiKey();
     if (apiKey.isEmpty) {
-      return 'AI service is not configured. Please contact support.';
+      return 'AI service is temporarily unavailable on this account. You can still continue from Bookings in the app, or contact support to re-enable Lizzy chat.';
     }
 
     final response = await http.post(
@@ -160,7 +160,7 @@ class AITextChatService {
 
     if (response.statusCode != 200) {
       debugPrint('Chat API error: ${response.statusCode}');
-      return 'I\'m having trouble connecting. Please try again.';
+      return 'I\'m having trouble connecting right now. Please try again shortly, or continue from the Bookings tab so you are not blocked.';
     }
 
     final data = jsonDecode(response.body);
@@ -413,7 +413,6 @@ class AITextChatService {
           }
         }
       }
-      final expandedSearchStr = expandedSearch.join(' ');
 
       // Score how well two strings match: exact > substring > word overlap (with synonym expansion)
       int matchScore(String a, String b) {
@@ -516,7 +515,7 @@ class AITextChatService {
       final snap = await FirebaseFirestore.instance
           .collection('categories')
           .where('status', isEqualTo: 'publish')
-          .where('parent_id', isEqualTo: '0')
+          .where('parent_id', isEqualTo: '')
           .get();
       final categories = snap.docs
           .map((d) => d.data()['category_name'] ?? 'Unknown')
@@ -690,6 +689,12 @@ class AITextChatService {
         } catch (e) { debugPrint('[AITextChat] pricing lookup failed: $e'); }
       }
 
+      // Technical guard: prevent R0 bookings — convert to RFQ if no pricing found
+      if (estimatedCost <= 0 && pricingSource == 'none') {
+        debugPrint('[AITextChat] No pricing found — creating as RFQ instead of R0 booking');
+        // Fall through but mark as RFQ with zero cost
+      }
+
       // Calculate deposit (35%) and balance (65%), matching WhatsApp bot + deposit_service.dart
       final depositAmount = (estimatedCost * 0.35 * 100).round() / 100;
       final balanceAmount = ((estimatedCost - depositAmount) * 100).round() / 100;
@@ -720,7 +725,7 @@ class AITextChatService {
         'cost': estimatedCost > 0 ? estimatedCost.toStringAsFixed(2) : '0',
         'deposit_amount': depositAmount.toStringAsFixed(2),
         'balance_amount': balanceAmount.toStringAsFixed(2),
-        'payment_type': '',
+        'payment_type': estimatedCost > 0 ? 'deposit' : '',
         'deposit_paid': false,
         'balance_paid': false,
         'payment_status': 'unpaid',
@@ -793,7 +798,8 @@ class AITextChatService {
                   .limit(200)
                   .get();
             }
-          } catch (_) {
+          } catch (e) {
+            debugPrint('[AITextChat] $e');
             artisanSnap = await FirebaseFirestore.instance
                 .collection('serviceProvider')
                 .limit(200)
@@ -855,7 +861,7 @@ class AITextChatService {
                 bookingId: bridgeId,
                 message: 'New $category booking ($orderNo) — R${estimatedCost.toStringAsFixed(2)}. Tap to view and accept.',
               );
-            } catch (_) {}
+            } catch (e) { debugPrint('[ai-text-chat] $e'); }
           }
           debugPrint('[AITextChat] Dispatched $bookingId to $dispatched artisans');
         } catch (e) { debugPrint('[AITextChat] artisan dispatch failed: $e'); }
@@ -1172,7 +1178,7 @@ class AITextChatService {
         'balance_amount': balanceAmount.toStringAsFixed(2),
         'deposit_paid': false,
         'balance_paid': false,
-        'payment_type': '',
+        'payment_type': 'deposit',
         'source': data['source'] ?? 'ai_text_chat',
         'is_rfq': 'yes',
         'rfq_status': 'accepted_converted',
@@ -1461,6 +1467,27 @@ class AITextChatService {
         found = true;
       }
       if (!found) return {'error': 'Booking not found'};
+
+      // Notify the assigned artisan about the reschedule
+      try {
+        final bookingData = doc1.exists ? (doc1.data() ?? {}) : (doc2.data() ?? {});
+        final artisanId = (bookingData['service_provider_id'] ?? bookingData['artisan_id'] ?? '').toString();
+        final orderNo = (bookingData['order_no'] ?? bookingId).toString();
+        if (artisanId.isNotEmpty) {
+          await FirebaseFirestore.instance.collection('Notifications').add({
+            'title': 'Booking Rescheduled',
+            'body': 'Booking $orderNo has been rescheduled to ${date ?? ''} ${time ?? ''}'.trim(),
+            'type': 'booking_rescheduled',
+            'booking_id': bookingId,
+            'target_user_id': artisanId,
+            'target': 'artisan',
+            'read': false,
+            'timestamp': FieldValue.serverTimestamp(),
+          });
+        }
+      } catch (e) {
+        debugPrint('[AITextChat] reschedule notification failed: \$e');
+      }
 
       return {'success': true, 'message': 'Booking rescheduled to ${date ?? ''} ${time ?? ''}'.trim()};
     } catch (e) {

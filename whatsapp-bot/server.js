@@ -420,6 +420,72 @@ setInterval(() => {
   }
 }, 10 * 60 * 1000); // every 10 minutes
 
+// ── Artisan acceptance timeout: re-dispatch or escalate after 30 minutes ──
+setInterval(async () => {
+  const firestore = db();
+  if (!firestore) return;
+  try {
+    const cutoff = new Date(Date.now() - 30 * 60 * 1000); // 30 min ago
+    // Check futureBookings stuck in pending_artisan_acceptance
+    const stuckSnap = await firestore.collection('futureBookings')
+      .where('status', '==', 'pending_artisan_acceptance')
+      .where('rfq_auto_assigned', '==', true)
+      .limit(20)
+      .get();
+    for (const doc of stuckSnap.docs) {
+      const data = doc.data();
+      // Parse various timestamp formats
+      let assignedAt = null;
+      const raw = data.rfq_auto_assigned_at || data.accepted_at || data.updated_at || data.creation_date;
+      if (raw) {
+        assignedAt = raw.toDate ? raw.toDate() : new Date(raw);
+      }
+      if (!assignedAt || assignedAt > cutoff) continue; // Not yet timed out
+
+      const rejCount = data.rfq_artisan_rejection_count || 0;
+      console.log(`[timeout] Booking ${doc.id} stuck ${Math.round((Date.now() - assignedAt.getTime()) / 60000)}min, rejections=${rejCount}`);
+
+      // Escalate to admin after timeout
+      await doc.ref.update({
+        status: 'pending_admin_review',
+        rfq_status: 'timeout_escalated',
+        rfq_timeout_at: new Date().toISOString(),
+        rfq_timeout_reason: `No artisan accepted within 30 minutes (${rejCount} rejections)`,
+        updated_at: new Date().toISOString(),
+      });
+      // Mirror to tasksManagement
+      try {
+        await firestore.collection('tasksManagement').doc(doc.id).update({
+          status: 'pending_admin_review',
+          rfq_status: 'timeout_escalated',
+          updated_at: new Date().toISOString(),
+        });
+      } catch (e) { /* tasksManagement doc may not exist */ }
+      // Notify admin
+      await firestore.collection('notifications').add({
+        title: '⏰ Artisan Acceptance Timeout',
+        body: `No artisan accepted booking ${data.rfq_no || data.order_no || doc.id} within 30 minutes. Manual assignment needed.`,
+        type: 'artisan_timeout',
+        user_type: 'admin',
+        booking_id: doc.id,
+        read: false,
+        created_at: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      // Notify customer via WhatsApp
+      const custPhone = data.customerPhone || data.contact || data.user_phone || '';
+      if (custPhone) {
+        try {
+          await sendWhatsAppMessage(custPhone,
+            `⏰ We're sorry — no artisan was available to accept your booking #${data.rfq_no || data.order_no || doc.id} within the expected timeframe.\n\nYour request has been escalated to our team. An admin will manually assign an artisan and notify you shortly. Thank you for your patience! 🙏`);
+        } catch (e) { console.warn(`[timeout] WA notify failed for ${doc.id}:`, e.message); }
+      }
+      console.log(`[timeout] Escalated ${doc.id} to admin review`);
+    }
+  } catch (e) {
+    console.warn('[timeout] Acceptance timeout check failed:', e.message);
+  }
+}, 15 * 60 * 1000); // check every 15 minutes
+
 /** Restore session context from Firestore when server restarts (best-effort). */
 async function restoreSessionFromFirestore(session) {
   if (session._restored) return;
@@ -446,6 +512,7 @@ async function restoreSessionFromFirestore(session) {
     if (data.lastBookingId) session.lastBookingId = data.lastBookingId;
     if (data.lastBookingCost) session.lastBookingCost = data.lastBookingCost;
     if (data.lastRfqId) session.lastRfqId = data.lastRfqId;
+    if (data.pendingRatingBookingId) session.pendingRatingBookingId = data.pendingRatingBookingId;
     if (data.sharedAddress) session.sharedAddress = data.sharedAddress;
     if (data.sharedLatitude) session.sharedLatitude = data.sharedLatitude;
     if (data.sharedLongitude) session.sharedLongitude = data.sharedLongitude;
@@ -2729,9 +2796,10 @@ async function executeWaTool(name, args, session) {
       if (!bid) return { error: 'Please provide a booking ID.' };
       if (!rating) return { error: 'Please provide a rating between 1 and 5.' };
 
-      // Get booking
+      // Get booking from tasksManagement, futureBookings, or rfq_requests
       let doc = await firestore.collection('tasksManagement').doc(bid).get();
       if (!doc.exists) doc = await firestore.collection('futureBookings').doc(bid).get();
+      if (!doc.exists) doc = await firestore.collection('rfq_requests').doc(bid).get();
       if (!doc.exists) return { error: `Booking "${bid}" not found.` };
 
       const d = doc.data();
@@ -2791,9 +2859,19 @@ async function executeWaTool(name, args, session) {
             rating: Math.round(avgRating * 10) / 10,
             job_count: admin.firestore.FieldValue.increment(1),
           });
-        } catch (e) { console.warn('[wa-tool] artisan rating update failed:', e.message); }
+        } catch (e) {
+          console.error('[wa-tool] artisan rating update failed:', e.message);
+          // Don't silently swallow — tell the user the review part failed
+          const stars = '⭐'.repeat(rating);
+          session.pendingRatingBookingId = null; // clear pending
+          return {
+            success: true,
+            message: `Thank you for your ${stars} rating! Your rating was saved but we had trouble updating the artisan's profile — our team will fix this. Your feedback is appreciated! 🙏`,
+          };
+        }
       }
 
+      session.pendingRatingBookingId = null; // clear pending rating
       const stars = '⭐'.repeat(rating);
       return {
         success: true,
@@ -3224,6 +3302,7 @@ async function executeWaTool(name, args, session) {
               rfq_assigned_artisan_names: artisanNames,
               rfq_auto_assigned: true,
               rfq_auto_assign_reason: autoReason,
+              rfq_auto_assigned_at: new Date().toISOString(),
               rfq_artisan_rejection_count: 0,
               rfq_artisan_rejections: [],
               artisan_name: matchedArtisans[0].name,
@@ -3790,6 +3869,7 @@ async function handleMessage(session, userMessage, imageDataUrl) {
         lastBookingId: session.lastBookingId || null,
         lastBookingCost: session.lastBookingCost || null,
         lastRfqId: session.lastRfqId || null,
+        pendingRatingBookingId: session.pendingRatingBookingId || null,
         sharedAddress: session.sharedAddress || null,
         sharedLatitude: session.sharedLatitude || null,
         sharedLongitude: session.sharedLongitude || null,
@@ -4367,6 +4447,10 @@ app.post('/api/job-status-update', async (req, res) => {
           role: 'system',
           content: `[SYSTEM STATUS UPDATE] Booking #${ref} (${mainBookingId}): status changed to "${status}". ${imageUrl ? `Photo uploaded: ${imageUrl}` : ''}`,
         });
+        // Track pending rating so bot can re-prompt after restart
+        if (status === 'completed') {
+          session.pendingRatingBookingId = mainBookingId;
+        }
       }
     } catch (e) { console.warn('[job-status-update] session inject failed:', e.message); }
 
