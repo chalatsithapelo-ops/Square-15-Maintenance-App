@@ -41,7 +41,7 @@ const crypto  = require('crypto');
 const app = express();
 app.use(helmet());
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
 
 const PORT = process.env.PORT || 3001;
 
@@ -1724,6 +1724,9 @@ async function executeWaTool(name, args, session) {
           const cats = (ad.categories || ad.category || '').toString().toLowerCase();
           if (cats && !cats.includes(catSlug) && catSlug !== 'general_maintenance') continue;
 
+          // Cap dispatch at 10 artisans to avoid flooding
+          if (dispatchedCount >= 10) break;
+
           const artisanId = artDoc.id;
           const bridgeId = `${bookingId}_${artisanId}`;
 
@@ -2548,6 +2551,24 @@ async function executeWaTool(name, args, session) {
           });
         }
       } catch (e) { console.warn('[wa-tool] futureBookings cancel sync failed:', e.message); }
+
+      // Clean up bridge records (artisan dispatch copies)
+      try {
+        const bridgeSnap = await firestore.collection('tasksManagement')
+          .where('future_booking_id', '==', bid).get();
+        const batch = firestore.batch();
+        let bridgeCount = 0;
+        bridgeSnap.forEach(doc => {
+          if (doc.id !== bid) {
+            batch.update(doc.ref, { status: 'cancelled', cancelled_at: now });
+            bridgeCount++;
+          }
+        });
+        if (bridgeCount > 0) {
+          await batch.commit();
+          console.log(`[wa-tool] Cancelled ${bridgeCount} bridge records for ${bid}`);
+        }
+      } catch (e) { console.warn('[wa-tool] bridge cleanup failed:', e.message); }
 
       // Initiate refund if paid
       let refundMsg = '';
@@ -3775,7 +3796,7 @@ app.post('/webhook', async (req, res) => {
   const appSecret = process.env.WHATSAPP_APP_SECRET || process.env.META_APP_SECRET || '';
   if (appSecret) {
     const signature = req.headers['x-hub-signature-256'] || '';
-    const rawBody = JSON.stringify(req.body);
+    const rawBody = req.rawBody || Buffer.from(JSON.stringify(req.body));
     const expected = 'sha256=' + require('crypto').createHmac('sha256', appSecret).update(rawBody).digest('hex');
     if (signature !== expected) {
       console.warn('[webhook] Invalid signature — rejecting');
@@ -3936,7 +3957,7 @@ app.post('/webhook', async (req, res) => {
 });
 
 // Health check
-app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: '5de1637-apr13' }));
+app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'cc31c07-apr13-v2' }));
 
 // ─── Diagnostic: test Firebase read/write ───
 app.get('/debug/firebase-test', async (req, res) => {
