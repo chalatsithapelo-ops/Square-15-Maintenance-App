@@ -94,21 +94,25 @@ async function sendWhatsAppMessage(to, text) {
   const token   = process.env.WHATSAPP_ACCESS_TOKEN;
   if (!phoneId || !token) { console.error('[wa] Missing credentials'); return; }
 
-  const res = await fetch(`${WA_API}/${phoneId}/messages`, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      messaging_product: 'whatsapp',
-      to,
-      type: 'text',
-      text: { body: text },
-    }),
-    signal: AbortSignal.timeout(15000),
-  });
-  if (!res.ok) console.error('[wa] send failed:', await res.text());
+  try {
+    const res = await fetch(`${WA_API}/${phoneId}/messages`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        messaging_product: 'whatsapp',
+        to,
+        type: 'text',
+        text: { body: text },
+      }),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) console.error('[wa] send failed:', await res.text());
+  } catch (e) {
+    console.error('[wa] sendWhatsAppMessage error:', e.message);
+  }
 }
 
 async function sendWhatsAppImage(to, imageUrl, caption) {
@@ -1711,10 +1715,12 @@ async function executeWaTool(name, args, session) {
 
         for (const artDoc of artisanSnap.docs) {
           const ad = artDoc.data() || {};
-          // Filter: status must be publish/approved, not suspended
+          // Filter: status must be publish/approved, not suspended, and active
           const st = (ad.status || '').toString().toLowerCase();
           if (st && st !== 'publish' && st !== 'published' && st !== 'approved' && st !== 'approve') continue;
           if (ad.is_suspended === true) continue;
+          const activeField = ad.active;
+          if (activeField != null && activeField !== 'y' && activeField !== true && activeField !== 'true') continue;
           const cats = (ad.categories || ad.category || '').toString().toLowerCase();
           if (cats && !cats.includes(catSlug) && catSlug !== 'general_maintenance') continue;
 
@@ -2293,9 +2299,29 @@ async function executeWaTool(name, args, session) {
 
       if (bookData.payment_status === 'paid') return { message: 'This booking is already paid!' };
 
-      // Ensure an artisan has accepted before allowing payment
-      const acceptStatus = (bookData.accept || '').toString().trim();
-      if (acceptStatus !== '1' && acceptStatus !== 'true') {
+      // Ensure an artisan has accepted before allowing payment (match request_payment_link logic)
+      let artisanAccepted = bookData.accept === '1' || bookData.accept === 1 ||
+          bookData.artisan_confirmed === 'yes' || bookData.status === 'pending_payment' || bookData.status === 'accepted';
+      if (!artisanAccepted) {
+        try {
+          const altDoc = await firestore.collection('futureBookings').doc(bid).get();
+          if (altDoc.exists) {
+            const a = altDoc.data();
+            artisanAccepted = a.accept === '1' || a.accept === 1 ||
+                a.artisan_confirmed === 'yes' || a.status === 'pending_payment' || a.status === 'accepted';
+          }
+        } catch (_) {}
+      }
+      if (!artisanAccepted) {
+        try {
+          const bridgeSnap = await firestore.collection('tasksManagement')
+            .where('future_booking_id', '==', bid)
+            .where('accept', '==', '1')
+            .limit(1).get();
+          artisanAccepted = !bridgeSnap.empty;
+        } catch (_) {}
+      }
+      if (!artisanAccepted) {
         return { error: 'No artisan has accepted this booking yet. Please wait for an artisan to accept before paying.' };
       }
 
@@ -3910,7 +3936,7 @@ app.post('/webhook', async (req, res) => {
 });
 
 // Health check
-app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: '38114bd-apr12' }));
+app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: '5de1637-apr13' }));
 
 // ─── Diagnostic: test Firebase read/write ───
 app.get('/debug/firebase-test', async (req, res) => {
