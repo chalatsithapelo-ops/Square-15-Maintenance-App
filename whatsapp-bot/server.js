@@ -3499,6 +3499,8 @@ async function executeWaTool(name, args, session) {
 // ─── Main message handler ───
 
 const SYSTEM_PROMPT = `You are Lizzy, the Square 15 Facility Solutions AI assistant on WhatsApp.
+You are an AI-powered assistant (not a human). When greeting a customer for the first time, introduce yourself clearly:
+"Hi! I'm Lizzy, your AI assistant from Square 15 Facility Solutions. I can help you book maintenance services, get quotes, track jobs, and process payments — all right here on WhatsApp. How can I help you today?"
 You help South African homeowners and tenants with property maintenance services.
 
 YOUR FULL CAPABILITIES:
@@ -4285,8 +4287,9 @@ app.post('/api/job-status-update', async (req, res) => {
       'buying_material':  `🛒 *${name} is buying materials!*\n\nYour artisan is purchasing the materials needed for booking #${ref}. They will head to your site once ready.\n\nWe'll keep you updated on progress. 🔧`,
       'before_photo':     `📸 *${name} has arrived!*\n\nYour artisan has arrived at the site and taken a before-work photo for booking #${ref}. Work is about to begin.\n\nWe'll keep you updated on progress. 🔧`,
       'after_photo':      `📸 *Work completed!*\n\nYour artisan has finished the job and uploaded an after-work photo for booking #${ref}.\n\nPlease review the work in the Square 15 app. ✅`,
-      'completed':        `✅ *Job completed!*\n\nThe work for booking #${ref} has been completed by ${name}.\n\nPlease open the Square 15 app to review the work, confirm satisfaction, and rate your artisan. ⭐`,
-      'balance_due':      `💰 *Balance payment due!*\n\nThe work for booking #${ref} has been completed. Please pay the remaining balance to finalise your booking.\n\nOpen the Square 15 app to make payment. 💳`,
+      'completed':        `✅ *Job completed!*\n\nThe work for booking #${ref} has been completed by ${name}.\n\n🙏 *Thank you for choosing Square 15!* We truly appreciate your trust in our service.\n\nPlease review the work and rate your artisan. ⭐ Your feedback helps us maintain high standards.`,
+      'balance_due':      `💰 *Balance payment due!*\n\nThe work for booking #${ref} has been completed. Please pay the remaining balance to finalise your booking.\n\nReply "pay balance" to get a secure payment link. 💳`,
+      'additional_work':  `🔧 *Additional work found!*\n\nYour artisan noticed an additional issue while working on booking #${ref}.\n\nYou qualify for a *15% discount* on the follow-up job. Check the Square 15 app or reply here for details.`,
     };
 
     const msg = statusMessages[status] || `📋 Your booking #${ref} status has been updated to: *${status}*`;
@@ -4315,9 +4318,9 @@ app.post('/api/job-status-update', async (req, res) => {
     // ── Auto-send balance payment prompt after job completion for deposit bookings ──
     if (status === 'completed' || status === 'after_photo') {
       try {
-        const bookDoc = await firestore.collection('tasksManagement').doc(mainBookingId).get()
-          || await firestore.collection('futureBookings').doc(mainBookingId).get();
-        if (bookDoc && bookDoc.exists) {
+        let bookDoc = await firestore.collection('tasksManagement').doc(mainBookingId).get();
+        if (!bookDoc.exists) bookDoc = await firestore.collection('futureBookings').doc(mainBookingId).get();
+        if (bookDoc.exists) {
           const bd = bookDoc.data();
           const isDepositPaid = bd.payment_status === 'deposit_paid';
           const balanceDone = bd.balance_paid === true;
