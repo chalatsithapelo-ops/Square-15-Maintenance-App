@@ -113,7 +113,9 @@ class _ModelBottomSheetState extends State<ModelBottomSheet> {
           _balanceAmount = info['balance_amount'] as double;
         });
       }
-    } catch (_) {}
+    } catch (e) {
+      debugPrint('[PaymentSheet] Deposit check failed: $e');
+    }
   }
 
   Future<void> _checkBnplEligibility() async {
@@ -131,7 +133,6 @@ class _ModelBottomSheetState extends State<ModelBottomSheet> {
   Widget build(BuildContext context) {
     final fullCost = double.tryParse(widget.record.cost?.toString() ?? '0') ?? 0;
     final cost = _isDepositTask ? _depositAmount : fullCost;
-    final instalment = fullCost / 4.0;
 
     return SafeArea(
       child: SingleChildScrollView(
@@ -290,7 +291,9 @@ class _ModelBottomSheetState extends State<ModelBottomSheet> {
                       if (rawBal.isNotEmpty && rawBal != '0' && rawBal != '0.0') {
                         appController.userBalance.value = rawBal;
                       }
-                    } catch (_) {}
+                    } catch (e) {
+                      debugPrint('[PaymentSheet] Wallet balance fetch failed: $e');
+                    }
                   }
                   final rawCost = _isDepositTask
                       ? _depositAmount
@@ -378,7 +381,7 @@ class _ModelBottomSheetState extends State<ModelBottomSheet> {
                         duration: const Duration(seconds: 4),
                         snackPosition: SnackPosition.TOP,
                         title: 'Payment Error',
-                        message: 'Could not connect to Ozow. Please try again or use wallet payment.',
+                        message: 'Could not connect to payment provider. Please try again or use wallet payment.',
                       ));
                       if (mounted) setState(() => _paymentProcessing = false);
                       return;
@@ -539,7 +542,8 @@ class _ModelBottomSheetState extends State<ModelBottomSheet> {
                       fontWeight: FontWeight.w700, fontSize: 14)),
               const SizedBox(height: 8),
               ..._availableBnpl.map((provider) {
-                final info = BnplService.providerInfo[provider]!;
+                final info = BnplService.providerInfo[provider];
+                if (info == null) return const SizedBox();
                 final perInstalment = fullCost / info.instalments;
                 return Padding(
                   padding: const EdgeInsets.only(bottom: 10),
@@ -823,7 +827,8 @@ class _ModelBottomSheetState extends State<ModelBottomSheet> {
   }
 
   Future<void> _initiateBnpl(BnplProvider provider) async {
-    final info = BnplService.providerInfo[provider]!;
+    final info = BnplService.providerInfo[provider];
+    if (info == null) return;
     EasyLoading.show(status: 'Setting up ${info.name}...');
 
     try {

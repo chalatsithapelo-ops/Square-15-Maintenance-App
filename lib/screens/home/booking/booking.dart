@@ -1191,13 +1191,13 @@ class GeneralMaintenancePage extends StatelessWidget {
                                                 record.paymentStatus ==
                                                     "deposit_paid" &&
                                                 record.status != "completed" &&
-                                                record.artisanImages == "2"
+                                                record.artisanImages != "0"
                                             ? _buildBalancePaymentButton(record, context, appController)
                                         : record.accept == "1" &&
                                                 record.paymentStatus ==
                                                     "paid" &&
                                                 record.status != "completed" &&
-                                                record.artisanImages == "2"
+                                                record.artisanImages != "0"
                                             ? Column(
                                                 children: [
                                                   Container(
@@ -1964,7 +1964,7 @@ class _BalancePaymentSheet extends StatelessWidget {
                         duration: const Duration(seconds: 4),
                         snackPosition: SnackPosition.TOP,
                         title: 'Payment Error',
-                        message: 'Could not connect to Ozow. Please try again or use wallet payment.',
+                        message: 'Could not connect to payment provider. Please try again or use wallet payment.',
                       ));
                       return;
                     }
