@@ -1190,7 +1190,7 @@ class GeneralMaintenancePage extends StatelessWidget {
                                         : record.accept == "1" &&
                                                 record.paymentStatus ==
                                                     "deposit_paid" &&
-                                                record.status != "completed" &&
+                                                record.status != "closed" &&
                                                 record.artisanImages != "0"
                                             ? _buildBalancePaymentButton(record, context, appController)
                                         : record.accept == "1" &&

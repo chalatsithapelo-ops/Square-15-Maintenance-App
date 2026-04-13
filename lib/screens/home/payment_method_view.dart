@@ -78,7 +78,7 @@ class _PaymentMethodViewState extends State<PaymentMethodView> {
                 message: 'You can retry from your bookings page.',
               ));
               Future.delayed(const Duration(seconds: 2), () {
-                if (mounted) Get.back();
+                if (mounted) Get.offAll(() => const BottomNavigatorExample());
               });
             } else if (url.contains('/api/payment/ozow-result') && status == 'success') {
               _paymentHandled = true;
@@ -97,11 +97,24 @@ class _PaymentMethodViewState extends State<PaymentMethodView> {
                 if (tmData['payment_type'] == 'deposit' &&
                     tmData['deposit_paid'] == true &&
                     tmData['balance_paid'] != true) {
+                  final now = DateTime.now().toString();
                   await FirebaseFirestore.instance
                       .collection('tasksManagement').doc(taskId).update({
                     'balance_paid': true,
-                    'balance_paid_at': DateTime.now().toString(),
+                    'balance_paid_at': now,
                   });
+                  // Also update futureBookings to keep collections in sync
+                  final fbId = (tmData['future_booking_id'] ?? '').toString().trim();
+                  final fbDocId = fbId.isNotEmpty ? fbId : taskId;
+                  try {
+                    await FirebaseFirestore.instance
+                        .collection('futureBookings').doc(fbDocId).update({
+                      'balance_paid': true,
+                      'balance_paid_at': now,
+                      'payment_status': 'paid',
+                      'updated_at': now,
+                    });
+                  } catch (_) {}
                 }
               }
               onOzowSuccess().then((_) {

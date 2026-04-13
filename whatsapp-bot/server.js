@@ -1513,9 +1513,41 @@ async function executeWaTool(name, args, session) {
         console.error('[create_booking] Pricing lookup error:', e.message);
       }
 
-      // If no pricing found at all, don't default to R500 — flag it
+      // If no pricing found at all, convert to RFQ instead of creating R0 booking
       if (estimatedCost === '0' || pricingSource === 'none') {
-        estimatedCost = '0';
+        console.log(`[create_booking] ⚠️ No pricing found for category="${args.category}" sub="${args.subcategory}" — converting to RFQ`);
+        const rfqId = `rfq_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+        const rfqDoc = {
+          id: rfqId,
+          category: args.category || '',
+          subcategory: args.subcategory || '',
+          description: args.description || '',
+          address: args.address || '',
+          customerName: args.customerName || '',
+          customerPhone: session.phone,
+          user_id: session.linkedUserId || `wa_${session.phone}`,
+          source: 'whatsapp',
+          status: 'pending',
+          work_images: session.photoUrls.length ? session.photoUrls : [],
+          created_at: new Date().toISOString(),
+        };
+        await firestore.collection('rfq_requests').doc(rfqId).set(rfqDoc);
+        // Notify admin
+        await firestore.collection('notifications').add({
+          title: 'New RFQ from WhatsApp',
+          body: `Customer needs pricing for ${args.category} > ${args.subcategory}. No fixed price found.`,
+          type: 'rfq_request',
+          user_type: 'admin',
+          rfq_id: rfqId,
+          read: false,
+          created_at: admin.firestore.FieldValue.serverTimestamp(),
+        });
+        return {
+          success: true,
+          rfq: true,
+          rfqId,
+          message: `We don't have a fixed price for "${args.subcategory || args.category}" yet. Your request has been sent to our team as a quote request (RFQ #${rfqId.substring(0, 8)}). An admin will review and provide a custom quote shortly. You'll be notified once pricing is ready.`,
+        };
       }
 
       // Apply promo discount if active
@@ -2218,11 +2250,19 @@ async function executeWaTool(name, args, session) {
 
       // Update Firestore with payment type choice
       if (isDeposit) {
+        // Check if deposit payment is already pending to prevent double-charge
+        if (data.payment_status === 'deposit_pending') {
+          return {
+            message: `A deposit payment is already in progress for this booking. Please complete or cancel the existing payment before requesting a new one.`,
+            bookingId: bid,
+          };
+        }
         try {
           await doc.ref.set({
             payment_type: 'deposit',
             deposit_amount: cost,
             balance_remaining: balanceAfterDeposit,
+            payment_status: 'deposit_pending',
             updated_at: new Date().toISOString(),
           }, { merge: true });
         } catch (e) {

@@ -7858,6 +7858,22 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
           signal: AbortSignal.timeout(10000),
         });
         console.log(`✅ [processPayment] WhatsApp notification sent for ${bookingId}`);
+        // Also update WA bot session state via payment-confirmed endpoint
+        try {
+          await fetch(`${waBot}/api/payment-confirmed`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              bookingId: fbId,
+              amount: artisanDisplayAmt,
+              paymentStatus: isBalancePayment ? 'balance_paid' : isDepositPayment ? 'deposit_paid' : 'paid',
+            }),
+            signal: AbortSignal.timeout(10000),
+          });
+          console.log(`✅ [processPayment] WA payment-confirmed sent for ${bookingId}`);
+        } catch (pcErr) {
+          console.warn(`[processPayment] WA payment-confirmed failed: ${pcErr.message}`);
+        }
       } catch (waErr) {
         console.warn(`[processPayment] WhatsApp notification failed: ${waErr.message}`);
       }
@@ -7902,7 +7918,7 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
               android: { priority: 'high', notification: { channelId: 'order_request_channel', sound: 'sound' } },
             });
             console.log(`✅ [processPayment] Artisan ${artisanId} notified via token ${tok.substring(0, 15)}...`);
-            break; // one successful send is enough
+            // Send to ALL tokens so multi-device artisans get notified everywhere
           } catch (singleErr) {
             console.warn(`[processPayment] FCM token failed for artisan ${artisanId}: ${singleErr.message}`);
           }
