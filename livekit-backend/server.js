@@ -6253,13 +6253,63 @@ app.post('/api/notifications/send', authMiddleware, assistantLimiter, async (req
   }
 });
 
+// ── In-memory payment session store (WhatsApp checkout) ──
+// PayFast /eng/process only accepts POST, not GET. So we store payment data
+// briefly and serve an auto-submit HTML form page via GET.
+const paymentSessions = new Map();
+const PAYMENT_SESSION_TTL = 30 * 60 * 1000; // 30 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, s] of paymentSessions) {
+    if (now - s.created > PAYMENT_SESSION_TTL) paymentSessions.delete(id);
+  }
+}, 5 * 60 * 1000);
+
+// ── GET checkout page — renders auto-submit POST form to PayFast ──
+app.get('/api/payment/checkout/:sessionId', (req, res) => {
+  const session = paymentSessions.get(req.params.sessionId);
+  if (!session) {
+    return res.status(404).send(`
+      <html><body style="font-family:sans-serif;text-align:center;padding:60px">
+        <h2>Payment link expired</h2>
+        <p>This payment link has expired or already been used. Please request a new one via WhatsApp.</p>
+      </body></html>
+    `);
+  }
+
+  const payfastUrl = env('PAYFAST_URL') || 'https://www.payfast.co.za/eng/process';
+  // Build hidden form fields — escape values for HTML safety
+  const esc = (s) => String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  const fields = Object.entries(session.paymentData)
+    .map(([k, v]) => `<input type="hidden" name="${esc(k)}" value="${esc(v)}">`)
+    .join('\n      ');
+
+  res.send(`
+    <html>
+    <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Square 15 — Redirecting to Payment</title></head>
+    <body style="font-family:sans-serif;text-align:center;padding:60px">
+      <h2>Redirecting to secure payment...</h2>
+      <p>Amount: <strong>R${esc(session.paymentData.amount)}</strong></p>
+      <p>Please wait, you will be redirected to PayFast shortly.</p>
+      <form id="pf" method="POST" action="${esc(payfastUrl)}">
+      ${fields}
+      </form>
+      <script>document.getElementById('pf').submit();</script>
+      <noscript><p>JavaScript is required. <button onclick="document.getElementById('pf').submit()">Click here to pay</button></p></noscript>
+    </body></html>
+  `);
+
+  // Mark as used after first render to prevent replay (allow a small window for redirects)
+  setTimeout(() => paymentSessions.delete(req.params.sessionId), 5 * 60 * 1000);
+});
+
 // ── WhatsApp Payment Link Generation (no Firebase auth required) ──
 // Called by WhatsApp bot to generate a payment link for customers who may not have the app.
 app.post('/api/payment/whatsapp-initiate', assistantLimiter, async (req, res) => {
   try {
     const merchantId = env('PAYFAST_MERCHANT_ID');
     const merchantKey = env('PAYFAST_MERCHANT_KEY');
-    const payfastUrl = env('PAYFAST_URL') || 'https://www.payfast.co.za/eng/process';
     const backendUrl = env('RENDER_EXTERNAL_URL') || 'https://square15-livekit-backend.onrender.com';
 
     if (!merchantId || !merchantKey) {
@@ -6287,7 +6337,6 @@ app.post('/api/payment/whatsapp-initiate', assistantLimiter, async (req, res) =>
       custom_str1: booking_id,
       ...(customer_name ? { name_first: customer_name } : {}),
       ...(customer_phone ? { cell_number: customer_phone } : {}),
-      // Force card-only checkout when requested (Visa, Mastercard, etc.)
       ...(payment_method === 'cc' ? { payment_method: 'cc' } : {}),
     };
 
@@ -6302,16 +6351,16 @@ app.post('/api/payment/whatsapp-initiate', assistantLimiter, async (req, res) =>
     }
     paymentData.signature = crypto.createHash('md5').update(sigInput).digest('hex');
 
-    const queryString = Object.entries(paymentData)
-      .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
-      .join('&');
-    const fullPaymentUrl = `${payfastUrl}?${queryString}`;
+    // Store payment session and return a GET-friendly checkout URL
+    const sessionId = crypto.randomUUID();
+    paymentSessions.set(sessionId, { paymentData, created: Date.now() });
+    const checkoutUrl = `${backendUrl}/api/payment/checkout/${sessionId}`;
 
-    console.log(`[wa-payment] Generated payment link for booking ${booking_id}, R${amount}`);
+    console.log(`[wa-payment] Generated checkout link for booking ${booking_id}, R${amount}, session=${sessionId}`);
 
     res.json({
       ok: true,
-      payment_url: fullPaymentUrl,
+      payment_url: checkoutUrl,
       booking_id,
       amount: parseFloat(amount).toFixed(2),
     });
