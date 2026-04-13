@@ -7538,14 +7538,13 @@ app.post('/api/admin/save-card', authMiddleware, async (req, res) => {
     const paymentData = {
       merchant_id: merchantId,
       merchant_key: merchantKey,
-      amount: '1.00', // R1 verification charge
-      item_name: 'Admin Card Verification',
+      amount: '10.00', // R10 verification charge
+      item_name: 'Square 15 Card Verification',
       return_url: `${backendUrl}/api/payment/ozow-result?status=success&booking_id=admin_card_save`,
       cancel_url: `${backendUrl}/api/payment/ozow-result?status=cancel&booking_id=admin_card_save`,
       notify_url: `${backendUrl}/api/payment/itn`,
       custom_str1: `admin_card_save_${adminUid}`,
       payment_method: 'cc',
-      subscription_type: '2', // Enable tokenization
     };
 
     // Generate PayFast signature
@@ -7729,6 +7728,33 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
     }
   } catch (fbErr) {
     console.warn(`[processPayment] futureBookings update failed: ${fbErr.message}`);
+  }
+
+  // ── Propagate payment_status to ALL bridge docs (e.g. {bookingId}_{artisanId}) ──
+  try {
+    const bridgeSnap = await admin.firestore().collection('tasksManagement')
+      .where('future_booking_id', '==', bookingId).get();
+    if (!bridgeSnap.empty) {
+      const batch = admin.firestore().batch();
+      bridgeSnap.forEach(doc => {
+        batch.update(doc.ref, {
+          payment_status: updateData.payment_status,
+          paymentStatus: updateData.paymentStatus || updateData.payment_status,
+          payment_verified: true,
+          payment_verified_at: now,
+          accept: '1',
+          artisan_confirmed: 'yes',
+          status: 'accepted',
+          updated_at: now,
+          ...(isDepositPayment ? { deposit_paid: true, deposit_paid_at: now } : {}),
+          ...(isBalancePayment ? { balance_paid: true, balance_paid_at: now } : {}),
+        });
+      });
+      await batch.commit();
+      console.log(`✅ [processPayment] Updated ${bridgeSnap.size} bridge doc(s) for ${bookingId}`);
+    }
+  } catch (bridgeErr) {
+    console.warn(`[processPayment] Bridge doc update failed: ${bridgeErr.message}`);
   }
 
   // ── Send WhatsApp notification to customer ──

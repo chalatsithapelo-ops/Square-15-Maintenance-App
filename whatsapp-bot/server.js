@@ -3603,6 +3603,8 @@ DEPOSIT vs BALANCE PAYMENTS (CRITICAL):
 - NEVER tell a customer "everything is paid" or "no balance to pay" when the status is "deposit_paid". They owe the remaining 65%.
 - When a customer with deposit_paid asks to pay, call request_payment_link with paymentType="full" — the system will automatically calculate the correct balance amount.
 - If check_booking_status returns balanceRemaining, always mention it: "You have a remaining balance of R[X] to pay."
+- CRITICAL: When a customer asks about balance, remaining payment, or wants to pay — you MUST call check_booking_status or request_payment_link FIRST. NEVER answer from memory or conversation history. Always verify the real-time database status.
+- If you see a [SYSTEM STATUS UPDATE] message with status "completed" or "after_photo", check if balance is due by calling check_booking_status.
 
 PHOTO REQUIREMENT (CRITICAL):
 - ALWAYS ask the customer to send a photo of the issue BEFORE creating a booking or RFQ.
@@ -4296,6 +4298,39 @@ app.post('/api/job-status-update', async (req, res) => {
         ? `📸 Before-work photo for booking #${ref}`
         : `📸 After-work photo for booking #${ref}`;
       await sendWhatsAppImage(to, imageUrl, caption);
+    }
+
+    // ── Inject status into AI session so it knows about job progress ──
+    try {
+      const phone = to.startsWith('27') ? to : to;
+      const session = sessions.get(phone);
+      if (session) {
+        session.messages.push({
+          role: 'system',
+          content: `[SYSTEM STATUS UPDATE] Booking #${ref} (${mainBookingId}): status changed to "${status}". ${imageUrl ? `Photo uploaded: ${imageUrl}` : ''}`,
+        });
+      }
+    } catch (e) { console.warn('[job-status-update] session inject failed:', e.message); }
+
+    // ── Auto-send balance payment prompt after job completion for deposit bookings ──
+    if (status === 'completed' || status === 'after_photo') {
+      try {
+        const bookDoc = await firestore.collection('tasksManagement').doc(mainBookingId).get()
+          || await firestore.collection('futureBookings').doc(mainBookingId).get();
+        if (bookDoc && bookDoc.exists) {
+          const bd = bookDoc.data();
+          const isDepositPaid = bd.payment_status === 'deposit_paid';
+          const balanceDone = bd.balance_paid === true;
+          const totalCost = parseFloat(bd.cost || bd.total_cost || '0');
+          const depositAmt = parseFloat(bd.deposit_amount || '0') || Math.round(totalCost * 0.35 * 100) / 100;
+          const balanceAmt = parseFloat(bd.balance_remaining || bd.balance_amount || '0') || Math.round((totalCost - depositAmt) * 100) / 100;
+
+          if (isDepositPaid && !balanceDone && balanceAmt > 0 && status === 'completed') {
+            const balanceMsg = `💰 *Balance payment due: R${balanceAmt.toFixed(2)}*\n\nYour artisan has completed the work for booking #${ref}. You still owe a balance of R${balanceAmt.toFixed(2)} (total R${totalCost.toFixed(2)} minus deposit of R${depositAmt.toFixed(2)}).\n\nWould you like to pay the balance now? Reply "pay balance" to get a payment link.`;
+            await sendWhatsAppMessage(to, balanceMsg);
+          }
+        }
+      } catch (e) { console.warn('[job-status-update] balance check failed:', e.message); }
     }
 
     console.log(`[api/job-status-update] Status "${status}" sent to ${to} for ${mainBookingId}${imageUrl ? ' (with image)' : ''}`);
