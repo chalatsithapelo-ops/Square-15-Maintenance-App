@@ -6326,19 +6326,20 @@ app.post('/api/payment/whatsapp-initiate', assistantLimiter, async (req, res) =>
     const cancelUrl = `${backendUrl}/api/payment/ozow-result?status=cancel&booking_id=${encodeURIComponent(booking_id)}`;
     const notifyUrl = `${backendUrl}/api/payment/itn`;
 
-    const paymentData = {
-      merchant_id: merchantId,
-      merchant_key: merchantKey,
-      amount: String(parseFloat(amount).toFixed(2)),
-      item_name: itemName,
-      return_url: returnUrl,
-      cancel_url: cancelUrl,
-      notify_url: notifyUrl,
-      custom_str1: booking_id,
-      ...(customer_name ? { name_first: customer_name } : {}),
-      ...(customer_phone ? { cell_number: customer_phone } : {}),
-      ...(payment_method === 'cc' ? { payment_method: 'cc' } : {}),
-    };
+    // PayFast requires parameters in a SPECIFIC order for signature verification:
+    // merchant → return/cancel/notify → personal → amount/item → custom → payment_method
+    const paymentData = {};
+    paymentData.merchant_id = merchantId;
+    paymentData.merchant_key = merchantKey;
+    paymentData.return_url = returnUrl;
+    paymentData.cancel_url = cancelUrl;
+    paymentData.notify_url = notifyUrl;
+    if (customer_name) paymentData.name_first = customer_name;
+    if (customer_phone) paymentData.cell_number = customer_phone;
+    paymentData.amount = String(parseFloat(amount).toFixed(2));
+    paymentData.item_name = itemName;
+    paymentData.custom_str1 = booking_id;
+    if (payment_method === 'cc') paymentData.payment_method = 'cc';
 
     // Generate PayFast signature
     const passphrase = env('PAYFAST_PASSPHRASE') || '';
@@ -6397,16 +6398,17 @@ app.post('/api/payment/initiate', authMiddleware, assistantLimiter, async (req, 
     const defaultCancel = `${backendUrl}/api/payment/ozow-result?status=cancel&booking_id=${encodeURIComponent(taskId)}`;
     const defaultNotify = `${backendUrl}/api/payment/itn`;
 
-    const paymentData = {
-      merchant_id: merchantId,
-      merchant_key: merchantKey,
-      amount: String(parseFloat(amount).toFixed(2)),
-      item_name: String(item_name),
-      return_url: return_url || defaultReturn,
-      cancel_url: cancel_url || defaultCancel,
-      notify_url: notify_url || defaultNotify,
-      ...(custom_str1 ? { custom_str1 } : {}),
-    };
+    // PayFast requires parameters in a SPECIFIC order for signature verification:
+    // merchant → return/cancel/notify → personal → amount/item → custom → payment_method → subscription
+    const paymentData = {};
+    paymentData.merchant_id = merchantId;
+    paymentData.merchant_key = merchantKey;
+    paymentData.return_url = return_url || defaultReturn;
+    paymentData.cancel_url = cancel_url || defaultCancel;
+    paymentData.notify_url = notify_url || defaultNotify;
+    paymentData.amount = String(parseFloat(amount).toFixed(2));
+    paymentData.item_name = String(item_name);
+    if (custom_str1) paymentData.custom_str1 = custom_str1;
 
     // Force card-only checkout when payment_method is 'cc'
     if (payment_method === 'cc') {
