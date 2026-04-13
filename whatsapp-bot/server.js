@@ -2318,7 +2318,7 @@ async function executeWaTool(name, args, session) {
       // Update Firestore with payment type choice
       if (isDeposit) {
         // Check if deposit payment is already pending to prevent double-charge
-        if (data.payment_status === 'deposit_pending') {
+        if (d.payment_status === 'deposit_pending') {
           return {
             message: `A deposit payment is already in progress for this booking. Please complete or cancel the existing payment before requesting a new one.`,
             bookingId: bid,
