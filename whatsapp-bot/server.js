@@ -2295,8 +2295,9 @@ async function executeWaTool(name, args, session) {
       const bid = args.bookingId;
       if (!bid) return { error: 'Please provide a booking ID.' };
 
-      // Get booking
+      // Get booking (check both collections)
       let bookDoc = await firestore.collection('tasksManagement').doc(bid).get();
+      if (!bookDoc.exists) bookDoc = await firestore.collection('futureBookings').doc(bid).get();
       if (!bookDoc.exists) return { error: `Booking "${bid}" not found.` };
       const bookData = bookDoc.data();
 
@@ -2694,6 +2695,18 @@ async function executeWaTool(name, args, session) {
       if (!doc.exists) return { error: `Booking "${bid}" not found.` };
 
       const d = doc.data();
+
+      // Verify the current WhatsApp user owns this booking
+      const bookingUserId = (d.user_id || d.userId || d.uid || '').toString().trim();
+      const bookingPhone = (d.user_phone || d.phone || d.contact || '').toString().replace(/\D/g, '');
+      const sessionUserId = (session.linkedUserId || '').toString().trim();
+      const sessionPhone = (session.phone || '').toString().replace(/\D/g, '');
+      const isOwner = (sessionUserId && (sessionUserId === bookingUserId)) ||
+                      (sessionPhone && bookingPhone.endsWith(sessionPhone.slice(-9)));
+      if (!isOwner) {
+        return { error: 'You can only rate bookings that belong to your account.' };
+      }
+
       const status = (d.status || '').toLowerCase();
 
       if (status !== 'completed' && status !== 'closed' && status !== 'done') {
@@ -3196,6 +3209,8 @@ async function executeWaTool(name, args, session) {
             }
             autoDispatched = true;
             console.log(`[wa-tool] Auto-dispatched RFQ ${rfqId} to ${artisanIds.length} artisans (${autoReason})`);
+          } else {
+            console.log(`[wa-tool] No artisans matched for RFQ ${rfqId} — admin will assign manually`);
           }
         } catch (e) { console.warn('[wa-tool] auto-dispatch failed, falling back to admin:', e.message); }
       }

@@ -6533,17 +6533,28 @@ app.post('/api/payment/charge-token', authMiddleware, assistantLimiter, async (r
     if (chargeResponse.ok && result.data) {
       console.log(`💳 Token charge successful: R${amount}, task=${custom_str1 || 'N/A'}`);
 
-      // Update task payment status
+      // Use shared payment processing for full notification chain
       if (custom_str1) {
-        const taskRef = admin.firestore().collection('tasksManagement').doc(custom_str1);
-        await taskRef.update({
-          payment_status: 'paid',
-          payment_verified: true,
-          payment_verified_at: new Date().toISOString(),
-          payment_verified_via: 'payfast_token_charge',
-          payment_method: 'saved_card',
-          updated_at: new Date().toISOString(),
-        });
+        try {
+          await processSuccessfulPayment(custom_str1, {
+            amountGross: amount,
+            pfPaymentId: result.data?.pf_payment_id || '',
+            itemName: item_name,
+            source: 'payfast_token_charge',
+          });
+        } catch (pspErr) {
+          console.warn(`[charge-token] processSuccessfulPayment fallback: ${pspErr.message}`);
+          // Fallback: direct update if shared function fails
+          const taskRef = admin.firestore().collection('tasksManagement').doc(custom_str1);
+          await taskRef.update({
+            payment_status: 'paid',
+            payment_verified: true,
+            payment_verified_at: new Date().toISOString(),
+            payment_verified_via: 'payfast_token_charge',
+            payment_method: 'saved_card',
+            updated_at: new Date().toISOString(),
+          });
+        }
       }
 
       res.json({ ok: true, message: 'Payment charged successfully', data: result.data });
@@ -8284,7 +8295,7 @@ app.use((err, req, res, next) => {
  * Sets { role: 'admin' } custom claim on the user so resolveRole() grants
  * admin access for backend endpoints.
  */
-app.post('/api/admin/bootstrap-claims', async (req, res) => {
+app.post('/api/admin/bootstrap-claims', adminLimiter, async (req, res) => {
   const firestore = requireFirebase(res);
   if (!firestore) return;
 
