@@ -2409,6 +2409,9 @@ async function executeWaTool(name, args, session) {
       const bookData = bookDoc.data();
 
       if (bookData.payment_status === 'paid') return { message: 'This booking is already paid!' };
+      if (bookData.payment_status === 'deposit_paid' && bookData.balance_paid === true) {
+        return { message: 'This booking is fully paid (deposit + balance)!' };
+      }
 
       // Ensure an artisan has accepted before allowing payment (match request_payment_link logic)
       let artisanAccepted = bookData.accept === '1' || bookData.accept === 1 ||
@@ -2436,8 +2439,28 @@ async function executeWaTool(name, args, session) {
         return { error: 'No artisan has accepted this booking yet. Please wait for an artisan to accept before paying.' };
       }
 
-      const cost = parseFloat(bookData.cost || '0');
-      if (cost <= 0) return { error: 'This booking does not have a confirmed price yet.' };
+      const totalCost = parseFloat(bookData.cost || '0');
+      if (totalCost <= 0) return { error: 'This booking does not have a confirmed price yet.' };
+
+      // Handle deposit/balance split: if deposit already paid, only charge the remaining balance
+      const isDepositPaid = bookData.payment_status === 'deposit_paid';
+      const balanceDone = bookData.balance_paid === true;
+      let chargeAmount, paymentLabel, newPaymentStatus, balanceFields;
+
+      if (isDepositPaid && !balanceDone) {
+        // Only charge the remaining balance (65%)
+        const depositAmt = parseFloat(bookData.deposit_amount || '0') || Math.round(totalCost * 0.35 * 100) / 100;
+        chargeAmount = parseFloat(bookData.balance_remaining || bookData.balance_amount || '0') || Math.round((totalCost - depositAmt) * 100) / 100;
+        paymentLabel = `balance payment of R${chargeAmount.toFixed(2)}`;
+        newPaymentStatus = 'paid';
+        balanceFields = { balance_paid: true, balance_paid_at: new Date().toISOString(), balance_payment_method: 'wallet' };
+      } else {
+        // Full payment
+        chargeAmount = totalCost;
+        paymentLabel = `payment of R${chargeAmount.toFixed(2)}`;
+        newPaymentStatus = 'paid';
+        balanceFields = {};
+      }
 
       // Get user balance (atomic transaction)
       try {
@@ -2447,15 +2470,16 @@ async function executeWaTool(name, args, session) {
           if (!userSnap.exists) throw new Error('User not found');
 
           const balance = parseFloat(userSnap.data().balance || '0');
-          if (balance < cost) throw new Error(`Insufficient balance. You have R${balance.toFixed(2)} but need R${cost.toFixed(2)}.`);
+          if (balance < chargeAmount) throw new Error(`Insufficient balance. You have R${balance.toFixed(2)} but need R${chargeAmount.toFixed(2)}.`);
 
-          const newBalance = balance - cost;
+          const newBalance = balance - chargeAmount;
           txn.update(userRef, { balance: newBalance.toFixed(2) });
           txn.update(firestore.collection('tasksManagement').doc(bid), {
-            payment_status: 'paid',
-            paymentStatus: 'paid',
+            payment_status: newPaymentStatus,
+            paymentStatus: newPaymentStatus,
             payment_method: 'wallet',
             paid_at: new Date().toISOString(),
+            ...balanceFields,
           });
 
           // Also update futureBookings if exists
@@ -2463,9 +2487,10 @@ async function executeWaTool(name, args, session) {
           const fbSnap = await txn.get(fbRef);
           if (fbSnap.exists) {
             txn.update(fbRef, {
-              payment_status: 'paid',
+              payment_status: newPaymentStatus,
               wallet_deducted: true,
               paid_at: new Date().toISOString(),
+              ...balanceFields,
             });
           }
         });
@@ -2474,15 +2499,15 @@ async function executeWaTool(name, args, session) {
         await firestore.collection('transactionLogs').add({
           user_id: session.linkedUserId,
           type: 'payment',
-          subtype: 'wallet_deduction',
-          amount: cost,
+          subtype: isDepositPaid ? 'wallet_balance_payment' : 'wallet_deduction',
+          amount: chargeAmount,
           booking_id: bid,
           source: 'whatsapp',
           status: 'success',
           created_at: admin.firestore.FieldValue.serverTimestamp(),
         });
 
-        return { success: true, message: `Payment of R${cost.toFixed(2)} successful via wallet! Your booking ${bid} is now confirmed.`, paid: `R${cost.toFixed(2)}` };
+        return { success: true, message: `${isDepositPaid ? 'Balance' : 'Full'} ${paymentLabel} successful via wallet! Your booking ${bid} is now fully paid.`, paid: `R${chargeAmount.toFixed(2)}` };
       } catch (e) {
         return { error: e.message || 'Payment failed. Please try again.' };
       }
@@ -4468,7 +4493,32 @@ app.post('/api/job-status-update', async (req, res) => {
           const balanceAmt = parseFloat(bd.balance_remaining || bd.balance_amount || '0') || Math.round((totalCost - depositAmt) * 100) / 100;
 
           if (isDepositPaid && !balanceDone && balanceAmt > 0 && status === 'completed') {
-            const balanceMsg = `💰 *Balance payment due: R${balanceAmt.toFixed(2)}*\n\nYour artisan has completed the work for booking #${ref}. You still owe a balance of R${balanceAmt.toFixed(2)} (total R${totalCost.toFixed(2)} minus deposit of R${depositAmt.toFixed(2)}).\n\nWould you like to pay the balance now? Reply "pay balance" to get a payment link.`;
+            // Auto-generate balance payment link
+            let balancePaymentUrl = '';
+            try {
+              const backendUrl = process.env.LIVEKIT_BACKEND_URL || 'https://square15-livekit-backend.onrender.com';
+              const resp = await fetch(`${backendUrl}/api/payment/whatsapp-initiate`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  amount: balanceAmt.toFixed(2),
+                  booking_id: mainBookingId,
+                  customer_name: bd.customerName || bd.name || '',
+                  customer_phone: to,
+                  description: `Balance payment for ${bd.description || bd.subcategory || bd.category_name || 'booking'} #${ref}`,
+                }),
+                signal: AbortSignal.timeout(15000),
+              });
+              const result = await resp.json();
+              if (result.ok && result.payment_url) balancePaymentUrl = result.payment_url;
+            } catch (e) { console.warn('[job-status-update] balance payment link generation failed:', e.message); }
+
+            let balanceMsg = `💰 *Balance payment due: R${balanceAmt.toFixed(2)}*\n\nYour artisan has completed the work for booking #${ref}. You still owe a balance of R${balanceAmt.toFixed(2)} (total R${totalCost.toFixed(2)} minus deposit of R${depositAmt.toFixed(2)}).`;
+            if (balancePaymentUrl) {
+              balanceMsg += `\n\n💳 *Pay now:* ${balancePaymentUrl}\n\nClick the link above to pay your remaining balance securely.`;
+            } else {
+              balanceMsg += `\n\nWould you like to pay the balance now? Reply "pay balance" to get a payment link.`;
+            }
             await sendWhatsAppMessage(to, balanceMsg);
           }
         }
