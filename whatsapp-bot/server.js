@@ -2315,7 +2315,7 @@ async function executeWaTool(name, args, session) {
         const backendUrl = process.env.LIVEKIT_BACKEND_URL || 'https://square15-livekit-backend.onrender.com';
         const resp = await fetch(`${backendUrl}/api/payment/whatsapp-initiate`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'x-internal-secret': process.env.INTERNAL_API_SECRET || '' },
           body: JSON.stringify({
             amount: cost.toFixed(2),
             booking_id: bid,
@@ -4531,7 +4531,7 @@ app.post('/api/job-status-update', requireInternalSecret, async (req, res) => {
               const backendUrl = process.env.LIVEKIT_BACKEND_URL || 'https://square15-livekit-backend.onrender.com';
               const resp = await fetch(`${backendUrl}/api/payment/whatsapp-initiate`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: { 'Content-Type': 'application/json', 'x-internal-secret': process.env.INTERNAL_API_SECRET || '' },
                 body: JSON.stringify({
                   amount: balanceAmt.toFixed(2),
                   booking_id: mainBookingId,
