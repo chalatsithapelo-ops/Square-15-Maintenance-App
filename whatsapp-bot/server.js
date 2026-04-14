@@ -94,6 +94,90 @@ function db() {
   return admin.firestore();
 }
 
+// ─── Push notification helper for linked app customers ───
+// Looks up the customer's app account by phone number or user_id,
+// finds their FCM token, and sends a push notification + in-app notification.
+async function notifyLinkedCustomer(firestore, { phone, userId, title, body, data }) {
+  try {
+    let custUserId = (userId || '').toString().trim();
+    let custDoc = null;
+
+    // If we have a userId that's a real app user (not wa_ prefix), use it directly
+    if (custUserId && !custUserId.startsWith('wa_')) {
+      const doc = await firestore.collection('users').doc(custUserId).get();
+      if (doc.exists) custDoc = doc;
+    }
+
+    // Fallback: look up user by phone number
+    if (!custDoc && phone) {
+      const cleanPhone = phone.replace(/[^0-9]/g, '');
+      const variants = [cleanPhone];
+      if (cleanPhone.startsWith('27')) variants.push('0' + cleanPhone.slice(2));
+      if (cleanPhone.startsWith('0')) variants.push('27' + cleanPhone.slice(1));
+      variants.push('+' + (cleanPhone.startsWith('27') ? cleanPhone : '27' + cleanPhone.replace(/^0/, '')));
+
+      for (const v of variants) {
+        const snap = await firestore.collection('users')
+          .where('phone', '==', v).limit(1).get();
+        if (!snap.empty) {
+          custDoc = snap.docs[0];
+          custUserId = custDoc.id;
+          break;
+        }
+        // Also check phoneNumber field
+        const snap2 = await firestore.collection('users')
+          .where('phoneNumber', '==', v).limit(1).get();
+        if (!snap2.empty) {
+          custDoc = snap2.docs[0];
+          custUserId = custDoc.id;
+          break;
+        }
+      }
+    }
+
+    if (!custDoc) return; // No linked app account
+
+    const cu = custDoc.data() || {};
+    const tokenCandidates = [cu.deviceToken, cu.device_token, cu.fcm_token, cu.fcmToken, cu.token, cu.push_token];
+    const seen = new Set();
+    const tokens = [];
+    for (const c of tokenCandidates) {
+      const t = String(c || '').trim();
+      if (t && !seen.has(t)) { seen.add(t); tokens.push(t); }
+    }
+
+    // Send FCM push
+    for (const tok of tokens) {
+      try {
+        await admin.messaging().send({
+          token: tok,
+          notification: { title, body },
+          data: { ...data, user_type: 'customer' },
+          android: { priority: 'high', notification: { channelId: 'order_request_channel', sound: 'sound' } },
+        });
+        console.log(`[push] Customer ${custUserId} notified via ${tok.substring(0, 15)}...`);
+      } catch (fcmErr) {
+        console.warn(`[push] Customer FCM failed: ${fcmErr.message}`);
+      }
+    }
+
+    // Write in-app notification
+    await firestore.collection('notifications').add({
+      user_id: custUserId,
+      user_type: 'customer',
+      title,
+      message: body,
+      type: data.type || 'status_update',
+      booking_id: data.booking_id || '',
+      read: false,
+      view: false,
+      created_at: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.warn(`[push] notifyLinkedCustomer failed: ${err.message}`);
+  }
+}
+
 // ─── OpenAI ───
 
 const OpenAI = require('openai');
@@ -1913,6 +1997,17 @@ async function executeWaTool(name, args, session) {
         }
         console.log(`[wa-tool] Dispatched booking ${bookingId} to ${dispatchedCount} artisans`);
       } catch (e) { console.warn('[wa-tool] artisan dispatch failed:', e.message); }
+
+      // Push notification to linked customer app (booking confirmation)
+      if (session.linkedUserId) {
+        await notifyLinkedCustomer(firestore, {
+          userId: session.linkedUserId,
+          phone: session.phone,
+          title: 'Booking Created',
+          body: `Your ${args.category || 'maintenance'} booking #${orderNo} has been created. We're finding available artisans.`,
+          data: { type: 'booking_created', booking_id: bookingId },
+        });
+      }
 
       // Store last booking ID for quick payment follow-up
       session.lastBookingId = bookingId;
@@ -4335,6 +4430,15 @@ app.post('/api/artisan-accepted', requireInternalSecret, async (req, res) => {
     await sendWhatsAppMessage(to, msg);
     console.log(`[api/artisan-accepted] Sent acceptance notification to ${to} for booking ${mainBookingId}`);
 
+    // Push notification to linked customer app
+    await notifyLinkedCustomer(firestore, {
+      phone: customerPhone,
+      userId: userId,
+      title: 'Artisan Accepted Your Booking',
+      body: `${artisanName || 'An artisan'} has accepted your booking${orderNo ? ' #' + orderNo : ''}. Open the app to proceed with payment.`,
+      data: { type: 'artisan_accepted', booking_id: mainBookingId },
+    });
+
     res.json({ success: true, to, bookingId: mainBookingId });
   } catch (err) {
     console.error('[api/artisan-accepted] error:', err.message);
@@ -4402,6 +4506,19 @@ app.post('/api/booking-status-update', requireInternalSecret, async (req, res) =
     const msg = customMsg || statusMessages[status] || `📋 Your booking status has been updated to: *${status}*`;
     await sendWhatsAppMessage(to, msg);
     console.log(`[api/booking-status-update] Status "${status}" sent to ${to} for ${mainBookingId}`);
+
+    // Push notification to linked customer app
+    const pushTitles = {
+      'in_progress': 'Job In Progress', 'progress': 'Job In Progress',
+      'completed': 'Job Completed', 'closed': 'Job Closed',
+      'cancelled': 'Booking Cancelled', 'payment_received': 'Payment Received',
+    };
+    await notifyLinkedCustomer(firestore, {
+      phone: customerPhone,
+      title: pushTitles[status] || 'Booking Update',
+      body: msg.replace(/[*_~`]/g, '').substring(0, 200),
+      data: { type: 'booking_status_update', booking_id: mainBookingId, status },
+    });
 
     res.json({ success: true, to, status });
   } catch (err) {
@@ -4578,6 +4695,20 @@ app.post('/api/job-status-update', requireInternalSecret, async (req, res) => {
     }
 
     console.log(`[api/job-status-update] Status "${status}" sent to ${to} for ${mainBookingId}${imageUrl ? ' (with image)' : ''}`);
+
+    // Push notification to linked customer app
+    const jobPushTitles = {
+      'progress': 'Artisan On The Way', 'buying_material': 'Buying Materials',
+      'before_photo': 'Artisan Has Arrived', 'after_photo': 'Work Completed',
+      'completed': 'Job Completed', 'balance_due': 'Balance Payment Due',
+      'additional_work': 'Additional Work Found', 'balance_collected': 'Balance Received',
+    };
+    await notifyLinkedCustomer(firestore, {
+      phone: customerPhone,
+      title: jobPushTitles[status] || 'Job Update',
+      body: msg.replace(/[*_~`]/g, '').substring(0, 200),
+      data: { type: 'job_status_update', booking_id: mainBookingId, status },
+    });
 
     res.json({ success: true, to, status });
   } catch (err) {
