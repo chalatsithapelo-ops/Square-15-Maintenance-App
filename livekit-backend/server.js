@@ -7812,11 +7812,16 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
 
   // ── Idempotency: use transaction to prevent race conditions (ozow-result + ITN arriving simultaneously) ──
   // For deposit bookings, allow a second payment (balance) after deposit is paid.
+  // CRITICAL: require at least 2 minutes since deposit was paid to prevent the ITN callback
+  // from the SAME deposit payment being treated as a balance payment.
+  const depositPaidAt = taskData.deposit_paid_at ? new Date(taskData.deposit_paid_at).getTime() : 0;
+  const timeSinceDeposit = depositPaidAt ? (Date.now() - depositPaidAt) : Infinity;
   const isBalanceFollowUp = taskData.payment_verified === true
     && taskData.payment_type === 'deposit'
     && taskData.deposit_paid === true
     && taskData.balance_paid !== true
-    && taskData.payment_status !== 'paid';
+    && taskData.payment_status !== 'paid'
+    && timeSinceDeposit > 120000; // must be >2 minutes since deposit was paid
 
   if (!isBalanceFollowUp) {
     try {
@@ -7824,9 +7829,11 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
         const freshSnap = await tx.get(taskRef);
         const fd = freshSnap.data() || {};
         if (fd.payment_verified === true) {
-          // Allow if this is a balance payment on a deposit booking
-          if (fd.payment_type === 'deposit' && fd.deposit_paid === true && fd.balance_paid !== true && fd.payment_status !== 'paid') {
-            // Balance payment — proceed
+          // Allow if this is a balance payment on a deposit booking (with time check)
+          const fdDepPaidAt = fd.deposit_paid_at ? new Date(fd.deposit_paid_at).getTime() : 0;
+          const fdTimeSinceDep = fdDepPaidAt ? (Date.now() - fdDepPaidAt) : Infinity;
+          if (fd.payment_type === 'deposit' && fd.deposit_paid === true && fd.balance_paid !== true && fd.payment_status !== 'paid' && fdTimeSinceDep > 120000) {
+            // Balance payment — proceed (genuine second payment, not ITN duplicate)
             return;
           }
           throw new Error('ALREADY_VERIFIED');
@@ -7835,13 +7842,13 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
       });
     } catch (txErr) {
       if (txErr.message === 'ALREADY_VERIFIED') {
-        console.log(`[processPayment] ${bookingId} already verified (by ${taskData.payment_verified_via || 'unknown'}), skipping`);
+        console.log(`[processPayment] ${bookingId} already verified (by ${taskData.payment_verified_via || 'unknown'}), timeSinceDeposit=${Math.round(timeSinceDeposit/1000)}s, skipping`);
         return { processed: false, reason: 'already verified' };
       }
       console.warn(`[processPayment] Idempotency transaction error: ${txErr.message}`);
     }
   } else {
-    console.log(`[processPayment] Balance payment for deposit booking ${bookingId} — bypassing idempotency`);
+    console.log(`[processPayment] Balance payment for deposit booking ${bookingId} (${Math.round(timeSinceDeposit/1000)}s after deposit) — bypassing idempotency`);
   }
 
   // ── Read deposit/balance info from futureBookings if missing on tasksManagement ──
