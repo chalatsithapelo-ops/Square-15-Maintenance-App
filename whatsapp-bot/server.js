@@ -4266,13 +4266,33 @@ app.post('/api/artisan-accepted', requireInternalSecret, async (req, res) => {
       return res.status(404).json({ error: 'No customer phone found for booking' });
     }
 
+    // Extract artisan ID from bridge bookingId (e.g. WA-XXX_artisanId → artisanId)
+    const artisanId = bookingId.includes('_') ? bookingId.split('_').slice(1).join('_') : '';
+
+    // Read canonical data from futureBookings so we can populate the main tasksManagement doc
+    let userId = '', bookingSource = 'whatsapp';
+    if (fbDoc.exists) {
+      const fd = fbDoc.data();
+      userId = fd.user_id || fd.userId || fd.uid || '';
+      bookingSource = fd.source || 'whatsapp';
+    }
+
     // Update the main tasksManagement doc to mark as accepted (so payment check passes)
+    // CRITICAL: include phone, source, service_provider_id, user_id so processSuccessfulPayment
+    // can send WhatsApp receipt and artisan push notifications
     try {
       await firestore.collection('tasksManagement').doc(mainBookingId).set({
         accept: '1',
         artisan_confirmed: 'yes',
         status: 'pending_payment',
         service_provider_name: artisanName || '',
+        source: bookingSource,
+        ...(customerPhone && { phone: customerPhone, customerPhone: customerPhone, contact: customerPhone, user_phone: customerPhone, client_phone: customerPhone }),
+        ...(artisanId && { service_provider_id: artisanId }),
+        ...(userId && { user_id: userId, userId: userId }),
+        ...(orderNo && { order_no: orderNo }),
+        ...(bookingCost && { cost: bookingCost, total_cost: bookingCost }),
+        ...(bookingDescription && { description: bookingDescription }),
         updated_at: new Date().toISOString(),
       }, { merge: true });
     } catch (e) { console.warn('[api/artisan-accepted] main doc update failed:', e.message); }

@@ -7767,19 +7767,61 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
 
   // ── Read deposit/balance info from futureBookings if missing on tasksManagement ──
   // The WA bot writes payment_type/deposit_amount to futureBookings, not always to tasksManagement
-  if (!taskData.payment_type) {
+  // ── Merge critical fields from futureBookings (phone, source, service_provider_id, user_id) ──
+  // The artisan-accepted handler may create a minimal tasksManagement doc without these fields.
+  // Always read futureBookings to fill gaps so WA notifications and push notifications work.
+  {
     try {
       const fbCheckId = taskData.future_booking_id || bookingId;
       const fbCheck = await admin.firestore().collection('futureBookings').doc(fbCheckId).get();
       if (fbCheck.exists) {
         const fbd = fbCheck.data() || {};
-        if (fbd.payment_type) taskData.payment_type = fbd.payment_type;
+        if (!taskData.payment_type && fbd.payment_type) taskData.payment_type = fbd.payment_type;
         if (fbd.deposit_amount && !taskData.deposit_amount) taskData.deposit_amount = fbd.deposit_amount;
         if (fbd.balance_amount && !taskData.balance_amount) taskData.balance_amount = fbd.balance_amount;
         if (fbd.balance_remaining && !taskData.balance_remaining) taskData.balance_remaining = fbd.balance_remaining;
         if (fbd.deposit_paid !== undefined && taskData.deposit_paid === undefined) taskData.deposit_paid = fbd.deposit_paid;
         if (fbd.balance_paid !== undefined && taskData.balance_paid === undefined) taskData.balance_paid = fbd.balance_paid;
         if (fbd.payment_status && !taskData.payment_status) taskData.payment_status = fbd.payment_status;
+        // Fill critical fields for WA notification + artisan push
+        if (!taskData.phone) taskData.phone = fbd.phone || fbd.user_phone || fbd.customerPhone || fbd.contact || fbd.client_phone || '';
+        if (!taskData.customer_phone) taskData.customer_phone = fbd.customer_phone || fbd.user_phone || fbd.customerPhone || '';
+        if (!taskData.customerPhone) taskData.customerPhone = fbd.customerPhone || fbd.user_phone || fbd.customer_phone || '';
+        if (!taskData.contact) taskData.contact = fbd.contact || '';
+        if (!taskData.user_phone) taskData.user_phone = fbd.user_phone || '';
+        if (!taskData.client_phone) taskData.client_phone = fbd.client_phone || '';
+        if (!taskData.source) taskData.source = fbd.source || '';
+        if (!taskData.service_provider_id) taskData.service_provider_id = fbd.service_provider_id || '';
+        if (!taskData.user_id && !taskData.userId) {
+          taskData.user_id = fbd.user_id || fbd.userId || fbd.uid || '';
+          taskData.userId = taskData.user_id;
+        }
+        if (!taskData.order_no) taskData.order_no = fbd.order_no || '';
+        if (!taskData.cost && !taskData.total_cost) {
+          taskData.cost = fbd.cost || fbd.total_cost || '';
+          taskData.total_cost = taskData.cost;
+        }
+      }
+    } catch (_) {}
+  }
+
+  // ── Also check bridge docs for service_provider_id if still missing ──
+  if (!taskData.service_provider_id) {
+    try {
+      const bridgeLookup = await admin.firestore().collection('tasksManagement')
+        .where('future_booking_id', '==', bookingId)
+        .where('accept', '==', '1')
+        .limit(1).get();
+      if (!bridgeLookup.empty) {
+        const bd = bridgeLookup.docs[0].data() || {};
+        taskData.service_provider_id = bd.service_provider_id || '';
+        if (!taskData.service_provider_id) {
+          // Extract from bridge doc ID: {bookingId}_{artisanId}
+          const bridgeDocId = bridgeLookup.docs[0].id;
+          if (bridgeDocId.includes('_')) {
+            taskData.service_provider_id = bridgeDocId.split('_').slice(1).join('_');
+          }
+        }
       }
     } catch (_) {}
   }
@@ -7914,7 +7956,7 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
 
   // ── Send WhatsApp notification to customer ──
   const taskSource = (taskData.source || '').toString().toLowerCase();
-  if (taskSource === 'whatsapp' || taskSource === 'whatsapp_rfq' || bookingId.startsWith('WA-')) {
+  if (taskSource.startsWith('whatsapp') || bookingId.startsWith('WA-')) {
     let phone = (taskData.phone || taskData.customer_phone || taskData.customerPhone || taskData.contact || taskData.user_phone || taskData.client_phone || '').toString().trim();
     if (!phone && (taskData.user_id || taskData.userId)) {
       try {
@@ -8035,6 +8077,60 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
     }
   } catch (artErr) {
     console.warn(`[processPayment] Artisan notification failed: ${artErr.message}`);
+  }
+
+  // ── Notify linked customer via push notification (if they have the app) ──
+  try {
+    const custUserId = (taskData.user_id || taskData.userId || '').toString().trim();
+    if (custUserId && !custUserId.startsWith('wa_')) {
+      const custDoc = await admin.firestore().collection('users').doc(custUserId).get();
+      if (custDoc.exists) {
+        const cu = custDoc.data() || {};
+        const custTokenCandidates = [cu.deviceToken, cu.device_token, cu.fcm_token, cu.fcmToken, cu.token, cu.push_token];
+        const custTokensSeen = new Set();
+        const custTokens = [];
+        for (const c of custTokenCandidates) {
+          const t = String(c || '').trim();
+          if (t && !custTokensSeen.has(t)) { custTokensSeen.add(t); custTokens.push(t); }
+        }
+        if (custTokens.length > 0) {
+          const custTitle = isBalancePayment ? 'Balance Payment Confirmed' : isDepositPayment ? 'Deposit Confirmed' : 'Payment Confirmed';
+          const custBody = isBalancePayment
+            ? `Your balance payment has been received. Booking #${taskData.order_no || fbId} is fully paid.`
+            : isDepositPayment
+              ? `Your deposit has been received. Booking #${taskData.order_no || fbId} is confirmed.`
+              : `Your payment has been received. Booking #${taskData.order_no || fbId} is confirmed.`;
+          for (const tok of custTokens) {
+            try {
+              await admin.messaging().send({
+                token: tok,
+                notification: { title: custTitle, body: custBody },
+                data: { type: 'payment_confirmed', booking_id: fbId, tasks_management_id: bookingId, user_type: 'customer' },
+                android: { priority: 'high', notification: { channelId: 'order_request_channel', sound: 'sound' } },
+              });
+              console.log(`✅ [processPayment] Customer ${custUserId} notified via token ${tok.substring(0, 15)}...`);
+            } catch (custFcmErr) {
+              console.warn(`[processPayment] Customer FCM failed: ${custFcmErr.message}`);
+            }
+          }
+        }
+        // Write in-app notification for customer
+        await admin.firestore().collection('notifications').add({
+          user_id: custUserId,
+          user_type: 'customer',
+          title: isBalancePayment ? 'Balance Payment Confirmed' : isDepositPayment ? 'Deposit Confirmed' : 'Payment Confirmed',
+          message: `Your payment for booking #${taskData.order_no || fbId} has been received.`,
+          booking_id: fbId,
+          tasks_management_id: bookingId,
+          type: 'payment_confirmed',
+          read: false,
+          view: false,
+          created_at: now,
+        });
+      }
+    }
+  } catch (custErr) {
+    console.warn(`[processPayment] Customer notification failed: ${custErr.message}`);
   }
 
   // ── Create transaction log ──
