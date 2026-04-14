@@ -7692,14 +7692,37 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
 
   const taskData = taskSnap.data() || {};
 
-  // ── Idempotency: skip if already verified ──
+  // ── Idempotency: skip if already verified (atomic check-and-set) ──
   if (taskData.payment_verified === true) {
     console.log(`[processPayment] ${bookingId} already verified (by ${taskData.payment_verified_via || 'unknown'}), skipping`);
     return { processed: false, reason: 'already verified' };
   }
+  // Atomic guard: immediately set payment_verified to prevent race conditions (ozow-result + ITN)
+  try {
+    await taskRef.update({ payment_verified: true, payment_verified_at: now, payment_verified_via: calledFrom || 'payment_callback' });
+  } catch (_) {}
+
+  // ── Read deposit/balance info from futureBookings if missing on tasksManagement ──
+  // The WA bot writes payment_type/deposit_amount to futureBookings, not always to tasksManagement
+  if (!taskData.payment_type) {
+    try {
+      const fbCheckId = taskData.future_booking_id || bookingId;
+      const fbCheck = await admin.firestore().collection('futureBookings').doc(fbCheckId).get();
+      if (fbCheck.exists) {
+        const fbd = fbCheck.data() || {};
+        if (fbd.payment_type) taskData.payment_type = fbd.payment_type;
+        if (fbd.deposit_amount && !taskData.deposit_amount) taskData.deposit_amount = fbd.deposit_amount;
+        if (fbd.balance_amount && !taskData.balance_amount) taskData.balance_amount = fbd.balance_amount;
+        if (fbd.balance_remaining && !taskData.balance_remaining) taskData.balance_remaining = fbd.balance_remaining;
+        if (fbd.deposit_paid !== undefined && taskData.deposit_paid === undefined) taskData.deposit_paid = fbd.deposit_paid;
+        if (fbd.balance_paid !== undefined && taskData.balance_paid === undefined) taskData.balance_paid = fbd.balance_paid;
+        if (fbd.payment_status && !taskData.payment_status) taskData.payment_status = fbd.payment_status;
+      }
+    } catch (_) {}
+  }
 
   // ── Determine payment type ──
-  const isDepositBooking = taskData.payment_type === 'deposit';
+  const isDepositBooking = taskData.payment_type === 'deposit' || taskData.payment_status === 'deposit_pending';
   const depositAlreadyPaid = taskData.deposit_paid === true;
   const balanceAlreadyPaid = taskData.balance_paid === true;
 
@@ -7835,8 +7858,16 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
     if (phone) {
       try {
         const waBot = env('WHATSAPP_BOT_URL') || 'https://square15-whatsapp-bot.onrender.com';
-        // Use parseFloat to skip '0' strings and fall through to real cost fields
-        const rawPayAmt = parseFloat(amountGross) || parseFloat(taskData.total_cost) || parseFloat(taskData.cost) || parseFloat(taskData.deposit_amount) || parseFloat(taskData.price) || 0;
+        // Calculate correct display amount based on payment type
+        const totalCostVal = parseFloat(taskData.total_cost) || parseFloat(taskData.cost) || 0;
+        let rawPayAmt;
+        if (isDepositPayment) {
+          rawPayAmt = parseFloat(amountGross) || parseFloat(taskData.deposit_amount) || Math.round(totalCostVal * 0.35 * 100) / 100;
+        } else if (isBalancePayment) {
+          rawPayAmt = parseFloat(amountGross) || parseFloat(taskData.balance_remaining) || parseFloat(taskData.balance_amount) || Math.round(totalCostVal * 0.65 * 100) / 100;
+        } else {
+          rawPayAmt = parseFloat(amountGross) || totalCostVal || parseFloat(taskData.price) || 0;
+        }
         const displayAmount = rawPayAmt > 0 ? rawPayAmt.toFixed(2) : '0.00';
         let waMessage;
         if (isBalancePayment) {
@@ -7858,22 +7889,6 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
           signal: AbortSignal.timeout(10000),
         });
         console.log(`✅ [processPayment] WhatsApp notification sent for ${bookingId}`);
-        // Also update WA bot session state via payment-confirmed endpoint
-        try {
-          await fetch(`${waBot}/api/payment-confirmed`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              bookingId: fbId,
-              amount: artisanDisplayAmt,
-              paymentStatus: isBalancePayment ? 'balance_paid' : isDepositPayment ? 'deposit_paid' : 'paid',
-            }),
-            signal: AbortSignal.timeout(10000),
-          });
-          console.log(`✅ [processPayment] WA payment-confirmed sent for ${bookingId}`);
-        } catch (pcErr) {
-          console.warn(`[processPayment] WA payment-confirmed failed: ${pcErr.message}`);
-        }
       } catch (waErr) {
         console.warn(`[processPayment] WhatsApp notification failed: ${waErr.message}`);
       }
@@ -7901,7 +7916,15 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
           }
         }
         const orderLabel = taskData.order_no || fbId;
-        const artisanPayAmt = parseFloat(amountGross) || parseFloat(taskData.total_cost) || parseFloat(taskData.cost) || parseFloat(taskData.deposit_amount) || 0;
+        const totalForArtisan = parseFloat(taskData.total_cost) || parseFloat(taskData.cost) || 0;
+        let artisanPayAmt;
+        if (isDepositPayment) {
+          artisanPayAmt = parseFloat(amountGross) || parseFloat(taskData.deposit_amount) || Math.round(totalForArtisan * 0.35 * 100) / 100;
+        } else if (isBalancePayment) {
+          artisanPayAmt = parseFloat(amountGross) || parseFloat(taskData.balance_remaining) || parseFloat(taskData.balance_amount) || Math.round(totalForArtisan * 0.65 * 100) / 100;
+        } else {
+          artisanPayAmt = parseFloat(amountGross) || totalForArtisan || 0;
+        }
         const artisanDisplayAmt = artisanPayAmt > 0 ? artisanPayAmt.toFixed(2) : '?';
         const title = isBalancePayment ? 'Balance Payment Received' : isDepositPayment ? 'Deposit Received' : 'Payment Received';
         const body = isBalancePayment
@@ -8014,6 +8037,14 @@ h1{color:${color};margin:0 0 16px}p{color:#555;line-height:1.6;margin:0}</style>
   // This ensures Firestore + WhatsApp are updated even if PayFast ITN never arrives
   if (isSuccess && booking_id) {
     try {
+      // Safety: only process if booking exists and is in a payable state
+      const preCheck = await admin.firestore().collection('tasksManagement').doc(booking_id).get();
+      const preData = preCheck.exists ? preCheck.data() : {};
+      const payableStates = ['unpaid', 'deposit_pending', 'deposit_paid', undefined, ''];
+      if (!payableStates.includes(preData.payment_status)) {
+        console.log(`[ozow-result] Booking ${booking_id} already in state '${preData.payment_status}', skipping fallback`);
+        return;
+      }
       const result = await processSuccessfulPayment(booking_id, {
         source: 'ozow-result-fallback',
       });

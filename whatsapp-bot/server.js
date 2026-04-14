@@ -502,6 +502,10 @@ async function restoreSessionFromFirestore(session) {
     // Restore conversation history
     if (Array.isArray(data.messages) && data.messages.length > 0) {
       session.messages = data.messages;
+      // Drop orphaned tool messages at the start
+      while (session.messages.length > 0 && session.messages[0].role === 'tool') {
+        session.messages.shift();
+      }
     }
     // Restore linked account
     if (data.linkedUserId) session.linkedUserId = data.linkedUserId;
@@ -2324,14 +2328,23 @@ async function executeWaTool(name, args, session) {
             bookingId: bid,
           };
         }
+        const depositFields = {
+          payment_type: 'deposit',
+          deposit_amount: cost,
+          balance_amount: balanceAfterDeposit,
+          balance_remaining: balanceAfterDeposit,
+          payment_status: 'deposit_pending',
+          updated_at: new Date().toISOString(),
+        };
         try {
-          await doc.ref.set({
-            payment_type: 'deposit',
-            deposit_amount: cost,
-            balance_remaining: balanceAfterDeposit,
-            payment_status: 'deposit_pending',
-            updated_at: new Date().toISOString(),
-          }, { merge: true });
+          // Write to the doc we found (futureBookings or tasksManagement)
+          await doc.ref.set(depositFields, { merge: true });
+          // Also write to the OTHER collection so processSuccessfulPayment can read it
+          const otherCollection = doc.ref.parent.id === 'futureBookings' ? 'tasksManagement' : 'futureBookings';
+          const otherDoc = await firestore.collection(otherCollection).doc(bid).get();
+          if (otherDoc.exists) {
+            await otherDoc.ref.set(depositFields, { merge: true });
+          }
         } catch (e) {
           console.error('[wa-tool] Failed to persist payment type:', e.message);
         }
@@ -3813,6 +3826,10 @@ async function handleMessage(session, userMessage, imageDataUrl) {
   // Keep context window manageable
   if (session.messages.length > 20) {
     session.messages = session.messages.slice(-16);
+    // Drop orphaned tool messages at the start (tool must follow assistant with tool_calls)
+    while (session.messages.length > 0 && session.messages[0].role === 'tool') {
+      session.messages.shift();
+    }
   }
 
   try {
@@ -3877,10 +3894,15 @@ async function handleMessage(session, userMessage, imageDataUrl) {
     // Persist session to Firestore (fire-and-forget)
     const firestore = db();
     if (firestore) {
+      // Strip orphaned tool messages before persisting
+      let persistMsgs = session.messages.slice(-10);
+      while (persistMsgs.length > 0 && persistMsgs[0].role === 'tool') {
+        persistMsgs.shift();
+      }
       firestore.collection('wa_sessions').doc(session.phone).set({
         phone: session.phone,
         linkedUserId: session.linkedUserId || null,
-        messages: session.messages.slice(-10).map(m => {
+        messages: persistMsgs.map(m => {
           // Truncate base64 image data to prevent exceeding Firestore 1MB doc limit
           if (typeof m.content === 'string' && m.content.length > 50000) {
             return { ...m, content: m.content.substring(0, 500) + '...[truncated]' };
@@ -4333,56 +4355,24 @@ app.post('/api/booking-status-update', async (req, res) => {
   }
 });
 
-// ─── App → WhatsApp: Notify client that payment was received ───
+// ─── App → WhatsApp: Update session state after payment (NO message — booking-status-update handles that) ───
 app.post('/api/payment-confirmed', async (req, res) => {
   try {
-    const { bookingId, paymentType, amount } = req.body || {};
+    const { bookingId, paymentStatus } = req.body || {};
     if (!bookingId) return res.status(400).json({ error: 'bookingId required' });
-
-    const firestore = db();
-    if (!firestore) return res.status(503).json({ error: 'Database unavailable' });
 
     const mainBookingId = bookingId.includes('_') ? bookingId.split('_')[0] : bookingId;
 
-    // Look up customer phone + booking details
-    let customerPhone = '', orderNo = '', cost = 0, balanceAmount = 0;
-    const fbDoc = await firestore.collection('futureBookings').doc(mainBookingId).get();
-    if (fbDoc.exists) {
-      const d = fbDoc.data();
-      customerPhone = d.user_phone || d.customerPhone || d.contact || d.client_phone || d.phone || '';
-      orderNo = d.order_no || d.orderNumber || mainBookingId;
-      cost = parseFloat(d.cost || d.total_cost || d.price || d.deposit_amount || '0') || 0;
-      balanceAmount = parseFloat(d.balance_amount || '0') || 0;
-    }
-    if (!customerPhone) {
-      const tmDoc = await firestore.collection('tasksManagement').doc(mainBookingId).get();
-      if (tmDoc.exists) {
-        const d = tmDoc.data();
-        customerPhone = d.customerPhone || d.contact || d.user_phone || d.client_phone || d.phone || '';
-        if (!orderNo) orderNo = d.order_no || d.orderNumber || mainBookingId;
-        if (!cost) cost = parseFloat(d.cost || d.total_cost || d.price || d.deposit_amount || '0') || 0;
-        if (!balanceAmount) balanceAmount = parseFloat(d.balance_amount || '0') || 0;
+    // Update any active WA session that references this booking
+    for (const [sid, session] of sessions) {
+      if (session.lastBookingId === mainBookingId) {
+        session.paymentStatus = paymentStatus || 'paid';
+        console.log(`[api/payment-confirmed] Updated session ${sid} paymentStatus=${session.paymentStatus}`);
       }
     }
-    if (!customerPhone) return res.status(404).json({ error: 'No customer phone found' });
 
-    let to = customerPhone.replace(/[^0-9]/g, '');
-    if (to.startsWith('0')) to = '27' + to.slice(1);
-
-    const paidAmt = parseFloat(amount || cost || '0');
-    const isDeposit = (paymentType || '').toLowerCase() === 'deposit';
-
-    let msg = `✅ *Payment Received!* R${paidAmt.toFixed(2)} for booking ${orderNo}.\n\n`;
-    if (isDeposit) {
-      const balance = balanceAmount > 0 ? balanceAmount : (cost * 0.65);
-      msg += `💰 Deposit secured. Remaining balance: R${balance.toFixed(2)} (due after job completion).\n\n`;
-    }
-    msg += `🔧 Your artisan will be in touch shortly. Thank you for using Square 15!`;
-
-    await sendWhatsAppMessage(to, msg);
-    console.log(`[api/payment-confirmed] Payment confirmation sent to ${to} for ${mainBookingId} (${paymentType || 'full'})`);
-
-    res.json({ success: true, to, bookingId: mainBookingId });
+    console.log(`[api/payment-confirmed] Session state updated for ${mainBookingId} (no WA message sent — handled by booking-status-update)`);
+    res.json({ success: true, bookingId: mainBookingId });
   } catch (err) {
     console.error('[api/payment-confirmed] error:', err.message);
     res.status(500).json({ error: err.message });
