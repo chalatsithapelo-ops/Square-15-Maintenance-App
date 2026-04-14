@@ -4309,6 +4309,15 @@ app.post('/api/artisan-accepted', async (req, res) => {
 });
 
 // ─── Artisan App → WhatsApp: Notify client of booking status changes ───
+// Dedup map to prevent duplicate messages within 60 seconds
+const _recentStatusMessages = new Map(); // key: `${bookingId}:${status}` → timestamp
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, ts] of _recentStatusMessages) {
+    if (now - ts > 60000) _recentStatusMessages.delete(k);
+  }
+}, 30000);
+
 app.post('/api/booking-status-update', async (req, res) => {
   try {
     const { bookingId, status, message: customMsg } = req.body || {};
@@ -4318,6 +4327,15 @@ app.post('/api/booking-status-update', async (req, res) => {
     if (!firestore) return res.status(503).json({ error: 'Database unavailable' });
 
     const mainBookingId = bookingId.includes('_') ? bookingId.split('_')[0] : bookingId;
+
+    // ── Dedup guard: skip if same booking+status sent within 60s ──
+    const dedupKey = `${mainBookingId}:${status}`;
+    const lastSent = _recentStatusMessages.get(dedupKey);
+    if (lastSent && Date.now() - lastSent < 60000) {
+      console.log(`[api/booking-status-update] Dedup: skipping duplicate "${status}" for ${mainBookingId} (sent ${Math.round((Date.now() - lastSent) / 1000)}s ago)`);
+      return res.json({ success: true, deduplicated: true, status });
+    }
+    _recentStatusMessages.set(dedupKey, Date.now());
 
     let customerPhone = '';
     const fbDoc = await firestore.collection('futureBookings').doc(mainBookingId).get();
