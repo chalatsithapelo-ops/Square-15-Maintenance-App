@@ -7752,9 +7752,31 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
       try {
         const waBot = env('WHATSAPP_BOT_URL') || 'https://square15-whatsapp-bot.onrender.com';
         const orderLabel = fbFields.order_no || bookingId;
-        const totalCostVal = parseFloat(fbFields.total_cost || fbFields.cost || amountGross || '0');
-        const displayAmount = totalCostVal > 0 ? totalCostVal.toFixed(2) : '0.00';
-        const waMessage = `💳 *Payment received!* R${displayAmount} for booking #${orderLabel}.\n\n✅ Your booking is confirmed. Your artisan will contact you to arrange the visit.\n\nThank you for choosing Square 15! 🙏`;
+        // Read deposit info from futureBookings to determine correct amount
+        let fbPayData = {};
+        try {
+          const fbPayDoc = await admin.firestore().collection('futureBookings').doc(bookingId).get();
+          if (fbPayDoc.exists) fbPayData = fbPayDoc.data() || {};
+        } catch (_) {}
+        const autoIsDeposit = fbPayData.payment_type === 'deposit' || fbPayData.payment_status === 'deposit_pending';
+        const autoDepositAlreadyPaid = fbPayData.deposit_paid === true;
+        const autoTotalCost = parseFloat(fbPayData.cost || fbPayData.total_cost || fbFields.total_cost || fbFields.cost || '0');
+        let autoDisplayAmt;
+        let waMessage;
+        if (autoIsDeposit && !autoDepositAlreadyPaid) {
+          autoDisplayAmt = parseFloat(fbPayData.deposit_amount || '0') || Math.round(autoTotalCost * 0.35 * 100) / 100;
+          const autoBalAmt = parseFloat(fbPayData.balance_amount || '0') || Math.round((autoTotalCost - autoDisplayAmt) * 100) / 100;
+          waMessage = `💳 *Deposit received!* R${autoDisplayAmt.toFixed(2)} for booking #${orderLabel}.\n\n✅ Your booking is confirmed. The remaining balance of R${autoBalAmt.toFixed(2)} will be due after job completion.\n\nYour artisan will contact you to arrange the visit. 🙏`;
+          // Update the minimal doc with deposit fields
+          await taskRef.update({ payment_type: 'deposit', deposit_paid: true, deposit_paid_at: now, deposit_amount: autoDisplayAmt.toFixed(2), balance_amount: autoBalAmt.toFixed(2), balance_remaining: autoBalAmt.toFixed(2), payment_status: 'deposit_paid', paymentStatus: 'deposit_paid' });
+        } else if (autoIsDeposit && autoDepositAlreadyPaid) {
+          autoDisplayAmt = parseFloat(fbPayData.balance_remaining || fbPayData.balance_amount || '0') || Math.round(autoTotalCost * 0.65 * 100) / 100;
+          waMessage = `💳 *Balance payment received!* R${autoDisplayAmt.toFixed(2)} for booking #${orderLabel}.\n\n✅ Your booking is now fully paid. You can now rate your artisan.\n\nThank you for choosing Square 15! 🙏`;
+          await taskRef.update({ balance_paid: true, balance_paid_at: now, payment_status: 'paid', paymentStatus: 'paid' });
+        } else {
+          autoDisplayAmt = autoTotalCost;
+          waMessage = `💳 *Payment received!* R${autoDisplayAmt > 0 ? autoDisplayAmt.toFixed(2) : '0.00'} for booking #${orderLabel}.\n\n✅ Your booking is confirmed. Your artisan will contact you to arrange the visit.\n\nThank you for choosing Square 15! 🙏`;
+        }
         await fetch(`${waBot}/api/booking-status-update`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'x-internal-secret': process.env.INTERNAL_API_SECRET || '' },
@@ -7766,12 +7788,21 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
         console.warn(`[processPayment] WhatsApp notification failed for auto-created ${bookingId}: ${waErr.message}`);
       }
     }
-    // Update futureBookings payment status
+    // Update futureBookings payment status (deposit-aware)
     try {
-      const fbRef = admin.firestore().collection('futureBookings').doc(bookingId);
-      const fbSnap = await fbRef.get();
-      if (fbSnap.exists) {
-        await fbRef.update({ payment_status: 'paid', paymentStatus: 'paid', payment_method: 'payfast', payment_paid_at: now, artisan_confirmed: 'yes', updated_at: now });
+      const fbRef2 = admin.firestore().collection('futureBookings').doc(bookingId);
+      const fbSnap2 = await fbRef2.get();
+      if (fbSnap2.exists) {
+        const fbPayType = (fbSnap2.data() || {}).payment_type;
+        const fbDepPaid = (fbSnap2.data() || {}).deposit_paid === true;
+        const fbPayUpdate = { payment_method: 'payfast', payment_paid_at: now, artisan_confirmed: 'yes', updated_at: now };
+        if (fbPayType === 'deposit' && !fbDepPaid) {
+          fbPayUpdate.deposit_paid = true; fbPayUpdate.deposit_paid_at = now;
+          fbPayUpdate.payment_status = 'deposit_paid'; fbPayUpdate.paymentStatus = 'deposit_paid';
+        } else {
+          fbPayUpdate.payment_status = 'paid'; fbPayUpdate.paymentStatus = 'paid';
+        }
+        await fbRef2.update(fbPayUpdate);
       }
     } catch (_) {}
     return { processed: true, paymentStatus: 'paid', autoCreated: true };
@@ -8257,7 +8288,7 @@ h1{color:${color};margin:0 0 16px}p{color:#555;line-height:1.6;margin:0}</style>
         } catch (_) {}
       }
       const result = await processSuccessfulPayment(booking_id, {
-        amountGross: fallbackAmount || '0',
+        amountGross: '',
         pfPaymentId: '',
         itemName: fallbackItem,
         source: 'ozow_result_fallback',
