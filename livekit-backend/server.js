@@ -7811,20 +7811,37 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
   const taskData = taskSnap.data() || {};
 
   // ── Idempotency: use transaction to prevent race conditions (ozow-result + ITN arriving simultaneously) ──
-  try {
-    await admin.firestore().runTransaction(async (tx) => {
-      const freshSnap = await tx.get(taskRef);
-      if (freshSnap.data()?.payment_verified === true) {
-        throw new Error('ALREADY_VERIFIED');
+  // For deposit bookings, allow a second payment (balance) after deposit is paid.
+  const isBalanceFollowUp = taskData.payment_verified === true
+    && taskData.payment_type === 'deposit'
+    && taskData.deposit_paid === true
+    && taskData.balance_paid !== true
+    && taskData.payment_status !== 'paid';
+
+  if (!isBalanceFollowUp) {
+    try {
+      await admin.firestore().runTransaction(async (tx) => {
+        const freshSnap = await tx.get(taskRef);
+        const fd = freshSnap.data() || {};
+        if (fd.payment_verified === true) {
+          // Allow if this is a balance payment on a deposit booking
+          if (fd.payment_type === 'deposit' && fd.deposit_paid === true && fd.balance_paid !== true && fd.payment_status !== 'paid') {
+            // Balance payment — proceed
+            return;
+          }
+          throw new Error('ALREADY_VERIFIED');
+        }
+        tx.update(taskRef, { payment_verified: true, payment_verified_at: now, payment_verified_via: calledFrom || 'payment_callback' });
+      });
+    } catch (txErr) {
+      if (txErr.message === 'ALREADY_VERIFIED') {
+        console.log(`[processPayment] ${bookingId} already verified (by ${taskData.payment_verified_via || 'unknown'}), skipping`);
+        return { processed: false, reason: 'already verified' };
       }
-      tx.update(taskRef, { payment_verified: true, payment_verified_at: now, payment_verified_via: calledFrom || 'payment_callback' });
-    });
-  } catch (txErr) {
-    if (txErr.message === 'ALREADY_VERIFIED') {
-      console.log(`[processPayment] ${bookingId} already verified (by ${taskData.payment_verified_via || 'unknown'}), skipping`);
-      return { processed: false, reason: 'already verified' };
+      console.warn(`[processPayment] Idempotency transaction error: ${txErr.message}`);
     }
-    console.warn(`[processPayment] Idempotency transaction error: ${txErr.message}`);
+  } else {
+    console.log(`[processPayment] Balance payment for deposit booking ${bookingId} — bypassing idempotency`);
   }
 
   // ── Read deposit/balance info from futureBookings if missing on tasksManagement ──
