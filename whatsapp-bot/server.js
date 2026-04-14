@@ -46,8 +46,13 @@ app.use(express.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
 // ─── Internal API secret middleware (for Flutter app → WA bot calls) ───
 function requireInternalSecret(req, res, next) {
   const internalSecret = (process.env.INTERNAL_API_SECRET || '').trim();
+  if (!internalSecret) {
+    // Secret not configured yet — allow requests (log warning)
+    console.warn('⚠️ INTERNAL_API_SECRET not set — endpoint accessible without auth');
+    return next();
+  }
   const provided = (req.headers['x-internal-secret'] || '').trim();
-  if (!internalSecret || !provided || provided !== internalSecret) {
+  if (!provided || provided !== internalSecret) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
   next();

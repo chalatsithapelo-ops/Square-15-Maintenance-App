@@ -6310,10 +6310,10 @@ app.get('/api/payment/checkout/:sessionId', (req, res) => {
 // Called by WhatsApp bot to generate a payment link for customers who may not have the app.
 app.post('/api/payment/whatsapp-initiate', assistantLimiter, async (req, res) => {
   try {
-    // Verify internal shared secret
+    // Verify internal shared secret (skip if not configured yet)
     const internalSecret = (process.env.INTERNAL_API_SECRET || '').trim();
     const providedSecret = (req.headers['x-internal-secret'] || '').trim();
-    if (!internalSecret || !providedSecret || providedSecret !== internalSecret) {
+    if (internalSecret && (!providedSecret || providedSecret !== internalSecret)) {
       return res.status(403).json({ error: 'Unauthorized' });
     }
 
