@@ -6310,10 +6310,14 @@ app.get('/api/payment/checkout/:sessionId', (req, res) => {
 // Called by WhatsApp bot to generate a payment link for customers who may not have the app.
 app.post('/api/payment/whatsapp-initiate', assistantLimiter, async (req, res) => {
   try {
-    // Verify internal shared secret (skip if not configured yet)
+    // Verify internal shared secret
     const internalSecret = (process.env.INTERNAL_API_SECRET || '').trim();
+    if (!internalSecret) {
+      console.error('FATAL: INTERNAL_API_SECRET not set — rejecting request');
+      return res.status(503).json({ error: 'Server misconfigured' });
+    }
     const providedSecret = (req.headers['x-internal-secret'] || '').trim();
-    if (internalSecret && (!providedSecret || providedSecret !== internalSecret)) {
+    if (!providedSecret || providedSecret !== internalSecret) {
       return res.status(403).json({ error: 'Unauthorized' });
     }
 

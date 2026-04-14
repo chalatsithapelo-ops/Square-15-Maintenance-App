@@ -47,9 +47,8 @@ app.use(express.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
 function requireInternalSecret(req, res, next) {
   const internalSecret = (process.env.INTERNAL_API_SECRET || '').trim();
   if (!internalSecret) {
-    // Secret not configured yet — allow requests (log warning)
-    console.warn('⚠️ INTERNAL_API_SECRET not set — endpoint accessible without auth');
-    return next();
+    console.error('FATAL: INTERNAL_API_SECRET not set — rejecting request');
+    return res.status(503).json({ error: 'Server misconfigured' });
   }
   const provided = (req.headers['x-internal-secret'] || '').trim();
   if (!provided || provided !== internalSecret) {
