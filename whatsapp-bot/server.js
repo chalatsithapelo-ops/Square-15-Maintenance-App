@@ -4244,7 +4244,7 @@ app.post('/api/artisan-accepted', requireInternalSecret, async (req, res) => {
     const fbDoc = await firestore.collection('futureBookings').doc(mainBookingId).get();
     if (fbDoc.exists) {
       const d = fbDoc.data();
-      customerPhone = d.user_phone || d.customerPhone || d.contact || '';
+      customerPhone = d.user_phone || d.customerPhone || d.contact || d.client_phone || d.phone || '';
       bookingCost = d.cost || '';
       bookingDescription = d.description || d.subcategory || d.category_name || '';
       orderNo = d.order_no || '';
@@ -4255,7 +4255,7 @@ app.post('/api/artisan-accepted', requireInternalSecret, async (req, res) => {
       const tmDoc = await firestore.collection('tasksManagement').doc(mainBookingId).get();
       if (tmDoc.exists) {
         const d = tmDoc.data();
-        customerPhone = d.customerPhone || d.contact || '';
+        customerPhone = d.customerPhone || d.contact || d.user_phone || d.client_phone || d.phone || '';
         bookingCost = d.cost || '';
         bookingDescription = d.description || d.subcategory || d.category_name || '';
         orderNo = d.order_no || '';
