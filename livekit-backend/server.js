@@ -5102,16 +5102,12 @@ app.post('/api/voice/start', assistantLimiter, async (req, res) => {
     }
     const metadata = typeof req.body.metadata === 'string' ? req.body.metadata : '';
 
-    // ── Enrich participant metadata with Firebase credentials ──
-    // The agent worker reads firebase_token from the participant metadata
-    // to initialize its backend API client. This eliminates race conditions
-    // from in-band credential delivery via data channel / setMetadata.
+    // ── Enrich participant metadata with session credentials ──
+    // Use voice_session_id + nonce for agent authentication instead of raw Firebase token.
     let enrichedMetadata = metadata;
     try {
       const parsed = metadata ? JSON.parse(metadata) : {};
-      if (idToken) {
-        parsed.firebase_token = idToken;
-      }
+      // Do NOT embed the raw Firebase ID token — it would leak to all room participants.
       parsed.voice_session_id = sessionId;
       parsed.voice_session_nonce = sessionNonce;
       enrichedMetadata = JSON.stringify(parsed);
@@ -6278,6 +6274,15 @@ app.get('/api/payment/checkout/:sessionId', (req, res) => {
   }
 
   const payfastUrl = env('PAYFAST_URL') || 'https://www.payfast.co.za/eng/process';
+
+  // Mark as used immediately to prevent replay attacks
+  if (session.used) {
+    return res.status(410).send(`<html><body style="font-family:sans-serif;text-align:center;padding:60px"><h2>Payment link expired</h2><p>This payment link has already been used. Please request a new one.</p></body></html>`);
+  }
+  session.used = true;
+  // Garbage-collect session after 5 minutes
+  setTimeout(() => paymentSessions.delete(req.params.sessionId), 5 * 60 * 1000);
+
   // Build hidden form fields — escape values for HTML safety
   const esc = (s) => String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   const fields = Object.entries(session.paymentData)
@@ -6299,15 +6304,19 @@ app.get('/api/payment/checkout/:sessionId', (req, res) => {
       <noscript><p>JavaScript is required. <button onclick="document.getElementById('pf').submit()">Click here to pay</button></p></noscript>
     </body></html>
   `);
-
-  // Mark as used after first render to prevent replay (allow a small window for redirects)
-  setTimeout(() => paymentSessions.delete(req.params.sessionId), 5 * 60 * 1000);
 });
 
-// ── WhatsApp Payment Link Generation (no Firebase auth required) ──
+// ── WhatsApp Payment Link Generation (internal use only) ──
 // Called by WhatsApp bot to generate a payment link for customers who may not have the app.
 app.post('/api/payment/whatsapp-initiate', assistantLimiter, async (req, res) => {
   try {
+    // Verify internal shared secret
+    const internalSecret = (process.env.INTERNAL_API_SECRET || '').trim();
+    const providedSecret = (req.headers['x-internal-secret'] || '').trim();
+    if (!internalSecret || !providedSecret || providedSecret !== internalSecret) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+
     const merchantId = env('PAYFAST_MERCHANT_ID');
     const merchantKey = env('PAYFAST_MERCHANT_KEY');
     const backendUrl = env('RENDER_EXTERNAL_URL') || 'https://square15-livekit-backend.onrender.com';
@@ -6798,6 +6807,24 @@ app.post('/api/payment/refund', authMiddleware, assistantLimiter, async (req, re
     // METHOD: CARD (PayFast refund API)
     // ═══════════════════════════════════════════════════════════
     if (method === 'card') {
+      // Atomically mark as processing to prevent concurrent card refunds
+      try {
+        await db.runTransaction(async (tx) => {
+          const freshDoc = await tx.get(docRef);
+          const freshData = freshDoc.data() || {};
+          const fRefundStatus = (freshData.refund_status || '').toLowerCase();
+          if (fRefundStatus === 'refunded' || fRefundStatus === 'processing') {
+            throw new Error('ALREADY_REFUNDED_OR_PROCESSING');
+          }
+          tx.update(docRef, { refund_status: 'processing', updated_at: now });
+        });
+      } catch (txErr) {
+        if (txErr.message === 'ALREADY_REFUNDED_OR_PROCESSING') {
+          return res.json({ ok: true, already_refunded: true, message: 'Refund already in progress or completed.' });
+        }
+        throw txErr;
+      }
+
       const merchantId = env('PAYFAST_MERCHANT_ID');
       const merchantKey = env('PAYFAST_MERCHANT_KEY');
       const passphrase = env('PAYFAST_PASSPHRASE') || '';
@@ -7423,20 +7450,29 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       }
     }
 
-    // Update artisan balance if applicable
+    // Update artisan balance atomically if applicable
     if (recipient_type === 'artisan') {
       const artisanRef = db.collection('serviceProvider').doc(recipient_id);
-      const artisanSnap = await artisanRef.get();
-      if (artisanSnap.exists) {
-        const artisanData = artisanSnap.data() || {};
-        const currentBalance = parseFloat(artisanData.balance || '0');
-        const newBalance = Math.max(0, currentBalance - payoutAmount);
-        await artisanRef.update({
-          balance: newBalance.toFixed(2),
-          last_payout_at: now,
-          last_payout_method: 'ozow_eft',
-          updated_at: now,
+      try {
+        await db.runTransaction(async (t) => {
+          const artisanSnap = await t.get(artisanRef);
+          if (!artisanSnap.exists) throw new Error('Artisan not found');
+          const artisanData = artisanSnap.data() || {};
+          const currentBalance = parseFloat(artisanData.balance || '0');
+          if (currentBalance < payoutAmount) {
+            throw new Error(`Insufficient balance: R${currentBalance.toFixed(2)} < R${payoutAmount.toFixed(2)}`);
+          }
+          const newBalance = (currentBalance - payoutAmount).toFixed(2);
+          t.update(artisanRef, {
+            balance: newBalance,
+            last_payout_at: now,
+            last_payout_method: 'ozow_eft',
+            updated_at: now,
+          });
         });
+      } catch (txErr) {
+        console.error('❌ Artisan balance deduction failed:', txErr.message);
+        // The Ozow payout was already initiated — log for manual reconciliation
       }
     }
 
@@ -7615,13 +7651,14 @@ app.post('/api/admin/save-card', authMiddleware, async (req, res) => {
     const paymentData = {
       merchant_id: merchantId,
       merchant_key: merchantKey,
-      amount: '10.00', // R10 verification charge
+      amount: '1.00', // R1 verification charge (will be refunded)
       item_name: 'Square 15 Card Verification',
       return_url: `${backendUrl}/api/payment/ozow-result?status=success&booking_id=admin_card_save`,
       cancel_url: `${backendUrl}/api/payment/ozow-result?status=cancel&booking_id=admin_card_save`,
       notify_url: `${backendUrl}/api/payment/itn`,
       custom_str1: `admin_card_save_${adminUid}`,
       payment_method: 'cc',
+      subscription_type: '2', // Ad-hoc tokenization — required for PayFast to return a card token
     };
 
     // Generate PayFast signature
@@ -7909,7 +7946,7 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
         }
         await fetch(`${waBot}/api/booking-status-update`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'x-internal-secret': process.env.INTERNAL_API_SECRET || '' },
           body: JSON.stringify({
             bookingId: fbId,
             status: isBalancePayment ? 'balance_received' : 'payment_received',
@@ -8062,11 +8099,11 @@ h1{color:${color};margin:0 0 16px}p{color:#555;line-height:1.6;margin:0}</style>
 <p style="margin-top:20px;color:#999;font-size:14px">You can close this page.</p>
 </div></body></html>`);
 
-  // ── CRITICAL FALLBACK: Process payment in background after sending page ──
-  // This ensures Firestore + WhatsApp are updated even if PayFast ITN never arrives
+  // ── FALLBACK: Mark as pending verification in background ──
+  // Don't fully process here — wait for the signed ITN callback for actual confirmation.
+  // This prevents URL-guessing attacks from marking bookings as paid.
   if (isSuccess && booking_id) {
     try {
-      // Safety: only process if booking exists and is in a payable state
       const preCheck = await admin.firestore().collection('tasksManagement').doc(booking_id).get();
       const preData = preCheck.exists ? preCheck.data() : {};
       const payableStates = ['unpaid', 'deposit_pending', 'deposit_paid', undefined, ''];
@@ -8074,12 +8111,14 @@ h1{color:${color};margin:0 0 16px}p{color:#555;line-height:1.6;margin:0}</style>
         console.log(`[ozow-result] Booking ${booking_id} already in state '${preData.payment_status}', skipping fallback`);
         return;
       }
-      const result = await processSuccessfulPayment(booking_id, {
-        source: 'ozow-result-fallback',
+      // Only mark as pending — the ITN webhook with signature verification handles actual confirmation
+      await admin.firestore().collection('tasksManagement').doc(booking_id).update({
+        payment_status: 'pending_verification',
+        ozow_result_received_at: new Date().toISOString(),
       });
-      console.log(`[ozow-result] Fallback processing for ${booking_id}: ${JSON.stringify(result)}`);
+      console.log(`[ozow-result] Marked ${booking_id} as pending_verification (awaiting ITN)`);
     } catch (err) {
-      console.error(`[ozow-result] Fallback processing error for ${booking_id}:`, err.message);
+      console.error(`[ozow-result] Fallback error for ${booking_id}:`, err.message);
     }
   }
 });
@@ -8104,10 +8143,9 @@ app.post('/api/payment/itn', async (req, res) => {
       return res.status(400).send('Missing signature');
     }
 
-    // Build param string for signature verification (exclude signature itself)
+    // Build param string for signature verification (preserve original order from PayFast)
     const paramString = Object.keys(data)
       .filter(key => key !== 'signature')
-      .sort()
       .map(key => `${key}=${encodeURIComponent(String(data[key] || '')).replace(/%20/g, '+')}`)
       .join('&');
 
@@ -8381,7 +8419,8 @@ app.post('/api/admin/bootstrap-claims', adminLimiter, async (req, res) => {
   if (!bootstrapKey) {
     return res.status(500).json({ error: 'ADMIN_BOOTSTRAP_KEY not configured on server' });
   }
-  if (!providedKey || providedKey !== bootstrapKey) {
+  if (!providedKey || providedKey.length !== bootstrapKey.length ||
+      !crypto.timingSafeEqual(Buffer.from(providedKey), Buffer.from(bootstrapKey))) {
     return res.status(403).json({ error: 'Invalid bootstrap key' });
   }
 
@@ -8391,7 +8430,6 @@ app.post('/api/admin/bootstrap-claims', adminLimiter, async (req, res) => {
   }
 
   try {
-    const admin = require('firebase-admin');
     await admin.auth().setCustomUserClaims(uid, { role: 'admin' });
     console.log(`✅ Admin custom claims set for UID: ${uid}`);
     return res.json({ success: true, uid, message: 'Admin claims set. User must re-login for claims to take effect.' });
@@ -8878,7 +8916,12 @@ app.get('/api/finance/requests', adminLimiter, async (req, res) => {
   const limit = Math.max(1, Math.min(200, limitRaw));
 
   let q = firestore.collection('finance_requests').orderBy('created_at', 'desc').limit(limit);
-  if (status) q = firestore.collection('finance_requests').where('status', '==', status).orderBy('created_at', 'desc').limit(limit);
+  if (status) {
+    q = firestore.collection('finance_requests').where('status', '==', status).orderBy('created_at', 'desc').limit(limit);
+  }
+  if (type) {
+    q = q.where('type', '==', type);
+  }
 
   try {
     const snap = await q.get();

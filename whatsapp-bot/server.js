@@ -43,6 +43,16 @@ app.use(helmet());
 app.use(cors());
 app.use(express.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
 
+// ─── Internal API secret middleware (for Flutter app → WA bot calls) ───
+function requireInternalSecret(req, res, next) {
+  const internalSecret = (process.env.INTERNAL_API_SECRET || '').trim();
+  const provided = (req.headers['x-internal-secret'] || '').trim();
+  if (!internalSecret || !provided || provided !== internalSecret) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  next();
+}
+
 const PORT = process.env.PORT || 3001;
 
 // ─── Firebase Admin (lazy init, same pattern as livekit-backend) ───
@@ -4145,8 +4155,8 @@ app.post('/webhook', async (req, res) => {
 // Health check
 app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'cc31c07-apr13-v2' }));
 
-// ─── Diagnostic: test Firebase read/write ───
-app.get('/debug/firebase-test', async (req, res) => {
+// ─── Diagnostic: test Firebase read/write (auth-protected) ───
+app.get('/debug/firebase-test', requireInternalSecret, async (req, res) => {
   const results = { firebase_init: false, project_id: null, read_ok: false, write_ok: false, delete_ok: false, sp_count: 0, tm_count: 0, wa_bookings: 0, errors: [] };
   try {
     const firestore = db();
@@ -4206,7 +4216,7 @@ app.get('/debug/firebase-test', async (req, res) => {
 });
 
 // ─── Artisan App → WhatsApp: Notify client when artisan accepts/rejects ───
-app.post('/api/artisan-accepted', async (req, res) => {
+app.post('/api/artisan-accepted', requireInternalSecret, async (req, res) => {
   try {
     if (!req.body || typeof req.body !== 'object') {
       return res.status(400).json({ error: 'Invalid request body' });
@@ -4318,7 +4328,7 @@ setInterval(() => {
   }
 }, 30000);
 
-app.post('/api/booking-status-update', async (req, res) => {
+app.post('/api/booking-status-update', requireInternalSecret, async (req, res) => {
   try {
     const { bookingId, status, message: customMsg } = req.body || {};
     if (!bookingId || !status) return res.status(400).json({ error: 'bookingId and status required' });
@@ -4377,7 +4387,7 @@ app.post('/api/booking-status-update', async (req, res) => {
 });
 
 // ─── App → WhatsApp: Update session state after payment (NO message — booking-status-update handles that) ───
-app.post('/api/payment-confirmed', async (req, res) => {
+app.post('/api/payment-confirmed', requireInternalSecret, async (req, res) => {
   try {
     const { bookingId, paymentStatus } = req.body || {};
     if (!bookingId) return res.status(400).json({ error: 'bookingId required' });
@@ -4401,7 +4411,7 @@ app.post('/api/payment-confirmed', async (req, res) => {
 });
 
 // ─── Admin → WhatsApp: Send RFQ response back to client ───
-app.post('/api/send-rfq-response', async (req, res) => {
+app.post('/api/send-rfq-response', requireInternalSecret, async (req, res) => {
   try {
     const { phone, rfqNo, message } = req.body || {};
     if (!phone || !message) {
@@ -4422,7 +4432,7 @@ app.post('/api/send-rfq-response', async (req, res) => {
 });
 
 // ─── App → WhatsApp: Notify client of artisan job lifecycle events ───
-app.post('/api/job-status-update', async (req, res) => {
+app.post('/api/job-status-update', requireInternalSecret, async (req, res) => {
   try {
     const { bookingId, status, artisanName, imageUrl } = req.body || {};
     if (!bookingId || !status) return res.status(400).json({ error: 'bookingId and status required' });
