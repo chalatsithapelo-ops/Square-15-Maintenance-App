@@ -6470,6 +6470,10 @@ app.post('/api/payment/charge-token', authMiddleware, assistantLimiter, async (r
     if (!amount || !item_name) {
       return res.status(400).json({ error: 'Missing required: amount, item_name' });
     }
+    const numAmount = parseFloat(amount);
+    if (isNaN(numAmount) || numAmount <= 0 || numAmount > 100000) {
+      return res.status(400).json({ error: 'Invalid amount: must be between R0.01 and R100,000' });
+    }
 
     // Resolve token: either directly provided or look up from card_id
     let chargeToken = rawToken;
@@ -6528,7 +6532,13 @@ app.post('/api/payment/charge-token', authMiddleware, assistantLimiter, async (r
       signal: AbortSignal.timeout(30000),
     });
 
-    const result = await chargeResponse.json();
+    let result;
+    try {
+      result = await chargeResponse.json();
+    } catch (parseErr) {
+      console.error('❌ Failed to parse PayFast response:', parseErr.message);
+      return res.status(502).json({ ok: false, error: 'Payment gateway returned invalid response' });
+    }
 
     if (chargeResponse.ok && result.data) {
       console.log(`💳 Token charge successful: R${amount}, task=${custom_str1 || 'N/A'}`);
@@ -6545,15 +6555,20 @@ app.post('/api/payment/charge-token', authMiddleware, assistantLimiter, async (r
         } catch (pspErr) {
           console.warn(`[charge-token] processSuccessfulPayment fallback: ${pspErr.message}`);
           // Fallback: direct update if shared function fails
-          const taskRef = admin.firestore().collection('tasksManagement').doc(custom_str1);
-          await taskRef.update({
-            payment_status: 'paid',
-            payment_verified: true,
-            payment_verified_at: new Date().toISOString(),
-            payment_verified_via: 'payfast_token_charge',
-            payment_method: 'saved_card',
-            updated_at: new Date().toISOString(),
-          });
+          try {
+            const taskRef = admin.firestore().collection('tasksManagement').doc(custom_str1);
+            await taskRef.update({
+              payment_status: 'paid',
+              payment_verified: true,
+              payment_verified_at: new Date().toISOString(),
+              payment_verified_via: 'payfast_token_charge',
+              payment_method: 'saved_card',
+              updated_at: new Date().toISOString(),
+            });
+          } catch (fbErr) {
+            console.error(`[charge-token] Fallback Firestore update failed: ${fbErr.message}`);
+            return res.status(500).json({ ok: false, error: 'Payment charged but database update failed. Contact support.' });
+          }
         }
       }
 
@@ -7692,15 +7707,22 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
 
   const taskData = taskSnap.data() || {};
 
-  // ── Idempotency: skip if already verified (atomic check-and-set) ──
-  if (taskData.payment_verified === true) {
-    console.log(`[processPayment] ${bookingId} already verified (by ${taskData.payment_verified_via || 'unknown'}), skipping`);
-    return { processed: false, reason: 'already verified' };
-  }
-  // Atomic guard: immediately set payment_verified to prevent race conditions (ozow-result + ITN)
+  // ── Idempotency: use transaction to prevent race conditions (ozow-result + ITN arriving simultaneously) ──
   try {
-    await taskRef.update({ payment_verified: true, payment_verified_at: now, payment_verified_via: calledFrom || 'payment_callback' });
-  } catch (_) {}
+    await admin.firestore().runTransaction(async (tx) => {
+      const freshSnap = await tx.get(taskRef);
+      if (freshSnap.data()?.payment_verified === true) {
+        throw new Error('ALREADY_VERIFIED');
+      }
+      tx.update(taskRef, { payment_verified: true, payment_verified_at: now, payment_verified_via: calledFrom || 'payment_callback' });
+    });
+  } catch (txErr) {
+    if (txErr.message === 'ALREADY_VERIFIED') {
+      console.log(`[processPayment] ${bookingId} already verified (by ${taskData.payment_verified_via || 'unknown'}), skipping`);
+      return { processed: false, reason: 'already verified' };
+    }
+    console.warn(`[processPayment] Idempotency transaction error: ${txErr.message}`);
+  }
 
   // ── Read deposit/balance info from futureBookings if missing on tasksManagement ──
   // The WA bot writes payment_type/deposit_amount to futureBookings, not always to tasksManagement
@@ -7751,6 +7773,13 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
     updateData.deposit_paid_at = now;
     updateData.payment_status = 'deposit_paid';
     updateData.paymentStatus = 'deposit_paid';
+    updateData.payment_type = 'deposit';
+    // Persist deposit/balance amounts so Flutter app + WA bot can read them
+    const totalCost = parseFloat(taskData.cost || taskData.total_cost || '0');
+    const depAmt = parseFloat(taskData.deposit_amount || '0') || Math.round(totalCost * 0.35 * 100) / 100;
+    const balAmt = parseFloat(taskData.balance_amount || taskData.balance_remaining || '0') || Math.round((totalCost - depAmt) * 100) / 100;
+    if (depAmt > 0) updateData.deposit_amount = depAmt.toFixed(2);
+    if (balAmt > 0) { updateData.balance_amount = balAmt.toFixed(2); updateData.balance_remaining = balAmt.toFixed(2); }
     isDepositPayment = true;
     console.log(`[processPayment] Deposit received for ${bookingId}`);
   } else if (isDepositBooking && depositAlreadyPaid && !balanceAlreadyPaid) {

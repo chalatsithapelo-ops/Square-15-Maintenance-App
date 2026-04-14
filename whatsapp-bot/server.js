@@ -4208,7 +4208,10 @@ app.get('/debug/firebase-test', async (req, res) => {
 // ─── Artisan App → WhatsApp: Notify client when artisan accepts/rejects ───
 app.post('/api/artisan-accepted', async (req, res) => {
   try {
-    const { bookingId, artisanName } = req.body || {};
+    if (!req.body || typeof req.body !== 'object') {
+      return res.status(400).json({ error: 'Invalid request body' });
+    }
+    const { bookingId, artisanName } = req.body;
     if (!bookingId) return res.status(400).json({ error: 'bookingId required' });
 
     const firestore = db();
@@ -4389,6 +4392,9 @@ app.post('/api/send-rfq-response', async (req, res) => {
     // Normalise to international format (27…)
     let to = phone.replace(/[^0-9]/g, '');
     if (to.startsWith('0')) to = '27' + to.slice(1);
+    if (to.length < 10 || to.length > 15) {
+      return res.status(400).json({ error: 'Invalid phone number length' });
+    }
     await sendWhatsAppMessage(to, message);
     res.json({ success: true, to, rfqNo });
   } catch (err) {
@@ -4440,6 +4446,7 @@ app.post('/api/job-status-update', async (req, res) => {
       'completed':        `✅ *Job completed!*\n\nThe work for booking #${ref} has been completed by ${name}.\n\n🙏 *Thank you for choosing Square 15!* We truly appreciate your trust in our service.\n\nPlease review the work and rate your artisan. ⭐ Your feedback helps us maintain high standards.`,
       'balance_due':      `💰 *Balance payment due!*\n\nThe work for booking #${ref} has been completed. Please pay the remaining balance to finalise your booking.\n\nReply "pay balance" to get a secure payment link. 💳`,
       'additional_work':  `🔧 *Additional work found!*\n\nYour artisan noticed an additional issue while working on booking #${ref}.\n\nYou qualify for a *15% discount* on the follow-up job. Check the Square 15 app or reply here for details.`,
+      'balance_collected': `✅ *Balance payment received!*\n\nYour artisan has confirmed receipt of the balance payment for booking #${ref}.\n\nThank you for your payment! Your booking is now fully paid. 🙏`,
     };
 
     const msg = statusMessages[status] || `📋 Your booking #${ref} status has been updated to: *${status}*`;
