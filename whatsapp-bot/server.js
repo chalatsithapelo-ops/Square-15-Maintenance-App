@@ -4472,10 +4472,13 @@ app.post('/api/job-status-update', async (req, res) => {
     // ── Auto-send balance payment prompt after job completion for deposit bookings ──
     if (status === 'completed' || status === 'after_photo') {
       try {
-        let bookDoc = await firestore.collection('tasksManagement').doc(mainBookingId).get();
-        if (!bookDoc.exists) bookDoc = await firestore.collection('futureBookings').doc(mainBookingId).get();
-        if (bookDoc.exists) {
-          const bd = bookDoc.data();
+        // Merge data from both collections so deposit/balance fields are always available
+        let bd = {};
+        const tmDoc = await firestore.collection('tasksManagement').doc(mainBookingId).get();
+        const fbDoc2 = await firestore.collection('futureBookings').doc(mainBookingId).get();
+        if (fbDoc2.exists) Object.assign(bd, fbDoc2.data());
+        if (tmDoc.exists) Object.assign(bd, tmDoc.data());  // tasksManagement wins on conflicts
+        if (tmDoc.exists || fbDoc2.exists) {
           const isDepositPaid = bd.payment_status === 'deposit_paid';
           const balanceDone = bd.balance_paid === true;
           const totalCost = parseFloat(bd.cost || bd.total_cost || '0');
