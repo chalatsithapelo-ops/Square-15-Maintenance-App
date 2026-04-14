@@ -7743,6 +7743,37 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
     if (pfPaymentId) minimalDoc.payfast_payment_id = pfPaymentId;
     await taskRef.set(minimalDoc);
     console.log(`[processPayment] Created minimal tasksManagement/${bookingId} with ${Object.keys(fbFields).length} fields from futureBookings`);
+
+    // ── Send WA notification + push for auto-created doc (don't return early) ──
+    // Use fbFields as taskData source for phone, source, etc.
+    const taskSource = (fbFields.source || (bookingId.startsWith('WA-') ? 'whatsapp' : '')).toString().toLowerCase();
+    const phone = (fbFields.phone || fbFields.customer_phone || fbFields.customerPhone || fbFields.contact || fbFields.user_phone || fbFields.client_phone || '').toString().trim();
+    if (phone && (taskSource.startsWith('whatsapp') || bookingId.startsWith('WA-'))) {
+      try {
+        const waBot = env('WHATSAPP_BOT_URL') || 'https://square15-whatsapp-bot.onrender.com';
+        const orderLabel = fbFields.order_no || bookingId;
+        const totalCostVal = parseFloat(fbFields.total_cost || fbFields.cost || amountGross || '0');
+        const displayAmount = totalCostVal > 0 ? totalCostVal.toFixed(2) : '0.00';
+        const waMessage = `💳 *Payment received!* R${displayAmount} for booking #${orderLabel}.\n\n✅ Your booking is confirmed. Your artisan will contact you to arrange the visit.\n\nThank you for choosing Square 15! 🙏`;
+        await fetch(`${waBot}/api/booking-status-update`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-internal-secret': process.env.INTERNAL_API_SECRET || '' },
+          body: JSON.stringify({ bookingId: bookingId, status: 'payment_received', message: waMessage }),
+          signal: AbortSignal.timeout(10000),
+        });
+        console.log(`✅ [processPayment] WhatsApp notification sent for auto-created ${bookingId}`);
+      } catch (waErr) {
+        console.warn(`[processPayment] WhatsApp notification failed for auto-created ${bookingId}: ${waErr.message}`);
+      }
+    }
+    // Update futureBookings payment status
+    try {
+      const fbRef = admin.firestore().collection('futureBookings').doc(bookingId);
+      const fbSnap = await fbRef.get();
+      if (fbSnap.exists) {
+        await fbRef.update({ payment_status: 'paid', paymentStatus: 'paid', payment_method: 'payfast', payment_paid_at: now, artisan_confirmed: 'yes', updated_at: now });
+      }
+    } catch (_) {}
     return { processed: true, paymentStatus: 'paid', autoCreated: true };
   }
 
@@ -8199,24 +8230,39 @@ h1{color:${color};margin:0 0 16px}p{color:#555;line-height:1.6;margin:0}</style>
 <p style="margin-top:20px;color:#999;font-size:14px">You can close this page.</p>
 </div></body></html>`);
 
-  // ── FALLBACK: Mark as pending verification in background ──
-  // Don't fully process here — wait for the signed ITN callback for actual confirmation.
-  // This prevents URL-guessing attacks from marking bookings as paid.
+  // ── FALLBACK: Process payment directly since ITN may not reach Render (free tier sleep) ──
+  // processSuccessfulPayment has idempotency (ALREADY_VERIFIED transaction), so calling from
+  // both ozow-result AND ITN is safe — only the first one processes.
   if (isSuccess && booking_id) {
     try {
       const preCheck = await admin.firestore().collection('tasksManagement').doc(booking_id).get();
       const preData = preCheck.exists ? preCheck.data() : {};
-      const payableStates = ['unpaid', 'deposit_pending', 'deposit_paid', undefined, ''];
+      const payableStates = ['unpaid', 'deposit_pending', 'deposit_paid', 'pending_verification', undefined, ''];
       if (!payableStates.includes(preData.payment_status)) {
-        console.log(`[ozow-result] Booking ${booking_id} already in state '${preData.payment_status}', skipping fallback`);
+        console.log(`[ozow-result] Booking ${booking_id} already in state '${preData.payment_status}', skipping`);
         return;
       }
-      // Only mark as pending — the ITN webhook with signature verification handles actual confirmation
-      await admin.firestore().collection('tasksManagement').doc(booking_id).update({
-        payment_status: 'pending_verification',
-        ozow_result_received_at: new Date().toISOString(),
+      console.log(`[ozow-result] Processing payment for ${booking_id} (fallback — ITN may or may not arrive)`);
+      // Resolve amount from tasksManagement or futureBookings
+      let fallbackAmount = preData.cost || preData.total_cost || '';
+      let fallbackItem = preData.description || preData.item_name || '';
+      if (!fallbackAmount) {
+        try {
+          const fbFallback = await admin.firestore().collection('futureBookings').doc(booking_id).get();
+          if (fbFallback.exists) {
+            const fbd = fbFallback.data() || {};
+            fallbackAmount = fbd.cost || fbd.total_cost || '0';
+            if (!fallbackItem) fallbackItem = fbd.description || fbd.item_name || '';
+          }
+        } catch (_) {}
+      }
+      const result = await processSuccessfulPayment(booking_id, {
+        amountGross: fallbackAmount || '0',
+        pfPaymentId: '',
+        itemName: fallbackItem,
+        source: 'ozow_result_fallback',
       });
-      console.log(`[ozow-result] Marked ${booking_id} as pending_verification (awaiting ITN)`);
+      console.log(`[ozow-result] processSuccessfulPayment result: ${JSON.stringify(result)}`);
     } catch (err) {
       console.error(`[ozow-result] Fallback error for ${booking_id}:`, err.message);
     }
