@@ -314,6 +314,38 @@ async function sendWhatsAppList(to, header, body, buttonText, sections) {
   }).catch(e => console.error('[wa] list send failed:', e.message));
 }
 
+// ─── Chat logging (Firestore wa_chat_logs) ───
+
+async function logChatMessage(phone, direction, text, opts = {}) {
+  const firestore = db();
+  if (!firestore) return;
+  try {
+    const chatRef = firestore.collection('wa_chat_logs').doc(phone);
+    const msgData = {
+      direction,             // 'incoming' or 'outgoing'
+      text: (text || '').substring(0, 5000),
+      messageType: opts.messageType || 'text',
+      timestamp: admin.firestore.FieldValue.serverTimestamp(),
+      linkedUserId: opts.linkedUserId || null,
+      toolsCalled: opts.toolsCalled || [],
+      bookingRef: opts.bookingRef || null,
+    };
+    // Write message doc (fire-and-forget)
+    chatRef.collection('messages').add(msgData).catch(() => {});
+    // Update conversation summary
+    chatRef.set({
+      phone,
+      lastMessage: (text || '').substring(0, 200),
+      lastDirection: direction,
+      lastActivity: admin.firestore.FieldValue.serverTimestamp(),
+      linkedUserId: opts.linkedUserId || null,
+      displayName: opts.displayName || null,
+    }, { merge: true }).catch(() => {});
+  } catch (e) {
+    console.error('[chatLog] Error:', e.message);
+  }
+}
+
 // ─── Download media from WhatsApp Cloud API ───
 
 async function downloadWhatsAppMedia(mediaId) {
@@ -1342,6 +1374,7 @@ async function generateAIQuote(category, description, materialsResponsibility, a
   // 1. Look up pricing guidance from Firestore
   let laborRate = 150;
   let pricingContext = '';
+  let contingencyPct = 0.15; // default 15%
   try {
     if (firestore) {
       const catSlug = (category || '').toLowerCase().replace(/\s+/g, '_');
@@ -1350,7 +1383,11 @@ async function generateAIQuote(category, description, materialsResponsibility, a
         const gd = guidanceDoc.data();
         laborRate = parseFloat(gd.labor_cost_per_hour || gd.laborCostPerHour || 150);
         const servicePrices = gd.service_prices || gd.servicePrices || {};
-        pricingContext = `Labor rate for ${category}: R${laborRate}/hr. Known service prices: ${JSON.stringify(servicePrices)}`;
+        if (gd.contingency_percentage != null) {
+          contingencyPct = parseFloat(gd.contingency_percentage) / 100;
+          if (isNaN(contingencyPct) || contingencyPct < 0) contingencyPct = 0.15;
+        }
+        pricingContext = `Labor rate for ${category}: R${laborRate}/hr. Known service prices: ${JSON.stringify(servicePrices)}. Contingency: ${(contingencyPct * 100).toFixed(0)}%`;
       }
     }
   } catch (e) {
@@ -1456,7 +1493,7 @@ Use realistic South African pricing (ZAR). Include ALL materials needed. Return 
     const equipmentCost = (parseFloat(draft.equipmentCost) || 0) * learningFactor;
 
     const subtotal = laborCost + materialCostForTotals + equipmentCost;
-    const contingency = subtotal * 0.15;
+    const contingency = subtotal * contingencyPct;
     const grandTotal = subtotal + contingency;
 
     const buildersCount = materialsBOM.filter(b => b.matched_by && b.matched_by.startsWith('builders')).length;
@@ -2830,18 +2867,7 @@ async function executeWaTool(name, args, session) {
       if (wasPaid) {
         const cost = parseFloat(d.cost || '0');
         if (cost > 0) {
-          await firestore.collection('refund_requests').add({
-            booking_id: bid,
-            user_id: session.linkedUserId || d.user_id || '',
-            phone: session.phone,
-            amount: cost,
-            reason: args.reason || 'Cancelled via WhatsApp',
-            status: 'pending',
-            source: 'whatsapp',
-            created_at: admin.firestore.FieldValue.serverTimestamp(),
-          });
-
-          // If wallet payment, auto-refund
+          // If wallet payment, auto-refund and mark as processed (not pending)
           if (d.payment_method === 'wallet' && session.linkedUserId) {
             try {
               const userRef = firestore.collection('users').doc(session.linkedUserId);
@@ -2862,12 +2888,66 @@ async function executeWaTool(name, args, session) {
                 status: 'success',
                 created_at: admin.firestore.FieldValue.serverTimestamp(),
               });
+              // Mark booking as refunded
+              await docRef.update({
+                wallet_refunded: 'yes',
+                refund_status: 'refunded',
+                refund_method: 'wallet',
+                wallet_refund_amount: cost,
+                updated_at: new Date().toISOString(),
+              });
+              // Create refund_request already marked as processed (so admin sees it in history)
+              await firestore.collection('refund_requests').add({
+                booking_id: bid,
+                source_doc_id: bid,
+                source_doc_type: collectionName,
+                user_id: session.linkedUserId || d.user_id || '',
+                phone: session.phone,
+                amount: cost,
+                payment_method: 'wallet',
+                reason: args.reason || 'Cancelled via WhatsApp',
+                status: 'processed',
+                refund_method: 'wallet',
+                source: 'whatsapp',
+                created_at: admin.firestore.FieldValue.serverTimestamp(),
+                updated_at: admin.firestore.FieldValue.serverTimestamp(),
+              });
               refundMsg = ` R${cost.toFixed(2)} has been refunded to your wallet.`;
             } catch (e) {
               console.warn('[wa-tool] wallet refund failed:', e.message);
               refundMsg = ' Your refund request has been submitted. Admin will process it shortly.';
+              // Fallback: create pending refund request for admin
+              await firestore.collection('refund_requests').add({
+                booking_id: bid,
+                source_doc_id: bid,
+                source_doc_type: collectionName,
+                user_id: session.linkedUserId || d.user_id || '',
+                phone: session.phone,
+                amount: cost,
+                payment_method: 'wallet',
+                reason: args.reason || 'Cancelled via WhatsApp',
+                status: 'pending',
+                source: 'whatsapp',
+                created_at: admin.firestore.FieldValue.serverTimestamp(),
+                updated_at: admin.firestore.FieldValue.serverTimestamp(),
+              });
             }
           } else {
+            // Non-wallet payment — create pending refund request for admin
+            await firestore.collection('refund_requests').add({
+              booking_id: bid,
+              source_doc_id: bid,
+              source_doc_type: collectionName,
+              user_id: session.linkedUserId || d.user_id || '',
+              phone: session.phone,
+              amount: cost,
+              payment_method: d.payment_method || 'card',
+              reason: args.reason || 'Cancelled via WhatsApp',
+              status: 'pending',
+              source: 'whatsapp',
+              created_at: admin.firestore.FieldValue.serverTimestamp(),
+              updated_at: admin.firestore.FieldValue.serverTimestamp(),
+            });
             refundMsg = ' Your refund request has been submitted. It will be processed within 3-5 business days.';
           }
         }
@@ -3035,6 +3115,11 @@ async function executeWaTool(name, args, session) {
       if (!bid) return { error: 'Please provide a booking ID.' };
 
       let doc = await firestore.collection('tasksManagement').doc(bid).get();
+      let docType = 'tasksManagement';
+      if (!doc.exists) {
+        doc = await firestore.collection('futureBookings').doc(bid).get();
+        docType = 'futureBookings';
+      }
       if (!doc.exists) return { error: `Booking "${bid}" not found.` };
 
       const d = doc.data();
@@ -3044,21 +3129,31 @@ async function executeWaTool(name, args, session) {
 
       // Check if refund already requested
       const existingRefund = await firestore.collection('refund_requests')
-        .where('booking_id', '==', bid).where('status', '==', 'pending').limit(1).get();
+        .where('source_doc_id', '==', bid).where('status', 'in', ['pending', 'processing']).limit(1).get();
       if (!existingRefund.empty) {
+        return { message: 'A refund request for this booking is already being processed.' };
+      }
+      // Also check legacy booking_id field
+      const existingLegacy = await firestore.collection('refund_requests')
+        .where('booking_id', '==', bid).where('status', '==', 'pending').limit(1).get();
+      if (!existingLegacy.empty) {
         return { message: 'A refund request for this booking is already being processed.' };
       }
 
       const cost = parseFloat(d.cost || '0');
       await firestore.collection('refund_requests').add({
         booking_id: bid,
+        source_doc_id: bid,
+        source_doc_type: docType,
         user_id: session.linkedUserId || d.user_id || '',
         phone: session.phone,
         amount: cost,
+        payment_method: d.payment_method || 'unknown',
         reason: args.reason || 'Refund requested via WhatsApp',
         status: 'pending',
         source: 'whatsapp',
         created_at: admin.firestore.FieldValue.serverTimestamp(),
+        updated_at: admin.firestore.FieldValue.serverTimestamp(),
       });
 
       // Notify admin
@@ -3921,6 +4016,9 @@ GUIDELINES:
 - If the customer describes symptoms that sound like a bug (e.g. "the page is blank", "I keep getting an error", "my photos won't send", "payment keeps failing"), treat it as a technical error and report it`;
 
 async function handleMessage(session, userMessage, imageDataUrl) {
+  // Track tools called this turn (for chat logging)
+  session._lastToolsCalled = [];
+
   // Build user message content — supports text-only or text+image (vision)
   if (imageDataUrl) {
     const content = [
@@ -3942,12 +4040,21 @@ async function handleMessage(session, userMessage, imageDataUrl) {
   }
 
   try {
+    // Inject pending-rating hint so the AI knows to prompt the customer
+    const sysMessages = [{ role: 'system', content: SYSTEM_PROMPT }];
+    if (session.pendingRatingBookingId) {
+      sysMessages.push({
+        role: 'system',
+        content: `[PENDING RATING] Booking #${session.pendingRatingBookingId} has been completed and is awaiting a 1-5 star rating from the customer. Proactively ask if they'd like to rate the artisan.`,
+      });
+    }
+
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       temperature: 0.4,
       max_tokens: 500,
       messages: [
-        { role: 'system', content: SYSTEM_PROMPT },
+        ...sysMessages,
         ...session.messages,
       ],
       tools: waTools,
@@ -3967,7 +4074,7 @@ async function handleMessage(session, userMessage, imageDataUrl) {
         let toolArgs = {};
         try { toolArgs = JSON.parse(tc.function.arguments); } catch (_) {}
         console.log(`[tool] ${tc.function.name}(${JSON.stringify(toolArgs).substring(0, 100)})`);
-
+        session._lastToolsCalled.push(tc.function.name);
         let result;
         try {
           result = await executeWaTool(tc.function.name, toolArgs, session);
@@ -4111,6 +4218,9 @@ app.post('/webhook', async (req, res) => {
 
     if (!value?.messages) return; // status update, not a message
 
+    // Grab WhatsApp profile name for chat logs
+    const _contactName = value?.contacts?.[0]?.profile?.name || null;
+
     for (const msg of value.messages) {
       const from = msg.from; // phone number
       let userText = '';
@@ -4170,7 +4280,11 @@ app.post('/webhook', async (req, res) => {
               ? `[Customer sent a photo with caption: "${caption}"] Analyse this image of a maintenance/repair issue. Identify the problem and suggest the service category. Then call lookup_pricing to get the price, present it to the customer, and WAIT for their confirmation before creating any booking.`
               : '[Customer sent a photo of a maintenance issue] Analyse this image. Identify what repair or maintenance is needed and suggest the service category (plumbing, electrical, painting, etc.). Then call lookup_pricing to get the price, present it to the customer, and WAIT for their confirmation before creating any booking. Do NOT create a booking until the customer confirms the price.';
             console.log(`[msg] ${from}: [IMAGE received, ${(imageMedia.base64.length / 1024).toFixed(0)}KB]`);
+            // Log incoming image message
+            logChatMessage(from, 'incoming', caption || '[Photo]', { messageType: 'image', linkedUserId: session.linkedUserId, displayName: _contactName });
             const reply = await handleMessage(session, userText, imageMedia.dataUrl);
+            // Log outgoing bot reply
+            logChatMessage(from, 'outgoing', reply, { linkedUserId: session.linkedUserId, displayName: _contactName, toolsCalled: session._lastToolsCalled || [], bookingRef: session.lastBookingId || session.lastRfqId || null });
             const chunks = reply.match(/.{1,4000}/gs) || [reply];
             for (const chunk of chunks) {
               await sendWhatsAppMessage(from, chunk);
@@ -4227,6 +4341,10 @@ app.post('/webhook', async (req, res) => {
 
       console.log(`[msg] ${from}: ${userText.substring(0, 100)}`);
 
+      // Log incoming user message
+      const _logMsgType = msg.type === 'audio' ? 'audio' : msg.type === 'location' ? 'location' : msg.type === 'document' ? 'document' : 'text';
+      logChatMessage(from, 'incoming', userText, { messageType: _logMsgType, linkedUserId: session.linkedUserId, displayName: _contactName });
+
       const reply = await handleMessage(session, userText);
       if (!reply || !reply.trim()) {
         await sendWhatsAppMessage(
@@ -4235,6 +4353,9 @@ app.post('/webhook', async (req, res) => {
         );
         continue;
       }
+
+      // Log outgoing bot reply
+      logChatMessage(from, 'outgoing', reply, { linkedUserId: session.linkedUserId, displayName: _contactName, toolsCalled: session._lastToolsCalled || [], bookingRef: session.lastBookingId || session.lastRfqId || null });
 
       // Split long replies into chunks (WhatsApp has ~4096 char limit)
       const chunks = reply.match(/.{1,4000}/gs) || [reply];
