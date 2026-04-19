@@ -3653,11 +3653,16 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     try {
       const catSlug = category.toLowerCase().replace(/\s+/g, '_');
       const guidanceDoc = await firestore.collection('pricingGuidance').doc(catSlug).get();
+      let contingencyPct = 0.15; // default 15%
       if (guidanceDoc.exists) {
         const gd = guidanceDoc.data();
         laborRate = parseFloat(gd.labor_cost_per_hour || gd.laborCostPerHour || 150);
         const sp = gd.service_prices || gd.servicePrices || {};
-        pricingCtx = `Labor rate: R${laborRate}/hr. Service prices: ${JSON.stringify(sp)}`;
+        if (gd.contingency_percentage != null) {
+          contingencyPct = parseFloat(gd.contingency_percentage) / 100;
+          if (isNaN(contingencyPct) || contingencyPct < 0) contingencyPct = 0.15;
+        }
+        pricingCtx = `Labor rate: R${laborRate}/hr. Service prices: ${JSON.stringify(sp)}. Contingency: ${(contingencyPct * 100).toFixed(0)}%`;
       }
     } catch (e) { console.warn('\u26a0\ufe0f pricing guidance fetch:', e.message); }
 
@@ -3745,7 +3750,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       const matForTotals = artisanBuys ? matWithMarkup : 0;
       const eqCost = (parseFloat(draft.equipmentCost) || 0) * learningFactor;
       const subtotal = laborCost + matForTotals + eqCost;
-      const contingency = subtotal * 0.15;
+      const contingency = subtotal * contingencyPct;
       const grandTotal = subtotal + contingency;
 
       const buildersCount = bom.filter(b => b.matched_by && b.matched_by.startsWith('builders')).length;
@@ -6405,6 +6410,11 @@ app.post('/api/payment/initiate', authMiddleware, assistantLimiter, async (req, 
       return res.status(400).json({ error: 'Missing required fields: amount, item_name' });
     }
 
+    const parsedAmount = parseFloat(amount);
+    if (isNaN(parsedAmount) || parsedAmount <= 0) {
+      return res.status(400).json({ error: 'Amount must be greater than zero' });
+    }
+
     // Default return/cancel URLs point to our result page
     const taskId = custom_str1 || '';
     const defaultReturn = `${backendUrl}/api/payment/ozow-result?status=success&booking_id=${encodeURIComponent(taskId)}`;
@@ -7652,14 +7662,16 @@ app.post('/api/admin/save-card', authMiddleware, async (req, res) => {
       return res.status(503).json({ error: 'Payment credentials not configured.' });
     }
 
+    // PayFast requires parameters in a SPECIFIC order for signature verification:
+    // merchant → return/cancel/notify → personal → amount/item → custom → payment_method → subscription
     const paymentData = {
       merchant_id: merchantId,
       merchant_key: merchantKey,
-      amount: '1.00', // R1 verification charge (will be refunded)
-      item_name: 'Square 15 Card Verification',
       return_url: `${backendUrl}/api/payment/ozow-result?status=success&booking_id=admin_card_save`,
       cancel_url: `${backendUrl}/api/payment/ozow-result?status=cancel&booking_id=admin_card_save`,
       notify_url: `${backendUrl}/api/payment/itn`,
+      amount: '1.00', // R1 verification charge (will be refunded)
+      item_name: 'Square 15 Card Verification',
       custom_str1: `admin_card_save_${adminUid}`,
       payment_method: 'cc',
       subscription_type: '2', // Ad-hoc tokenization — required for PayFast to return a card token
@@ -7930,7 +7942,12 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
   if (pfPaymentId) {
     updateData.payfast_payment_id = pfPaymentId;
     updateData.payfast_itn_status = 'COMPLETE';
-    updateData.payfast_itn_amount = amountGross || '0';
+    // Use the actual amount from PayFast, but fall back to booking cost if PayFast sent 0/empty
+    const parsedAmount = parseFloat(amountGross);
+    const validAmount = (!isNaN(parsedAmount) && parsedAmount > 0)
+      ? parsedAmount.toFixed(2)
+      : (parseFloat(taskData.cost || taskData.total_cost || 0) || 0).toFixed(2);
+    updateData.payfast_itn_amount = validAmount;
     updateData.payfast_itn_received_at = now;
   }
 
@@ -8312,7 +8329,7 @@ h1{color:${color};margin:0 0 16px}p{color:#555;line-height:1.6;margin:0}</style>
         } catch (_) {}
       }
       const result = await processSuccessfulPayment(booking_id, {
-        amountGross: '',
+        amountGross: fallbackAmount || '',
         pfPaymentId: '',
         itemName: fallbackItem,
         source: 'ozow_result_fallback',
@@ -8368,7 +8385,10 @@ app.post('/api/payment/itn', async (req, res) => {
     // 2. Extract payment info
     const paymentStatus = String(data.payment_status || '');
     const pfPaymentId = String(data.pf_payment_id || '');
-    const amountGross = String(data.amount_gross || '0');
+    const rawAmountGross = parseFloat(data.amount_gross);
+    const amountGross = (!isNaN(rawAmountGross) && rawAmountGross > 0)
+      ? rawAmountGross.toFixed(2)
+      : String(data.amount_gross || '0');
     const customStr1 = String(data.custom_str1 || ''); // tasksManagement ID
     const itemName = String(data.item_name || '');
     const token = String(data.token || ''); // Card tokenization token (when subscription_type=2)
