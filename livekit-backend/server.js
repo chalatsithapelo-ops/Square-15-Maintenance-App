@@ -6404,7 +6404,7 @@ app.post('/api/payment/initiate', authMiddleware, assistantLimiter, async (req, 
       return res.status(503).json({ error: 'Payment credentials not configured on server' });
     }
 
-    const { amount, item_name, return_url, cancel_url, notify_url, custom_str1, payment_method, save_card } = req.body;
+    const { amount, item_name, return_url, cancel_url, notify_url, custom_str1, payment_method, save_card, email_address, name_first } = req.body;
 
     if (!amount || !item_name) {
       return res.status(400).json({ error: 'Missing required fields: amount, item_name' });
@@ -6413,6 +6413,21 @@ app.post('/api/payment/initiate', authMiddleware, assistantLimiter, async (req, 
     const parsedAmount = parseFloat(amount);
     if (isNaN(parsedAmount) || parsedAmount <= 0) {
       return res.status(400).json({ error: 'Amount must be greater than zero' });
+    }
+
+    // Resolve buyer email/name from request body or Firebase Auth token
+    const decoded = req.user;
+    let buyerEmail = email_address || '';
+    let buyerName = name_first || '';
+    if ((!buyerEmail || !buyerName) && decoded && decoded.uid) {
+      try {
+        const userDoc = await admin.firestore().collection('users').doc(decoded.uid).get();
+        if (userDoc.exists) {
+          const userData = userDoc.data();
+          if (!buyerEmail) buyerEmail = userData.email || decoded.email || '';
+          if (!buyerName) buyerName = (userData.name || decoded.name || '').split(' ')[0];
+        }
+      } catch (e) { /* non-critical */ }
     }
 
     // Default return/cancel URLs point to our result page
@@ -6429,6 +6444,8 @@ app.post('/api/payment/initiate', authMiddleware, assistantLimiter, async (req, 
     paymentData.return_url = return_url || defaultReturn;
     paymentData.cancel_url = cancel_url || defaultCancel;
     paymentData.notify_url = notify_url || defaultNotify;
+    if (buyerName) paymentData.name_first = buyerName;
+    if (buyerEmail) paymentData.email_address = buyerEmail;
     paymentData.amount = String(parseFloat(amount).toFixed(2));
     paymentData.item_name = String(item_name);
     if (custom_str1) paymentData.custom_str1 = custom_str1;
@@ -7662,20 +7679,27 @@ app.post('/api/admin/save-card', authMiddleware, async (req, res) => {
       return res.status(503).json({ error: 'Payment credentials not configured.' });
     }
 
+    // Fetch admin profile for email (required by PayFast for tokenization)
+    const adminDoc = await db.collection('users').doc(adminUid).get();
+    const adminData = adminDoc.exists ? adminDoc.data() : {};
+    const adminEmail = adminData.email || decoded.email || '';
+    const adminName = adminData.name || decoded.name || 'Admin';
+
     // PayFast requires parameters in a SPECIFIC order for signature verification:
     // merchant → return/cancel/notify → personal → amount/item → custom → payment_method → subscription
-    const paymentData = {
-      merchant_id: merchantId,
-      merchant_key: merchantKey,
-      return_url: `${backendUrl}/api/payment/ozow-result?status=success&booking_id=admin_card_save`,
-      cancel_url: `${backendUrl}/api/payment/ozow-result?status=cancel&booking_id=admin_card_save`,
-      notify_url: `${backendUrl}/api/payment/itn`,
-      amount: '1.00', // R1 verification charge (will be refunded)
-      item_name: 'Square 15 Card Verification',
-      custom_str1: `admin_card_save_${adminUid}`,
-      payment_method: 'cc',
-      subscription_type: '2', // Ad-hoc tokenization — required for PayFast to return a card token
-    };
+    const paymentData = {};
+    paymentData.merchant_id = merchantId;
+    paymentData.merchant_key = merchantKey;
+    paymentData.return_url = `${backendUrl}/api/payment/ozow-result?status=success&booking_id=admin_card_save`;
+    paymentData.cancel_url = `${backendUrl}/api/payment/ozow-result?status=cancel&booking_id=admin_card_save`;
+    paymentData.notify_url = `${backendUrl}/api/payment/itn`;
+    if (adminName) paymentData.name_first = adminName.split(' ')[0];
+    if (adminEmail) paymentData.email_address = adminEmail;
+    paymentData.amount = '1.00'; // R1 verification charge
+    paymentData.item_name = 'Square 15 Card Verification';
+    paymentData.custom_str1 = `admin_card_save_${adminUid}`;
+    paymentData.payment_method = 'cc';
+    paymentData.subscription_type = '2'; // Ad-hoc tokenization — required for PayFast to return a card token
 
     // Generate PayFast signature
     const passphrase = env('PAYFAST_PASSPHRASE') || '';
