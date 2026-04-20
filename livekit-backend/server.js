@@ -7376,26 +7376,30 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
     const payoutRef = `SQ${Date.now().toString(36).toUpperCase()}`;
 
     // ── Call Ozow Payout API ──
-    const ozowBaseUrl = env('OZOW_IS_TEST') === 'true'
-      ? 'https://stagingapi.ozow.com'
-      : 'https://api.ozow.com';
+    // Ozow Payout API lives on pay.ozow.com (NOT api.ozow.com)
+    const ozowPayoutUrl = env('OZOW_IS_TEST') === 'true'
+      ? 'https://stagingpay.ozow.com/api/v1/sendpayout'
+      : 'https://pay.ozow.com/api/v1/sendpayout';
+
+    const notifyUrl = `${env('RENDER_EXTERNAL_URL') || 'https://square15-livekit-backend.onrender.com'}/api/ozow-payout-notify`;
 
     const payoutPayload = {
-      siteCode: ozowSiteCode,
-      amount: parseFloat(payoutAmount.toFixed(2)),
-      bankReference: payoutRef,
-      beneficiaryName: (recipient_name || 'Square 15 Payout').slice(0, 50),
-      beneficiaryBankCode: ozowBankCode,
-      beneficiaryAccountNumber: account_number,
-      beneficiaryAccountType: parseInt(ozowAccountType, 10),
-      isRealTimeClearing: true,
-      notifyUrl: `${env('RENDER_EXTERNAL_URL') || 'https://square15-livekit-backend.onrender.com'}/api/ozow-payout-notify`,
+      SiteCode: ozowSiteCode,
+      Amount: parseFloat(payoutAmount.toFixed(2)),
+      BankReference: payoutRef,
+      BeneficiaryName: (recipient_name || 'Square 15 Payout').slice(0, 50),
+      BeneficiaryBankCode: ozowBankCode,
+      BeneficiaryAccountNumber: account_number,
+      BeneficiaryAccountType: parseInt(ozowAccountType, 10),
+      IsRealTimeClearing: true,
+      NotifyUrl: notifyUrl,
     };
 
     console.log(`[admin/ozow-payout] Initiating R${payoutAmount.toFixed(2)} to ${recipient_type} ${recipient_id} (${bank_name} ****${account_number.slice(-4)})`);
+    console.log(`[admin/ozow-payout] URL: ${ozowPayoutUrl}`);
     console.log(`[admin/ozow-payout] Payload:`, JSON.stringify(payoutPayload));
 
-    const ozowResponse = await fetch(`${ozowBaseUrl}/v1/payouts/create`, {
+    const ozowResponse = await fetch(ozowPayoutUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -7418,7 +7422,13 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       });
     }
 
-    if (!ozowResponse.ok || !ozowResult.payoutId) {
+    console.log(`[admin/ozow-payout] Ozow response (${ozowResponse.status}):`, JSON.stringify(ozowResult));
+
+    // Ozow may return PascalCase or camelCase — handle both
+    const payoutId = ozowResult.payoutId || ozowResult.PayoutId || ozowResult.id || ozowResult.Id;
+    const ozowStatus = ozowResult.status || ozowResult.Status;
+
+    if (!ozowResponse.ok || !payoutId) {
       console.error(`[admin/ozow-payout] Ozow API error (HTTP ${ozowResponse.status}):`, JSON.stringify(ozowResult));
       const errMsg = ozowResult.message || ozowResult.errorMessage || ozowResult.error
         || (ozowResult.errors && JSON.stringify(ozowResult.errors))
@@ -7431,13 +7441,13 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       });
     }
 
-    console.log(`✅ Ozow payout created: ${ozowResult.payoutId} ref=${payoutRef}`);
+    console.log(`✅ Ozow payout created: ${payoutId} ref=${payoutRef}`);
 
     // ── Record payout in Firestore ──
     const txId = crypto.randomUUID();
     const payoutRecord = {
       id: txId,
-      ozow_payout_id: ozowResult.payoutId,
+      ozow_payout_id: payoutId,
       payout_reference: payoutRef,
       type: recipient_type === 'partner' ? 'partner_payout' : 'artisan_payout',
       method: 'ozow_eft',
@@ -7449,8 +7459,8 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       account_number_masked: `****${account_number.slice(-4)}`,
       branch_code,
       account_type: account_type || 'cheque',
-      status: ozowResult.status || 'pending',
-      ozow_status: ozowResult.status || 'Pending',
+      status: ozowStatus || 'pending',
+      ozow_status: ozowStatus || 'Pending',
       admin_id: adminUid,
       reason: reason || `Admin EFT payout to ${recipient_type}`,
       ...(booking_id ? { tasks_management_id: booking_id } : {}),
@@ -7473,7 +7483,7 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       schema_version: 2,
       payment_method: 'ozow_eft',
       payout_reference: payoutRef,
-      ozow_payout_id: ozowResult.payoutId,
+      ozow_payout_id: payoutId,
       recipient_id,
       recipient_name: recipient_name || '',
       admin_id: adminUid,
@@ -7543,9 +7553,9 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
 
     return res.json({
       ok: true,
-      payout_id: ozowResult.payoutId,
+      payout_id: payoutId,
       reference: payoutRef,
-      status: ozowResult.status || 'pending',
+      status: ozowStatus || 'pending',
       amount: payoutAmount.toFixed(2),
       message: `R${payoutAmount.toFixed(2)} EFT payout initiated to ${recipient_name || recipient_type}. Funds will arrive within minutes (RTC) or next business day.`,
     });
@@ -7729,11 +7739,17 @@ app.post('/api/admin/save-card', authMiddleware, async (req, res) => {
     paymentData.notify_url = `${backendUrl}/api/payment/itn`;
     if (adminName) paymentData.name_first = adminName.split(' ')[0];
     if (adminEmail) paymentData.email_address = adminEmail;
-    paymentData.amount = '1.00'; // R1 verification charge
+    paymentData.m_payment_id = `card_save_${adminUid}_${Date.now()}`;
+    paymentData.amount = '10.00'; // R10 verification charge (below min may trigger 400)
     paymentData.item_name = 'Square 15 Card Verification';
     paymentData.custom_str1 = `admin_card_save_${adminUid}`;
     paymentData.payment_method = 'cc';
-    paymentData.subscription_type = '2'; // Ad-hoc tokenization — required for PayFast to return a card token
+    // subscription_type=2 requires merchant to have ad-hoc tokenization enabled in PayFast dashboard
+    // Only add it if the merchant has explicitly enabled it
+    const enableTokenization = env('PAYFAST_ENABLE_TOKENIZATION') === 'true';
+    if (enableTokenization) {
+      paymentData.subscription_type = '2';
+    }
 
     // Generate PayFast signature — use + for spaces (PayFast standard)
     const passphrase = env('PAYFAST_PASSPHRASE') || '';
