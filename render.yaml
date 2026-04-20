@@ -37,6 +37,13 @@ services:
         sync: false
       - key: OZOW_IS_TEST
         value: "false"
+      # PayFast payment credentials (set as Secret in Render dashboard)
+      - key: PAYFAST_MERCHANT_ID
+        sync: false
+      - key: PAYFAST_MERCHANT_KEY
+        sync: false
+      - key: PAYFAST_PASSPHRASE
+        sync: false
       - key: BACKEND_BASE_URL
         value: "https://square15-livekit-backend.onrender.com"
       # Admin bootstrap key for setting admin custom claims

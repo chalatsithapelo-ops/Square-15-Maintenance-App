@@ -6474,17 +6474,34 @@ app.post('/api/payment/initiate', authMiddleware, assistantLimiter, async (req, 
     const signature = crypto.createHash('md5').update(sigInput).digest('hex');
     paymentData.signature = signature;
 
-    // Build full payment URL with query params so WebView can load it directly
+    // Build full payment URL with query params — use + encoding (matches signature)
     const queryString = Object.entries(paymentData)
-      .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+      .map(([k, v]) => `${encodeURIComponent(k).replace(/%20/g, '+')}=${encodeURIComponent(String(v || '')).replace(/%20/g, '+')}`)
       .join('&');
     const fullPaymentUrl = `${payfastUrl}?${queryString}`;
+
+    // Build auto-submitting HTML form (POST) — most reliable PayFast integration method
+    const formFields = Object.entries(paymentData)
+      .map(([k, v]) => `<input type="hidden" name="${k}" value="${String(v || '').replace(/"/g, '&quot;')}" />`)
+      .join('\n      ');
+    const formHtml = `<!DOCTYPE html>
+<html><head><title>Redirecting to PayFast...</title>
+<style>body{display:flex;align-items:center;justify-content:center;height:100vh;margin:0;font-family:sans-serif;background:#f5f5f5;}
+.loader{text-align:center;}.spinner{border:4px solid #ddd;border-top:4px solid #1a73e8;border-radius:50%;width:40px;height:40px;animation:spin 1s linear infinite;margin:0 auto 16px;}
+@keyframes spin{to{transform:rotate(360deg);}}</style></head>
+<body><div class="loader"><div class="spinner"></div><p>Redirecting to PayFast...</p></div>
+<form id="pf" method="POST" action="${payfastUrl}">
+      ${formFields}
+</form>
+<script>document.getElementById('pf').submit();</script>
+</body></html>`;
 
     console.log(`[payment] Initiated ${payment_method || 'eft'} payment, amount=R${amount}, save_card=${!!save_card}, task=${taskId}`);
 
     res.json({
       ok: true,
       payment_url: fullPaymentUrl,
+      payment_form_html: formHtml,
       payfast_url: payfastUrl,
       payment_data: paymentData,
     });
@@ -7355,7 +7372,8 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
     const ozowAccountType = accountTypeMap[(account_type || 'cheque').toLowerCase()] || '1';
 
     const now = new Date().toISOString();
-    const payoutRef = `SQ15-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
+    // Ozow bankReference max 20 chars — use compact format
+    const payoutRef = `SQ${Date.now().toString(36).toUpperCase()}`;
 
     // ── Call Ozow Payout API ──
     const ozowBaseUrl = env('OZOW_IS_TEST') === 'true'
@@ -7364,17 +7382,18 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
 
     const payoutPayload = {
       siteCode: ozowSiteCode,
-      amount: payoutAmount.toFixed(2),
+      amount: parseFloat(payoutAmount.toFixed(2)),
       bankReference: payoutRef,
       beneficiaryName: (recipient_name || 'Square 15 Payout').slice(0, 50),
       beneficiaryBankCode: ozowBankCode,
       beneficiaryAccountNumber: account_number,
-      beneficiaryAccountType: ozowAccountType,
+      beneficiaryAccountType: parseInt(ozowAccountType, 10),
       isRealTimeClearing: true,
       notifyUrl: `${env('RENDER_EXTERNAL_URL') || 'https://square15-livekit-backend.onrender.com'}/api/ozow-payout-notify`,
     };
 
     console.log(`[admin/ozow-payout] Initiating R${payoutAmount.toFixed(2)} to ${recipient_type} ${recipient_id} (${bank_name} ****${account_number.slice(-4)})`);
+    console.log(`[admin/ozow-payout] Payload:`, JSON.stringify(payoutPayload));
 
     const ozowResponse = await fetch(`${ozowBaseUrl}/v1/payouts/create`, {
       method: 'POST',
@@ -7387,13 +7406,28 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       signal: AbortSignal.timeout(30000),
     });
 
-    const ozowResult = await ozowResponse.json();
+    let ozowResult;
+    try {
+      ozowResult = await ozowResponse.json();
+    } catch (parseErr) {
+      const rawText = await ozowResponse.text().catch(() => '(unreadable)');
+      console.error(`[admin/ozow-payout] Ozow returned non-JSON (${ozowResponse.status}):`, rawText);
+      return res.status(502).json({
+        ok: false,
+        error: `Ozow returned invalid response (HTTP ${ozowResponse.status}). Check API key and endpoint.`,
+      });
+    }
 
     if (!ozowResponse.ok || !ozowResult.payoutId) {
-      console.error(`[admin/ozow-payout] Ozow API error:`, ozowResult);
+      console.error(`[admin/ozow-payout] Ozow API error (HTTP ${ozowResponse.status}):`, JSON.stringify(ozowResult));
+      const errMsg = ozowResult.message || ozowResult.errorMessage || ozowResult.error
+        || (ozowResult.errors && JSON.stringify(ozowResult.errors))
+        || `Ozow payout failed (HTTP ${ozowResponse.status})`;
       return res.status(400).json({
         ok: false,
-        error: ozowResult.message || ozowResult.errorMessage || `Ozow payout failed (${ozowResponse.status})`,
+        error: errMsg,
+        ozow_status: ozowResponse.status,
+        ozow_response: ozowResult,
       });
     }
 
@@ -7701,7 +7735,7 @@ app.post('/api/admin/save-card', authMiddleware, async (req, res) => {
     paymentData.payment_method = 'cc';
     paymentData.subscription_type = '2'; // Ad-hoc tokenization — required for PayFast to return a card token
 
-    // Generate PayFast signature
+    // Generate PayFast signature — use + for spaces (PayFast standard)
     const passphrase = env('PAYFAST_PASSPHRASE') || '';
     const pfParamString = Object.entries(paymentData)
       .map(([k, v]) => `${encodeURIComponent(k).replace(/%20/g, '+')}=${encodeURIComponent(String(v || '')).replace(/%20/g, '+')}`)
@@ -7712,13 +7746,30 @@ app.post('/api/admin/save-card', authMiddleware, async (req, res) => {
     }
     paymentData.signature = crypto.createHash('md5').update(sigInput).digest('hex');
 
+    // Build auto-submitting HTML form (POST) — PayFast requires form POST for reliable signature validation
+    const formFields = Object.entries(paymentData)
+      .map(([k, v]) => `<input type="hidden" name="${k}" value="${String(v || '').replace(/"/g, '&quot;')}" />`)
+      .join('\n      ');
+    const formHtml = `<!DOCTYPE html>
+<html><head><title>Redirecting to PayFast...</title>
+<style>body{display:flex;align-items:center;justify-content:center;height:100vh;margin:0;font-family:sans-serif;background:#f5f5f5;}
+.loader{text-align:center;}.spinner{border:4px solid #ddd;border-top:4px solid #1a73e8;border-radius:50%;width:40px;height:40px;animation:spin 1s linear infinite;margin:0 auto 16px;}
+@keyframes spin{to{transform:rotate(360deg);}}</style></head>
+<body><div class="loader"><div class="spinner"></div><p>Redirecting to PayFast...</p></div>
+<form id="pf" method="POST" action="${payfastUrl}">
+      ${formFields}
+</form>
+<script>document.getElementById('pf').submit();</script>
+</body></html>`;
+
+    // Also build GET URL as fallback
     const queryString = Object.entries(paymentData)
-      .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+      .map(([k, v]) => `${encodeURIComponent(k).replace(/%20/g, '+')}=${encodeURIComponent(String(v || '')).replace(/%20/g, '+')}`)
       .join('&');
     const fullPaymentUrl = `${payfastUrl}?${queryString}`;
 
-    console.log(`[admin] Card save initiated for admin ${adminUid}`);
-    res.json({ ok: true, payment_url: fullPaymentUrl });
+    console.log(`[admin] Card save initiated for admin ${adminUid}, email=${adminEmail ? 'yes' : 'MISSING'}`);
+    res.json({ ok: true, payment_url: fullPaymentUrl, payment_form_html: formHtml });
   } catch (error) {
     console.error('❌ Admin save-card error:', error);
     res.status(500).json({ error: 'Failed to initiate card save.' });
