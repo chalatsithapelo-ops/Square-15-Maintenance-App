@@ -6455,9 +6455,10 @@ app.post('/api/payment/initiate', authMiddleware, assistantLimiter, async (req, 
       paymentData.payment_method = 'cc';
     }
 
-    // Enable ad-hoc tokenization (save card) when requested
-    // PayFast will return a token in the ITN callback that can be used for future charges
-    if (save_card === true && payment_method === 'cc') {
+    // Enable ad-hoc tokenization (save card) only when explicitly enabled in env.
+    // This avoids PayFast 400 errors on merchants that have not enabled ad-hoc tokenization.
+    const enableTokenization = env('PAYFAST_ENABLE_TOKENIZATION') === 'true';
+    if (save_card === true && payment_method === 'cc' && enableTokenization) {
       paymentData.subscription_type = '2';
     }
 
@@ -7395,30 +7396,100 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       NotifyUrl: notifyUrl,
     };
 
+    // Fallback payload casing for environments that expect camelCase fields.
+    const payoutPayloadFallback = {
+      siteCode: ozowSiteCode,
+      amount: parseFloat(payoutAmount.toFixed(2)),
+      bankReference: payoutRef,
+      beneficiaryName: (recipient_name || 'Square 15 Payout').slice(0, 50),
+      beneficiaryBankCode: ozowBankCode,
+      beneficiaryAccountNumber: account_number,
+      beneficiaryAccountType: parseInt(ozowAccountType, 10),
+      isRealTimeClearing: true,
+      notifyUrl: notifyUrl,
+    };
+
     console.log(`[admin/ozow-payout] Initiating R${payoutAmount.toFixed(2)} to ${recipient_type} ${recipient_id} (${bank_name} ****${account_number.slice(-4)})`);
     console.log(`[admin/ozow-payout] URL: ${ozowPayoutUrl}`);
     console.log(`[admin/ozow-payout] Payload:`, JSON.stringify(payoutPayload));
 
-    const ozowResponse = await fetch(ozowPayoutUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'ApiKey': ozowApiKey,
-        'Accept': 'application/json',
+    const ozowAttempts = [
+      {
+        name: 'primary_pascal_apiKey',
+        headers: {
+          'Content-Type': 'application/json',
+          'ApiKey': ozowApiKey,
+          'Accept': 'application/json',
+        },
+        payload: payoutPayload,
       },
-      body: JSON.stringify(payoutPayload),
-      signal: AbortSignal.timeout(30000),
-    });
+      {
+        name: 'fallback_camel_bearer',
+        headers: {
+          'Content-Type': 'application/json',
+          'ApiKey': ozowApiKey,
+          'Authorization': `Bearer ${ozowApiKey}`,
+          'X-Api-Key': ozowApiKey,
+          'Accept': 'application/json',
+        },
+        payload: payoutPayloadFallback,
+      },
+    ];
 
-    let ozowResult;
-    try {
-      ozowResult = await ozowResponse.json();
-    } catch (parseErr) {
-      const rawText = await ozowResponse.text().catch(() => '(unreadable)');
-      console.error(`[admin/ozow-payout] Ozow returned non-JSON (${ozowResponse.status}):`, rawText);
+    let ozowResponse = null;
+    let ozowResult = null;
+    let ozowRawText = '';
+
+    for (const attempt of ozowAttempts) {
+      try {
+        const response = await fetch(ozowPayoutUrl, {
+          method: 'POST',
+          headers: attempt.headers,
+          body: JSON.stringify(attempt.payload),
+          signal: AbortSignal.timeout(30000),
+        });
+
+        const rawText = await response.text().catch(() => '');
+        let parsed;
+        try {
+          parsed = rawText ? JSON.parse(rawText) : {};
+        } catch (_) {
+          parsed = null;
+        }
+
+        const parsedPayoutId = parsed && (parsed.payoutId || parsed.PayoutId || parsed.id || parsed.Id);
+        ozowResponse = response;
+        ozowResult = parsed;
+        ozowRawText = rawText;
+
+        if (response.ok && parsedPayoutId) {
+          console.log(`[admin/ozow-payout] Ozow success via ${attempt.name}`);
+          break;
+        }
+
+        console.warn(`[admin/ozow-payout] Attempt ${attempt.name} failed (HTTP ${response.status})`);
+        if (response.status < 500) {
+          // 4xx is usually a real validation/auth error; don't keep retrying variants.
+          break;
+        }
+      } catch (attemptErr) {
+        console.warn(`[admin/ozow-payout] Attempt ${attempt.name} threw: ${attemptErr.message}`);
+      }
+    }
+
+    if (!ozowResponse) {
+      return res.status(502).json({
+        ok: false,
+        error: 'Ozow request failed before receiving a response. Please try again.',
+      });
+    }
+
+    if (!ozowResult) {
+      console.error(`[admin/ozow-payout] Ozow returned non-JSON (${ozowResponse.status}):`, ozowRawText || '(empty body)');
       return res.status(502).json({
         ok: false,
         error: `Ozow returned invalid response (HTTP ${ozowResponse.status}). Check API key and endpoint.`,
+        ozow_status: ozowResponse.status,
       });
     }
 
@@ -7723,6 +7794,13 @@ app.post('/api/admin/save-card', authMiddleware, async (req, res) => {
       return res.status(503).json({ error: 'Payment credentials not configured.' });
     }
 
+    const enableTokenization = env('PAYFAST_ENABLE_TOKENIZATION') === 'true';
+    if (!enableTokenization) {
+      return res.status(400).json({
+        error: 'Card saving is not enabled on this merchant yet. Enable PayFast ad-hoc tokenization first, then retry.',
+      });
+    }
+
     // Fetch admin profile for email (required by PayFast for tokenization)
     const adminDoc = await db.collection('users').doc(adminUid).get();
     const adminData = adminDoc.exists ? adminDoc.data() : {};
@@ -7746,10 +7824,7 @@ app.post('/api/admin/save-card', authMiddleware, async (req, res) => {
     paymentData.payment_method = 'cc';
     // subscription_type=2 requires merchant to have ad-hoc tokenization enabled in PayFast dashboard
     // Only add it if the merchant has explicitly enabled it
-    const enableTokenization = env('PAYFAST_ENABLE_TOKENIZATION') === 'true';
-    if (enableTokenization) {
-      paymentData.subscription_type = '2';
-    }
+    paymentData.subscription_type = '2';
 
     // Generate PayFast signature — use + for spaces (PayFast standard)
     const passphrase = env('PAYFAST_PASSPHRASE') || '';

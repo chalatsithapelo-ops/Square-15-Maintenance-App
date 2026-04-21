@@ -4282,7 +4282,36 @@ app.post('/webhook', async (req, res) => {
             console.log(`[msg] ${from}: [IMAGE received, ${(imageMedia.base64.length / 1024).toFixed(0)}KB]`);
             // Log incoming image message
             logChatMessage(from, 'incoming', caption || '[Photo]', { messageType: 'image', linkedUserId: session.linkedUserId, displayName: _contactName });
-            const reply = await handleMessage(session, userText, imageMedia.dataUrl);
+
+            // Keep vision payloads lightweight and compatible to avoid crashes on repeated/unsupported photos.
+            const mime = (imageMedia.mimeType || '').toLowerCase();
+            const supportedVisionMime = mime.includes('jpeg') || mime.includes('jpg') || mime.includes('png') || mime.includes('webp');
+            const approxBytes = Math.floor((imageMedia.base64.length * 3) / 4);
+            const maxVisionBytes = 3 * 1024 * 1024;
+
+            let reply = '';
+            try {
+              if (supportedVisionMime && approxBytes <= maxVisionBytes) {
+                reply = await handleMessage(session, userText, imageMedia.dataUrl);
+              } else {
+                const reason = !supportedVisionMime ? 'unsupported image format' : 'image too large for analysis';
+                console.warn(`[msg] ${from}: image vision fallback (${reason}, mime=${mime || 'unknown'}, bytes=${approxBytes})`);
+                reply = await handleMessage(
+                  session,
+                  `${userText} The uploaded image could not be analyzed directly (${reason}). Continue using the user's text/caption and ask for one clear JPG/PNG close-up photo if needed.`
+                );
+              }
+            } catch (imageErr) {
+              console.error(`[msg] ${from}: vision processing failed, retrying text-only:`, imageErr.message);
+              reply = await handleMessage(
+                session,
+                `${userText} Image analysis failed on the last photo. Continue with text-only diagnosis and ask for another clear photo if needed.`
+              );
+            }
+
+            if (!reply || !reply.trim()) {
+              reply = 'Thanks, I received your photo. Please briefly describe the issue as well so I can assist immediately.';
+            }
             // Log outgoing bot reply
             logChatMessage(from, 'outgoing', reply, { linkedUserId: session.linkedUserId, displayName: _contactName, toolsCalled: session._lastToolsCalled || [], bookingRef: session.lastBookingId || session.lastRfqId || null });
             const chunks = reply.match(/.{1,4000}/gs) || [reply];
