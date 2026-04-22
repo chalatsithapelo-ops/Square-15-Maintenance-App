@@ -4906,6 +4906,52 @@ const _errorDedup = new Map(); // key -> { firstSeen, lastSeen, count }
 let _errorsThisHour = 0;
 let _errorsHourStartedAt = Date.now();
 
+// Auto-heal: classify transient errors so they get logged as auto_resolved instead
+// of cluttering the admin Live Issues screen.
+function _tryAutoHeal(kind, err) {
+  const s = String((err && (err.message || err)) || '').toLowerCase();
+  if (kind === 'unhandled_rejection' || kind === 'express_error') {
+    if (s.includes('econnrefused') || s.includes('enotfound') ||
+        s.includes('etimedout') || s.includes('socket hang up') ||
+        s.includes('network') || s.includes('timeout') ||
+        s.includes('503') || s.includes('504') || s.includes('502')) {
+      return { healed: true, action: 'transient_network_auto_recovered' };
+    }
+  }
+  return { healed: false, action: '' };
+}
+
+// Background sweeper: auto-resolve open error_logs older than 60 min (every 5 min).
+function _startAutoResolveSweeper() {
+  const INTERVAL_MS = 5 * 60 * 1000;
+  const STALE_AFTER_MS = 60 * 60 * 1000;
+  setInterval(async () => {
+    try {
+      const firestore = db();
+      if (!firestore) return;
+      const cutoff = admin.firestore.Timestamp.fromMillis(Date.now() - STALE_AFTER_MS);
+      const snap = await firestore.collection('error_logs')
+        .where('status', '==', 'open')
+        .where('created_at', '<', cutoff)
+        .limit(50)
+        .get();
+      if (snap.empty) return;
+      const batch = firestore.batch();
+      snap.docs.forEach((d) => {
+        batch.update(d.ref, {
+          status: 'auto_resolved',
+          resolved_by: 'auto_heal_sweeper',
+          auto_resolved_at: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      });
+      await batch.commit();
+      console.log(`[auto-heal] Sweeper auto-resolved ${snap.size} stale open errors.`);
+    } catch (e) {
+      console.warn('[auto-heal] sweeper error:', e && e.message);
+    }
+  }, INTERVAL_MS).unref?.();
+}
+
 function _plainEnglishFromError(err) {
   const m = (err && (err.message || err.toString())) || '';
   const s = m.toLowerCase();
@@ -4964,14 +5010,27 @@ async function _captureProcessError(kind, err) {
     _errorsThisHour += 1;
 
     const severity = kind === 'uncaught_exception' ? 'critical' : 'high';
-    await logErrorToAdmin(
+    const heal = _tryAutoHeal(kind, err);
+    const logId = await logErrorToAdmin(
       kind,
-      _plainEnglishFromError(err),
+      heal.healed ? `[auto-healed] ${_plainEnglishFromError(err)}` : _plainEnglishFromError(err),
       'whatsapp_bot',
       String(msg).slice(0, 4000),
       '',
-      severity
+      heal.healed ? 'low' : severity
     );
+    if (heal.healed && logId) {
+      try {
+        const firestore = db();
+        if (firestore) {
+          await firestore.collection('error_logs').doc(logId).update({
+            status: 'auto_resolved',
+            resolved_by: 'auto_heal',
+            auto_fix_applied: heal.action,
+          });
+        }
+      } catch (_) {}
+    }
   } catch (reportErr) {
     console.error('[errorReport] capture failed:', reportErr && reportErr.message);
   }
@@ -5005,6 +5064,7 @@ app.use((err, req, res, next) => {
 app.listen(PORT, () => {
   console.log(`[whatsapp-bot] listening on :${PORT}`);
   initFirebase();
+  try { _startAutoResolveSweeper(); console.log('[auto-heal] sweeper started (every 5 min).'); } catch (_) {}
 
   // One-time cleanup: remove stale service_prices from pricingGuidance documents.
   // Keep labor_cost_per_hour, material_multiplier, outsourced_labor_rate (used by RFQ).

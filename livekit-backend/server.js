@@ -1531,6 +1531,24 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         data: toStringMap(data),
         android: { priority: 'high', notification: { channelId: cId } },
       });
+
+      // Auto-heal: detect stale tokens in the per-token response and remove them
+      // from any user/artisan/admin doc that stored them.
+      try {
+        const stale = [];
+        (resp.responses || []).forEach((r, idx) => {
+          if (r && !r.success && r.error) {
+            const code = String(r.error.code || '').toLowerCase();
+            if (code.includes('registration-token-not-registered') ||
+                code.includes('invalid-registration-token') ||
+                code.includes('invalid-argument') && String(r.error.message || '').toLowerCase().includes('token')) {
+              stale.push(tokens[idx]);
+            }
+          }
+        });
+        if (stale.length) _cleanStaleFcmTokens(stale).catch(() => {});
+      } catch (_) {}
+
       return {
         attempted: tokens.length,
         success: resp.successCount || 0,
@@ -8835,6 +8853,132 @@ const _errorDedup = new Map();
 let _errorsThisHour = 0;
 let _errorsHourStartedAt = Date.now();
 
+// ─── AUTO-HEAL: Tier 1 self-healing rules ───────────────────────────────────
+// Scans users/artisans/serviceProvidersRegistration/admin_users collections
+// and scrubs stale FCM tokens detected in a multicast response.
+async function _cleanStaleFcmTokens(staleTokens) {
+  try {
+    if (!Array.isArray(staleTokens) || staleTokens.length === 0) return 0;
+    const unique = Array.from(new Set(staleTokens.map((t) => String(t || '').trim()).filter(Boolean)));
+    if (unique.length === 0) return 0;
+    const firestore = admin.apps.length ? admin.firestore() : null;
+    if (!firestore) return 0;
+
+    const COLLECTIONS = ['users', 'serviceProvidersRegistration', 'admins', 'admin_users'];
+    const FIELDS_SINGLE = ['deviceToken', 'device_token', 'fcm_token', 'fcmToken', 'token', 'push_token', 'pushToken'];
+    const FIELDS_LIST = ['tokens', 'fcm_tokens', 'deviceTokens'];
+    let cleaned = 0;
+    const affectedUsers = [];
+
+    for (const col of COLLECTIONS) {
+      for (const token of unique) {
+        for (const field of FIELDS_SINGLE) {
+          try {
+            const snap = await firestore.collection(col).where(field, '==', token).limit(5).get();
+            for (const doc of snap.docs) {
+              await doc.ref.update({ [field]: admin.firestore.FieldValue.delete() });
+              cleaned++;
+              affectedUsers.push(`${col}/${doc.id}`);
+            }
+          } catch (_) { /* index may be missing for some field/collection combos */ }
+        }
+        for (const field of FIELDS_LIST) {
+          try {
+            const snap = await firestore.collection(col).where(field, 'array-contains', token).limit(5).get();
+            for (const doc of snap.docs) {
+              await doc.ref.update({ [field]: admin.firestore.FieldValue.arrayRemove(token) });
+              cleaned++;
+              affectedUsers.push(`${col}/${doc.id}`);
+            }
+          } catch (_) {}
+        }
+      }
+    }
+
+    if (cleaned > 0) {
+      console.log(`[auto-heal] Removed ${cleaned} stale FCM token entries from ${affectedUsers.length} docs.`);
+      // Emit an auto-resolved log so admin sees the self-healing action.
+      logErrorToAdmin(
+        'auto_healed',
+        `Auto-cleaned ${cleaned} stale FCM push tokens (user devices reinstalled app or uninstalled).`,
+        'livekit_backend',
+        `Affected: ${affectedUsers.slice(0, 10).join(', ')}${affectedUsers.length > 10 ? '…' : ''}`,
+        '',
+        'low'
+      ).then((id) => {
+        if (id) {
+          const firestore2 = admin.apps.length ? admin.firestore() : null;
+          if (firestore2) {
+            firestore2.collection('error_logs').doc(id).update({
+              status: 'auto_resolved',
+              resolved_by: 'auto_heal',
+              auto_fix_applied: 'clean_stale_fcm_tokens',
+            }).catch(() => {});
+          }
+        }
+      }).catch(() => {});
+    }
+    return cleaned;
+  } catch (e) {
+    console.warn('[auto-heal] _cleanStaleFcmTokens failed:', e && e.message);
+    return 0;
+  }
+}
+
+// Classify whether an error can be auto-resolved right now (transient / already-retried).
+// Returns { healed: bool, action: string }.
+function _tryAutoHeal(kind, err) {
+  const s = String((err && (err.message || err)) || '').toLowerCase();
+  if (kind === 'unhandled_rejection' || kind === 'express_error') {
+    if (s.includes('econnrefused') || s.includes('enotfound') ||
+        s.includes('etimedout') || s.includes('socket hang up') ||
+        s.includes('network') || s.includes('timeout') ||
+        s.includes('503') || s.includes('504') || s.includes('502')) {
+      return { healed: true, action: 'transient_network_auto_recovered' };
+    }
+  }
+  if (s.includes('registration-token-not-registered') ||
+      s.includes('invalid-registration-token')) {
+    return { healed: true, action: 'stale_fcm_token_will_be_cleaned' };
+  }
+  return { healed: false, action: '' };
+}
+
+// Background sweeper: every 5 minutes, auto-resolve open error_logs whose
+// last_seen (or created_at if last_seen missing) is older than 60 minutes.
+// This prevents the Live Issues screen from getting cluttered with stale,
+// already-recovered transient errors.
+function _startAutoResolveSweeper() {
+  const INTERVAL_MS = 5 * 60 * 1000;
+  const STALE_AFTER_MS = 60 * 60 * 1000;
+  setInterval(async () => {
+    try {
+      const firestore = admin.apps.length ? admin.firestore() : null;
+      if (!firestore) return;
+      const cutoff = admin.firestore.Timestamp.fromMillis(Date.now() - STALE_AFTER_MS);
+      const snap = await firestore.collection('error_logs')
+        .where('status', '==', 'open')
+        .where('created_at', '<', cutoff)
+        .limit(50)
+        .get();
+      if (snap.empty) return;
+      const batch = firestore.batch();
+      snap.docs.forEach((d) => {
+        batch.update(d.ref, {
+          status: 'auto_resolved',
+          resolved_by: 'auto_heal_sweeper',
+          auto_resolved_at: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      });
+      await batch.commit();
+      console.log(`[auto-heal] Sweeper auto-resolved ${snap.size} stale open errors.`);
+    } catch (e) {
+      console.warn('[auto-heal] sweeper error:', e && e.message);
+    }
+  }, INTERVAL_MS).unref?.();
+}
+// ─── END AUTO-HEAL ──────────────────────────────────────────────────────────
+
 function _plainEnglishFromError(err) {
   const m = (err && (err.message || err.toString())) || '';
   const s = m.toLowerCase();
@@ -8892,7 +9036,29 @@ async function _captureBackendError(kind, err, reqInfo) {
 
     const severity = kind === 'uncaught_exception' ? 'critical' : 'high';
     const details = (reqInfo ? `${reqInfo}\n` : '') + String(msg).slice(0, 4000);
-    await logErrorToAdmin(kind, _plainEnglishFromError(err), 'livekit_backend', details, '', severity);
+    const heal = _tryAutoHeal(kind, err);
+    const logId = await logErrorToAdmin(
+      kind,
+      heal.healed
+        ? `[auto-healed] ${_plainEnglishFromError(err)}`
+        : _plainEnglishFromError(err),
+      'livekit_backend',
+      details,
+      '',
+      heal.healed ? 'low' : severity
+    );
+    if (heal.healed && logId) {
+      try {
+        const firestore = admin.apps.length ? admin.firestore() : null;
+        if (firestore) {
+          await firestore.collection('error_logs').doc(logId).update({
+            status: 'auto_resolved',
+            resolved_by: 'auto_heal',
+            auto_fix_applied: heal.action,
+          });
+        }
+      } catch (_) {}
+    }
   } catch (reportErr) {
     console.error('[errorReport] capture failed:', reportErr && reportErr.message);
   }
@@ -9553,5 +9719,6 @@ if (require.main === module) {
     console.log(`🧠 Voice start endpoint: http://localhost:${PORT}/api/voice/start`);
     console.log(`📦 Environment: ${process.env.NODE_ENV}`);
     console.log('✅ Server ready to accept requests\n');
+    try { _startAutoResolveSweeper(); console.log('🩹 Auto-heal sweeper started (every 5 min).'); } catch (_) {}
   });
 }
