@@ -6478,6 +6478,19 @@ app.post('/api/payment/initiate', authMiddleware, assistantLimiter, async (req, 
     const enableTokenization = env('PAYFAST_ENABLE_TOKENIZATION') === 'true';
     if (save_card === true && payment_method === 'cc' && enableTokenization) {
       paymentData.subscription_type = '2';
+    } else if (save_card === true && !enableTokenization) {
+      // Client asked to save a card but backend is not configured for it.
+      // Log once so admin sees the config issue in Live Issues.
+      try {
+        await logErrorToAdmin(
+          'payment_config_error',
+          'Customer tried to save a card but PAYFAST_ENABLE_TOKENIZATION is not set to "true" on Render. Card will NOT be saved (payment will still proceed as a one-off charge).',
+          'backend',
+          `uid=${decoded && decoded.uid} save_card=true payment_method=${payment_method}`,
+          taskId || null,
+          'medium'
+        );
+      } catch (_) {}
     }
 
     // Generate PayFast signature (MD5 of param string + passphrase)
@@ -6526,7 +6539,17 @@ app.post('/api/payment/initiate', authMiddleware, assistantLimiter, async (req, 
     });
   } catch (error) {
     console.error('❌ Payment initiation error:', error);
-    res.status(500).json({ error: 'Payment initiation failed' });
+    try {
+      await logErrorToAdmin(
+        'payment_initiation_error',
+        'Customer could not start a PayFast payment. They saw a 500 error on the app.',
+        'backend',
+        `${error && error.stack ? error.stack : error && error.message ? error.message : String(error)}`,
+        req.body && req.body.custom_str1 ? req.body.custom_str1 : null,
+        'high'
+      );
+    } catch (_) {}
+    res.status(500).json({ error: 'Payment initiation failed', detail: error && error.message });
   }
 });
 
@@ -7814,6 +7837,16 @@ app.post('/api/admin/save-card', authMiddleware, async (req, res) => {
 
     const enableTokenization = env('PAYFAST_ENABLE_TOKENIZATION') === 'true';
     if (!enableTokenization) {
+      try {
+        await logErrorToAdmin(
+          'payment_config_error',
+          'Admin tried to save a card but PayFast ad-hoc tokenization is not enabled on Render. Set PAYFAST_ENABLE_TOKENIZATION=true in Render env vars AND enable ad-hoc tokenization in the PayFast merchant dashboard, then redeploy.',
+          'backend',
+          `adminUid=${adminUid} route=/api/admin/save-card`,
+          null,
+          'high'
+        );
+      } catch (_) {}
       return res.status(400).json({
         error: 'Card saving is not enabled on this merchant yet. Enable PayFast ad-hoc tokenization first, then retry.',
       });

@@ -4156,6 +4156,16 @@ async function handleMessage(session, userMessage, imageDataUrl) {
     return reply;
   } catch (err) {
     console.error('[handleMessage] Error:', err.message);
+    try {
+      await logErrorToAdmin(
+        'whatsapp_bot_error',
+        `Bot failed to respond to ${session && session.phone ? session.phone : 'a customer'}. They received a generic "try again" message.`,
+        'whatsapp_bot',
+        `${err && err.stack ? err.stack : err && err.message ? err.message : String(err)}`,
+        null,
+        'high'
+      );
+    } catch (_) {}
     return "I'm having trouble right now. Please try again in a moment, or send 'Hi' to restart our conversation.";
   }
 }
@@ -4312,6 +4322,16 @@ app.post('/webhook', async (req, res) => {
               }
             } catch (imageErr) {
               console.error(`[msg] ${from}: vision processing failed, retrying text-only:`, imageErr.message);
+              try {
+                await logErrorToAdmin(
+                  'whatsapp_vision_error',
+                  `Photo analysis failed for ${from}. Bot fell back to text-only. Customer may get "I'm having trouble" reply if retry also fails.`,
+                  'whatsapp_bot',
+                  `mime=${mime || 'unknown'} bytes=${approxBytes} err=${imageErr && imageErr.message}`,
+                  null,
+                  'high'
+                );
+              } catch (_) {}
               reply = await handleMessage(
                 session,
                 `${userText} Image analysis failed on the last photo. Continue with text-only diagnosis and ask for another clear photo if needed.`
