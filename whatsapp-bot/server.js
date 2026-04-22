@@ -467,7 +467,7 @@ async function logErrorToAdmin(errorType, description, source, errorDetails, boo
       created_at: admin.firestore.FieldValue.serverTimestamp(),
     });
 
-    await firestore.collection('Notifications').add({
+    await firestore.collection('notifications').add({
       title: `${icons[sev] || '🔵'} ${label}`,
       body: description,
       type: 'error_report',
@@ -2800,10 +2800,18 @@ async function executeWaTool(name, args, session) {
       const bid = args.bookingId;
       if (!bid) return { error: 'Please provide a booking ID.' };
 
+      // Search tasksManagement first, then fall back to futureBookings so
+      // pending RFQs (not yet dispatched) can also be cancelled.
       let doc = await firestore.collection('tasksManagement').doc(bid).get();
+      let collectionName = 'tasksManagement';
+      if (!doc.exists) {
+        doc = await firestore.collection('futureBookings').doc(bid).get();
+        collectionName = 'futureBookings';
+      }
       if (!doc.exists) return { error: `Booking "${bid}" not found.` };
 
       const d = doc.data();
+      const docRef = doc.ref;
       const status = (d.status || '').toLowerCase();
 
       // Can't cancel completed or already cancelled
@@ -2821,8 +2829,8 @@ async function executeWaTool(name, args, session) {
       const now = new Date().toISOString();
       const wasPaid = d.payment_status === 'paid' || d.paymentStatus === 'paid';
 
-      // Cancel in tasksManagement
-      await firestore.collection('tasksManagement').doc(bid).update({
+      // Cancel the primary doc (whichever collection it came from)
+      await docRef.update({
         status: 'cancelled',
         cancelled_at: now,
         cancelled_by: 'client_whatsapp',
@@ -2830,11 +2838,12 @@ async function executeWaTool(name, args, session) {
         cancellation_reason: args.reason || 'Cancelled via WhatsApp',
       });
 
-      // Cancel in futureBookings if exists
+      // Mirror cancellation to the other collection if it also has this ID
       try {
-        const fbDoc = await firestore.collection('futureBookings').doc(bid).get();
-        if (fbDoc.exists) {
-          await firestore.collection('futureBookings').doc(bid).update({
+        const otherCollection = collectionName === 'tasksManagement' ? 'futureBookings' : 'tasksManagement';
+        const mirrorDoc = await firestore.collection(otherCollection).doc(bid).get();
+        if (mirrorDoc.exists) {
+          await firestore.collection(otherCollection).doc(bid).update({
             status: 'cancelled',
             cancelled_at: now,
             cancelled_by: 'client_whatsapp',
@@ -2842,7 +2851,7 @@ async function executeWaTool(name, args, session) {
             cancellation_reason: args.reason || 'Cancelled via WhatsApp',
           });
         }
-      } catch (e) { console.warn('[wa-tool] futureBookings cancel sync failed:', e.message); }
+      } catch (e) { console.warn('[wa-tool] mirror cancel sync failed:', e.message); }
 
       // Clean up bridge records (artisan dispatch copies)
       try {
