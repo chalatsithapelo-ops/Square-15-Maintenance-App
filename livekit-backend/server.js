@@ -9192,6 +9192,134 @@ async function runFraudChecks({ firestore, type, amount, targetUserId, requested
   return { alerts, blocked, requiresReview, score: alerts.length };
 }
 
+// ─── Tier-2 admin one-tap remediation actions ───────────────────────────────
+// POST /api/admin/ops/fix
+// Body: { error_id: string, action: string, target?: string }
+// action ∈ 'clean_fcm_tokens' | 'reset_dispatch_lock' | 'bootstrap_claims'
+//        | 'restart_worker' | 'resolve'
+// Admin-only. Applies the action and marks the error_log as status=resolved.
+app.post('/api/admin/ops/fix', adminLimiter, async (req, res) => {
+  const firestore = requireFirebase(res);
+  if (!firestore) return;
+  const decoded = await verifyFirebaseAuth(req, res);
+  if (!decoded) return;
+  const actorUid = decoded.uid;
+  const actorRole = await resolveRole({ firestore, uid: actorUid, decodedToken: decoded });
+  if (actorRole !== 'admin') {
+    return res.status(403).json({ error: 'forbidden', message: 'Admin only' });
+  }
+
+  const errorId = String(req.body.error_id || '').trim();
+  const action = String(req.body.action || '').trim();
+  const target = String(req.body.target || '').trim();
+  if (!action) return res.status(400).json({ error: 'missing_action' });
+
+  const result = { action, success: false, detail: '', affected: 0 };
+
+  try {
+    if (action === 'clean_fcm_tokens') {
+      // target = token string OR user/artisan docId — we scrub by token string;
+      // if a docId is given, pull tokens off that doc first.
+      let tokens = [];
+      if (target) {
+        // If it looks like an FCM token (long, contains ':'), use directly.
+        if (target.length > 80 && target.includes(':')) {
+          tokens = [target];
+        } else {
+          for (const col of ['users', 'serviceProvidersRegistration', 'admins', 'admin_users']) {
+            try {
+              const snap = await firestore.collection(col).doc(target).get();
+              if (snap.exists) {
+                const d = snap.data() || {};
+                for (const f of ['deviceToken','device_token','fcm_token','fcmToken','token','push_token','pushToken']) {
+                  if (d[f]) tokens.push(String(d[f]));
+                }
+                for (const f of ['tokens','fcm_tokens','deviceTokens']) {
+                  if (Array.isArray(d[f])) d[f].forEach(t => t && tokens.push(String(t)));
+                }
+                break;
+              }
+            } catch (_) {}
+          }
+        }
+      }
+      if (tokens.length === 0) {
+        result.detail = 'No target FCM tokens found to clean. Provide target=<docId> or a token string.';
+      } else {
+        const cleaned = await _cleanStaleFcmTokens(tokens);
+        result.success = true;
+        result.affected = cleaned;
+        result.detail = `Removed ${cleaned} token entries.`;
+      }
+    } else if (action === 'reset_dispatch_lock') {
+      // target = booking id
+      if (!target) {
+        result.detail = 'target (booking_id) required';
+      } else {
+        const bref = firestore.collection('bookings').doc(target);
+        const bsnap = await bref.get();
+        if (!bsnap.exists) {
+          result.detail = `Booking ${target} not found`;
+        } else {
+          await bref.update({
+            in_dispatch: false,
+            dispatch_locked_at: admin.firestore.FieldValue.delete(),
+            current_dispatch_to: admin.firestore.FieldValue.delete(),
+            dispatch_reset_by: actorUid,
+            dispatch_reset_at: admin.firestore.FieldValue.serverTimestamp(),
+          });
+          result.success = true;
+          result.affected = 1;
+          result.detail = `Cleared dispatch lock on booking ${target}.`;
+        }
+      }
+    } else if (action === 'bootstrap_claims') {
+      // target = firebase auth uid to grant admin claim
+      if (!target) {
+        result.detail = 'target (uid) required';
+      } else {
+        await admin.auth().setCustomUserClaims(target, { role: 'admin' });
+        result.success = true;
+        result.affected = 1;
+        result.detail = `Granted admin claim to ${target}. They must sign out and back in.`;
+      }
+    } else if (action === 'restart_worker') {
+      // Graceful shutdown: Render will auto-restart the process.
+      result.success = true;
+      result.detail = 'Worker restart requested. Render will spin up a fresh instance within ~30s.';
+      setTimeout(() => { try { process.exit(0); } catch (_) {} }, 500);
+    } else if (action === 'resolve') {
+      // Just mark the error as resolved (no remediation).
+      result.success = true;
+      result.detail = 'Error marked resolved without remediation.';
+    } else {
+      return res.status(400).json({ error: 'unknown_action', action });
+    }
+
+    // Mark the error_log entry as resolved with audit trail.
+    if (errorId && result.success) {
+      try {
+        await firestore.collection('error_logs').doc(errorId).update({
+          status: 'resolved',
+          resolved_by: actorUid,
+          resolved_by_role: 'admin',
+          resolved_at: admin.firestore.FieldValue.serverTimestamp(),
+          auto_fix_applied: action,
+          auto_fix_detail: result.detail,
+        });
+      } catch (e) {
+        console.warn('[ops/fix] error_log update failed:', e && e.message);
+      }
+    }
+
+    return res.json({ ok: true, ...result, request_id: req.requestId || null });
+  } catch (e) {
+    console.error('[ops/fix] failed:', e && (e.stack || e.message));
+    return res.status(500).json({ ok: false, error: 'fix_failed', message: e && e.message, action });
+  }
+});
+// ─── END Tier-2 admin ops ───────────────────────────────────────────────────
+
 // ── Create Finance Request (admin-only, creates approval doc) ────────────────
 app.post('/api/finance/request', adminLimiter, async (req, res) => {
   const firestore = requireFirebase(res);
