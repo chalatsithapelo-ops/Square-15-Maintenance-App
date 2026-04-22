@@ -4899,6 +4899,107 @@ app.get('/terms', (req, res) => {
 </body></html>`);
 });
 
+// ─── Global error capture: process-level + express middleware ───
+// Dedups identical error messages within a 60s window and caps at 200 reports per hour
+// so a crash-loop cannot flood Firestore / admin popups.
+const _errorDedup = new Map(); // key -> { firstSeen, lastSeen, count }
+let _errorsThisHour = 0;
+let _errorsHourStartedAt = Date.now();
+
+function _plainEnglishFromError(err) {
+  const m = (err && (err.message || err.toString())) || '';
+  const s = m.toLowerCase();
+  if (s.includes('econnrefused') || s.includes('enotfound') || s.includes('etimedout') || s.includes('socket hang up')) {
+    return 'The bot could not reach an external service (network/API unreachable). It will keep running and retry.';
+  }
+  if (s.includes('permission-denied') || s.includes('permission denied')) {
+    return 'Firestore rejected a write. A security rule or missing admin claim is blocking the bot.';
+  }
+  if (s.includes('quota') || s.includes('resource-exhausted')) {
+    return 'Firebase/Firestore quota hit. Requests will be throttled until quota resets.';
+  }
+  if (s.includes('invalid-argument') || s.includes('invalid argument')) {
+    return 'Bad data was sent to Firestore (invalid field or type). See stack trace for exact field.';
+  }
+  if (s.includes('whatsapp') || s.includes('graph.facebook')) {
+    return 'WhatsApp Graph API call failed. Check WHATSAPP_TOKEN / phone-number-id.';
+  }
+  if (s.includes('openai') || s.includes('gpt') || s.includes('401') && s.includes('api')) {
+    return 'OpenAI/Whisper call failed (auth or rate limit). Check OPENAI_API_KEY.';
+  }
+  if (s.includes('payfast') || s.includes('ozow')) {
+    return 'Payment gateway call failed. Customer may need to retry payment.';
+  }
+  if (s.includes('timeout')) {
+    return 'An operation timed out. Bot kept running and will retry on next message.';
+  }
+  return 'Unexpected error in WhatsApp bot. Auto-recovered — bot still running. See stack for details.';
+}
+
+async function _captureProcessError(kind, err) {
+  try {
+    // rate-limit
+    const now = Date.now();
+    if (now - _errorsHourStartedAt > 60 * 60 * 1000) {
+      _errorsHourStartedAt = now;
+      _errorsThisHour = 0;
+    }
+    if (_errorsThisHour >= 200) return;
+
+    const msg = (err && (err.stack || err.message || String(err))) || 'unknown error';
+    const key = `${kind}::${(err && err.message) || String(err)}`.slice(0, 256);
+    const dedup = _errorDedup.get(key);
+    if (dedup && now - dedup.lastSeen < 60 * 1000) {
+      dedup.lastSeen = now;
+      dedup.count += 1;
+      return; // skip duplicate within 60s window
+    }
+    _errorDedup.set(key, { firstSeen: now, lastSeen: now, count: 1 });
+    // prune old entries
+    if (_errorDedup.size > 500) {
+      for (const [k, v] of _errorDedup.entries()) {
+        if (now - v.lastSeen > 10 * 60 * 1000) _errorDedup.delete(k);
+      }
+    }
+    _errorsThisHour += 1;
+
+    const severity = kind === 'uncaught_exception' ? 'critical' : 'high';
+    await logErrorToAdmin(
+      kind,
+      _plainEnglishFromError(err),
+      'whatsapp_bot',
+      String(msg).slice(0, 4000),
+      '',
+      severity
+    );
+  } catch (reportErr) {
+    console.error('[errorReport] capture failed:', reportErr && reportErr.message);
+  }
+}
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[process] unhandledRejection:', reason && (reason.stack || reason.message || reason));
+  const err = reason instanceof Error ? reason : new Error(String(reason));
+  _captureProcessError('unhandled_rejection', err);
+  // DO NOT exit — let bot keep serving other webhooks
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('[process] uncaughtException:', err && (err.stack || err.message));
+  _captureProcessError('uncaught_exception', err);
+  // DO NOT exit for non-fatal errors. Render will restart us if truly broken.
+});
+
+// Express error middleware — catches sync/async errors inside request handlers
+app.use((err, req, res, next) => {
+  console.error('[express] handler error on', req.method, req.originalUrl, ':', err && (err.stack || err.message));
+  _captureProcessError('express_error', err);
+  if (res.headersSent) return next(err);
+  try {
+    res.status(500).json({ ok: false, error: 'internal_error' });
+  } catch (_) {}
+});
+
 // ─── Start ───
 
 app.listen(PORT, () => {

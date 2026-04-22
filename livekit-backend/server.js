@@ -8778,9 +8778,132 @@ app.post('/api/dispatch-agent', authMiddleware, async (req, res) => {
   }
 });
 
-// Error handling middleware
+// ─── Admin-visible error reporter (writes to Firestore error_logs + notifications) ───
+// Mirrors the WhatsApp bot's logErrorToAdmin so admin popup service picks it up live.
+async function logErrorToAdmin(errorType, description, source, errorDetails, bookingId, severity) {
+  try {
+    initFirebaseIfPossible();
+    const firestore = admin.apps.length ? admin.firestore() : null;
+    if (!firestore) return null;
+    const errorId = firestore.collection('error_logs').doc().id;
+    const sev = severity || 'medium';
+    const icons = { critical: '🔴', high: '🟠', medium: '🟡', low: '🔵' };
+    const labels = {
+      express_error: 'API Request Failed',
+      uncaught_exception: 'Backend Crash (Recovered)',
+      unhandled_rejection: 'Backend Promise Failure',
+      livekit_error: 'Voice Session Error',
+      firebase_error: 'Firebase/Firestore Error',
+      payment_error: 'Payment Error',
+      ozow_error: 'Ozow Payment Error',
+      payfast_error: 'PayFast Payment Error',
+    };
+    const label = labels[errorType] || `Backend Error: ${errorType}`;
+    await firestore.collection('error_logs').doc(errorId).set({
+      id: errorId,
+      error_type: errorType,
+      description,
+      source: source || 'livekit_backend',
+      error_details: errorDetails || '',
+      booking_id: bookingId || '',
+      user_id: '',
+      severity: sev,
+      status: 'open',
+      created_at: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    await firestore.collection('notifications').add({
+      title: `${icons[sev] || '🔵'} ${label}`,
+      body: description,
+      type: 'error_report',
+      error_id: errorId,
+      booking_id: bookingId || '',
+      target: 'admin',
+      user_type: 'admin',
+      read: false,
+      timestamp: admin.firestore.FieldValue.serverTimestamp(),
+      created_at: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    return errorId;
+  } catch (reportErr) {
+    console.error('[errorReport] Failed to log error:', reportErr && reportErr.message);
+    return null;
+  }
+}
+
+// Dedup + rate-limit wrapper so a crash loop can't flood Firestore / admin popups.
+const _errorDedup = new Map();
+let _errorsThisHour = 0;
+let _errorsHourStartedAt = Date.now();
+
+function _plainEnglishFromError(err) {
+  const m = (err && (err.message || err.toString())) || '';
+  const s = m.toLowerCase();
+  if (s.includes('econnrefused') || s.includes('enotfound') || s.includes('etimedout') || s.includes('socket hang up')) {
+    return 'Backend could not reach an upstream service (network/API unreachable). It kept running.';
+  }
+  if (s.includes('permission-denied') || s.includes('permission denied')) {
+    return 'Firestore rejected a write. A security rule or missing admin claim is blocking the backend.';
+  }
+  if (s.includes('quota') || s.includes('resource-exhausted')) {
+    return 'Firebase/Firestore quota hit. Requests will be throttled until quota resets.';
+  }
+  if (s.includes('invalid-argument')) {
+    return 'Bad data was sent to Firestore (invalid field or type). See stack trace.';
+  }
+  if (s.includes('livekit') || s.includes('egress') || s.includes('ingress')) {
+    return 'LiveKit voice session failed. Customer voice call may have dropped.';
+  }
+  if (s.includes('openai') || s.includes('whisper') || s.includes('gpt')) {
+    return 'OpenAI/Whisper call failed (auth or rate limit). Check OPENAI_API_KEY.';
+  }
+  if (s.includes('payfast')) return 'PayFast payment gateway call failed.';
+  if (s.includes('ozow')) return 'Ozow payment gateway call failed.';
+  if (s.includes('timeout')) return 'An operation timed out. Backend still running.';
+  if (s.includes('cannot read') || s.includes('undefined is not')) {
+    return 'Code error — a variable was missing or wrong shape. Auto-recovered.';
+  }
+  return 'Unexpected backend error. Auto-recovered — server still running. See stack for details.';
+}
+
+async function _captureBackendError(kind, err, reqInfo) {
+  try {
+    const now = Date.now();
+    if (now - _errorsHourStartedAt > 60 * 60 * 1000) {
+      _errorsHourStartedAt = now;
+      _errorsThisHour = 0;
+    }
+    if (_errorsThisHour >= 200) return;
+
+    const msg = (err && (err.stack || err.message || String(err))) || 'unknown error';
+    const key = `${kind}::${(err && err.message) || String(err)}`.slice(0, 256);
+    const dedup = _errorDedup.get(key);
+    if (dedup && now - dedup.lastSeen < 60 * 1000) {
+      dedup.lastSeen = now;
+      dedup.count += 1;
+      return;
+    }
+    _errorDedup.set(key, { firstSeen: now, lastSeen: now, count: 1 });
+    if (_errorDedup.size > 500) {
+      for (const [k, v] of _errorDedup.entries()) {
+        if (now - v.lastSeen > 10 * 60 * 1000) _errorDedup.delete(k);
+      }
+    }
+    _errorsThisHour += 1;
+
+    const severity = kind === 'uncaught_exception' ? 'critical' : 'high';
+    const details = (reqInfo ? `${reqInfo}\n` : '') + String(msg).slice(0, 4000);
+    await logErrorToAdmin(kind, _plainEnglishFromError(err), 'livekit_backend', details, '', severity);
+  } catch (reportErr) {
+    console.error('[errorReport] capture failed:', reportErr && reportErr.message);
+  }
+}
+
+// Error handling middleware — also forwards to admin dashboard
 app.use((err, req, res, next) => {
   console.error('❌ Server error:', err);
+  const reqInfo = `${req.method} ${req.originalUrl}`;
+  _captureBackendError('express_error', err, reqInfo);
+  if (res.headersSent) return next(err);
   res.status(500).json({
     error: 'Internal server error',
     message: process.env.NODE_ENV !== 'production' ? err.message : 'An unexpected error occurred'
@@ -9412,10 +9535,14 @@ module.exports = app;
 if (require.main === module) {
   process.on('unhandledRejection', (reason, promise) => {
     console.error('\u274c Unhandled Rejection:', reason);
+    const err = reason instanceof Error ? reason : new Error(String(reason));
+    _captureBackendError('unhandled_rejection', err);
+    // DO NOT exit — keep serving other requests
   });
   process.on('uncaughtException', (error) => {
     console.error('\u274c Uncaught Exception:', error);
-    process.exit(1);
+    _captureBackendError('uncaught_exception', error);
+    // DO NOT exit for non-fatal errors. Render will restart us only if truly broken.
   });
 
   app.listen(PORT, () => {
