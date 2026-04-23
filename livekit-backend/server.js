@@ -8871,9 +8871,17 @@ async function logErrorToAdmin(errorType, description, source, errorDetails, boo
       firebase_error: 'Firebase/Firestore Error',
       payment_error: 'Payment Error',
       ozow_error: 'Ozow Payment Error',
+      ozow_payout_error: 'Ozow Payout Failed',
+      ozow_payout_exception: 'Ozow Payout Crashed',
       payfast_error: 'PayFast Payment Error',
+      payment_config_error: 'Payment Config Issue',
+      payment_initiation_error: 'Payment Initiation Failed',
+      whatsapp_bot_error: 'WhatsApp Bot Error',
+      whatsapp_vision_error: 'WhatsApp Photo Analysis Failed',
     };
     const label = labels[errorType] || `Backend Error: ${errorType}`;
+    const title = `${icons[sev] || '🔵'} ${label}`;
+
     await firestore.collection('error_logs').doc(errorId).set({
       id: errorId,
       error_type: errorType,
@@ -8886,18 +8894,115 @@ async function logErrorToAdmin(errorType, description, source, errorDetails, boo
       status: 'open',
       created_at: admin.firestore.FieldValue.serverTimestamp(),
     });
-    await firestore.collection('notifications').add({
-      title: `${icons[sev] || '🔵'} ${label}`,
-      body: description,
+
+    // Fan out to every admin so in-app popups AND FCM pushes reach all of them.
+    // Admin popup listener filters on (user_type='admin', user_id ∈ [uid,'admin']).
+    // We write one doc with user_id='admin' (catches the generic subscription),
+    // plus per-admin docs (catches the uid-specific subscription). We also
+    // collect tokens and fire real FCM pushes so the tray lights up even when
+    // the app is backgrounded or closed.
+    const basePayload = {
+      title,
+      message: description,   // admin_popup_alerts_service reads 'message'
+      body: description,      // keep 'body' for any older listeners
       type: 'error_report',
+      error_type: errorType,
       error_id: errorId,
       booking_id: bookingId || '',
+      severity: sev,
       target: 'admin',
       user_type: 'admin',
       read: false,
       timestamp: admin.firestore.FieldValue.serverTimestamp(),
       created_at: admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    // 1) Generic admin doc (popup listener picks this up via user_id='admin').
+    await firestore.collection('notifications').add({
+      ...basePayload,
+      user_id: 'admin',
     });
+
+    // 2) Per-admin docs + FCM push to their device tokens.
+    try {
+      const adminSnap = await firestore.collection('users')
+        .where('isAdmin', '==', true)
+        .limit(25)
+        .get();
+
+      const TOKEN_FIELDS_SINGLE = ['deviceToken', 'device_token', 'fcm_token', 'fcmToken', 'token', 'push_token', 'pushToken'];
+      const TOKEN_FIELDS_LIST = ['tokens', 'fcm_tokens', 'deviceTokens'];
+      const tokens = [];
+      const tokenSet = new Set();
+      const perAdminWrites = [];
+
+      for (const doc of adminSnap.docs) {
+        const data = doc.data() || {};
+        perAdminWrites.push(firestore.collection('notifications').add({
+          ...basePayload,
+          user_id: doc.id,
+        }));
+        for (const f of TOKEN_FIELDS_SINGLE) {
+          const t = String(data[f] || '').trim();
+          if (t && !tokenSet.has(t)) { tokenSet.add(t); tokens.push(t); }
+        }
+        for (const f of TOKEN_FIELDS_LIST) {
+          const list = data[f];
+          if (!Array.isArray(list)) continue;
+          for (const item of list) {
+            const t = String(item || '').trim();
+            if (t && !tokenSet.has(t)) { tokenSet.add(t); tokens.push(t); }
+          }
+        }
+      }
+      await Promise.all(perAdminWrites).catch(() => {});
+
+      // Fire actual FCM push so the OS tray notification lights up.
+      if (tokens.length > 0) {
+        const shortBody = String(description || '').slice(0, 240);
+        const stale = [];
+        try {
+          const resp = await admin.messaging().sendEachForMulticast({
+            tokens,
+            notification: { title, body: shortBody },
+            data: {
+              type: 'error_report',
+              error_type: String(errorType || ''),
+              error_id: String(errorId || ''),
+              severity: String(sev || ''),
+              booking_id: String(bookingId || ''),
+            },
+            android: {
+              priority: 'high',
+              notification: { channelId: 'high_importance_channel' },
+            },
+            apns: {
+              payload: { aps: { sound: 'default', badge: 1 } },
+            },
+          });
+          (resp.responses || []).forEach((r, idx) => {
+            if (r && !r.success && r.error) {
+              const code = String(r.error.code || '').toLowerCase();
+              if (code.includes('registration-token-not-registered') ||
+                  code.includes('invalid-registration-token')) {
+                stale.push(tokens[idx]);
+              }
+            }
+          });
+          console.log(`[errorReport] FCM push: ${resp.successCount}/${tokens.length} delivered for error=${errorId}`);
+        } catch (fcmErr) {
+          console.warn('[errorReport] FCM multicast failed:', fcmErr && fcmErr.message);
+        }
+        if (stale.length && typeof _cleanStaleFcmTokens === 'function') {
+          _cleanStaleFcmTokens(stale).catch(() => {});
+        }
+      } else {
+        console.warn('[errorReport] No admin FCM tokens found — push not sent (error_log still written).');
+      }
+    } catch (fanoutErr) {
+      console.warn('[errorReport] admin fanout failed:', fanoutErr && fanoutErr.message);
+    }
+
     return errorId;
   } catch (reportErr) {
     console.error('[errorReport] Failed to log error:', reportErr && reportErr.message);
@@ -9248,6 +9353,42 @@ async function runFraudChecks({ firestore, type, amount, targetUserId, requested
 
   return { alerts, blocked, requiresReview, score: alerts.length };
 }
+
+// ─── Device-sourced error reporter ──────────────────────────────────────────
+// POST /api/report-error  (authenticated)
+// Body: { error_type, description, source?, error_details?, booking_id?, severity? }
+// Client/admin Flutter apps POST here when their global crash handler fires.
+// This routes through logErrorToAdmin so admin devices get an FCM push too.
+app.post('/api/report-error', authMiddleware, async (req, res) => {
+  try {
+    const {
+      error_type,
+      description,
+      source,
+      error_details,
+      booking_id,
+      severity,
+    } = req.body || {};
+
+    if (!error_type || !description) {
+      return res.status(400).json({ error: 'missing error_type or description' });
+    }
+
+    const errorId = await logErrorToAdmin(
+      String(error_type).slice(0, 80),
+      String(description).slice(0, 500),
+      String(source || (req.user && req.user.email) || 'device').slice(0, 40),
+      String(error_details || '').slice(0, 4000),
+      String(booking_id || '').slice(0, 80),
+      ['critical', 'high', 'medium', 'low'].includes(severity) ? severity : 'medium'
+    );
+
+    return res.json({ ok: true, error_id: errorId });
+  } catch (err) {
+    console.error('[api/report-error]', err && err.message);
+    return res.status(500).json({ error: 'failed_to_report', detail: err && err.message });
+  }
+});
 
 // ─── Tier-2 admin one-tap remediation actions ───────────────────────────────
 // POST /api/admin/ops/fix

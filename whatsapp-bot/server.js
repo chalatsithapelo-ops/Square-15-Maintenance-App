@@ -451,8 +451,11 @@ async function logErrorToAdmin(errorType, description, source, errorDetails, boo
       transcription_error: 'Voice Transcription Failed',
       rfq_quote_error: 'RFQ Quote Generation Failed',
       network_error: 'Network/API Error',
+      whatsapp_bot_error: 'WhatsApp Bot Error',
+      whatsapp_vision_error: 'WhatsApp Photo Analysis Failed',
     };
     const label = labels[errorType] || `System Error: ${errorType}`;
+    const title = `${icons[sev] || '🔵'} ${label}`;
 
     await firestore.collection('error_logs').doc(errorId).set({
       id: errorId,
@@ -467,18 +470,90 @@ async function logErrorToAdmin(errorType, description, source, errorDetails, boo
       created_at: admin.firestore.FieldValue.serverTimestamp(),
     });
 
-    await firestore.collection('notifications').add({
-      title: `${icons[sev] || '🔵'} ${label}`,
+    const basePayload = {
+      title,
+      message: description, // admin popup service reads 'message'
       body: description,
       type: 'error_report',
+      error_type: errorType,
       error_id: errorId,
       booking_id: bookingId || '',
+      severity: sev,
       target: 'admin',
       user_type: 'admin',
       read: false,
       timestamp: admin.firestore.FieldValue.serverTimestamp(),
       created_at: admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    // Generic admin notification
+    await firestore.collection('notifications').add({
+      ...basePayload,
+      user_id: 'admin',
     });
+
+    // Per-admin docs + FCM push so OS tray lights up when app is closed
+    try {
+      const adminSnap = await firestore.collection('users')
+        .where('isAdmin', '==', true)
+        .limit(25)
+        .get();
+
+      const TOKEN_FIELDS_SINGLE = ['deviceToken', 'device_token', 'fcm_token', 'fcmToken', 'token', 'push_token', 'pushToken'];
+      const TOKEN_FIELDS_LIST = ['tokens', 'fcm_tokens', 'deviceTokens'];
+      const tokens = [];
+      const tokenSet = new Set();
+      const perAdminWrites = [];
+
+      for (const doc of adminSnap.docs) {
+        const data = doc.data() || {};
+        perAdminWrites.push(firestore.collection('notifications').add({
+          ...basePayload,
+          user_id: doc.id,
+        }));
+        for (const f of TOKEN_FIELDS_SINGLE) {
+          const t = String(data[f] || '').trim();
+          if (t && !tokenSet.has(t)) { tokenSet.add(t); tokens.push(t); }
+        }
+        for (const f of TOKEN_FIELDS_LIST) {
+          const list = data[f];
+          if (!Array.isArray(list)) continue;
+          for (const item of list) {
+            const t = String(item || '').trim();
+            if (t && !tokenSet.has(t)) { tokenSet.add(t); tokens.push(t); }
+          }
+        }
+      }
+      await Promise.all(perAdminWrites).catch(() => {});
+
+      if (tokens.length > 0) {
+        try {
+          const resp = await admin.messaging().sendEachForMulticast({
+            tokens,
+            notification: { title, body: String(description || '').slice(0, 240) },
+            data: {
+              type: 'error_report',
+              error_type: String(errorType || ''),
+              error_id: String(errorId || ''),
+              severity: String(sev || ''),
+              booking_id: String(bookingId || ''),
+            },
+            android: {
+              priority: 'high',
+              notification: { channelId: 'high_importance_channel' },
+            },
+            apns: { payload: { aps: { sound: 'default', badge: 1 } } },
+          });
+          console.log(`[errorReport] FCM push: ${resp.successCount}/${tokens.length} delivered for error=${errorId}`);
+        } catch (fcmErr) {
+          console.warn('[errorReport] FCM multicast failed:', fcmErr && fcmErr.message);
+        }
+      } else {
+        console.warn('[errorReport] No admin FCM tokens found — push not sent.');
+      }
+    } catch (fanoutErr) {
+      console.warn('[errorReport] admin fanout failed:', fanoutErr && fanoutErr.message);
+    }
 
     return errorId;
   } catch (err) {
