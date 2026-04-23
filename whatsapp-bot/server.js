@@ -604,7 +604,20 @@ async function pushAdminNotification({ title, body, type, bookingId = '', extraD
       }
     }
     await Promise.all(perAdminWrites).catch(() => {});
-    if (!tokens.length) { console.warn(`[adminPush:${type}] no admin tokens found`); return; }
+    if (!tokens.length) {
+      console.warn(`[adminPush:${type}] no admin tokens found (admins=${adminSnap.size})`);
+      try {
+        await firestore.collection('errorLogs').add({
+          type: 'fcm_no_admin_tokens',
+          severity: 'high',
+          source: 'whatsapp_bot',
+          message: `No FCM tokens found on any admin user — push for "${notifPayload.title}" was not delivered. Admins must sign in to the admin app at least once so their device token is saved.`,
+          context: `admins_found=${adminSnap.size}; type=${type}; booking_id=${notifPayload.body}`,
+          created_at: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      } catch (_) {}
+      return;
+    }
     try {
       const data = { type: notifPayload.type, booking_id: notifPayload.booking_id };
       for (const [k, v] of Object.entries(extraData || {})) data[k] = String(v == null ? '' : v).slice(0, 500);
@@ -1675,6 +1688,7 @@ Do NOT include specialty items or proprietary accessories that Builders does not
 Use realistic South African pricing (ZAR). Include ALL materials needed. Return ONLY the JSON object.`;
 
   try {
+    console.log(`[ai-quote] step=openai_request category=${category} matResp=${materialsResponsibility}`);
     const completion = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       temperature: 0.3,
@@ -1685,9 +1699,11 @@ Use realistic South African pricing (ZAR). Include ALL materials needed. Return 
         { role: 'user', content: quotePrompt },
       ],
     });
+    console.log(`[ai-quote] step=openai_done`);
 
     const raw = completion.choices[0]?.message?.content || '{}';
     const draft = JSON.parse(raw);
+    console.log(`[ai-quote] step=parsed bom_count=${(draft.materialsBOM || []).length} laborHours=${draft.laborHours}`);
 
     const laborHours = parseFloat(draft.laborHours) || 4;
     const laborCostPerHour = parseFloat(draft.laborCostPerHour) || laborRate;
@@ -2958,6 +2974,30 @@ async function executeWaTool(name, args, session) {
       if (!firestore) return { error: 'Database unavailable' };
 
      try {
+      // ── SERVER-SIDE GATE: force show_material_options when artisan supplies materials ──
+      // If the LLM tries to skip the material picker, refuse and tell it exactly what
+      // to call next. This guarantees the client sees options BEFORE the RFQ is filed.
+      const materialsResp = String(args.materialsResponsibility || 'artisan').toLowerCase();
+      const hasShownOptions = !!(session.pendingMaterialChoice && Array.isArray(session.pendingMaterialChoice.options) && session.pendingMaterialChoice.options.length);
+      const hasChoice = !!String(args.materialChoice || '').trim();
+      const cat = String(args.category || '').toLowerCase();
+      const NEEDS_PARTS = ['plumb', 'electric', 'tile', 'tiling', 'carpent', 'lock', 'paint', 'roof', 'appliance'];
+      const needsParts = NEEDS_PARTS.some(k => cat.includes(k));
+      if (materialsResp === 'artisan' && needsParts && !hasShownOptions && !hasChoice) {
+        // Try to infer the itemType from the description so the LLM has a hint.
+        const desc = String(args.description || '').toLowerCase();
+        const ITEM_HINTS = ['shower mixer', 'mixer', 'toilet cistern', 'cistern', 'tap', 'door lock', 'lock', 'ceiling light', 'light', 'geyser', 'tile', 'paint', 'basin', 'sink'];
+        const guess = ITEM_HINTS.find(h => desc.includes(h)) || (cat.includes('plumb') ? 'tap' : cat.includes('electric') ? 'ceiling light' : cat.includes('lock') ? 'door lock' : 'fixture');
+        console.log(`[submit_rfq] BLOCKED: artisan materials but no options shown. Forcing show_material_options (guess: ${guess})`);
+        return {
+          success: false,
+          error: 'Material options must be shown to the client BEFORE submitting this RFQ.',
+          required_next_action: 'call_show_material_options',
+          suggested_itemType: guess,
+          instruction: `STOP. The artisan will supply materials but you have not shown the client any options yet. Call show_material_options now with itemType="${guess}" (or a better guess based on the description). Wait for the client to pick an option, then call submit_rfq again with materialChoice set to their pick. Do NOT call submit_rfq again until the client has picked an option.`,
+        };
+      }
+
       // ── IDEMPOTENCY GUARD ──
       // If this session already created an RFQ in the last 10 minutes, treat a
       // repeat call as an UPDATE (e.g. client just supplied budget or material choice
@@ -3162,11 +3202,53 @@ async function executeWaTool(name, args, session) {
       }
 
       // Fallback if quote generation fails — DO NOT leave the RFQ at R0.
-      // Set a conservative labour-only placeholder and flag it for admin.
+      // Build a minimal labour-only quote so admin sees breakdown + flag for manual review.
       const fallbackBudget = Number(args.clientBudget) > 0 ? Number(args.clientBudget) : 0;
-      const fallbackTotal = fallbackBudget > 0 ? fallbackBudget : 1500; // safe min labour estimate
+      let fallbackLaborRate = 250;
+      let fallbackContingency = 0.15;
+      try {
+        const catSlug = String(args.category || '').toLowerCase().replace(/\s+/g, '_');
+        const gd = await firestore.collection('pricingGuidance').doc(catSlug).get();
+        if (gd.exists) {
+          const d = gd.data() || {};
+          const lr = parseFloat(d.labor_cost_per_hour || d.laborCostPerHour);
+          if (lr > 0) fallbackLaborRate = lr;
+          const cp = parseFloat(d.contingency_percentage);
+          if (!isNaN(cp) && cp > 0) fallbackContingency = cp / 100;
+        }
+      } catch (_) {}
+      const fallbackHours = 4;
+      const fallbackLabor = Math.round(fallbackHours * fallbackLaborRate * 100) / 100;
+      const fallbackContTotal = Math.round(fallbackLabor * fallbackContingency * 100) / 100;
+      const fallbackTotal = fallbackBudget > 0 ? fallbackBudget : Math.round((fallbackLabor + fallbackContTotal) * 100) / 100;
+      const fallbackQuote = {
+        laborHours: fallbackHours,
+        laborCostPerHour: fallbackLaborRate,
+        laborCost: fallbackLabor,
+        complexity: 3,
+        materialsBOM: [],
+        materials_subtotal: 0,
+        materials_with_markup: 0,
+        materials_responsibility: String(args.materialsResponsibility || 'artisan'),
+        equipmentCost: 0,
+        subtotal: fallbackLabor,
+        contingency: fallbackContTotal,
+        grand_total: fallbackTotal,
+        scope_of_work: args.description || '',
+        estimated_duration: 'To be confirmed by admin',
+        learning_factor: 1,
+        pricing_sources: { builders: 0, catalog: 0, ai_estimate: 0 },
+        breakdown: [
+          { description: `Labour estimate (${fallbackHours}hrs @ R${fallbackLaborRate}/hr) — ADMIN PLEASE REVISE`, cost: fallbackLabor.toFixed(2) },
+          { description: `Contingency (${(fallbackContingency * 100).toFixed(0)}%)`, cost: fallbackContTotal.toFixed(2) },
+        ],
+        disclaimer: 'AI quote generation failed — this is a labour-only placeholder. Admin must price materials and finalise.',
+        generated_at: new Date().toISOString(),
+        source: 'whatsapp_fallback',
+      };
       try {
         await firestore.collection('futureBookings').doc(rfqId).update({
+          ai_quote: fallbackQuote,
           cost: fallbackTotal.toString(),
           total_price: fallbackTotal.toString(),
           quoted_price: fallbackTotal.toString(),
@@ -3175,7 +3257,7 @@ async function executeWaTool(name, args, session) {
           rfq_status: 'pending_admin_review',
           rfq_awaiting_admin_review_reason: 'quote_generation_failed',
         });
-      } catch (_) {}
+      } catch (e) { console.error('[submit_rfq] fallback update failed:', e.message); }
       try {
         await pushAdminNotification({
           title: 'RFQ Needs Manual Quote',
@@ -5142,7 +5224,7 @@ app.post('/webhook', async (req, res) => {
 });
 
 // Health check
-app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'rfq-live-builders-v8', commit: process.env.RENDER_GIT_COMMIT || 'unknown', deployedAt: process.env.RENDER_DEPLOY_TIME || new Date().toISOString() }));
+app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'rfq-gate-v9', commit: process.env.RENDER_GIT_COMMIT || 'unknown', deployedAt: process.env.RENDER_DEPLOY_TIME || new Date().toISOString() }));
 
 // ─── Diagnostic: test Firebase read/write (auth-protected) ───
 app.get('/debug/firebase-test', requireInternalSecret, async (req, res) => {
