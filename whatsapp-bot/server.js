@@ -992,6 +992,22 @@ const waTools = [
   {
     type: 'function',
     function: {
+      name: 'browse_builders_materials',
+      description: 'LIVE search of Builders Warehouse catalogue when the client is not happy with the initial options, wants more variety, a specific brand, or a different price range. Pulls top 3 matching products (real photos, real current prices, real product URLs) and sends them as images to the client on WhatsApp. Use this whenever the client says things like "show me more", "different brand", "something cheaper", "any others?", "I don\'t like these" — instead of re-calling show_material_options with its limited built-in catalog.',
+      parameters: {
+        type: 'object',
+        properties: {
+          keyword: { type: 'string', description: 'Search keyword for Builders Warehouse — include brand/style/size if the client mentioned any. Examples: "cobra shower mixer", "thermostatic shower mixer chrome", "budget basin mixer", "400x400 porcelain floor tile".' },
+          itemType: { type: 'string', description: 'Generic item category to remember against the RFQ (e.g. "shower mixer", "tap", "tile", "ceiling light")' },
+          limit:    { type: 'number', description: 'How many options to return (default 3, max 5).' },
+        },
+        required: ['keyword', 'itemType'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'cancel_booking',
       description: 'Cancel a booking and initiate refund if payment was made',
       parameters: {
@@ -1353,6 +1369,86 @@ function extractPriceFromBffItem(item) {
     p = parseZarPrice(item?.[k]); if (p > 0) return p;
   }
   return null;
+}
+
+// Extract a product image URL from a Builders BFF item (field names vary).
+function extractImageFromBffItem(item) {
+  if (!item || typeof item !== 'object') return '';
+  const tryField = (v) => {
+    if (!v) return '';
+    if (typeof v === 'string') return v;
+    if (Array.isArray(v) && v.length) {
+      const f = v[0];
+      if (typeof f === 'string') return f;
+      if (f && typeof f === 'object') return _str(f.url || f.src || f.imageUrl || f.image || f.href || '');
+    }
+    if (typeof v === 'object') return _str(v.url || v.src || v.imageUrl || v.image || v.href || v.large || v.medium || v.default || '');
+    return '';
+  };
+  const fields = ['image', 'images', 'imageUrl', 'imageURL', 'thumbnail', 'thumbnails', 'picture', 'pictures', 'primaryImage', 'mainImage', 'media'];
+  for (const k of fields) {
+    const u = tryField(item[k]);
+    if (u && /^https?:\/\//i.test(u)) return u;
+  }
+  // Builders sometimes stores a code we can map to images.builders.co.za
+  const code = _str(item.code || item.id || item.productCode);
+  if (code && /^\d{4,8}$/.test(code)) return `https://images.builders.co.za/product/360/360/${code}.jpg`;
+  return '';
+}
+
+// Live search against Builders BFF returning top N options with real image URLs.
+// Used by browse_builders_materials tool and as a live source for show_material_options.
+async function buildersSearchOptions(keyword, limit = 3) {
+  try {
+    const q = normalizeBuildersQuery(keyword);
+    if (!q) return [];
+    const cfg = await getBuildersBffConfig();
+    if (!cfg) return [];
+    const uri = `https://www.builders.co.za/wmapi/bff/graphql/${cfg.searchKey}/${cfg.searchHash}`;
+    const r = await buildersFetch(uri, {
+      method: 'POST',
+      headers: buildersBffHeaders({ operationName: cfg.searchKey, operationHash: cfg.searchHash }),
+      body: JSON.stringify({ variables: { keyword: q, offset: 0, pageSize: 24, dynamicPriceRange: true, site: cfg.site } }),
+      timeoutMs: 12000,
+    });
+    if (!r.ok) return [];
+    const decoded = await r.json().catch(() => null);
+    const items = decoded?.data?.search?.data?.results?.items;
+    if (!Array.isArray(items)) return [];
+    const qt = new Set(buildersTokens(q));
+    const scored = [];
+    for (const it of items) {
+      if (!it) continue;
+      const title = _str(it.name || it.title || it.productName); if (!title) continue;
+      let urlPath = _str(it.url || it.productUrl || it.seoUrl || it.link);
+      if (!urlPath) { const code = _str(it.code || it.id || it.productCode); if (code) urlPath = `/p/${code}`; }
+      if (!urlPath) continue;
+      const url = urlPath.startsWith('http') ? urlPath : `https://www.builders.co.za${urlPath.startsWith('/') ? '' : '/'}${urlPath}`;
+      const price = extractPriceFromBffItem(it) || 0;
+      const image_url = extractImageFromBffItem(it);
+      const tt = new Set(buildersTokens(title));
+      let score = 0;
+      for (const t of qt) if (tt.has(t)) score++;
+      if (price > 0) score += 2;
+      if (image_url) score += 1;
+      scored.push({ score, option: { label: title.slice(0, 60), price, image_url, product_url: url } });
+    }
+    if (!scored.length) return [];
+    scored.sort((a, b) => b.score - a.score);
+    // Spread across low/mid/high price if we have enough distinct prices
+    const withPrice = scored.filter(s => s.option.price > 0);
+    if (withPrice.length >= limit) {
+      const sorted = [...withPrice].sort((a, b) => a.option.price - b.option.price);
+      const picks = [];
+      const idxs = [0, Math.floor(sorted.length / 2), sorted.length - 1];
+      for (const i of idxs.slice(0, limit)) if (sorted[i] && !picks.includes(sorted[i])) picks.push(sorted[i]);
+      return picks.map(p => p.option);
+    }
+    return scored.slice(0, limit).map(s => s.option);
+  } catch (e) {
+    console.error('[builders-search] error:', e.message);
+    return [];
+  }
 }
 
 async function getBuildersBffConfig() {
@@ -3179,6 +3275,14 @@ async function executeWaTool(name, args, session) {
           if (bucket) options = FALLBACK[bucket];
         }
 
+        // 3) If still empty, try a LIVE Builders search as last resort
+        if (!options.length) {
+          const live = await buildersSearchOptions(itemType, 3);
+          options = live.filter(o => o && o.image_url && o.price > 0).map(o => ({
+            label: o.label, price: o.price, image_url: o.image_url, note: 'Builders Warehouse live',
+          }));
+        }
+
         if (!options.length) {
           return {
             success: false,
@@ -3214,6 +3318,69 @@ async function executeWaTool(name, args, session) {
         };
       } catch (e) {
         console.error('[show_material_options] error:', e.message);
+        return { success: false, error: e.message };
+      }
+    }
+
+    // ═══════════════════════════════════════════
+    // 10c) BROWSE BUILDERS MATERIALS (LIVE catalogue search)
+    // ═══════════════════════════════════════════
+    case 'browse_builders_materials': {
+      try {
+        const keyword = String(args.keyword || '').trim();
+        const itemType = String(args.itemType || keyword).toLowerCase().trim();
+        const limit = Math.min(5, Math.max(1, Number(args.limit) || 3));
+        if (!keyword) return { success: false, error: 'keyword required' };
+
+        const raw = await buildersSearchOptions(keyword, limit);
+        const live = raw.filter(o => o && o.image_url && o.price > 0);
+        if (!live.length) {
+          return {
+            success: false,
+            note: `I couldn't find live options for "${keyword}" on Builders right now. Tell the client "I couldn't pull live options just now — our admin will pick suitable materials when they review the quote." Then proceed to submit_rfq with what we have.`,
+          };
+        }
+
+        // Send each option as image + caption to the client
+        const to = session.phone;
+        try {
+          await sendWhatsAppMessage(to, `Here are ${live.length} live options from Builders Warehouse for "${keyword}". Reply with the option number (1/2/3) or say "none of these" if you'd like different ones:`);
+        } catch (_) {}
+        let idx = 0;
+        for (const opt of live) {
+          idx++;
+          const caption = `*Option ${idx}: ${opt.label}*\nR${Number(opt.price).toFixed(0)} — Builders Warehouse\n${opt.product_url}`;
+          try { await sendWhatsAppImage(to, opt.image_url, caption); }
+          catch (_) { try { await sendWhatsAppMessage(to, caption); } catch (__) {} }
+        }
+
+        session.pendingMaterialChoice = {
+          itemType,
+          category: String(args.category || '').toLowerCase(),
+          options: live.map((o, i) => ({
+            label: `Option ${i + 1}: ${o.label}`,
+            price: Number(o.price),
+            image_url: o.image_url,
+            note: 'Builders Warehouse live',
+            product_url: o.product_url,
+          })),
+          source: 'builders_live',
+        };
+
+        return {
+          success: true,
+          presented: live.length,
+          source: 'builders_live',
+          options: live.map((o, i) => ({
+            number: i + 1,
+            label: o.label,
+            price: `R${Number(o.price).toFixed(0)}`,
+            product_url: o.product_url,
+          })),
+          note: 'Live Builders options were sent to the client with real photos and prices. WAIT for their reply (option number or "none of these"). If they say "none of these", call browse_builders_materials again with a refined keyword. Pass the chosen label in submit_rfq.materialChoice.',
+        };
+      } catch (e) {
+        console.error('[browse_builders_materials] error:', e.message);
         return { success: false, error: e.message };
       }
     }
@@ -4449,6 +4616,8 @@ PHOTO REQUIREMENT (CRITICAL):
   1. SCOPE CONFIRMATION — understand the issue. If photos were sent, analyse them and state your understanding in one short sentence (e.g. "Got it — the shower mixer is leaking at the wall connection, correct?"). Wait for the customer to confirm or correct you.
   2. MATERIALS-RESPONSIBILITY — ask exactly: "Will you be buying the materials yourself, or should our artisan source them for you?" Wait for the answer.
   3. MATERIAL CHOICE (MANDATORY whenever materialsResponsibility="artisan" AND the category is plumbing / electrical / tiling / carpentry / locksmith / painting / roofing / appliance repair — basically anything that involves fitting a visible part): you MUST call show_material_options with the best-guess itemType (e.g. "shower mixer", "toilet cistern", "tap", "door lock", "ceiling light", "geyser", "tile", "paint") BEFORE calling submit_rfq. Do NOT skip this step by reasoning "the scope is too vague" — if in doubt, pick the most likely itemType and show options. The client will see pictures and prices and reply with the option label. Wait for their reply, then pass it as materialChoice to submit_rfq. If the client says "any" / "you choose" / "whichever is best", pick the mid-range option yourself and tell them which one you picked.
+     ➤ IF THE CLIENT IS NOT HAPPY WITH THE OPTIONS, wants more variety, a specific brand, something cheaper/premium, or asks "show me more" / "any others?" / "different brand" — IMMEDIATELY call browse_builders_materials with a keyword (e.g. "cobra shower mixer", "thermostatic shower mixer", "budget basin mixer"). It pulls LIVE products from Builders Warehouse with REAL photos and REAL prices. Repeat with refined keywords until the client picks one or agrees to admin selection.
+     ➤ CRITICAL IMAGE RULE: NEVER write markdown image links, NEVER invent URLs, NEVER use example.com or any placeholder domain. The tools already send real WhatsApp images to the client — after calling show_material_options or browse_builders_materials, simply say "I've sent you the options — take a look above and let me know which one you like" in plain text. If the client says "send me a picture" AFTER you already called the tool, the images were already delivered — acknowledge and ask which option they prefer; DO NOT type out any URLs.
   4. BUDGET — ask exactly: "What's your budget for this job? A rough number is fine — it helps us keep the quote realistic." Wait for the answer. If the client says "no budget" or "whatever it costs", pass clientBudget=0. Otherwise pass the number (strip the "R").
   5. Only AFTER scope + materials answer + (if applicable) material choice + BUDGET ANSWER, call submit_rfq EXACTLY ONCE with: category, description (include any material choice inside the description), address, customerName, materialsResponsibility, clientBudget, and materialChoice if applicable. NEVER call submit_rfq twice for the same request — if you already called it, do NOT call it again; just relay the response message to the client.
 - submit_rfq will auto-generate a detailed quote using real-time Builders Warehouse material prices + the company pricing guide (labour rate, material multiplier, contingency %). You do NOT compute the price yourself.
@@ -4973,7 +5142,7 @@ app.post('/webhook', async (req, res) => {
 });
 
 // Health check
-app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'rfq-debug-v7', commit: process.env.RENDER_GIT_COMMIT || 'unknown', deployedAt: process.env.RENDER_DEPLOY_TIME || new Date().toISOString() }));
+app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'rfq-live-builders-v8', commit: process.env.RENDER_GIT_COMMIT || 'unknown', deployedAt: process.env.RENDER_DEPLOY_TIME || new Date().toISOString() }));
 
 // ─── Diagnostic: test Firebase read/write (auth-protected) ───
 app.get('/debug/firebase-test', requireInternalSecret, async (req, res) => {
