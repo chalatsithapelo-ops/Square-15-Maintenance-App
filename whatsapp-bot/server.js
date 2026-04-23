@@ -1374,6 +1374,27 @@ function extractRetailPriceFromHtml(html) {
   return null;
 }
 
+// Extract the OpenGraph / Twitter product image URL from a Builders product page HTML.
+function extractOgImageFromHtml(html) {
+  if (!html) return '';
+  const tryMatch = (re) => { const m = html.match(re); return m && m[1] ? m[1].trim() : ''; };
+  let u = tryMatch(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i)
+       || tryMatch(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']/i)
+       || tryMatch(/<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']/i)
+       || tryMatch(/<meta[^>]+content=["']([^"']+)["'][^>]+name=["']twitter:image["']/i);
+  if (!u) {
+    // JSON-LD image field
+    const ld = html.match(/"image"\s*:\s*"([^"]+\.(?:jpg|jpeg|png|webp))"/i);
+    if (ld && ld[1]) u = ld[1];
+  }
+  if (!u) return '';
+  u = u.trim();
+  if (u.startsWith('//')) u = 'https:' + u;
+  if (u.startsWith('/')) u = 'https://www.builders.co.za' + u;
+  if (!/^https?:\/\//i.test(u)) return '';
+  return u;
+}
+
 function buildersBffHeaders({ operationName, operationHash } = {}) {
   return {
     ...buildersHeaders({ referer: 'https://www.builders.co.za/' }),
@@ -1478,14 +1499,43 @@ async function buildersSearchOptions(keyword, limit = 3) {
     scored.sort((a, b) => b.score - a.score);
     // Spread across low/mid/high price if we have enough distinct prices
     const withPrice = scored.filter(s => s.option.price > 0);
+    let picks;
     if (withPrice.length >= limit) {
       const sorted = [...withPrice].sort((a, b) => a.option.price - b.option.price);
-      const picks = [];
+      picks = [];
       const idxs = [0, Math.floor(sorted.length / 2), sorted.length - 1];
       for (const i of idxs.slice(0, limit)) if (sorted[i] && !picks.includes(sorted[i])) picks.push(sorted[i]);
-      return picks.map(p => p.option);
+    } else {
+      picks = scored.slice(0, limit);
     }
-    return scored.slice(0, limit).map(s => s.option);
+    const baseOptions = picks.map(p => p.option);
+    // HYDRATE: fetch each product page to grab og:image (real product photo) and
+    // (if missing) a price. This is what makes WhatsApp display actual images.
+    const hydrated = await Promise.all(baseOptions.map(async (opt) => {
+      try {
+        const referer = `https://www.builders.co.za/search?text=${encodeURIComponent(q)}`;
+        const res = await buildersFetch(opt.product_url, { headers: buildersHeaders({ referer }), timeoutMs: 15000 });
+        if (!res.ok) return opt;
+        const html = await res.text();
+        if (!html) return opt;
+        const og = extractOgImageFromHtml(html);
+        if (og) opt.image_url = og;
+        if (!(opt.price > 0)) {
+          const p = extractRetailPriceFromHtml(html);
+          if (p > 0) opt.price = p;
+        }
+        // Canonical URL from <link rel="canonical">
+        const canon = html.match(/<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["']/i);
+        if (canon && canon[1]) {
+          let c = canon[1].trim();
+          if (c.startsWith('//')) c = 'https:' + c;
+          if (c.startsWith('/')) c = 'https://www.builders.co.za' + c;
+          if (/^https?:\/\//i.test(c)) opt.product_url = c;
+        }
+      } catch (e) { /* keep baseline option */ }
+      return opt;
+    }));
+    return hydrated;
   } catch (e) {
     console.error('[builders-search] error:', e.message);
     return [];
@@ -1798,12 +1848,24 @@ Use realistic South African pricing (ZAR). Include ALL materials needed. Return 
     const aiCount = materialsBOM.filter(b => b.matched_by === 'ai_estimate').length;
 
     const r2 = (v) => Math.round(v * 100) / 100;
+    // Admin's Amend Quote dialog reads materialsPriced_reference / materialsUnpriced_reference.
+    // Provide them as simple {name, unit, qty, unit_price} rows for direct editing.
+    const materialsPriced_reference = materialsBOM
+      .filter(b => Number(b.unit_price) > 0)
+      .map(b => ({ name: b.name, unit: b.unit || 'each', qty: b.qty, unit_price: r2(b.unit_price), product_url: b.builders_url || '' }));
+    const materialsUnpriced_reference = materialsBOM
+      .filter(b => !(Number(b.unit_price) > 0))
+      .map(b => ({ name: b.name, unit: b.unit || 'each', qty: b.qty, unit_price: 0 }));
     return {
       laborHours,
       laborCostPerHour,
+      labor_hours: laborHours,
+      labor_cost_per_hour: laborCostPerHour,
       laborCost: r2(laborCost),
       complexity: draft.complexity || 3,
       materialsBOM,
+      materialsPriced_reference,
+      materialsUnpriced_reference,
       materialsMultiplier,
       materials_subtotal: r2(materialsSubtotal),
       materials_with_markup: r2(materialsWithMarkup),
@@ -3325,9 +3387,27 @@ async function executeWaTool(name, args, session) {
         const cat = String(args.category || '').toLowerCase().trim();
         if (!itemType) return { success: false, error: 'itemType required' };
 
-        // 1) Try admin-curated Firestore catalog first
         let options = [];
-        if (firestore) {
+
+        // 1) PRIMARY: live Builders search with hydrated real product images + URLs.
+        // This gives the client real Builders products (name, photo, price, direct link)
+        // exactly like the admin app's "Select a Builders item" picker.
+        try {
+          const live = await buildersSearchOptions(itemType, 3);
+          const liveGood = live.filter(o => o && o.image_url && o.product_url && o.price > 0);
+          if (liveGood.length) {
+            options = liveGood.map(o => ({
+              label: o.label,
+              price: o.price,
+              image_url: o.image_url,
+              note: 'Builders Warehouse',
+              product_url: o.product_url,
+            }));
+          }
+        } catch (e) { console.warn('[show_material_options] live search failed:', e.message); }
+
+        // 2) Admin-curated Firestore catalog (used when live search returned nothing)
+        if (!options.length && firestore) {
           try {
             const snap = await firestore.collection('materials_catalog')
               .where('active', '==', true)
@@ -3347,6 +3427,7 @@ async function executeWaTool(name, args, session) {
                   price: Number(opt.price || 0),
                   image_url: String(opt.image_url || '').trim(),
                   note: String(opt.note || '').trim(),
+                  product_url: String(opt.product_url || '').trim(),
                 });
               }
               if (options.length >= 3) break;
@@ -3354,7 +3435,7 @@ async function executeWaTool(name, args, session) {
           } catch (e) { console.warn('[show_material_options] catalog read failed:', e.message); }
         }
 
-        // 2) Fallback default catalog so the feature works even with empty Firestore
+        // 3) Last-resort built-in fallback (text-only; happens if both live & catalog failed)
         if (!options.length) {
           const FALLBACK = {
             'shower mixer': [
@@ -5293,7 +5374,7 @@ app.post('/webhook', async (req, res) => {
 });
 
 // Health check
-app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'rfq-image-fix-v10', commit: process.env.RENDER_GIT_COMMIT || 'unknown', deployedAt: process.env.RENDER_DEPLOY_TIME || new Date().toISOString() }));
+app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'rfq-live-first-v11', commit: process.env.RENDER_GIT_COMMIT || 'unknown', deployedAt: process.env.RENDER_DEPLOY_TIME || new Date().toISOString() }));
 
 // ─── Diagnostic: test Firebase read/write (auth-protected) ───
 app.get('/debug/firebase-test', requireInternalSecret, async (req, res) => {
