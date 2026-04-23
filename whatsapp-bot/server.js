@@ -3394,15 +3394,27 @@ async function executeWaTool(name, args, session) {
         // exactly like the admin app's "Select a Builders item" picker.
         try {
           const live = await buildersSearchOptions(itemType, 3);
-          const liveGood = live.filter(o => o && o.image_url && o.product_url && o.price > 0);
+          // Accept ANY live option that has a real product URL (not a search
+          // page). Image or price can be filled in later by the client tapping
+          // through. This avoids the dreaded fallback of /search?text=... URLs
+          // when product-page hydration times out or Builders blocks us.
+          const isRealProductUrl = (u) => {
+            if (!u || typeof u !== 'string') return false;
+            if (/\/search\?/i.test(u)) return false;
+            if (!/^https?:\/\/(?:www\.)?builders\.co\.za\//i.test(u)) return false;
+            return true;
+          };
+          const liveGood = live.filter(o => o && isRealProductUrl(o.product_url));
           if (liveGood.length) {
             options = liveGood.map(o => ({
               label: o.label,
-              price: o.price,
-              image_url: o.image_url,
-              note: 'Builders Warehouse',
+              price: Number(o.price) > 0 ? Number(o.price) : 0,
+              image_url: o.image_url || '',
+              note: Number(o.price) > 0 ? 'Builders Warehouse' : 'Builders Warehouse (price TBC)',
               product_url: o.product_url,
             }));
+          } else if (live.length) {
+            console.warn('[show_material_options] live returned items but none had real product URLs:', live.map(o => o && o.product_url).join(' | '));
           }
         } catch (e) { console.warn('[show_material_options] live search failed:', e.message); }
 
@@ -3435,43 +3447,16 @@ async function executeWaTool(name, args, session) {
           } catch (e) { console.warn('[show_material_options] catalog read failed:', e.message); }
         }
 
-        // 3) Last-resort built-in fallback (text-only; happens if both live & catalog failed)
+        // 3) Last-resort built-in fallback: if live AND catalog both returned
+        // nothing, DO NOT send the client search-result URLs (that produced the
+        // April 2026 bug where clients got /search?text=... links instead of
+        // products). Instead return a friendly "admin will curate" note and
+        // let the AI push on with submit_rfq.
         if (!options.length) {
-          const FALLBACK = {
-            'shower mixer': [
-              { label: 'Standard shower mixer (chrome)', price: 450, image_url: '', note: 'Entry-level, reliable', product_url: 'https://www.builders.co.za/search?text=shower+mixer+chrome' },
-              { label: 'Mid-range shower mixer (dual-control)', price: 950, image_url: '', note: 'Most popular, better flow', product_url: 'https://www.builders.co.za/search?text=shower+mixer+dual+control' },
-              { label: 'Premium thermostatic mixer', price: 1850, image_url: '', note: 'Temperature-safe, long warranty', product_url: 'https://www.builders.co.za/search?text=thermostatic+shower+mixer' },
-            ],
-            'toilet cistern': [
-              { label: 'Standard dual-flush cistern', price: 650, image_url: '', note: 'Water-saving', product_url: 'https://www.builders.co.za/search?text=dual+flush+cistern' },
-              { label: 'Mid-range slim cistern', price: 1200, image_url: '', note: 'Compact, quiet fill', product_url: 'https://www.builders.co.za/search?text=slim+cistern' },
-            ],
-            'tap': [
-              { label: 'Pillar tap (basin/sink)', price: 280, image_url: '', product_url: 'https://www.builders.co.za/search?text=pillar+tap' },
-              { label: 'Mixer tap with swivel spout', price: 720, image_url: '', product_url: 'https://www.builders.co.za/search?text=mixer+tap+swivel' },
-              { label: 'Premium lever mixer', price: 1400, image_url: '', product_url: 'https://www.builders.co.za/search?text=lever+mixer+tap' },
-            ],
-            'ceiling light': [
-              { label: 'Standard LED flush mount', price: 220, image_url: '', product_url: 'https://www.builders.co.za/search?text=led+flush+mount+ceiling' },
-              { label: 'Modern LED panel (cool white)', price: 480, image_url: '', product_url: 'https://www.builders.co.za/search?text=led+panel+light' },
-            ],
-            'door lock': [
-              { label: 'Standard cylinder lock', price: 320, image_url: '', product_url: 'https://www.builders.co.za/search?text=cylinder+lock' },
-              { label: 'Security deadbolt', price: 780, image_url: '', product_url: 'https://www.builders.co.za/search?text=deadbolt+lock' },
-            ],
+          return {
+            success: false,
+            note: `I couldn't pull live Builders options for "${itemType}" right now. Tell the client "Our admin will pick suitable ${itemType} options when they review the quote." Then call submit_rfq and move on \u2014 do NOT hallucinate product URLs.`,
           };
-          // fuzzy pick a fallback bucket
-          const bucket = Object.keys(FALLBACK).find(k => itemType.includes(k) || k.includes(itemType));
-          if (bucket) options = FALLBACK[bucket];
-        }
-
-        // 3) If still empty, try a LIVE Builders search as last resort
-        if (!options.length) {
-          const live = await buildersSearchOptions(itemType, 3);
-          options = live.filter(o => o && o.image_url && o.price > 0).map(o => ({
-            label: o.label, price: o.price, image_url: o.image_url, note: 'Builders Warehouse live',
-          }));
         }
 
         if (!options.length) {
@@ -5374,7 +5359,7 @@ app.post('/webhook', async (req, res) => {
 });
 
 // Health check
-app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'rfq-live-first-v11', commit: process.env.RENDER_GIT_COMMIT || 'unknown', deployedAt: process.env.RENDER_DEPLOY_TIME || new Date().toISOString() }));
+app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'rfq-no-search-urls-v12', commit: process.env.RENDER_GIT_COMMIT || 'unknown', deployedAt: process.env.RENDER_DEPLOY_TIME || new Date().toISOString() }));
 
 // ─── Diagnostic: test Firebase read/write (auth-protected) ───
 app.get('/debug/firebase-test', requireInternalSecret, async (req, res) => {
