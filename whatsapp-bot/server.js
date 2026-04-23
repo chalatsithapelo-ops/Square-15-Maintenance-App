@@ -2285,22 +2285,42 @@ async function executeWaTool(name, args, session) {
           }
           return [...expanded];
         };
-        // STRICT fuzzyMatch: only accept DIRECT overlap between query and service name.
-        // Previously this used bidirectional synonym expansion which caused false matches
-        // (e.g. "shower repair" matching "bath unblocking" via the plumbing synonym group)
-        // and returned a misleading fixed price. Synonyms are still used for category
-        // filtering below, but NOT for picking the specific matched service.
+        // STRICT fuzzyMatch: only accept DIRECT overlap on a DISTINCTIVE (non-generic) word.
+        // Previous version still matched "shower repair" against "toilet repair" via the
+        // generic word "repair", returning a misleading fixed price. We now exclude a
+        // stopword list of generic action/filler words when scoring word overlap.
+        // Synonyms are still used for category filtering below, but NOT for picking the
+        // specific matched service.
+        const STOPWORDS = new Set([
+          'repair', 'repairs', 'repairing',
+          'fix', 'fixing', 'fixes',
+          'install', 'installation', 'installing', 'installs',
+          'replace', 'replacement', 'replacing',
+          'service', 'services', 'servicing',
+          'maintain', 'maintenance',
+          'general', 'standard', 'basic', 'simple',
+          'work', 'works', 'job', 'jobs', 'task', 'tasks',
+          'problem', 'problems', 'issue', 'issues',
+          'need', 'needs', 'want', 'wants',
+          'please', 'help', 'quote', 'price', 'pricing', 'cost',
+          'home', 'house', 'room',
+        ]);
+        const distinctive = (words) => words.filter(w => !STOPWORDS.has(w) && !STOPWORDS.has(stem(w)));
         const fuzzyMatch = (queryNorm, svcNorm) => {
           if (svcNorm === queryNorm) return true;
-          if (svcNorm.includes(queryNorm) && queryNorm.length >= 4) return true;
-          if (queryNorm.includes(svcNorm) && svcNorm.length >= 4) return true;
+          // Full-phrase containment only counts if the contained phrase has ≥1 distinctive word.
+          const containHas = (phrase) => distinctive(phrase.split(/\s+/).filter(w => w.length >= 3)).length >= 1;
+          if (svcNorm.includes(queryNorm) && queryNorm.length >= 4 && containHas(queryNorm)) return true;
+          if (queryNorm.includes(svcNorm) && svcNorm.length >= 4 && containHas(svcNorm)) return true;
           const qWords = queryNorm.split(/\s+/).filter(w => w.length >= 4);
           const sWords = svcNorm.split(/\s+/).filter(w => w.length >= 4);
-          // Require at least one direct content-word overlap (length >= 4).
-          if (qWords.some(w => sWords.includes(w))) return true;
-          // Or at least one shared stem of length >= 4.
-          const qStems = qWords.map(stem).filter(s => s.length >= 4);
-          const sStems = sWords.map(stem).filter(s => s.length >= 4);
+          const qDist = distinctive(qWords);
+          const sDist = distinctive(sWords);
+          // Require overlap on at least one DISTINCTIVE (non-generic) word.
+          if (qDist.some(w => sDist.includes(w))) return true;
+          // Or at least one shared stem of a distinctive word.
+          const qStems = qDist.map(stem).filter(s => s.length >= 4);
+          const sStems = sDist.map(stem).filter(s => s.length >= 4);
           if (qStems.some(qs => sStems.includes(qs))) return true;
           return false;
         };
@@ -4598,7 +4618,7 @@ app.post('/webhook', async (req, res) => {
 });
 
 // Health check
-app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'b3ebfec-rfq-photo-batch-v3', commit: process.env.RENDER_GIT_COMMIT || 'unknown', deployedAt: process.env.RENDER_DEPLOY_TIME || new Date().toISOString() }));
+app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'stopword-fuzzy-v4', commit: process.env.RENDER_GIT_COMMIT || 'unknown', deployedAt: process.env.RENDER_DEPLOY_TIME || new Date().toISOString() }));
 
 // ─── Diagnostic: test Firebase read/write (auth-protected) ───
 app.get('/debug/firebase-test', requireInternalSecret, async (req, res) => {
