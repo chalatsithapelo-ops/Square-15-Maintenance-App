@@ -1450,6 +1450,7 @@ async function generateAIQuote(category, description, materialsResponsibility, a
   let laborRate = 150;
   let pricingContext = '';
   let contingencyPct = 0.15; // default 15%
+  let materialMultiplierFromGuide = 1.5; // default markup on materials
   try {
     if (firestore) {
       const catSlug = (category || '').toLowerCase().replace(/\s+/g, '_');
@@ -1462,7 +1463,9 @@ async function generateAIQuote(category, description, materialsResponsibility, a
           contingencyPct = parseFloat(gd.contingency_percentage) / 100;
           if (isNaN(contingencyPct) || contingencyPct < 0) contingencyPct = 0.15;
         }
-        pricingContext = `Labor rate for ${category}: R${laborRate}/hr. Known service prices: ${JSON.stringify(servicePrices)}. Contingency: ${(contingencyPct * 100).toFixed(0)}%`;
+        const mm = parseFloat(gd.material_multiplier || gd.materialMultiplier);
+        if (!isNaN(mm) && mm > 0) materialMultiplierFromGuide = mm;
+        pricingContext = `Labor rate for ${category}: R${laborRate}/hr. Known service prices: ${JSON.stringify(servicePrices)}. Contingency: ${(contingencyPct * 100).toFixed(0)}%. Material multiplier: ${materialMultiplierFromGuide}x`;
       }
     }
   } catch (e) {
@@ -1528,7 +1531,7 @@ Use realistic South African pricing (ZAR). Include ALL materials needed. Return 
     }
 
     // 4. Build BOM with real prices (Builders > Catalog > AI estimate fallback)
-    const materialsMultiplier = 1.5;
+    const materialsMultiplier = materialMultiplierFromGuide;
     let materialsSubtotal = 0;
     const materialsBOM = [];
     for (let i = 0; i < rawBom.length; i++) {
@@ -2282,17 +2285,23 @@ async function executeWaTool(name, args, session) {
           }
           return [...expanded];
         };
+        // STRICT fuzzyMatch: only accept DIRECT overlap between query and service name.
+        // Previously this used bidirectional synonym expansion which caused false matches
+        // (e.g. "shower repair" matching "bath unblocking" via the plumbing synonym group)
+        // and returned a misleading fixed price. Synonyms are still used for category
+        // filtering below, but NOT for picking the specific matched service.
         const fuzzyMatch = (queryNorm, svcNorm) => {
-          if (svcNorm.includes(queryNorm) || queryNorm.includes(svcNorm)) return true;
-          const qWords = queryNorm.split(/\s+/).filter(w => w.length >= 3);
-          const sWords = svcNorm.split(/\s+/).filter(w => w.length >= 3);
-          if (qWords.some(w => svcNorm.includes(w)) || sWords.some(w => queryNorm.includes(w))) return true;
-          const qStems = qWords.map(stem);
-          const sStems = sWords.map(stem);
-          if (qStems.some(qs => sStems.some(ss => qs === ss || qs.includes(ss) || ss.includes(qs)))) return true;
-          const qExpanded = expandWithSynonyms(qWords.concat(qStems));
-          if (qExpanded.some(qe => sWords.some(sw => sw.includes(qe) || qe.includes(sw)))
-              || qExpanded.some(qe => sStems.some(ss => ss.includes(qe) || qe.includes(ss)))) return true;
+          if (svcNorm === queryNorm) return true;
+          if (svcNorm.includes(queryNorm) && queryNorm.length >= 4) return true;
+          if (queryNorm.includes(svcNorm) && svcNorm.length >= 4) return true;
+          const qWords = queryNorm.split(/\s+/).filter(w => w.length >= 4);
+          const sWords = svcNorm.split(/\s+/).filter(w => w.length >= 4);
+          // Require at least one direct content-word overlap (length >= 4).
+          if (qWords.some(w => sWords.includes(w))) return true;
+          // Or at least one shared stem of length >= 4.
+          const qStems = qWords.map(stem).filter(s => s.length >= 4);
+          const sStems = sWords.map(stem).filter(s => s.length >= 4);
+          if (qStems.some(qs => sStems.includes(qs))) return true;
           return false;
         };
         const subNorm = normalize(subQuery);
@@ -4075,6 +4084,20 @@ PHOTO REQUIREMENT (CRITICAL):
 - If the customer says they cannot send a photo (e.g. "I can't right now"), proceed without one — don't block the booking.
 - Photos are automatically attached to the booking and sent to artisans when they receive the job request.
 - The artisan will see the photos alongside the job description, address, and pricing.
+- Customers often send multiple photos in one go. Treat them as ONE set and respond ONCE — do NOT send the same reply multiple times.
+
+🏗️ CUSTOM JOB / AI RFQ FLOW (CRITICAL — use whenever the service is NOT in the fixed price list):
+- If lookup_pricing returns matched=false (or the customer's job doesn't match any fixed service price), this is a CUSTOM job that needs an AI-generated quote via submit_rfq.
+- NEVER invent a price. NEVER reuse an unrelated fixed price. If no fixed price matches, the ONLY correct path is submit_rfq.
+- Before calling submit_rfq you MUST:
+  1. Understand the issue. If photos were sent, analyse them and state your understanding in one short sentence (e.g. "Got it — the shower mixer is leaking at the wall connection, correct?"). Wait for the customer to confirm or correct you.
+  2. Ask exactly this question and WAIT for the answer: "Will you be buying the materials yourself, or should our artisan source them for you?"
+  3. Based on the answer, pass materialsResponsibility to submit_rfq:
+     - Customer buys materials → materialsResponsibility="client"
+     - Artisan sources materials → materialsResponsibility="artisan"
+- Only AFTER scope confirmation AND materials-responsibility answer, call submit_rfq.
+- submit_rfq will auto-generate a detailed quote using real-time Builders Warehouse material prices + the company pricing guide (labour rate, material multiplier, contingency %). You do NOT compute the price yourself.
+- The generated quote is automatically shown to the customer; present it clearly and ask if they'd like to proceed.
 
 GUIDELINES:
 - Be warm, professional, and concise (WhatsApp messages should be short)
@@ -4105,8 +4128,13 @@ async function handleMessage(session, userMessage, imageDataUrl) {
 
   // Build user message content — supports text-only or text+image (vision)
   if (imageDataUrl) {
+    // Accept either a single data URL (string) or an array of data URLs (multi-photo).
+    const urls = Array.isArray(imageDataUrl)
+      ? imageDataUrl.filter(u => typeof u === 'string' && u.length > 0)
+      : [imageDataUrl];
+    const imageParts = urls.map(u => ({ type: 'image_url', image_url: { url: u, detail: 'auto' } }));
     const content = [
-      { type: 'image_url', image_url: { url: imageDataUrl, detail: 'auto' } },
+      ...imageParts,
       { type: 'text', text: userMessage },
     ];
     session.messages.push({ role: 'user', content });
@@ -4286,6 +4314,96 @@ app.get('/webhook', (req, res) => {
   res.status(403).send('Forbidden');
 });
 
+// ─── Photo batching ───
+// WhatsApp delivers albums of photos as separate webhook events arriving ~milliseconds
+// to seconds apart. Processing each one individually causes duplicate replies and
+// wasted vision calls. We collect pending photos per-session and process them as ONE
+// batch after a short quiet period (PHOTO_BATCH_DEBOUNCE_MS).
+const PHOTO_BATCH_DEBOUNCE_MS = 4000;
+
+async function _flushPendingPhotos(from, contactName) {
+  const session = sessions.get(from);
+  if (!session || !session.pendingPhotos || session.pendingPhotos.length === 0) return;
+
+  const photos = session.pendingPhotos;
+  session.pendingPhotos = [];
+  session.pendingPhotoTimer = null;
+
+  const n = photos.length;
+  const captions = photos.map(p => p.caption).filter(Boolean);
+  const captionText = captions.length ? ` Customer caption(s): ${captions.map(c => `"${c}"`).join(' | ')}.` : '';
+  const plural = n === 1 ? 'a photo' : `${n} photos`;
+  const userText = `[Customer sent ${plural} of a maintenance/repair issue.${captionText}] Analyse the image(s) together and identify the single underlying problem. Then follow the pricing rules: first call lookup_pricing with the specific service. If it returns matched=true use that fixed price and wait for confirmation. If it returns matched=false, follow the AI RFQ flow — confirm your understanding in one sentence, then ask whether the customer or the artisan will buy the materials, and only after both are answered call submit_rfq.`;
+
+  // Filter to vision-safe images
+  const VISION_MAX = 3 * 1024 * 1024;
+  const safeUrls = photos
+    .filter(p => p.supportedVisionMime && p.approxBytes <= VISION_MAX)
+    .map(p => p.dataUrl);
+  const dropped = photos.length - safeUrls.length;
+  const textForAi = dropped > 0
+    ? `${userText} Note: ${dropped} of the ${photos.length} image(s) could not be analysed (unsupported format or too large) — base your analysis on the ones you can see.`
+    : userText;
+
+  let reply = '';
+  try {
+    reply = safeUrls.length > 0
+      ? await handleMessage(session, textForAi, safeUrls)
+      : await handleMessage(session, `${textForAi} None of the photos could be analysed — please ask the customer for ONE clear JPG/PNG close-up.`);
+  } catch (err) {
+    console.error(`[photo-batch] ${from}: vision processing failed:`, err && err.message);
+    try {
+      await logErrorToAdmin(
+        'whatsapp_vision_error',
+        `Photo batch analysis failed for ${from} (${photos.length} photo(s)). Falling back to text-only reply.`,
+        'whatsapp_bot',
+        `count=${photos.length} err=${err && err.message}`,
+        null,
+        'high'
+      );
+    } catch (_) {}
+    try {
+      reply = await handleMessage(session, `${textForAi} Image analysis failed on the last batch — continue with text-only diagnosis.`);
+    } catch (_) { reply = ''; }
+  }
+
+  if (!reply || !reply.trim()) {
+    reply = n === 1
+      ? 'Thanks, I received your photo. Please briefly describe the issue as well so I can assist.'
+      : `Thanks, I received all ${n} photos. Please briefly describe the issue so I can assist.`;
+  }
+
+  // Deduplicate: if this exact reply was sent in the last 30s, skip sending again.
+  const now = Date.now();
+  if (session._lastReplyText === reply && (now - (session._lastReplyAt || 0)) < 30000) {
+    console.log(`[photo-batch] ${from}: suppressed duplicate reply`);
+    return;
+  }
+  session._lastReplyText = reply;
+  session._lastReplyAt = now;
+
+  logChatMessage(from, 'outgoing', reply, { linkedUserId: session.linkedUserId, displayName: contactName || null, toolsCalled: session._lastToolsCalled || [], bookingRef: session.lastBookingId || session.lastRfqId || null });
+  const chunks = reply.match(/.{1,4000}/gs) || [reply];
+  for (const chunk of chunks) {
+    try { await sendWhatsAppMessage(from, chunk); } catch (_) {}
+  }
+}
+
+function _queuePhoto(from, contactName, photo) {
+  const session = sessions.get(from);
+  if (!session) return;
+  if (!Array.isArray(session.pendingPhotos)) session.pendingPhotos = [];
+  session.pendingPhotos.push(photo);
+  if (session.pendingPhotoTimer) {
+    clearTimeout(session.pendingPhotoTimer);
+  }
+  session.pendingPhotoTimer = setTimeout(() => {
+    _flushPendingPhotos(from, contactName).catch(err => {
+      console.error('[photo-batch] flush error:', err && err.message);
+    });
+  }, PHOTO_BATCH_DEBOUNCE_MS);
+}
+
 // Incoming messages
 app.post('/webhook', async (req, res) => {
   // Verify Meta webhook signature (X-Hub-Signature-256)
@@ -4363,74 +4481,36 @@ app.post('/webhook', async (req, res) => {
         case 'image': {
           const imageMedia = await downloadWhatsAppMedia(msg.image?.id);
           const caption = msg.image?.caption || '';
-          if (imageMedia) {
-            // Upload photo to Firebase Storage so artisans can see it
-            const storageUrl = await uploadImageToStorage(imageMedia.buffer, imageMedia.mimeType);
-            if (storageUrl) {
-              session.photoUrls.push(storageUrl);
-              console.log(`[msg] ${from}: [IMAGE uploaded to Storage, ${session.photoUrls.length} total]`);
-            }
-            userText = caption
-              ? `[Customer sent a photo with caption: "${caption}"] Analyse this image of a maintenance/repair issue. Identify the problem and suggest the service category. Then call lookup_pricing to get the price, present it to the customer, and WAIT for their confirmation before creating any booking.`
-              : '[Customer sent a photo of a maintenance issue] Analyse this image. Identify what repair or maintenance is needed and suggest the service category (plumbing, electrical, painting, etc.). Then call lookup_pricing to get the price, present it to the customer, and WAIT for their confirmation before creating any booking. Do NOT create a booking until the customer confirms the price.';
-            console.log(`[msg] ${from}: [IMAGE received, ${(imageMedia.base64.length / 1024).toFixed(0)}KB]`);
-            // Log incoming image message
-            logChatMessage(from, 'incoming', caption || '[Photo]', { messageType: 'image', linkedUserId: session.linkedUserId, displayName: _contactName });
-
-            // Keep vision payloads lightweight and compatible to avoid crashes on repeated/unsupported photos.
-            const mime = (imageMedia.mimeType || '').toLowerCase();
-            const supportedVisionMime = mime.includes('jpeg') || mime.includes('jpg') || mime.includes('png') || mime.includes('webp');
-            const approxBytes = Math.floor((imageMedia.base64.length * 3) / 4);
-            const maxVisionBytes = 3 * 1024 * 1024;
-
-            let reply = '';
-            try {
-              if (supportedVisionMime && approxBytes <= maxVisionBytes) {
-                reply = await handleMessage(session, userText, imageMedia.dataUrl);
-              } else {
-                const reason = !supportedVisionMime ? 'unsupported image format' : 'image too large for analysis';
-                console.warn(`[msg] ${from}: image vision fallback (${reason}, mime=${mime || 'unknown'}, bytes=${approxBytes})`);
-                reply = await handleMessage(
-                  session,
-                  `${userText} The uploaded image could not be analyzed directly (${reason}). Continue using the user's text/caption and ask for one clear JPG/PNG close-up photo if needed.`
-                );
-              }
-            } catch (imageErr) {
-              console.error(`[msg] ${from}: vision processing failed, retrying text-only:`, imageErr.message);
-              try {
-                await logErrorToAdmin(
-                  'whatsapp_vision_error',
-                  `Photo analysis failed for ${from}. Bot fell back to text-only. Customer may get "I'm having trouble" reply if retry also fails.`,
-                  'whatsapp_bot',
-                  `mime=${mime || 'unknown'} bytes=${approxBytes} err=${imageErr && imageErr.message}`,
-                  null,
-                  'high'
-                );
-              } catch (_) {}
-              reply = await handleMessage(
-                session,
-                `${userText} Image analysis failed on the last photo. Continue with text-only diagnosis and ask for another clear photo if needed.`
-              );
-            }
-
-            if (!reply || !reply.trim()) {
-              reply = 'Thanks, I received your photo. Please briefly describe the issue as well so I can assist immediately.';
-            }
-            // Log outgoing bot reply
-            logChatMessage(from, 'outgoing', reply, { linkedUserId: session.linkedUserId, displayName: _contactName, toolsCalled: session._lastToolsCalled || [], bookingRef: session.lastBookingId || session.lastRfqId || null });
-            const chunks = reply.match(/.{1,4000}/gs) || [reply];
-            for (const chunk of chunks) {
-              await sendWhatsAppMessage(from, chunk);
-            }
-            continue; // Skip normal handleMessage below — already handled
-          } else {
+          if (!imageMedia) {
             await sendWhatsAppMessage(
               from,
               'I could not download your photo. Please send the photo again, or describe the issue in text.'
             );
             continue;
           }
-          break;
+
+          // Upload to Firebase Storage so artisans can see it alongside the job.
+          const storageUrl = await uploadImageToStorage(imageMedia.buffer, imageMedia.mimeType);
+          if (storageUrl) {
+            session.photoUrls.push(storageUrl);
+            console.log(`[msg] ${from}: [IMAGE uploaded to Storage, ${session.photoUrls.length} total]`);
+          }
+          logChatMessage(from, 'incoming', caption || '[Photo]', { messageType: 'image', linkedUserId: session.linkedUserId, displayName: _contactName });
+
+          const mime = (imageMedia.mimeType || '').toLowerCase();
+          const supportedVisionMime = mime.includes('jpeg') || mime.includes('jpg') || mime.includes('png') || mime.includes('webp');
+          const approxBytes = Math.floor((imageMedia.base64.length * 3) / 4);
+
+          // Queue the photo and let the debounced batcher produce ONE consolidated reply
+          // even when customers send albums of 2–10 photos in quick succession.
+          _queuePhoto(from, _contactName, {
+            dataUrl: imageMedia.dataUrl,
+            caption,
+            mime,
+            approxBytes,
+            supportedVisionMime,
+          });
+          continue;
         }
         case 'document':
           userText = '[Customer sent a document: ' + (msg.document?.filename || 'unknown') + ']';
@@ -4485,6 +4565,18 @@ app.post('/webhook', async (req, res) => {
           'I could not generate a reply for that yet. Please rephrase your request, or send Hi to restart.'
         );
         continue;
+      }
+
+      // Duplicate-reply guard (30s window) — protects against Meta retry storms
+      // and rapid-fire identical bot responses.
+      {
+        const now = Date.now();
+        if (session._lastReplyText === reply && (now - (session._lastReplyAt || 0)) < 30000) {
+          console.log(`[webhook] ${from}: suppressed duplicate reply`);
+          continue;
+        }
+        session._lastReplyText = reply;
+        session._lastReplyAt = now;
       }
 
       // Log outgoing bot reply
