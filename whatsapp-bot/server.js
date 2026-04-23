@@ -5360,7 +5360,37 @@ app.post('/webhook', async (req, res) => {
 });
 
 // Health check
-app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'rfq-no-inline-options-v13', commit: process.env.RENDER_GIT_COMMIT || 'unknown', deployedAt: process.env.RENDER_DEPLOY_TIME || new Date().toISOString() }));
+app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'rfq-diag-v14', commit: process.env.RENDER_GIT_COMMIT || 'unknown', deployedAt: process.env.RENDER_DEPLOY_TIME || new Date().toISOString() }));
+
+// Diagnostic: run buildersSearchOptions live and report what happens.
+// GET /diag/builders?q=shower+mixer&limit=3
+app.get('/diag/builders', async (req, res) => {
+  const q = String(req.query.q || 'shower mixer').trim();
+  const limit = Math.min(5, Math.max(1, Number(req.query.limit) || 3));
+  const t0 = Date.now();
+  try {
+    const cfg = await getBuildersBffConfig();
+    const tCfg = Date.now() - t0;
+    const opts = await buildersSearchOptions(q, limit);
+    const tAll = Date.now() - t0;
+    res.json({
+      q,
+      limit,
+      timings_ms: { bff_config_ms: tCfg, total_ms: tAll },
+      bff_config: cfg ? { hasHash: !!cfg.searchHash, site: cfg.site } : null,
+      options_count: opts.length,
+      options: opts.map(o => ({
+        label: o.label,
+        price: o.price,
+        has_image: !!o.image_url,
+        image_preview: (o.image_url || '').slice(0, 120),
+        product_url: o.product_url,
+      })),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message, stack: (e.stack || '').split('\n').slice(0, 5) });
+  }
+});
 
 // ─── Diagnostic: test Firebase read/write (auth-protected) ───
 app.get('/debug/firebase-test', requireInternalSecret, async (req, res) => {
