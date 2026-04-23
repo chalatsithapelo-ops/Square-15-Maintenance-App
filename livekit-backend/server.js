@@ -7542,14 +7542,28 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
 
     if (!ozowResponse.ok || !payoutId) {
       console.error(`[admin/ozow-payout] Ozow API error (HTTP ${ozowResponse.status}):`, JSON.stringify(ozowResult));
+      console.error(`[admin/ozow-payout] Ozow raw body:`, ozowRawText || '(empty)');
       const errMsg = ozowResult.message || ozowResult.errorMessage || ozowResult.error
         || (ozowResult.errors && JSON.stringify(ozowResult.errors))
+        || (ozowRawText && ozowRawText.length < 500 ? ozowRawText : null)
         || `Ozow payout failed (HTTP ${ozowResponse.status})`;
+      // Log to Live Issues so admin sees the root cause in the dashboard
+      try {
+        await logErrorToAdmin(
+          'ozow_payout_error',
+          `Ozow rejected a R${payoutAmount.toFixed(2)} EFT payout to ${recipient_name || recipient_type} (${bank_name} ****${account_number.slice(-4)}). HTTP ${ozowResponse.status}. ${ozowResponse.status === 500 ? 'Usually means: (1) Ozow payout feature not yet activated on your merchant account, (2) wrong OZOW_PAYOUT_API_KEY / OZOW_SITE_CODE in Render env, or (3) server IP not whitelisted in Ozow payout portal.' : 'See ozow_raw detail for the actual rejection reason.'}`,
+          'backend',
+          `status=${ozowResponse.status} raw=${ozowRawText || '(empty)'} parsed=${JSON.stringify(ozowResult).slice(0, 500)} bank_code=${ozowBankCode} account_type=${ozowAccountType} site_code=${ozowSiteCode ? 'set' : 'MISSING'} api_key=${ozowApiKey ? 'set' : 'MISSING'} test_mode=${env('OZOW_IS_TEST') === 'true'}`,
+          booking_id || null,
+          'high'
+        );
+      } catch (_) {}
       return res.status(400).json({
         ok: false,
         error: errMsg,
         ozow_status: ozowResponse.status,
         ozow_response: ozowResult,
+        ozow_raw: ozowRawText && ozowRawText.length < 500 ? ozowRawText : undefined,
       });
     }
 
@@ -7673,7 +7687,17 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
     });
   } catch (error) {
     console.error('❌ Ozow payout error:', error);
-    res.status(500).json({ error: 'EFT payout failed. Please try again.' });
+    try {
+      await logErrorToAdmin(
+        'ozow_payout_exception',
+        'Admin-triggered Ozow payout crashed before reaching Ozow. Likely a validation, Firestore, or code error.',
+        'backend',
+        `${error && error.stack ? error.stack : error && error.message ? error.message : String(error)}`,
+        (req.body && req.body.booking_id) || null,
+        'high'
+      );
+    } catch (_) {}
+    res.status(500).json({ error: 'EFT payout failed. Please try again.', detail: error && error.message });
   }
 });
 
