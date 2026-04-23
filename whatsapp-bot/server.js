@@ -3064,29 +3064,11 @@ async function executeWaTool(name, args, session) {
       if (!firestore) return { error: 'Database unavailable' };
 
      try {
-      // ── SERVER-SIDE GATE: force show_material_options when artisan supplies materials ──
-      // If the LLM tries to skip the material picker, refuse and tell it exactly what
-      // to call next. This guarantees the client sees options BEFORE the RFQ is filed.
-      const materialsResp = String(args.materialsResponsibility || 'artisan').toLowerCase();
-      const hasShownOptions = !!(session.pendingMaterialChoice && Array.isArray(session.pendingMaterialChoice.options) && session.pendingMaterialChoice.options.length);
-      const hasChoice = !!String(args.materialChoice || '').trim();
-      const cat = String(args.category || '').toLowerCase();
-      const NEEDS_PARTS = ['plumb', 'electric', 'tile', 'tiling', 'carpent', 'lock', 'paint', 'roof', 'appliance'];
-      const needsParts = NEEDS_PARTS.some(k => cat.includes(k));
-      if (materialsResp === 'artisan' && needsParts && !hasShownOptions && !hasChoice) {
-        // Try to infer the itemType from the description so the LLM has a hint.
-        const desc = String(args.description || '').toLowerCase();
-        const ITEM_HINTS = ['shower mixer', 'mixer', 'toilet cistern', 'cistern', 'tap', 'door lock', 'lock', 'ceiling light', 'light', 'geyser', 'tile', 'paint', 'basin', 'sink'];
-        const guess = ITEM_HINTS.find(h => desc.includes(h)) || (cat.includes('plumb') ? 'tap' : cat.includes('electric') ? 'ceiling light' : cat.includes('lock') ? 'door lock' : 'fixture');
-        console.log(`[submit_rfq] BLOCKED: artisan materials but no options shown. Forcing show_material_options (guess: ${guess})`);
-        return {
-          success: false,
-          error: 'Material options must be shown to the client BEFORE submitting this RFQ.',
-          required_next_action: 'call_show_material_options',
-          suggested_itemType: guess,
-          instruction: `STOP. The artisan will supply materials but you have not shown the client any options yet. Call show_material_options now with itemType="${guess}" (or a better guess based on the description). Wait for the client to pick an option, then call submit_rfq again with materialChoice set to their pick. Do NOT call submit_rfq again until the client has picked an option.`,
-        };
-      }
+      // ── REMOVED server-side gate (v15): Builders live search is blocked by
+      // PerimeterX from every server-side egress (Render + GCF), so forcing
+      // show_material_options just produced "admin will pick" messages and
+      // delayed the RFQ. Admin curates options during Review instead; the
+      // client app surfaces them. submit_rfq proceeds directly.
 
       // ── IDEMPOTENCY GUARD ──
       // If this session already created an RFQ in the last 10 minutes, treat a
@@ -3454,8 +3436,9 @@ async function executeWaTool(name, args, session) {
         // let the AI push on with submit_rfq.
         if (!options.length) {
           return {
-            success: false,
-            note: `I couldn't pull live Builders options for "${itemType}" right now. Tell the client "Our admin will pick suitable ${itemType} options when they review the quote." Then call submit_rfq and move on \u2014 do NOT hallucinate product URLs.`,
+            success: true,
+            pending_admin_curation: true,
+            note: `Live Builders search is currently unavailable from the server (bot-protection block). Tell the client: "No problem — I've logged your ${itemType} request. Our admin will hand-pick suitable options with real photos, prices and product links and send them with your quote shortly." Then call submit_rfq and move on. Do NOT hallucinate product URLs or prices.`,
           };
         }
 
@@ -3531,8 +3514,9 @@ async function executeWaTool(name, args, session) {
         const live = raw.filter(o => o && o.image_url && o.price > 0);
         if (!live.length) {
           return {
-            success: false,
-            note: `I couldn't find live options for "${keyword}" on Builders right now. Tell the client "I couldn't pull live options just now — our admin will pick suitable materials when they review the quote." Then proceed to submit_rfq with what we have.`,
+            success: true,
+            pending_admin_curation: true,
+            note: `Live Builders search is currently unavailable from the server (bot-protection block). Tell the client: "No problem — I've logged your request for \"${keyword}\". Our admin will hand-pick suitable options with real photos, prices and product links and send them with your quote shortly." Then proceed to submit_rfq.`,
           };
         }
 
@@ -4832,10 +4816,11 @@ PHOTO REQUIREMENT (CRITICAL):
 - Before calling submit_rfq you MUST complete ALL of these steps IN ORDER:
   1. SCOPE CONFIRMATION — understand the issue. If photos were sent, analyse them and state your understanding in one short sentence (e.g. "Got it — the shower mixer is leaking at the wall connection, correct?"). Wait for the customer to confirm or correct you.
   2. MATERIALS-RESPONSIBILITY — ask exactly: "Will you be buying the materials yourself, or should our artisan source them for you?" Wait for the answer.
-  3. MATERIAL CHOICE (MANDATORY whenever materialsResponsibility="artisan" AND the category is plumbing / electrical / tiling / carpentry / locksmith / painting / roofing / appliance repair — basically anything that involves fitting a visible part): you MUST call show_material_options with the best-guess itemType (e.g. "shower mixer", "toilet cistern", "tap", "door lock", "ceiling light", "geyser", "tile", "paint") BEFORE calling submit_rfq. Do NOT skip this step by reasoning "the scope is too vague" — if in doubt, pick the most likely itemType and show options. The client will see pictures and prices and reply with the option label. Wait for their reply, then pass it as materialChoice to submit_rfq. If the client says "any" / "you choose" / "whichever is best", pick the mid-range option yourself and tell them which one you picked.
-     ➤ IF THE CLIENT IS NOT HAPPY WITH THE OPTIONS, wants more variety, a specific brand, something cheaper/premium, or asks "show me more" / "any others?" / "different brand" — IMMEDIATELY call browse_builders_materials with a keyword (e.g. "cobra shower mixer", "thermostatic shower mixer", "budget basin mixer"). It pulls LIVE products from Builders Warehouse with REAL photos and REAL prices. Repeat with refined keywords until the client picks one or agrees to admin selection.
-     ➤ CRITICAL IMAGE RULE: NEVER write markdown image links, NEVER invent URLs, NEVER use example.com or any placeholder domain. The tools already send real WhatsApp images to the client — after calling show_material_options or browse_builders_materials, simply say "I've sent you the options — take a look above and let me know which one you like" in plain text. If the client says "send me a picture" AFTER you already called the tool, the images were already delivered — acknowledge and ask which option they prefer; DO NOT type out any URLs.
-     ➤ ABSOLUTELY FORBIDDEN: typing option labels and prices in chat text yourself (e.g. "Standard shower mixer – R450, Mid-range – R950, Premium – R1850"). Those numbers are imaginary. The ONLY way to present material options is by calling show_material_options or browse_builders_materials — the tool sends real images + real prices as separate WhatsApp messages. If a tool call returns success:false, tell the client "our admin will pick suitable options when they review the quote" and proceed to submit_rfq. NEVER substitute with made-up options.
+  3. MATERIAL CHOICE (OPTIONAL — admin curates during review): when materialsResponsibility="artisan" you MAY call show_material_options to try to offer live Builders product options. HOWEVER: Builders' site is frequently unreachable from our server (bot-protection). If the tool returns pending_admin_curation:true OR success:false, that is EXPECTED — simply tell the client verbatim: "No problem — I've logged your request. Our admin will hand-pick suitable product options with real photos, prices and links and send them with your quote shortly." Then proceed to submit_rfq immediately. Do NOT retry show_material_options or browse_builders_materials more than once per item. Do NOT block the RFQ on material choice.
+     ➤ If the tool DOES return real options (images were sent), wait for the client's reply (option label or "any") and pass materialChoice to submit_rfq. If the client says "any" / "you choose", pick the mid-range option.
+     ➤ If the client asks for more variety after real options are delivered, you MAY call browse_builders_materials ONCE with a refined keyword. If that also returns pending_admin_curation, stop retrying and tell the client admin will curate.
+     ➤ CRITICAL IMAGE RULE: NEVER write markdown image links, NEVER invent URLs, NEVER use example.com or any placeholder domain. The tools send real WhatsApp images directly — after a successful call, just say "I've sent you the options above — let me know which you prefer." DO NOT type out any URLs.
+     ➤ ABSOLUTELY FORBIDDEN: typing option labels and prices in chat text yourself (e.g. "Standard shower mixer – R450, Mid-range – R950, Premium – R1850"). Those numbers are imaginary. The ONLY way to present material options is via a successful tool call that delivered images. If a tool call returns pending_admin_curation OR success:false, DO NOT substitute any options — tell the client admin will curate, and move on to submit_rfq.
   4. BUDGET — ask exactly: "What's your budget for this job? A rough number is fine — it helps us keep the quote realistic." Wait for the answer. If the client says "no budget" or "whatever it costs", pass clientBudget=0. Otherwise pass the number (strip the "R").
   5. Only AFTER scope + materials answer + (if applicable) material choice + BUDGET ANSWER, call submit_rfq EXACTLY ONCE with: category, description (include any material choice inside the description), address, customerName, materialsResponsibility, clientBudget, and materialChoice if applicable. NEVER call submit_rfq twice for the same request — if you already called it, do NOT call it again; just relay the response message to the client.
 - submit_rfq will auto-generate a detailed quote using real-time Builders Warehouse material prices + the company pricing guide (labour rate, material multiplier, contingency %). You do NOT compute the price yourself.
@@ -5360,7 +5345,7 @@ app.post('/webhook', async (req, res) => {
 });
 
 // Health check
-app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'rfq-diag-v14', commit: process.env.RENDER_GIT_COMMIT || 'unknown', deployedAt: process.env.RENDER_DEPLOY_TIME || new Date().toISOString() }));
+app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'rfq-admin-curate-v15', commit: process.env.RENDER_GIT_COMMIT || 'unknown', deployedAt: process.env.RENDER_DEPLOY_TIME || new Date().toISOString() }));
 
 // Diagnostic: run buildersSearchOptions live and report what happens.
 // GET /diag/builders?q=shower+mixer&limit=3
