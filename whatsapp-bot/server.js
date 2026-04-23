@@ -216,7 +216,29 @@ async function sendWhatsAppMessage(to, text) {
 async function sendWhatsAppImage(to, imageUrl, caption) {
   const phoneId = process.env.WHATSAPP_PHONE_NUMBER_ID;
   const token   = process.env.WHATSAPP_ACCESS_TOKEN;
-  if (!phoneId || !token) { console.error('[wa-image] Missing credentials'); return; }
+  if (!phoneId || !token) { console.error('[wa-image] Missing credentials'); return { ok: false, error: 'no_credentials' }; }
+  if (!imageUrl || !/^https?:\/\//i.test(imageUrl)) {
+    console.warn('[wa-image] skipping, invalid url:', imageUrl);
+    return { ok: false, error: 'invalid_url' };
+  }
+
+  // Pre-flight: make sure the URL resolves and returns an image content-type.
+  // WhatsApp rejects broken/non-image URLs silently from the client's POV.
+  try {
+    const head = await fetch(imageUrl, { method: 'HEAD', signal: AbortSignal.timeout(6000), redirect: 'follow' });
+    if (!head.ok) {
+      console.warn('[wa-image] HEAD failed', head.status, imageUrl);
+      return { ok: false, error: `head_${head.status}` };
+    }
+    const ct = String(head.headers.get('content-type') || '').toLowerCase();
+    if (!ct.startsWith('image/')) {
+      console.warn('[wa-image] wrong content-type:', ct, imageUrl);
+      return { ok: false, error: `bad_ct_${ct}` };
+    }
+  } catch (e) {
+    console.warn('[wa-image] HEAD error:', e.message, imageUrl);
+    return { ok: false, error: 'head_error' };
+  }
 
   try {
     const res = await fetch(`${WA_API}/${phoneId}/messages`, {
@@ -236,9 +258,15 @@ async function sendWhatsAppImage(to, imageUrl, caption) {
       }),
       signal: AbortSignal.timeout(15000),
     });
-    if (!res.ok) console.error('[wa-image] send failed:', res.status, await res.text().catch(() => ''));
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => '');
+      console.error('[wa-image] send failed:', res.status, errBody);
+      return { ok: false, error: `send_${res.status}`, detail: errBody.slice(0, 300) };
+    }
+    return { ok: true };
   } catch (e) {
     console.error('[wa-image] error:', e.message);
+    return { ok: false, error: e.message };
   }
 }
 
@@ -3330,26 +3358,26 @@ async function executeWaTool(name, args, session) {
         if (!options.length) {
           const FALLBACK = {
             'shower mixer': [
-              { label: 'Standard shower mixer (chrome)', price: 450, image_url: 'https://images.builders.co.za/product/360/360/294090.jpg', note: 'Entry-level, reliable' },
-              { label: 'Mid-range shower mixer (dual-control)', price: 950, image_url: 'https://images.builders.co.za/product/360/360/302431.jpg', note: 'Most popular, better flow' },
-              { label: 'Premium thermostatic mixer', price: 1850, image_url: 'https://images.builders.co.za/product/360/360/308811.jpg', note: 'Temperature-safe, long warranty' },
+              { label: 'Standard shower mixer (chrome)', price: 450, image_url: '', note: 'Entry-level, reliable', product_url: 'https://www.builders.co.za/search?text=shower+mixer+chrome' },
+              { label: 'Mid-range shower mixer (dual-control)', price: 950, image_url: '', note: 'Most popular, better flow', product_url: 'https://www.builders.co.za/search?text=shower+mixer+dual+control' },
+              { label: 'Premium thermostatic mixer', price: 1850, image_url: '', note: 'Temperature-safe, long warranty', product_url: 'https://www.builders.co.za/search?text=thermostatic+shower+mixer' },
             ],
             'toilet cistern': [
-              { label: 'Standard dual-flush cistern', price: 650, image_url: 'https://images.builders.co.za/product/360/360/279902.jpg', note: 'Water-saving' },
-              { label: 'Mid-range slim cistern', price: 1200, image_url: 'https://images.builders.co.za/product/360/360/285114.jpg', note: 'Compact, quiet fill' },
+              { label: 'Standard dual-flush cistern', price: 650, image_url: '', note: 'Water-saving', product_url: 'https://www.builders.co.za/search?text=dual+flush+cistern' },
+              { label: 'Mid-range slim cistern', price: 1200, image_url: '', note: 'Compact, quiet fill', product_url: 'https://www.builders.co.za/search?text=slim+cistern' },
             ],
             'tap': [
-              { label: 'Pillar tap (basin/sink)', price: 280, image_url: 'https://images.builders.co.za/product/360/360/294082.jpg' },
-              { label: 'Mixer tap with swivel spout', price: 720, image_url: 'https://images.builders.co.za/product/360/360/294117.jpg' },
-              { label: 'Premium lever mixer', price: 1400, image_url: 'https://images.builders.co.za/product/360/360/297550.jpg' },
+              { label: 'Pillar tap (basin/sink)', price: 280, image_url: '', product_url: 'https://www.builders.co.za/search?text=pillar+tap' },
+              { label: 'Mixer tap with swivel spout', price: 720, image_url: '', product_url: 'https://www.builders.co.za/search?text=mixer+tap+swivel' },
+              { label: 'Premium lever mixer', price: 1400, image_url: '', product_url: 'https://www.builders.co.za/search?text=lever+mixer+tap' },
             ],
             'ceiling light': [
-              { label: 'Standard LED flush mount', price: 220, image_url: 'https://images.builders.co.za/product/360/360/293811.jpg' },
-              { label: 'Modern LED panel (cool white)', price: 480, image_url: 'https://images.builders.co.za/product/360/360/303555.jpg' },
+              { label: 'Standard LED flush mount', price: 220, image_url: '', product_url: 'https://www.builders.co.za/search?text=led+flush+mount+ceiling' },
+              { label: 'Modern LED panel (cool white)', price: 480, image_url: '', product_url: 'https://www.builders.co.za/search?text=led+panel+light' },
             ],
             'door lock': [
-              { label: 'Standard cylinder lock', price: 320, image_url: 'https://images.builders.co.za/product/360/360/279455.jpg' },
-              { label: 'Security deadbolt', price: 780, image_url: 'https://images.builders.co.za/product/360/360/285770.jpg' },
+              { label: 'Standard cylinder lock', price: 320, image_url: '', product_url: 'https://www.builders.co.za/search?text=cylinder+lock' },
+              { label: 'Security deadbolt', price: 780, image_url: '', product_url: 'https://www.builders.co.za/search?text=deadbolt+lock' },
             ],
           };
           // fuzzy pick a fallback bucket
@@ -3377,26 +3405,45 @@ async function executeWaTool(name, args, session) {
         try {
           await sendWhatsAppMessage(to, `Here are ${options.length} options for a ${itemType}. Reply with the option label you'd prefer (or say "any" and I'll pick the mid-range one):`);
         } catch (_) {}
+        let imageSuccessCount = 0;
+        const imageFailures = [];
         for (const opt of options) {
-          const caption = `*${opt.label}* — approx R${Number(opt.price).toFixed(0)}${opt.note ? `\n_${opt.note}_` : ''}`;
+          const productLink = opt.product_url ? `\n🔗 ${opt.product_url}` : '';
+          const caption = `*${opt.label}* — approx R${Number(opt.price).toFixed(0)}${opt.note ? `\n_${opt.note}_` : ''}${productLink}`;
+          let imageDelivered = false;
           if (opt.image_url) {
-            try { await sendWhatsAppImage(to, opt.image_url, caption); } catch (e) {
-              // Fallback to plain text if image send fails
-              try { await sendWhatsAppMessage(to, caption); } catch (_) {}
-            }
-          } else {
+            const imgResult = await sendWhatsAppImage(to, opt.image_url, caption).catch(e => ({ ok: false, error: e.message }));
+            if (imgResult && imgResult.ok) { imageDelivered = true; imageSuccessCount++; }
+            else { imageFailures.push({ url: opt.image_url, reason: imgResult?.error || 'unknown' }); }
+          }
+          if (!imageDelivered) {
+            // Fall back to text message with caption + product link
             try { await sendWhatsAppMessage(to, caption); } catch (_) {}
           }
         }
+        // Log image failures so admin can fix the catalog URLs
+        if (imageFailures.length && firestore) {
+          try {
+            await firestore.collection('errorLogs').add({
+              type: 'material_image_send_failed',
+              severity: 'medium',
+              source: 'whatsapp_bot',
+              message: `Material option images could not be sent to ${session.phone} (itemType=${itemType}). ${imageSuccessCount}/${options.length} succeeded. Populate materials_catalog with working publicly-accessible image URLs (Firebase Storage recommended).`,
+              context: JSON.stringify(imageFailures).slice(0, 800),
+              created_at: admin.firestore.FieldValue.serverTimestamp(),
+            });
+          } catch (_) {}
+        }
 
         // Track that options were presented so the bot knows to wait for the pick
-        session.pendingMaterialChoice = { itemType, category: cat, options: options.map(o => ({ label: o.label, price: o.price, image_url: o.image_url || '', note: o.note || '' })) };
+        session.pendingMaterialChoice = { itemType, category: cat, options: options.map(o => ({ label: o.label, price: o.price, image_url: o.image_url || '', note: o.note || '', product_url: o.product_url || '' })) };
 
         return {
           success: true,
           presented: options.length,
-          options: options.map(o => ({ label: o.label, price: `R${Number(o.price).toFixed(0)}`, note: o.note || '' })),
-          note: 'Options were sent to the client with images. WAIT for their reply (option label or "any") before calling submit_rfq. Pass the chosen label in submit_rfq.materialChoice.',
+          images_delivered: imageSuccessCount,
+          options: options.map(o => ({ label: o.label, price: `R${Number(o.price).toFixed(0)}`, note: o.note || '', product_url: o.product_url || '' })),
+          note: `Options were sent to the client (${imageSuccessCount}/${options.length} with images, rest as text with Builders product links). WAIT for their reply (option label or "any") before calling submit_rfq. Pass the chosen label in submit_rfq.materialChoice.`,
         };
       } catch (e) {
         console.error('[show_material_options] error:', e.message);
@@ -3429,11 +3476,32 @@ async function executeWaTool(name, args, session) {
           await sendWhatsAppMessage(to, `Here are ${live.length} live options from Builders Warehouse for "${keyword}". Reply with the option number (1/2/3) or say "none of these" if you'd like different ones:`);
         } catch (_) {}
         let idx = 0;
+        let imageSuccessCount = 0;
+        const imageFailures = [];
         for (const opt of live) {
           idx++;
-          const caption = `*Option ${idx}: ${opt.label}*\nR${Number(opt.price).toFixed(0)} — Builders Warehouse\n${opt.product_url}`;
-          try { await sendWhatsAppImage(to, opt.image_url, caption); }
-          catch (_) { try { await sendWhatsAppMessage(to, caption); } catch (__) {} }
+          const caption = `*Option ${idx}: ${opt.label}*\nR${Number(opt.price).toFixed(0)} — Builders Warehouse\n🔗 ${opt.product_url}`;
+          let delivered = false;
+          if (opt.image_url) {
+            const r = await sendWhatsAppImage(to, opt.image_url, caption).catch(e => ({ ok: false, error: e.message }));
+            if (r && r.ok) { delivered = true; imageSuccessCount++; }
+            else { imageFailures.push({ url: opt.image_url, reason: r?.error || 'unknown' }); }
+          }
+          if (!delivered) {
+            try { await sendWhatsAppMessage(to, caption); } catch (_) {}
+          }
+        }
+        if (imageFailures.length && firestore) {
+          try {
+            await firestore.collection('errorLogs').add({
+              type: 'builders_image_send_failed',
+              severity: 'low',
+              source: 'whatsapp_bot',
+              message: `Builders live image URLs failed WhatsApp delivery for ${session.phone} (keyword="${keyword}"). ${imageSuccessCount}/${live.length} delivered.`,
+              context: JSON.stringify(imageFailures).slice(0, 800),
+              created_at: admin.firestore.FieldValue.serverTimestamp(),
+            });
+          } catch (_) {}
         }
 
         session.pendingMaterialChoice = {
@@ -3452,6 +3520,7 @@ async function executeWaTool(name, args, session) {
         return {
           success: true,
           presented: live.length,
+          images_delivered: imageSuccessCount,
           source: 'builders_live',
           options: live.map((o, i) => ({
             number: i + 1,
@@ -3459,7 +3528,7 @@ async function executeWaTool(name, args, session) {
             price: `R${Number(o.price).toFixed(0)}`,
             product_url: o.product_url,
           })),
-          note: 'Live Builders options were sent to the client with real photos and prices. WAIT for their reply (option number or "none of these"). If they say "none of these", call browse_builders_materials again with a refined keyword. Pass the chosen label in submit_rfq.materialChoice.',
+          note: `Live Builders options sent (${imageSuccessCount}/${live.length} with photos). WAIT for client reply (option number or "none of these"). If they say "none", call browse_builders_materials again with a refined keyword. Pass the chosen label in submit_rfq.materialChoice.`,
         };
       } catch (e) {
         console.error('[browse_builders_materials] error:', e.message);
@@ -5224,7 +5293,7 @@ app.post('/webhook', async (req, res) => {
 });
 
 // Health check
-app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'rfq-gate-v9', commit: process.env.RENDER_GIT_COMMIT || 'unknown', deployedAt: process.env.RENDER_DEPLOY_TIME || new Date().toISOString() }));
+app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'rfq-image-fix-v10', commit: process.env.RENDER_GIT_COMMIT || 'unknown', deployedAt: process.env.RENDER_DEPLOY_TIME || new Date().toISOString() }));
 
 // ─── Diagnostic: test Firebase read/write (auth-protected) ───
 app.get('/debug/firebase-test', requireInternalSecret, async (req, res) => {
