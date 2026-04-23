@@ -5367,10 +5367,29 @@ app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-wha
 app.get('/diag/builders', async (req, res) => {
   const q = String(req.query.q || 'shower mixer').trim();
   const limit = Math.min(5, Math.max(1, Number(req.query.limit) || 3));
+  const raw = String(req.query.raw || '') === '1';
   const t0 = Date.now();
   try {
     const cfg = await getBuildersBffConfig();
     const tCfg = Date.now() - t0;
+    if (raw && cfg) {
+      const qn = normalizeBuildersQuery(q);
+      const uri = `https://www.builders.co.za/wmapi/bff/graphql/${cfg.searchKey}/${cfg.searchHash}`;
+      const r = await buildersFetch(uri, {
+        method: 'POST',
+        headers: buildersBffHeaders({ operationName: cfg.searchKey, operationHash: cfg.searchHash }),
+        body: JSON.stringify({ variables: { keyword: qn, offset: 0, pageSize: 24, dynamicPriceRange: true, site: cfg.site } }),
+        timeoutMs: 12000,
+      });
+      const txt = await r.text().catch(() => '');
+      return res.json({
+        q, qn,
+        http_status: r.status,
+        http_ok: r.ok,
+        bff_config: { hasHash: !!cfg.searchHash, site: cfg.site, hashPrefix: (cfg.searchHash || '').slice(0, 8) },
+        response_preview: txt.slice(0, 2000),
+      });
+    }
     const opts = await buildersSearchOptions(q, limit);
     const tAll = Date.now() - t0;
     res.json({
