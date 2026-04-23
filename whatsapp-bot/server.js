@@ -2861,6 +2861,39 @@ async function executeWaTool(name, args, session) {
     case 'submit_rfq': {
       if (!firestore) return { error: 'Database unavailable' };
 
+     try {
+      // ── IDEMPOTENCY GUARD ──
+      // If this session already created an RFQ in the last 10 minutes, treat a
+      // repeat call as an UPDATE (e.g. client just supplied budget or material choice
+      // after the first attempt). This prevents duplicate RFQs from being created
+      // when the LLM calls submit_rfq twice in the same conversation.
+      const REUSE_WINDOW_MS = 10 * 60 * 1000;
+      if (session.lastRfqId && session.lastRfqAt && (Date.now() - session.lastRfqAt) < REUSE_WINDOW_MS) {
+        const existingId = session.lastRfqId;
+        const existingNo = session.lastRfqNo || existingId;
+        console.log(`[submit_rfq] Idempotency: reusing existing ${existingNo} (${Math.round((Date.now()-session.lastRfqAt)/1000)}s ago)`);
+        try {
+          const updatePatch = {
+            description: args.description || '',
+            problem_description: args.description || '',
+            materials_responsibility: args.materialsResponsibility || 'artisan',
+            user_budget: Number(args.clientBudget) > 0 ? Number(args.clientBudget) : 0,
+            material_choice: String(args.materialChoice || '').trim(),
+            updated_at: new Date().toISOString(),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          };
+          await firestore.collection('futureBookings').doc(existingId).update(updatePatch);
+        } catch (e) { console.error('[submit_rfq] idempotent update failed:', e.message); }
+        return {
+          success: true,
+          rfqId: existingId,
+          rfqNo: existingNo,
+          hasQuote: false,
+          duplicate_prevented: true,
+          message: `RFQ ${existingNo} already received — I've updated it with your latest info. Our admin is reviewing the quote and we'll send it through here shortly.`,
+        };
+      }
+
       const rfqId = `RFQ-${Date.now().toString(36).toUpperCase()}`;
       const rfqNo = `SQ15-RFQ-${rfqId}`;
       const now = new Date().toISOString();
@@ -2913,6 +2946,7 @@ async function executeWaTool(name, args, session) {
       // Track in session for follow-up
       session.lastRfqId = rfqId;
       session.lastRfqNo = rfqNo;
+      session.lastRfqAt = Date.now();
 
       // Notify admin (Firestore doc + FCM push so OS tray lights up)
       const budgetNote = Number(args.clientBudget) > 0 ? ` (budget R${Number(args.clientBudget).toFixed(0)})` : '';
@@ -3028,17 +3062,52 @@ async function executeWaTool(name, args, session) {
           }
         }
       } catch (quoteErr) {
-        console.error('[submit_rfq] AI quote generation error:', quoteErr.message);
+        console.error('[submit_rfq] AI quote generation error:', quoteErr.message, quoteErr.stack);
       }
 
-      // Fallback if quote generation fails
+      // Fallback if quote generation fails — DO NOT leave the RFQ at R0.
+      // Set a conservative labour-only placeholder and flag it for admin.
+      const fallbackBudget = Number(args.clientBudget) > 0 ? Number(args.clientBudget) : 0;
+      const fallbackTotal = fallbackBudget > 0 ? fallbackBudget : 1500; // safe min labour estimate
+      try {
+        await firestore.collection('futureBookings').doc(rfqId).update({
+          cost: fallbackTotal.toString(),
+          total_price: fallbackTotal.toString(),
+          quoted_price: fallbackTotal.toString(),
+          quote_details: args.description || '',
+          quote_generation_failed: true,
+          rfq_status: 'pending_admin_review',
+          rfq_awaiting_admin_review_reason: 'quote_generation_failed',
+        });
+      } catch (_) {}
+      try {
+        await pushAdminNotification({
+          title: 'RFQ Needs Manual Quote',
+          body: `${args.customerName || 'Client'} • ${args.category || 'service'} • AI quote failed, please price manually. RFQ ${rfqNo}`,
+          type: 'rfq_quote_needs_review',
+          bookingId: rfqId,
+          extraData: { reason: 'quote_generation_failed' },
+        });
+      } catch (_) {}
       return {
         success: true,
         rfqId,
         rfqNo,
         hasQuote: false,
-        message: `RFQ ${rfqNo} submitted! Our team will review your request and provide a detailed quotation. You'll receive the quote here on WhatsApp.`,
+        message: `Thanks! RFQ ${rfqNo} is in. Our admin is reviewing your request and will send the quote here on WhatsApp shortly (usually within a couple of hours during business hours).`,
       };
+     } catch (outerErr) {
+        // Catch-all so we NEVER dead-end the conversation with a raw tool error.
+        console.error('[submit_rfq] OUTER error:', outerErr.message, outerErr.stack);
+        const fallbackRfqNo = session.lastRfqNo || 'pending';
+        return {
+          success: true,
+          rfqId: session.lastRfqId || '',
+          rfqNo: fallbackRfqNo,
+          hasQuote: false,
+          message: `Thanks — I've logged your request${fallbackRfqNo !== 'pending' ? ` as ${fallbackRfqNo}` : ''}. Our admin will review it and get back to you here on WhatsApp shortly.`,
+        };
+     }
     }
 
     // ═══════════════════════════════════════════
@@ -4379,9 +4448,9 @@ PHOTO REQUIREMENT (CRITICAL):
 - Before calling submit_rfq you MUST complete ALL of these steps IN ORDER:
   1. SCOPE CONFIRMATION — understand the issue. If photos were sent, analyse them and state your understanding in one short sentence (e.g. "Got it — the shower mixer is leaking at the wall connection, correct?"). Wait for the customer to confirm or correct you.
   2. MATERIALS-RESPONSIBILITY — ask exactly: "Will you be buying the materials yourself, or should our artisan source them for you?" Wait for the answer.
-  3. MATERIAL CHOICE (only if artisan will supply materials AND the job needs a specific fixture/part — shower mixer, toilet cistern, tap, door lock, ceiling light, geyser, tile, paint brand etc.): CALL show_material_options with the itemType BEFORE submit_rfq. The client will see pictures and prices and reply with the option label. Wait for their reply, then pass it as materialChoice to submit_rfq. If the client says "any" or "you choose", pick the mid-range option yourself and tell them.
-  4. BUDGET — ask exactly: "What's your budget for this job? A rough number is fine — it helps us keep the quote realistic." If the client says "no budget" or "whatever it costs", pass clientBudget=0. Otherwise pass the number.
-  5. Only AFTER scope + materials answer + (if applicable) material choice + budget, call submit_rfq with: category, description (include any material choice inside the description), address, customerName, materialsResponsibility, clientBudget, and materialChoice if applicable.
+  3. MATERIAL CHOICE (MANDATORY whenever materialsResponsibility="artisan" AND the category is plumbing / electrical / tiling / carpentry / locksmith / painting / roofing / appliance repair — basically anything that involves fitting a visible part): you MUST call show_material_options with the best-guess itemType (e.g. "shower mixer", "toilet cistern", "tap", "door lock", "ceiling light", "geyser", "tile", "paint") BEFORE calling submit_rfq. Do NOT skip this step by reasoning "the scope is too vague" — if in doubt, pick the most likely itemType and show options. The client will see pictures and prices and reply with the option label. Wait for their reply, then pass it as materialChoice to submit_rfq. If the client says "any" / "you choose" / "whichever is best", pick the mid-range option yourself and tell them which one you picked.
+  4. BUDGET — ask exactly: "What's your budget for this job? A rough number is fine — it helps us keep the quote realistic." Wait for the answer. If the client says "no budget" or "whatever it costs", pass clientBudget=0. Otherwise pass the number (strip the "R").
+  5. Only AFTER scope + materials answer + (if applicable) material choice + BUDGET ANSWER, call submit_rfq EXACTLY ONCE with: category, description (include any material choice inside the description), address, customerName, materialsResponsibility, clientBudget, and materialChoice if applicable. NEVER call submit_rfq twice for the same request — if you already called it, do NOT call it again; just relay the response message to the client.
 - submit_rfq will auto-generate a detailed quote using real-time Builders Warehouse material prices + the company pricing guide (labour rate, material multiplier, contingency %). You do NOT compute the price yourself.
 - TWO OUTCOMES after submit_rfq:
   • materialsResponsibility="client" (client supplies materials) → the generated quote is shown directly to the client. Present it clearly and ask if they'd like to proceed. If accepted, it auto-dispatches to artisans (under R12K).
@@ -4904,7 +4973,7 @@ app.post('/webhook', async (req, res) => {
 });
 
 // Health check
-app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'rfq-admin-review-v6', commit: process.env.RENDER_GIT_COMMIT || 'unknown', deployedAt: process.env.RENDER_DEPLOY_TIME || new Date().toISOString() }));
+app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'rfq-debug-v7', commit: process.env.RENDER_GIT_COMMIT || 'unknown', deployedAt: process.env.RENDER_DEPLOY_TIME || new Date().toISOString() }));
 
 // ─── Diagnostic: test Firebase read/write (auth-protected) ───
 app.get('/debug/firebase-test', requireInternalSecret, async (req, res) => {
