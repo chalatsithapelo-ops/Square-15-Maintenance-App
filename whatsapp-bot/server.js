@@ -562,6 +562,68 @@ async function logErrorToAdmin(errorType, description, source, errorDetails, boo
   }
 }
 
+// ─── Admin push helper: creates a notification doc AND fires FCM to every admin device ───
+// Use this for non-error events (new RFQ, quote accepted, escalation etc) where we want
+// the admin phone to light up even when the app is closed.
+async function pushAdminNotification({ title, body, type, bookingId = '', extraData = {} }) {
+  if (!firestore) return;
+  try {
+    const notifPayload = {
+      title: String(title || 'Square 15'),
+      body: String(body || '').slice(0, 500),
+      type: String(type || 'admin_event'),
+      user_type: 'admin',
+      booking_id: String(bookingId || ''),
+      read: false,
+      source: 'whatsapp_bot',
+      timestamp: admin.firestore.FieldValue.serverTimestamp(),
+      created_at: admin.firestore.FieldValue.serverTimestamp(),
+    };
+    await firestore.collection('notifications').add({ ...notifPayload, user_id: 'admin' });
+
+    const adminSnap = await firestore.collection('users').where('isAdmin', '==', true).limit(25).get();
+    const TOKEN_FIELDS_SINGLE = ['deviceToken', 'device_token', 'fcm_token', 'fcmToken', 'token', 'push_token', 'pushToken'];
+    const TOKEN_FIELDS_LIST = ['tokens', 'fcm_tokens', 'deviceTokens'];
+    const tokens = [];
+    const tokenSet = new Set();
+    const perAdminWrites = [];
+    for (const doc of adminSnap.docs) {
+      const data = doc.data() || {};
+      perAdminWrites.push(firestore.collection('notifications').add({ ...notifPayload, user_id: doc.id }));
+      for (const f of TOKEN_FIELDS_SINGLE) {
+        const t = String(data[f] || '').trim();
+        if (t && !tokenSet.has(t)) { tokenSet.add(t); tokens.push(t); }
+      }
+      for (const f of TOKEN_FIELDS_LIST) {
+        const list = data[f];
+        if (!Array.isArray(list)) continue;
+        for (const item of list) {
+          const t = String(item || '').trim();
+          if (t && !tokenSet.has(t)) { tokenSet.add(t); tokens.push(t); }
+        }
+      }
+    }
+    await Promise.all(perAdminWrites).catch(() => {});
+    if (!tokens.length) { console.warn(`[adminPush:${type}] no admin tokens found`); return; }
+    try {
+      const data = { type: notifPayload.type, booking_id: notifPayload.booking_id };
+      for (const [k, v] of Object.entries(extraData || {})) data[k] = String(v == null ? '' : v).slice(0, 500);
+      const resp = await admin.messaging().sendEachForMulticast({
+        tokens,
+        notification: { title: notifPayload.title, body: notifPayload.body },
+        data,
+        android: { priority: 'high', notification: { channelId: 'high_importance_channel' } },
+        apns: { payload: { aps: { sound: 'default', badge: 1 } } },
+      });
+      console.log(`[adminPush:${type}] FCM ${resp.successCount}/${tokens.length} delivered`);
+    } catch (fcmErr) {
+      console.warn(`[adminPush:${type}] FCM multicast failed:`, fcmErr && fcmErr.message);
+    }
+  } catch (e) {
+    console.warn('[adminPush] failed:', e && e.message);
+  }
+}
+
 async function notifyWebhookProcessingFailure(phone, err, userText = '') {
   const detail = err?.message || String(err || 'unknown_error');
   try {
@@ -905,8 +967,25 @@ const waTools = [
           address:      { type: 'string', description: 'Property address' },
           customerName: { type: 'string', description: 'Customer full name' },
           materialsResponsibility: { type: 'string', enum: ['client', 'artisan'], description: 'Who provides materials' },
+          clientBudget: { type: 'number', description: 'Client stated budget in ZAR (ask them before calling submit_rfq). Pass 0 if the client explicitly said they have no budget in mind.' },
+          materialChoice: { type: 'string', description: 'If materialsResponsibility=artisan and you already called show_material_options and the client picked one, pass the chosen option label (e.g. "Mid-range shower mixer").' },
         },
-        required: ['category', 'description', 'customerName'],
+        required: ['category', 'description', 'customerName', 'materialsResponsibility', 'clientBudget'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'show_material_options',
+      description: 'Call this when materialsResponsibility=artisan and the job needs a specific part/fixture (shower mixer, toilet cistern, tap, door lock, tile, paint, geyser etc). Sends the client 2-4 material options with photos and approximate prices so they can pick their preferred quality/style BEFORE you call submit_rfq. Ask the client to reply with the option label.',
+      parameters: {
+        type: 'object',
+        properties: {
+          category: { type: 'string', description: 'Service category (e.g. plumbing, electrical, tiling, painting)' },
+          itemType: { type: 'string', description: 'Specific item the client needs, e.g. "shower mixer", "toilet cistern", "ceiling light", "wall tile"' },
+        },
+        required: ['category', 'itemType'],
       },
     },
   },
@@ -2800,6 +2879,15 @@ async function executeWaTool(name, args, session) {
         problem_description: args.description || '',
         address: args.address || '',
         materials_responsibility: args.materialsResponsibility || 'artisan',
+        // User-stated budget — drives sales-conversion tactics and admin review UI
+        user_budget: Number(args.clientBudget) > 0 ? Number(args.clientBudget) : 0,
+        // If the client picked a specific material option via show_material_options
+        material_choice: String(args.materialChoice || '').trim(),
+        // Full list of material options that were presented to the client (so admin can review/amend)
+        material_options_shown: (session.pendingMaterialChoice && Array.isArray(session.pendingMaterialChoice.options))
+          ? session.pendingMaterialChoice.options.map(o => ({ label: String(o.label || ''), price: Number(o.price || 0), image_url: String(o.image_url || ''), note: String(o.note || '') }))
+          : [],
+        material_item_type: (session.pendingMaterialChoice && session.pendingMaterialChoice.itemType) || '',
         status: 'rfq_pending',
         payment_status: 'unpaid',
         cost: '',
@@ -2826,15 +2914,20 @@ async function executeWaTool(name, args, session) {
       session.lastRfqId = rfqId;
       session.lastRfqNo = rfqNo;
 
-      // Notify admin
-      await firestore.collection('notifications').add({
+      // Notify admin (Firestore doc + FCM push so OS tray lights up)
+      const budgetNote = Number(args.clientBudget) > 0 ? ` (budget R${Number(args.clientBudget).toFixed(0)})` : '';
+      const matNote = args.materialsResponsibility === 'client' ? ' — client supplies materials (labour-only)' : '';
+      await pushAdminNotification({
         title: 'New WhatsApp RFQ',
-        body: `${args.customerName} submitted RFQ for ${args.category} via WhatsApp. RFQ: ${rfqNo}`,
+        body: `${args.customerName || 'Client'}: ${args.category || 'service'}${matNote}${budgetNote}. RFQ ${rfqNo}`,
         type: 'new_rfq',
-        user_type: 'admin',
-        booking_id: rfqId,
-        read: false,
-        created_at: admin.firestore.FieldValue.serverTimestamp(),
+        bookingId: rfqId,
+        extraData: {
+          customer_name: args.customerName || '',
+          category: args.category || '',
+          materials_responsibility: args.materialsResponsibility || 'artisan',
+          user_budget: String(Number(args.clientBudget) || 0),
+        },
       });
 
       // ── AI Quote Generation ──
@@ -2859,28 +2952,80 @@ async function executeWaTool(name, args, session) {
           imageContext.trim()
         );
 
+        // RULE (2026-04-23): when the artisan supplies materials, the AI quote must be
+        // reviewed by admin BEFORE it's shown to the client (so admin can check the
+        // material selection and amend if needed). When the client supplies materials,
+        // the quote goes directly to the client for acceptance (fast labour-only path).
+        const materialsRespLc = String(args.materialsResponsibility || '').toLowerCase();
+        const clientSuppliesMaterials = materialsRespLc === 'client';
+
         if (quote) {
-          // Save quote to the RFQ document
-          await firestore.collection('futureBookings').doc(rfqId).update({
-            ai_quote: quote,
-            quoted_price: quote.grand_total.toString(),
-            quote_details: quote.scope_of_work,
-            rfq_status: 'pending_client_response',
-            total_price: quote.grand_total.toString(),
-            cost: quote.grand_total.toString(),
-          });
+          if (clientSuppliesMaterials) {
+            // ── FAST PATH: client buys materials → present quote now, auto-dispatch on accept ──
+            await firestore.collection('futureBookings').doc(rfqId).update({
+              ai_quote: quote,
+              quoted_price: quote.grand_total.toString(),
+              quote_details: quote.scope_of_work,
+              rfq_status: 'pending_client_response',
+              total_price: quote.grand_total.toString(),
+              cost: quote.grand_total.toString(),
+            });
 
-          const quoteMsg = formatQuoteForWhatsApp(quote, rfqNo);
-          console.log(`[submit_rfq] AI quote generated: R${quote.grand_total.toFixed(2)} for ${rfqNo}`);
+            const quoteMsg = formatQuoteForWhatsApp(quote, rfqNo);
+            console.log(`[submit_rfq] AI quote (client-materials) R${quote.grand_total.toFixed(2)} for ${rfqNo} — going straight to client`);
 
-          return {
-            success: true,
-            rfqId,
-            rfqNo,
-            hasQuote: true,
-            grand_total: `R${quote.grand_total.toFixed(2)}`,
-            message: `RFQ ${rfqNo} submitted with AI-generated quote!\n\n${quoteMsg}`,
-          };
+            return {
+              success: true,
+              rfqId,
+              rfqNo,
+              hasQuote: true,
+              grand_total: `R${quote.grand_total.toFixed(2)}`,
+              message: `RFQ ${rfqNo} submitted with AI-generated quote!\n\n${quoteMsg}`,
+            };
+          } else {
+            // ── REVIEW PATH: artisan buys materials → hold for admin, DO NOT show client yet ──
+            await firestore.collection('futureBookings').doc(rfqId).update({
+              ai_quote: quote,
+              quoted_price: quote.grand_total.toString(),
+              quote_details: quote.scope_of_work,
+              rfq_status: 'pending_admin_review',
+              rfq_awaiting_admin_review_reason: 'artisan_supplies_materials',
+              total_price: quote.grand_total.toString(),
+              cost: quote.grand_total.toString(),
+            });
+            console.log(`[submit_rfq] AI quote (artisan-materials) R${quote.grand_total.toFixed(2)} for ${rfqNo} — HELD for admin review`);
+
+            // Push admins: quote needs review (include material list for context)
+            try {
+              const matCount = Array.isArray(session.pendingMaterialChoice?.options) ? session.pendingMaterialChoice.options.length : 0;
+              await pushAdminNotification({
+                title: 'RFQ Quote Ready — Needs Admin Review',
+                body: `${args.customerName || 'Client'} • ${args.category || 'service'} • R${quote.grand_total.toFixed(2)} • ${matCount} material option(s) shown. Review & send to client.`,
+                type: 'rfq_quote_needs_review',
+                bookingId: rfqId,
+                extraData: {
+                  price: String(quote.grand_total),
+                  material_choice: String(args.materialChoice || ''),
+                  materials_responsibility: 'artisan',
+                  user_budget: String(Number(args.clientBudget) || 0),
+                },
+              });
+            } catch (_) {}
+
+            // Clear pending options now that they're persisted on the RFQ
+            session.pendingMaterialChoice = null;
+
+            return {
+              success: true,
+              rfqId,
+              rfqNo,
+              hasQuote: true,
+              adminReviewRequired: true,
+              grand_total: `R${quote.grand_total.toFixed(2)}`,
+              // Message the bot should relay to the client — do NOT include the quote breakdown.
+              message: `Thanks! RFQ ${rfqNo} is in. Because our artisan will source the materials, our admin is reviewing the quote to make sure everything's right — we'll send it through here shortly (usually within a couple of hours during business hours). I'll ping you the moment it's ready.`,
+            };
+          }
         }
       } catch (quoteErr) {
         console.error('[submit_rfq] AI quote generation error:', quoteErr.message);
@@ -2894,6 +3039,114 @@ async function executeWaTool(name, args, session) {
         hasQuote: false,
         message: `RFQ ${rfqNo} submitted! Our team will review your request and provide a detailed quotation. You'll receive the quote here on WhatsApp.`,
       };
+    }
+
+    // ═══════════════════════════════════════════
+    // 10b) SHOW MATERIAL OPTIONS (with images)
+    // ═══════════════════════════════════════════
+    case 'show_material_options': {
+      try {
+        const itemType = String(args.itemType || '').toLowerCase().trim();
+        const cat = String(args.category || '').toLowerCase().trim();
+        if (!itemType) return { success: false, error: 'itemType required' };
+
+        // 1) Try admin-curated Firestore catalog first
+        let options = [];
+        if (firestore) {
+          try {
+            const snap = await firestore.collection('materials_catalog')
+              .where('active', '==', true)
+              .limit(50).get();
+            for (const d of snap.docs) {
+              const m = d.data() || {};
+              const keywords = [
+                String(m.item_type || '').toLowerCase(),
+                ...(Array.isArray(m.keywords) ? m.keywords.map(k => String(k).toLowerCase()) : []),
+              ].filter(Boolean);
+              const matched = keywords.some(k => k && (itemType.includes(k) || k.includes(itemType)));
+              if (!matched) continue;
+              const opts = Array.isArray(m.options) ? m.options : [];
+              for (const opt of opts.slice(0, 4)) {
+                options.push({
+                  label: String(opt.label || '').trim(),
+                  price: Number(opt.price || 0),
+                  image_url: String(opt.image_url || '').trim(),
+                  note: String(opt.note || '').trim(),
+                });
+              }
+              if (options.length >= 3) break;
+            }
+          } catch (e) { console.warn('[show_material_options] catalog read failed:', e.message); }
+        }
+
+        // 2) Fallback default catalog so the feature works even with empty Firestore
+        if (!options.length) {
+          const FALLBACK = {
+            'shower mixer': [
+              { label: 'Standard shower mixer (chrome)', price: 450, image_url: 'https://images.builders.co.za/product/360/360/294090.jpg', note: 'Entry-level, reliable' },
+              { label: 'Mid-range shower mixer (dual-control)', price: 950, image_url: 'https://images.builders.co.za/product/360/360/302431.jpg', note: 'Most popular, better flow' },
+              { label: 'Premium thermostatic mixer', price: 1850, image_url: 'https://images.builders.co.za/product/360/360/308811.jpg', note: 'Temperature-safe, long warranty' },
+            ],
+            'toilet cistern': [
+              { label: 'Standard dual-flush cistern', price: 650, image_url: 'https://images.builders.co.za/product/360/360/279902.jpg', note: 'Water-saving' },
+              { label: 'Mid-range slim cistern', price: 1200, image_url: 'https://images.builders.co.za/product/360/360/285114.jpg', note: 'Compact, quiet fill' },
+            ],
+            'tap': [
+              { label: 'Pillar tap (basin/sink)', price: 280, image_url: 'https://images.builders.co.za/product/360/360/294082.jpg' },
+              { label: 'Mixer tap with swivel spout', price: 720, image_url: 'https://images.builders.co.za/product/360/360/294117.jpg' },
+              { label: 'Premium lever mixer', price: 1400, image_url: 'https://images.builders.co.za/product/360/360/297550.jpg' },
+            ],
+            'ceiling light': [
+              { label: 'Standard LED flush mount', price: 220, image_url: 'https://images.builders.co.za/product/360/360/293811.jpg' },
+              { label: 'Modern LED panel (cool white)', price: 480, image_url: 'https://images.builders.co.za/product/360/360/303555.jpg' },
+            ],
+            'door lock': [
+              { label: 'Standard cylinder lock', price: 320, image_url: 'https://images.builders.co.za/product/360/360/279455.jpg' },
+              { label: 'Security deadbolt', price: 780, image_url: 'https://images.builders.co.za/product/360/360/285770.jpg' },
+            ],
+          };
+          // fuzzy pick a fallback bucket
+          const bucket = Object.keys(FALLBACK).find(k => itemType.includes(k) || k.includes(itemType));
+          if (bucket) options = FALLBACK[bucket];
+        }
+
+        if (!options.length) {
+          return {
+            success: false,
+            note: 'No material options available for that item yet. Ask the client to describe what they want (brand, style, budget) and include it in the RFQ description.',
+          };
+        }
+
+        // Send each option as an image + caption to the client on WhatsApp
+        const to = session.phone;
+        try {
+          await sendWhatsAppMessage(to, `Here are ${options.length} options for a ${itemType}. Reply with the option label you'd prefer (or say "any" and I'll pick the mid-range one):`);
+        } catch (_) {}
+        for (const opt of options) {
+          const caption = `*${opt.label}* — approx R${Number(opt.price).toFixed(0)}${opt.note ? `\n_${opt.note}_` : ''}`;
+          if (opt.image_url) {
+            try { await sendWhatsAppImage(to, opt.image_url, caption); } catch (e) {
+              // Fallback to plain text if image send fails
+              try { await sendWhatsAppMessage(to, caption); } catch (_) {}
+            }
+          } else {
+            try { await sendWhatsAppMessage(to, caption); } catch (_) {}
+          }
+        }
+
+        // Track that options were presented so the bot knows to wait for the pick
+        session.pendingMaterialChoice = { itemType, category: cat, options: options.map(o => ({ label: o.label, price: o.price, image_url: o.image_url || '', note: o.note || '' })) };
+
+        return {
+          success: true,
+          presented: options.length,
+          options: options.map(o => ({ label: o.label, price: `R${Number(o.price).toFixed(0)}`, note: o.note || '' })),
+          note: 'Options were sent to the client with images. WAIT for their reply (option label or "any") before calling submit_rfq. Pass the chosen label in submit_rfq.materialChoice.',
+        };
+      } catch (e) {
+        console.error('[show_material_options] error:', e.message);
+        return { success: false, error: e.message };
+      }
     }
 
     // ═══════════════════════════════════════════
@@ -3613,15 +3866,29 @@ async function executeWaTool(name, args, session) {
         read: false,
         created_at: admin.firestore.FieldValue.serverTimestamp(),
       });
+      // FCM push so admin phones tray lights up even when app is closed
+      const materialsRespForPush = (data.materials_responsibility || '').toString().trim().toLowerCase();
+      const overCap = priceNum >= 12000;
+      await pushAdminNotification({
+        title: overCap ? '⚠️ RFQ Accepted — Needs Admin Review (> R12K)' : 'RFQ Quote Accepted',
+        body: `R${priceNum.toFixed(2)} — ${data.user_name || 'Client'} accepted RFQ ${data.rfq_no || rfqId}. ${overCap ? 'Over R12K cap — please review & dispatch manually.' : 'Will auto-dispatch to artisans.'}`,
+        type: overCap ? 'rfq_accepted_admin_review' : 'rfq_accepted',
+        bookingId: rfqId,
+        extraData: { price: String(priceNum), materials_responsibility: materialsRespForPush, over_12k: overCap ? '1' : '0' },
+      });
 
       // ── Auto-dispatch: route directly to artisans when conditions met ──
+      // RULE (2026-04-23): R12K is an ABSOLUTE cap. Even if the client buys
+      // materials (labour-only), any quote >= R12K must be reviewed by admin
+      // and dispatched manually. Under R12K, auto-dispatch happens whether
+      // the client or the artisan supplies materials.
       const materialsResp = (data.materials_responsibility || '').toString().trim().toLowerCase();
       const clientBuysMaterials = materialsResp === 'client';
       const underThreshold = priceNum > 0 && priceNum < 12000;
       let autoDispatched = false;
 
-      if (clientBuysMaterials || underThreshold) {
-        const autoReason = clientBuysMaterials ? 'client_buys_materials' : 'under_12k';
+      if (underThreshold) {
+        const autoReason = clientBuysMaterials ? 'client_buys_materials_under_12k' : 'under_12k';
         const cat = (data.category || data.category_name || '').toLowerCase().replace(/\s+/g, '_');
         try {
           // Query without inequality filter — Firestore != excludes docs
@@ -4109,15 +4376,34 @@ PHOTO REQUIREMENT (CRITICAL):
 🏗️ CUSTOM JOB / AI RFQ FLOW (CRITICAL — use whenever the service is NOT in the fixed price list):
 - If lookup_pricing returns matched=false (or the customer's job doesn't match any fixed service price), this is a CUSTOM job that needs an AI-generated quote via submit_rfq.
 - NEVER invent a price. NEVER reuse an unrelated fixed price. If no fixed price matches, the ONLY correct path is submit_rfq.
-- Before calling submit_rfq you MUST:
-  1. Understand the issue. If photos were sent, analyse them and state your understanding in one short sentence (e.g. "Got it — the shower mixer is leaking at the wall connection, correct?"). Wait for the customer to confirm or correct you.
-  2. Ask exactly this question and WAIT for the answer: "Will you be buying the materials yourself, or should our artisan source them for you?"
-  3. Based on the answer, pass materialsResponsibility to submit_rfq:
-     - Customer buys materials → materialsResponsibility="client"
-     - Artisan sources materials → materialsResponsibility="artisan"
-- Only AFTER scope confirmation AND materials-responsibility answer, call submit_rfq.
+- Before calling submit_rfq you MUST complete ALL of these steps IN ORDER:
+  1. SCOPE CONFIRMATION — understand the issue. If photos were sent, analyse them and state your understanding in one short sentence (e.g. "Got it — the shower mixer is leaking at the wall connection, correct?"). Wait for the customer to confirm or correct you.
+  2. MATERIALS-RESPONSIBILITY — ask exactly: "Will you be buying the materials yourself, or should our artisan source them for you?" Wait for the answer.
+  3. MATERIAL CHOICE (only if artisan will supply materials AND the job needs a specific fixture/part — shower mixer, toilet cistern, tap, door lock, ceiling light, geyser, tile, paint brand etc.): CALL show_material_options with the itemType BEFORE submit_rfq. The client will see pictures and prices and reply with the option label. Wait for their reply, then pass it as materialChoice to submit_rfq. If the client says "any" or "you choose", pick the mid-range option yourself and tell them.
+  4. BUDGET — ask exactly: "What's your budget for this job? A rough number is fine — it helps us keep the quote realistic." If the client says "no budget" or "whatever it costs", pass clientBudget=0. Otherwise pass the number.
+  5. Only AFTER scope + materials answer + (if applicable) material choice + budget, call submit_rfq with: category, description (include any material choice inside the description), address, customerName, materialsResponsibility, clientBudget, and materialChoice if applicable.
 - submit_rfq will auto-generate a detailed quote using real-time Builders Warehouse material prices + the company pricing guide (labour rate, material multiplier, contingency %). You do NOT compute the price yourself.
-- The generated quote is automatically shown to the customer; present it clearly and ask if they'd like to proceed.
+- TWO OUTCOMES after submit_rfq:
+  • materialsResponsibility="client" (client supplies materials) → the generated quote is shown directly to the client. Present it clearly and ask if they'd like to proceed. If accepted, it auto-dispatches to artisans (under R12K).
+  • materialsResponsibility="artisan" (artisan sources materials) → the quote is HELD for admin review. The submit_rfq response will have adminReviewRequired=true and a client-facing message you should relay verbatim. DO NOT show the price breakdown to the client. The admin will review the material selection and send the finalised quote to the client themselves.
+- DISPATCH RULES (inform the customer when relevant):
+  • Labour-only jobs (client supplies materials) under R12,000 → auto-dispatched to artisans the moment the client accepts.
+  • Any job under R12,000 with client-supplied materials → auto-dispatched on acceptance.
+  • Any job where artisan supplies materials → admin reviews the quote before the client sees it.
+  • Any job R12,000 or more → reviewed by admin, then dispatched manually regardless of who supplies materials.
+
+💰 SALES CONVERSION (CRITICAL — always try to close the deal, especially when price pushback or drop-off):
+- You are a sales-focused assistant. Every conversation should end in a confirmed booking, RFQ, or follow-up appointment — never a silent drop-off.
+- If the client hesitates on price or says "too expensive" / "I'll think about it" / "let me check" / goes silent mid-flow:
+  1. Acknowledge warmly: "Totally understand — let me see what I can do."
+  2. Offer a LABOUR-ONLY variant: "If you source the materials yourself, we can drop the labour portion to R[X]. Want me to send you a shopping list?" (this also unlocks auto-dispatch under R12K, faster turnaround).
+  3. Offer PHASING: "We can split this into two visits — fix the critical part now for R[Y], then the cosmetic part next month."
+  4. Offer a CHEAPER material choice via show_material_options (e.g. standard vs premium mixer).
+  5. Ask for their target price: "What price would work for you? I'll see if we can make it fit."
+  6. If they still decline, keep it open: "No problem. I'll keep the quote on file for 30 days — just message me 'yes' when you're ready."
+- If the client has booked before, look for UPSELL angles: "While we're there, would you like us to check your geyser / service the aircon / replace the bathroom silicon? We can add it for R[X] and save you a separate call-out fee."
+- If the client declines the quote (calls reject_rfq_quote), ALWAYS capture the reason ("may I ask what feels off — the price, timing, or scope?"). Save it in reason — admin uses this to re-quote.
+- Never be pushy, but never let a silent drop end the chat. If they go quiet after a quote, one gentle nudge after a pause: "Still thinking it over? Happy to adjust scope or materials to fit your budget."
 
 GUIDELINES:
 - Be warm, professional, and concise (WhatsApp messages should be short)
@@ -4353,7 +4639,7 @@ async function _flushPendingPhotos(from, contactName) {
   const captions = photos.map(p => p.caption).filter(Boolean);
   const captionText = captions.length ? ` Customer caption(s): ${captions.map(c => `"${c}"`).join(' | ')}.` : '';
   const plural = n === 1 ? 'a photo' : `${n} photos`;
-  const userText = `[Customer sent ${plural} of a maintenance/repair issue.${captionText}] Analyse the image(s) together and identify the single underlying problem. Then follow the pricing rules: first call lookup_pricing with the specific service. If it returns matched=true use that fixed price and wait for confirmation. If it returns matched=false, follow the AI RFQ flow — confirm your understanding in one sentence, then ask whether the customer or the artisan will buy the materials, and only after both are answered call submit_rfq.`;
+  const userText = `[Customer sent ${plural} of a maintenance/repair issue.${captionText}] Analyse the image(s) together and identify the single underlying problem. Then follow the pricing rules: first call lookup_pricing with the specific service. If it returns matched=true use that fixed price and wait for confirmation. If it returns matched=false, follow the AI RFQ flow strictly in order — (1) confirm your understanding in one sentence, (2) ask whether the customer or the artisan will buy the materials, (3) if the artisan will buy materials and the job needs a specific fixture/part, call show_material_options and wait for their pick, (4) ask for the client's budget, (5) only then call submit_rfq with materialsResponsibility, clientBudget and (if applicable) materialChoice.`;
 
   // Filter to vision-safe images
   const VISION_MAX = 3 * 1024 * 1024;
@@ -4618,7 +4904,7 @@ app.post('/webhook', async (req, res) => {
 });
 
 // Health check
-app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'stopword-fuzzy-v4', commit: process.env.RENDER_GIT_COMMIT || 'unknown', deployedAt: process.env.RENDER_DEPLOY_TIME || new Date().toISOString() }));
+app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'rfq-admin-review-v6', commit: process.env.RENDER_GIT_COMMIT || 'unknown', deployedAt: process.env.RENDER_DEPLOY_TIME || new Date().toISOString() }));
 
 // ─── Diagnostic: test Firebase read/write (auth-protected) ───
 app.get('/debug/firebase-test', requireInternalSecret, async (req, res) => {
