@@ -3227,51 +3227,56 @@ async function executeWaTool(name, args, session) {
         const clientSuppliesMaterials = materialsRespLc === 'client';
 
         if (quote) {
+          const gt = Number(quote.grand_total);
+          const gtStr = (Number.isFinite(gt) ? gt : 0).toFixed(2);
+          if (!Number.isFinite(gt) || gt <= 0) {
+            console.warn(`[submit_rfq] AI quote returned but grand_total invalid (${quote.grand_total}) — will fall through to fallback`);
+          }
           if (clientSuppliesMaterials) {
             // ── FAST PATH: client buys materials → present quote now, auto-dispatch on accept ──
             await firestore.collection('futureBookings').doc(rfqId).update({
               ai_quote: quote,
-              quoted_price: quote.grand_total.toString(),
-              quote_details: quote.scope_of_work,
+              quoted_price: gtStr,
+              quote_details: quote.scope_of_work || args.description || '',
               rfq_status: 'pending_client_response',
-              total_price: quote.grand_total.toString(),
-              cost: quote.grand_total.toString(),
+              total_price: gtStr,
+              cost: gtStr,
             });
 
             const quoteMsg = formatQuoteForWhatsApp(quote, rfqNo);
-            console.log(`[submit_rfq] AI quote (client-materials) R${quote.grand_total.toFixed(2)} for ${rfqNo} — going straight to client`);
+            console.log(`[submit_rfq] AI quote (client-materials) R${gtStr} for ${rfqNo} — going straight to client`);
 
             return {
               success: true,
               rfqId,
               rfqNo,
               hasQuote: true,
-              grand_total: `R${quote.grand_total.toFixed(2)}`,
+              grand_total: `R${gtStr}`,
               message: `RFQ ${rfqNo} submitted with AI-generated quote!\n\n${quoteMsg}`,
             };
           } else {
             // ── REVIEW PATH: artisan buys materials → hold for admin, DO NOT show client yet ──
             await firestore.collection('futureBookings').doc(rfqId).update({
               ai_quote: quote,
-              quoted_price: quote.grand_total.toString(),
-              quote_details: quote.scope_of_work,
+              quoted_price: gtStr,
+              quote_details: quote.scope_of_work || args.description || '',
               rfq_status: 'pending_admin_review',
               rfq_awaiting_admin_review_reason: 'artisan_supplies_materials',
-              total_price: quote.grand_total.toString(),
-              cost: quote.grand_total.toString(),
+              total_price: gtStr,
+              cost: gtStr,
             });
-            console.log(`[submit_rfq] AI quote (artisan-materials) R${quote.grand_total.toFixed(2)} for ${rfqNo} — HELD for admin review`);
+            console.log(`[submit_rfq] AI quote (artisan-materials) R${gtStr} for ${rfqNo} — HELD for admin review`);
 
             // Push admins: quote needs review (include material list for context)
             try {
               const matCount = Array.isArray(session.pendingMaterialChoice?.options) ? session.pendingMaterialChoice.options.length : 0;
               await pushAdminNotification({
                 title: 'RFQ Quote Ready — Needs Admin Review',
-                body: `${args.customerName || 'Client'} • ${args.category || 'service'} • R${quote.grand_total.toFixed(2)} • ${matCount} material option(s) shown. Review & send to client.`,
+                body: `${args.customerName || 'Client'} • ${args.category || 'service'} • R${gtStr} • ${matCount} material option(s) shown. Review & send to client.`,
                 type: 'rfq_quote_needs_review',
                 bookingId: rfqId,
                 extraData: {
-                  price: String(quote.grand_total),
+                  price: gtStr,
                   material_choice: String(args.materialChoice || ''),
                   materials_responsibility: 'artisan',
                   user_budget: String(Number(args.clientBudget) || 0),
@@ -3288,7 +3293,7 @@ async function executeWaTool(name, args, session) {
               rfqNo,
               hasQuote: true,
               adminReviewRequired: true,
-              grand_total: `R${quote.grand_total.toFixed(2)}`,
+              grand_total: `R${gtStr}`,
               // Message the bot should relay to the client — do NOT include the quote breakdown.
               message: `Thanks! RFQ ${rfqNo} is in. Because our artisan will source the materials, our admin is reviewing the quote to make sure everything's right — we'll send it through here shortly (usually within a couple of hours during business hours). I'll ping you the moment it's ready.`,
             };
@@ -3375,9 +3380,69 @@ async function executeWaTool(name, args, session) {
         // Catch-all so we NEVER dead-end the conversation with a raw tool error.
         console.error('[submit_rfq] OUTER error:', outerErr.message, outerErr.stack);
         const fallbackRfqNo = session.lastRfqNo || 'pending';
+        const fallbackRfqId = session.lastRfqId || '';
+        // Even on outer error, guarantee the admin sees *some* draft pricing so
+        // the RFQ isn't blank in the Review screen.
+        if (fallbackRfqId && firestore) {
+          try {
+            const budget = Number(args.clientBudget) > 0 ? Number(args.clientBudget) : 0;
+            const emergencyLabor = Math.round(4 * 250 * 100) / 100;
+            const emergencyCont = Math.round(emergencyLabor * 0.15 * 100) / 100;
+            const emergencyTotal = budget > 0 ? budget : Math.round((emergencyLabor + emergencyCont) * 100) / 100;
+            const emergencyQuote = {
+              laborHours: 4,
+              laborCostPerHour: 250,
+              laborCost: emergencyLabor,
+              complexity: 3,
+              materialsBOM: [],
+              materialsPriced_reference: [],
+              materialsUnpriced_reference: [],
+              materials_subtotal: 0,
+              materials_with_markup: 0,
+              materials_responsibility: String(args.materialsResponsibility || 'artisan'),
+              equipmentCost: 0,
+              subtotal: emergencyLabor,
+              contingency: emergencyCont,
+              grand_total: emergencyTotal,
+              scope_of_work: args.description || '',
+              estimated_duration: 'To be confirmed by admin',
+              learning_factor: 1,
+              pricing_sources: { builders: 0, catalog: 0, ai_estimate: 0 },
+              breakdown: [
+                { description: `Labour estimate (4hrs @ R250/hr) — ADMIN PLEASE REVISE`, cost: emergencyLabor.toFixed(2) },
+                { description: 'Contingency (15%)', cost: emergencyCont.toFixed(2) },
+              ],
+              disclaimer: 'Bot hit an unexpected error generating the quote. Admin must review and price manually.',
+              generated_at: new Date().toISOString(),
+              source: 'whatsapp_emergency_fallback',
+              emergency_error: String(outerErr.message || 'unknown').slice(0, 300),
+            };
+            await firestore.collection('futureBookings').doc(fallbackRfqId).set({
+              ai_quote: emergencyQuote,
+              cost: emergencyTotal.toString(),
+              total_price: emergencyTotal.toString(),
+              quoted_price: emergencyTotal.toString(),
+              quote_details: args.description || '',
+              quote_generation_failed: true,
+              rfq_status: 'pending_admin_review',
+              rfq_awaiting_admin_review_reason: 'outer_exception',
+            }, { merge: true });
+            try {
+              await pushAdminNotification({
+                title: 'RFQ Needs Manual Quote (bot error)',
+                body: `${args.customerName || 'Client'} • ${args.category || 'service'} • RFQ ${fallbackRfqNo}. Bot crashed — please price manually.`,
+                type: 'rfq_quote_needs_review',
+                bookingId: fallbackRfqId,
+                extraData: { reason: 'outer_exception', error: String(outerErr.message || '').slice(0, 200) },
+              });
+            } catch (_) {}
+          } catch (emergencyErr) {
+            console.error('[submit_rfq] emergency fallback write failed:', emergencyErr.message);
+          }
+        }
         return {
           success: true,
-          rfqId: session.lastRfqId || '',
+          rfqId: fallbackRfqId,
           rfqNo: fallbackRfqNo,
           hasQuote: false,
           message: `Thanks — I've logged your request${fallbackRfqNo !== 'pending' ? ` as ${fallbackRfqNo}` : ''}. Our admin will review it and get back to you here on WhatsApp shortly.`,
@@ -5376,7 +5441,7 @@ app.post('/webhook', async (req, res) => {
 });
 
 // Health check
-app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'rfq-try-once-v16', commit: process.env.RENDER_GIT_COMMIT || 'unknown', deployedAt: process.env.RENDER_DEPLOY_TIME || new Date().toISOString() }));
+app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'rfq-safe-quote-v17', commit: process.env.RENDER_GIT_COMMIT || 'unknown', deployedAt: process.env.RENDER_DEPLOY_TIME || new Date().toISOString() }));
 
 // Diagnostic: run buildersSearchOptions live and report what happens.
 // GET /diag/builders?q=shower+mixer&limit=3
