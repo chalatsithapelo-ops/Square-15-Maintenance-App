@@ -3064,11 +3064,31 @@ async function executeWaTool(name, args, session) {
       if (!firestore) return { error: 'Database unavailable' };
 
      try {
-      // ── REMOVED server-side gate (v15): Builders live search is blocked by
-      // PerimeterX from every server-side egress (Render + GCF), so forcing
-      // show_material_options just produced "admin will pick" messages and
-      // delayed the RFQ. Admin curates options during Review instead; the
-      // client app surfaces them. submit_rfq proceeds directly.
+      // ── LIGHTWEIGHT GATE (v16): require ONE attempt at show_material_options
+      // before filing an artisan-materials RFQ. We don't require SUCCESS — just
+      // that the bot tried, so the client sees either real options or the
+      // "admin will curate" message. Builders live search often fails due to
+      // PerimeterX; we accept that and still record the attempt.
+      const materialsResp = String(args.materialsResponsibility || 'artisan').toLowerCase();
+      const hasShownOptions = !!(session.pendingMaterialChoice && Array.isArray(session.pendingMaterialChoice.options) && session.pendingMaterialChoice.options.length);
+      const hasChoice = !!String(args.materialChoice || '').trim();
+      const hasAttempted = !!session.materialOptionsAttempted;
+      const cat = String(args.category || '').toLowerCase();
+      const NEEDS_PARTS = ['plumb', 'electric', 'tile', 'tiling', 'carpent', 'lock', 'paint', 'roof', 'appliance'];
+      const needsParts = NEEDS_PARTS.some(k => cat.includes(k));
+      if (materialsResp === 'artisan' && needsParts && !hasShownOptions && !hasChoice && !hasAttempted) {
+        const desc = String(args.description || '').toLowerCase();
+        const ITEM_HINTS = ['shower mixer', 'mixer', 'toilet cistern', 'cistern', 'tap', 'door lock', 'lock', 'ceiling light', 'light', 'geyser', 'tile', 'paint', 'basin', 'sink'];
+        const guess = ITEM_HINTS.find(h => desc.includes(h)) || (cat.includes('plumb') ? 'tap' : cat.includes('electric') ? 'ceiling light' : cat.includes('lock') ? 'door lock' : 'fixture');
+        console.log(`[submit_rfq] GATE: artisan materials but show_material_options never attempted. Requiring one attempt (guess: ${guess})`);
+        return {
+          success: false,
+          error: 'Call show_material_options once before filing this RFQ.',
+          required_next_action: 'call_show_material_options',
+          suggested_itemType: guess,
+          instruction: `Call show_material_options with itemType="${guess}" exactly once. If it returns pending_admin_curation (expected when Builders blocks us), tell the client admin will curate and then call submit_rfq again — the gate will not fire a second time.`,
+        };
+      }
 
       // ── IDEMPOTENCY GUARD ──
       // If this session already created an RFQ in the last 10 minutes, treat a
@@ -3157,20 +3177,25 @@ async function executeWaTool(name, args, session) {
       session.lastRfqAt = Date.now();
 
       // Notify admin (Firestore doc + FCM push so OS tray lights up)
-      const budgetNote = Number(args.clientBudget) > 0 ? ` (budget R${Number(args.clientBudget).toFixed(0)})` : '';
-      const matNote = args.materialsResponsibility === 'client' ? ' — client supplies materials (labour-only)' : '';
-      await pushAdminNotification({
-        title: 'New WhatsApp RFQ',
-        body: `${args.customerName || 'Client'}: ${args.category || 'service'}${matNote}${budgetNote}. RFQ ${rfqNo}`,
-        type: 'new_rfq',
-        bookingId: rfqId,
-        extraData: {
-          customer_name: args.customerName || '',
-          category: args.category || '',
-          materials_responsibility: args.materialsResponsibility || 'artisan',
-          user_budget: String(Number(args.clientBudget) || 0),
-        },
-      });
+      // Wrapped in try/catch so a notification failure does NOT skip AI quote generation.
+      try {
+        const budgetNote = Number(args.clientBudget) > 0 ? ` (budget R${Number(args.clientBudget).toFixed(0)})` : '';
+        const matNote = args.materialsResponsibility === 'client' ? ' — client supplies materials (labour-only)' : '';
+        await pushAdminNotification({
+          title: 'New WhatsApp RFQ',
+          body: `${args.customerName || 'Client'}: ${args.category || 'service'}${matNote}${budgetNote}. RFQ ${rfqNo}`,
+          type: 'new_rfq',
+          bookingId: rfqId,
+          extraData: {
+            customer_name: args.customerName || '',
+            category: args.category || '',
+            materials_responsibility: args.materialsResponsibility || 'artisan',
+            user_budget: String(Number(args.clientBudget) || 0),
+          },
+        });
+      } catch (notifyErr) {
+        console.error('[submit_rfq] admin notification failed (continuing):', notifyErr.message);
+      }
 
       // ── AI Quote Generation ──
       // Extract any image analysis context from the conversation history
@@ -3368,6 +3393,11 @@ async function executeWaTool(name, args, session) {
         const itemType = String(args.itemType || '').toLowerCase().trim();
         const cat = String(args.category || '').toLowerCase().trim();
         if (!itemType) return { success: false, error: 'itemType required' };
+
+        // Mark that the bot attempted material options for this session so the
+        // submit_rfq gate knows it can proceed even if this call returns
+        // pending_admin_curation.
+        session.materialOptionsAttempted = true;
 
         let options = [];
 
@@ -4816,9 +4846,10 @@ PHOTO REQUIREMENT (CRITICAL):
 - Before calling submit_rfq you MUST complete ALL of these steps IN ORDER:
   1. SCOPE CONFIRMATION — understand the issue. If photos were sent, analyse them and state your understanding in one short sentence (e.g. "Got it — the shower mixer is leaking at the wall connection, correct?"). Wait for the customer to confirm or correct you.
   2. MATERIALS-RESPONSIBILITY — ask exactly: "Will you be buying the materials yourself, or should our artisan source them for you?" Wait for the answer.
-  3. MATERIAL CHOICE (OPTIONAL — admin curates during review): when materialsResponsibility="artisan" you MAY call show_material_options to try to offer live Builders product options. HOWEVER: Builders' site is frequently unreachable from our server (bot-protection). If the tool returns pending_admin_curation:true OR success:false, that is EXPECTED — simply tell the client verbatim: "No problem — I've logged your request. Our admin will hand-pick suitable product options with real photos, prices and links and send them with your quote shortly." Then proceed to submit_rfq immediately. Do NOT retry show_material_options or browse_builders_materials more than once per item. Do NOT block the RFQ on material choice.
-     ➤ If the tool DOES return real options (images were sent), wait for the client's reply (option label or "any") and pass materialChoice to submit_rfq. If the client says "any" / "you choose", pick the mid-range option.
-     ➤ If the client asks for more variety after real options are delivered, you MAY call browse_builders_materials ONCE with a refined keyword. If that also returns pending_admin_curation, stop retrying and tell the client admin will curate.
+  3. MATERIAL CHOICE (TRY ONCE — admin curates if unavailable): when materialsResponsibility="artisan" AND the category involves fitting a visible part (plumbing / electrical / tiling / carpentry / locksmith / painting / roofing / appliance repair), you MUST call show_material_options EXACTLY ONCE with the best-guess itemType (e.g. "shower mixer", "toilet cistern", "tap", "door lock", "ceiling light", "geyser", "tile", "paint") BEFORE calling submit_rfq. This attempt is REQUIRED even though it often fails — because when it succeeds, the client gets to pick, and when it fails the client understands admin will curate.
+     ➤ If show_material_options returns pending_admin_curation:true OR success:false, that is EXPECTED (Builders often blocks our server). Relay this to the client verbatim: "No problem — I've logged your request. Our admin will hand-pick suitable product options with real photos, prices and links and send them with your quote shortly." Then proceed DIRECTLY to the budget question and submit_rfq. Do NOT retry the tool.
+     ➤ If the tool DOES return real options (images delivered), wait for the client's reply (option label or "any") and pass materialChoice to submit_rfq. If the client says "any" / "you choose", pick the mid-range option.
+     ➤ If the client asks for more variety AFTER real options were delivered, you MAY call browse_builders_materials ONCE with a refined keyword. If that also returns pending_admin_curation, stop retrying and tell the client admin will curate.
      ➤ CRITICAL IMAGE RULE: NEVER write markdown image links, NEVER invent URLs, NEVER use example.com or any placeholder domain. The tools send real WhatsApp images directly — after a successful call, just say "I've sent you the options above — let me know which you prefer." DO NOT type out any URLs.
      ➤ ABSOLUTELY FORBIDDEN: typing option labels and prices in chat text yourself (e.g. "Standard shower mixer – R450, Mid-range – R950, Premium – R1850"). Those numbers are imaginary. The ONLY way to present material options is via a successful tool call that delivered images. If a tool call returns pending_admin_curation OR success:false, DO NOT substitute any options — tell the client admin will curate, and move on to submit_rfq.
   4. BUDGET — ask exactly: "What's your budget for this job? A rough number is fine — it helps us keep the quote realistic." Wait for the answer. If the client says "no budget" or "whatever it costs", pass clientBudget=0. Otherwise pass the number (strip the "R").
@@ -5345,7 +5376,7 @@ app.post('/webhook', async (req, res) => {
 });
 
 // Health check
-app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'rfq-admin-curate-v15', commit: process.env.RENDER_GIT_COMMIT || 'unknown', deployedAt: process.env.RENDER_DEPLOY_TIME || new Date().toISOString() }));
+app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'rfq-try-once-v16', commit: process.env.RENDER_GIT_COMMIT || 'unknown', deployedAt: process.env.RENDER_DEPLOY_TIME || new Date().toISOString() }));
 
 // Diagnostic: run buildersSearchOptions live and report what happens.
 // GET /diag/builders?q=shower+mixer&limit=3
