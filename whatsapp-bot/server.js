@@ -2662,22 +2662,59 @@ async function executeWaTool(name, args, session) {
           return 20;
         };
 
+        // Action-verb guard: a query about INSTALLATION must not match a task
+        // about REPLACEMENT/INSPECTION/REPAIR (and vice versa). Different action
+        // = different job = different price. April 2026: "solar geyser
+        // installation" was wrongly matched to "geyser element replacement"
+        // (R450) because both share the noun "geyser". Reject such mismatches.
+        const ACTION_GROUPS = {
+          install:  ['install', 'installation', 'installing', 'installs', 'fit', 'fitting', 'mount', 'mounting', 'setup', 'set'],
+          replace:  ['replace', 'replacement', 'replacing', 'replaces', 'swap', 'swapping', 'change'],
+          repair:   ['repair', 'repairs', 'repairing', 'fix', 'fixing', 'fixes', 'mend', 'mending'],
+          inspect:  ['inspect', 'inspection', 'inspecting', 'check', 'checking', 'assess', 'assessment', 'report'],
+          clean:    ['clean', 'cleaning', 'wash', 'washing', 'scrub', 'scrubbing'],
+          unblock:  ['unblock', 'unblocking', 'clear', 'clearing'],
+          service:  ['service', 'servicing', 'maintain', 'maintenance'],
+          paint:    ['paint', 'painting'],
+        };
+        const actionOf = (text) => {
+          const tokens = (text || '').toLowerCase().split(/[^a-z]+/).filter(Boolean);
+          for (const tk of tokens) {
+            for (const [grp, verbs] of Object.entries(ACTION_GROUPS)) {
+              if (verbs.includes(tk)) return grp;
+            }
+          }
+          return null;
+        };
+        const actionsCompatible = (qAction, sAction) => {
+          if (!qAction || !sAction) return true; // unknown on either side → don't block
+          return qAction === sAction;
+        };
+
         // Try to match subcategory against tasks — pick BEST match
         if (subQuery) {
+          const qAction = actionOf(subQuery);
           let bestMatch = null;
+          const rejected = [];
           for (const t of taskResults) {
             const tNorm = normalize(t.name);
-            if (fuzzyMatch(subNorm, tNorm)) {
-              const score = matchScore(subNorm, tNorm);
-              if (!bestMatch || score > bestMatch.score) {
-                bestMatch = { ...t, score };
-              }
+            if (!fuzzyMatch(subNorm, tNorm)) continue;
+            const sAction = actionOf(t.name);
+            if (!actionsCompatible(qAction, sAction)) {
+              rejected.push({ name: t.name, sAction, qAction });
+              continue;
+            }
+            const score = matchScore(subNorm, tNorm);
+            if (!bestMatch || score > bestMatch.score) {
+              bestMatch = { ...t, score };
             }
           }
           if (bestMatch) {
             matchedService = bestMatch.name;
             matchedPrice = bestMatch.cost;
             categoryName = bestMatch.category_name || categoryName;
+          } else if (rejected.length) {
+            console.log(`[lookup_pricing] action-mismatch rejected ${rejected.length} candidate(s) for "${subQuery}" (qAction=${qAction}):`, rejected.map(r => `${r.name}[${r.sAction}]`).join(', '));
           }
         }
 
@@ -5607,7 +5644,7 @@ app.post('/webhook', async (req, res) => {
 });
 
 // Health check
-app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'rfq-images-nodupe-v23', commit: process.env.RENDER_GIT_COMMIT || 'unknown', deployedAt: process.env.RENDER_DEPLOY_TIME || new Date().toISOString() }));
+app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'rfq-action-guard-v24', commit: process.env.RENDER_GIT_COMMIT || 'unknown', deployedAt: process.env.RENDER_DEPLOY_TIME || new Date().toISOString() }));
 
 // Diagnostic: run buildersSearchOptions live and report what happens.
 // GET /diag/builders?q=shower+mixer&limit=3
