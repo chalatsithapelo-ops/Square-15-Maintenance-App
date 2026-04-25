@@ -1080,6 +1080,23 @@ const waTools = [
   {
     type: 'function',
     function: {
+      name: 'set_preferred_schedule',
+      description: 'Capture the client\'s preferred date/time for a NEWLY ACCEPTED RFQ (after accept_rfq_quote). Use this — NOT reschedule_booking — the very first time the client tells you when they want the work done. This stores the preferred slot on the RFQ and notifies admin + the assigned artisan. Reschedule_booking is only for changing an already-scheduled booking.',
+      parameters: {
+        type: 'object',
+        properties: {
+          bookingId:     { type: 'string', description: 'The RFQ / booking ID (from session.lastRfqId or accept_rfq_quote response)' },
+          preferredDate: { type: 'string', description: 'Preferred date in YYYY-MM-DD format. Convert vague phrases (e.g. "Friday morning") into the next matching calendar date in 2026.' },
+          preferredTime: { type: 'string', description: 'Preferred time in HH:MM (24h). Use sensible defaults: morning=08:00, afternoon=13:00, evening=17:00.' },
+          notes:         { type: 'string', description: 'Optional free text from the client (e.g. "after 4pm only", "weekends only").' },
+        },
+        required: ['bookingId', 'preferredDate'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'rate_booking',
       description: 'Submit a rating and review for a completed job',
       parameters: {
@@ -3911,6 +3928,92 @@ async function executeWaTool(name, args, session) {
     }
 
     // ═══════════════════════════════════════════
+    // 12b) SET PREFERRED SCHEDULE (after accept_rfq_quote)
+    // ═══════════════════════════════════════════
+    case 'set_preferred_schedule': {
+      if (!firestore) return { error: 'Database unavailable' };
+      const bid = String(args.bookingId || session.lastRfqId || session.lastBookingId || '').trim();
+      if (!bid) return { error: 'Please provide a booking/RFQ ID.' };
+      const dateStr = String(args.preferredDate || '').trim();
+      const timeStr = String(args.preferredTime || '').trim();
+      const notes = String(args.notes || '').trim();
+      if (!dateStr) return { error: 'Please provide a preferred date (YYYY-MM-DD).' };
+
+      // Validate date format and that it's not in the past
+      const parsed = new Date(dateStr);
+      if (isNaN(parsed.getTime())) return { error: 'Invalid date format — use YYYY-MM-DD.' };
+      const today = new Date(); today.setHours(0, 0, 0, 0);
+      if (parsed < today) return { error: 'Preferred date must be today or later.' };
+
+      let doc = await firestore.collection('futureBookings').doc(bid).get();
+      if (!doc.exists) doc = await firestore.collection('tasksManagement').doc(bid).get();
+      if (!doc.exists) return { error: `Booking "${bid}" not found.` };
+
+      const data = doc.data() || {};
+      const update = {
+        scheduled_date: dateStr,
+        scheduled_time: timeStr,
+        client_preferred_date: dateStr,
+        client_preferred_time: timeStr,
+        client_schedule_notes: notes,
+        client_schedule_set_at: new Date().toISOString(),
+        client_schedule_via: 'whatsapp',
+      };
+
+      try { await firestore.collection('futureBookings').doc(bid).set(update, { merge: true }); } catch (e) { console.warn('[wa-tool] set_preferred_schedule futureBookings failed:', e.message); }
+      try { await firestore.collection('tasksManagement').doc(bid).set(update, { merge: true }); } catch (e) { console.warn('[wa-tool] set_preferred_schedule tasksManagement failed:', e.message); }
+
+      // Notify admin
+      try {
+        await firestore.collection('notifications').add({
+          title: 'Client preferred schedule set',
+          body: `Client picked ${dateStr}${timeStr ? ' ' + timeStr : ''} for RFQ ${data.rfq_no || bid}.${notes ? ' Note: ' + notes : ''}`,
+          type: 'rfq_schedule_set',
+          user_type: 'admin',
+          booking_id: bid,
+          read: false,
+          created_at: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      } catch (e) { console.warn('[wa-tool] set_preferred_schedule admin notify failed:', e.message); }
+
+      // Notify assigned artisan(s) via FCM if any
+      try {
+        const ids = Array.isArray(data.rfq_assigned_artisan_ids) ? data.rfq_assigned_artisan_ids : [];
+        for (const aid of ids) {
+          try {
+            const aDoc = await firestore.collection('serviceProvider').doc(String(aid)).get();
+            const token = aDoc.exists ? (aDoc.data().fcm_token || aDoc.data().deviceToken || '') : '';
+            if (!token) continue;
+            await admin.messaging().send({
+              token,
+              notification: {
+                title: '📅 Client picked a date',
+                body: `RFQ ${data.rfq_no || bid}: ${dateStr}${timeStr ? ' ' + timeStr : ''}${notes ? ' — ' + notes : ''}`,
+              },
+              data: { type: 'rfq_schedule_set', booking_id: bid },
+              android: { notification: { channelId: 'order_request_channel', sound: 'sound' } },
+            });
+          } catch (fcmErr) { console.warn('[wa-tool] set_preferred_schedule FCM artisan failed:', fcmErr.message); }
+        }
+      } catch (e) { console.warn('[wa-tool] set_preferred_schedule artisan loop failed:', e.message); }
+
+      const cost = parseFloat(data.admin_quote_total || data.rfq_total || data.quoted_price || 0) || 0;
+      const deposit = cost > 0 ? Math.round(cost * 0.35 * 100) / 100 : 0;
+      const balance = cost > 0 ? Math.round((cost - deposit) * 100) / 100 : 0;
+      const payHint = cost > 0
+        ? `\n\n💰 *Payment options* (after artisan accepts):\n• Full: R${cost.toFixed(2)}\n• Deposit (35%): R${deposit.toFixed(2)} now, R${balance.toFixed(2)} after job completion\n\nReply "pay deposit" or "pay full" when an artisan accepts and you're ready, and I'll send a secure payment link.`
+        : '';
+
+      return {
+        success: true,
+        message: `Got it — preferred schedule for RFQ ${data.rfq_no || bid}: *${dateStr}*${timeStr ? ' at *' + timeStr + '*' : ''}.${notes ? '\nNote: ' + notes : ''}\n\n⏳ I've notified the artisan. They'll confirm shortly.${payHint}`,
+        bookingId: bid,
+        scheduledDate: dateStr,
+        scheduledTime: timeStr,
+      };
+    }
+
+    // ═══════════════════════════════════════════
     // 13) RATE BOOKING
     // ═══════════════════════════════════════════
     case 'rate_booking': {
@@ -4826,9 +4929,13 @@ RFQ FLOW (CRITICAL — Follow this exactly):
 4. The AI quote includes: labour hours × rate, materials BOM with markup (1.5×), equipment, and 15% contingency
 5. Present the full quote breakdown to the customer (it's included in the submit_rfq response)
 6. Ask if they want to ACCEPT or NEGOTIATE the quote
-7. If ACCEPT → call accept_rfq_quote → proceed to payment
+7. If ACCEPT → call accept_rfq_quote → after success, ASK the client when they want the work done (date + optional time) and IMMEDIATELY call set_preferred_schedule with their answer (convert "Friday morning" / "tomorrow at 2pm" / "next Monday" into a real YYYY-MM-DD + HH:MM in 2026). NEVER call reschedule_booking for this — that tool is only for changing an already-set schedule.
 8. If NEGOTIATE → call reject_rfq_quote with their feedback → admin reviews
 9. Customer can check RFQ status anytime with check_rfq_status
+
+⚠️ IMPORTANT — REVISED QUOTES FROM ADMIN:
+If the client receives a "quote request has been reviewed" message from us (admin amended the quote) and replies YES / accept / approve / proceed, call accept_rfq_quote with their RFQ ID — the bot will use the admin-amended total (NOT the original AI quote).
+If they reply NO / reject / negotiate / not happy, call reject_rfq_quote and capture WHY (price too high? scope wrong? timing?) so admin can re-quote.
 
 PHOTO ANALYSIS FOR RFQ:
 - When a customer sends photos, analyse them with vision to identify the issue
@@ -5493,7 +5600,7 @@ app.post('/webhook', async (req, res) => {
 });
 
 // Health check
-app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'rfq-amend-relay-v20', commit: process.env.RENDER_GIT_COMMIT || 'unknown', deployedAt: process.env.RENDER_DEPLOY_TIME || new Date().toISOString() }));
+app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'rfq-schedule-v21', commit: process.env.RENDER_GIT_COMMIT || 'unknown', deployedAt: process.env.RENDER_DEPLOY_TIME || new Date().toISOString() }));
 
 // Diagnostic: run buildersSearchOptions live and report what happens.
 // GET /diag/builders?q=shower+mixer&limit=3
