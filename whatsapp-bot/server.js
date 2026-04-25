@@ -3208,7 +3208,10 @@ async function executeWaTool(name, args, session) {
         material_specs: recordedSpecs.map(s => ({
           itemType: String(s.itemType || ''),
           category: String(s.category || ''),
+          // Keep both naming styles for admin-app compatibility.
+          specSummary: String(s.spec_summary || ''),
           spec_summary: String(s.spec_summary || ''),
+          brandPreference: String(s.brand_preference || 'any'),
           brand_preference: String(s.brand_preference || 'any'),
           qty: Number(s.qty) > 0 ? Number(s.qty) : 1,
           unit: String(s.unit || 'ea'),
@@ -3298,6 +3301,16 @@ async function executeWaTool(name, args, session) {
             subtotal: 0,
             contingency: 0,
             grand_total: 0,
+            total: 0,
+            estimatedCost: 0,
+            breakdown: [
+              ...materialsBOMPlaceholder.map(m => ({
+                description: `Material: ${m.name || 'item'}`,
+                cost: 0,
+                source: 'pending_admin_pick',
+              })),
+              { description: 'Labor (to be finalised by admin)', cost: 0, source: 'pending_admin_review' },
+            ],
             scope_of_work: args.description || '',
             estimated_duration: 'To be confirmed by admin',
             disclaimer: 'Awaiting admin to pick each material on Builders Warehouse and finalise pricing.',
