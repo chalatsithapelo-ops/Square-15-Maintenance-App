@@ -3603,7 +3603,8 @@ async function executeWaTool(name, args, session) {
           presented: options.length,
           images_delivered: imageSuccessCount,
           options: options.map(o => ({ label: o.label, price: `R${Number(o.price).toFixed(0)}`, note: o.note || '', product_url: o.product_url || '' })),
-          note: `Options were sent to the client (${imageSuccessCount}/${options.length} with images, rest as text with Builders product links). WAIT for their reply (option label or "any") before calling submit_rfq. Pass the chosen label in submit_rfq.materialChoice.`,
+          already_delivered_to_whatsapp: true,
+          note: `IMPORTANT: The ${options.length} options (with photos + prices + product links) have ALREADY been sent to the client as separate WhatsApp messages by this tool. DO NOT list, repeat, summarise or re-send them in your reply. Your next reply must be ONE short sentence only — e.g. "Which one would you like? Reply with the option name, or say 'any' and I'll pick the mid-range." Then WAIT for their pick before calling submit_rfq with materialChoice set to the chosen label.`,
         };
       } catch (e) {
         console.error('[show_material_options] error:', e.message);
@@ -5606,7 +5607,7 @@ app.post('/webhook', async (req, res) => {
 });
 
 // Health check
-app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'rfq-cost-sync-v22', commit: process.env.RENDER_GIT_COMMIT || 'unknown', deployedAt: process.env.RENDER_DEPLOY_TIME || new Date().toISOString() }));
+app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'rfq-images-nodupe-v23', commit: process.env.RENDER_GIT_COMMIT || 'unknown', deployedAt: process.env.RENDER_DEPLOY_TIME || new Date().toISOString() }));
 
 // Diagnostic: run buildersSearchOptions live and report what happens.
 // GET /diag/builders?q=shower+mixer&limit=3
