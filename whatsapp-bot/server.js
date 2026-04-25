@@ -4451,6 +4451,12 @@ async function executeWaTool(name, args, session) {
         rfq_status: 'accepted_converted',
         status: 'pending_artisan_acceptance',
         artisan_confirmed: 'pending',
+        // Sync the canonical cost fields with the (possibly admin-amended) price
+        // so /api/artisan-accepted, the admin app, and the artisan app all
+        // surface the same total to the client.
+        cost: priceNum.toFixed(2),
+        total_price: priceNum.toFixed(2),
+        quoted_price: priceNum.toFixed(2),
         deposit_amount: depositAmount.toFixed(2),
         balance_amount: balanceAmount.toFixed(2),
         payment_type: '',
@@ -5600,7 +5606,7 @@ app.post('/webhook', async (req, res) => {
 });
 
 // Health check
-app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'rfq-schedule-v21', commit: process.env.RENDER_GIT_COMMIT || 'unknown', deployedAt: process.env.RENDER_DEPLOY_TIME || new Date().toISOString() }));
+app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'rfq-cost-sync-v22', commit: process.env.RENDER_GIT_COMMIT || 'unknown', deployedAt: process.env.RENDER_DEPLOY_TIME || new Date().toISOString() }));
 
 // Diagnostic: run buildersSearchOptions live and report what happens.
 // GET /diag/builders?q=shower+mixer&limit=3
