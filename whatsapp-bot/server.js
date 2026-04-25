@@ -3129,8 +3129,22 @@ async function executeWaTool(name, args, session) {
       const cat = String(args.category || '').toLowerCase();
       const NEEDS_PARTS = ['plumb', 'electric', 'tile', 'tiling', 'carpent', 'lock', 'paint', 'roof', 'appliance'];
       const needsParts = NEEDS_PARTS.some(k => cat.includes(k));
-      if (materialsResp === 'artisan' && needsParts && !hasShownOptions && !hasChoice && !hasAttempted) {
-        const desc = String(args.description || '').toLowerCase();
+      // Complex / site-surveyed installations are NOT a "pick tier 1/2/3"
+      // material decision — they need an admin-curated full quote (system
+      // sizing, labour, certificate of compliance, etc.). Skip the
+      // show_material_options gate for these and route straight to admin.
+      const desc = String(args.description || '').toLowerCase();
+      const COMPLEX_INSTALL_KEYWORDS = [
+        'solar geyser', 'solar panel', 'solar system', 'solar inverter', 'pv install',
+        'heat pump', 'borehole', 'jojo tank', 'water tank install',
+        'full bathroom', 'bathroom renovation', 'kitchen renovation',
+        'rewire', 'rewiring', 'db board install', 'db board upgrade',
+        'gate motor install', 'electric fence install', 'cctv install',
+        'aircon install', 'air conditioner install', 'underfloor heating',
+        'pool pump install', 'pool install', 'roof replacement',
+      ];
+      const isComplexInstall = COMPLEX_INSTALL_KEYWORDS.some(k => desc.includes(k));
+      if (materialsResp === 'artisan' && needsParts && !hasShownOptions && !hasChoice && !hasAttempted && !isComplexInstall) {
         const ITEM_HINTS = ['shower mixer', 'mixer', 'toilet cistern', 'cistern', 'tap', 'door lock', 'lock', 'ceiling light', 'light', 'geyser', 'tile', 'paint', 'basin', 'sink', 'plug point', 'plug', 'socket', 'breaker', 'earth leakage'];
         const guess = ITEM_HINTS.find(h => desc.includes(h)) || (cat.includes('plumb') ? 'tap' : cat.includes('electric') ? 'ceiling light' : cat.includes('lock') ? 'door lock' : 'fixture');
         console.log(`[submit_rfq] GATE: artisan materials but show_material_options never attempted. Requiring one attempt (guess: ${guess})`);
@@ -3141,6 +3155,9 @@ async function executeWaTool(name, args, session) {
           suggested_itemType: guess,
           instruction: `Call show_material_options with itemType="${guess}" exactly once. The client will see 3 options (Standard/Mid-range/Premium). Wait for their reply and pass the chosen label as materialChoice to submit_rfq.`,
         };
+      }
+      if (isComplexInstall) {
+        console.log(`[submit_rfq] Complex install detected ("${COMPLEX_INSTALL_KEYWORDS.find(k => desc.includes(k))}") — bypassing material picker, routing to admin curation.`);
       }
 
       // ── IDEMPOTENCY GUARD ──
@@ -3511,6 +3528,32 @@ async function executeWaTool(name, args, session) {
         const itemType = String(args.itemType || '').toLowerCase().trim();
         const cat = String(args.category || '').toLowerCase().trim();
         if (!itemType) return { success: false, error: 'itemType required' };
+
+        // Complex / site-surveyed installations are NOT a "pick tier 1/2/3"
+        // material decision. A solar geyser, heat pump, full bathroom reno, etc.
+        // needs an admin-curated quote (system sizing, certificate of compliance,
+        // labour, etc.). Do NOT show fake catalog options for these — instead
+        // return a hint so the AI moves straight to submit_rfq → admin review.
+        const COMPLEX_INSTALL_KEYWORDS_MO = [
+          'solar geyser', 'solar panel', 'solar system', 'solar inverter', 'solar',
+          'heat pump', 'borehole', 'jojo', 'water tank',
+          'full bathroom', 'bathroom renovation', 'kitchen renovation',
+          'rewire', 'rewiring', 'db board upgrade', 'db board install',
+          'gate motor', 'electric fence', 'cctv',
+          'aircon', 'air conditioner', 'underfloor heating',
+          'pool pump', 'pool install', 'roof replacement',
+        ];
+        const isComplex = COMPLEX_INSTALL_KEYWORDS_MO.some(k => itemType.includes(k));
+        if (isComplex) {
+          session.materialOptionsAttempted = true;
+          console.log(`[show_material_options] Complex install "${itemType}" — skipping catalog, routing to admin curation.`);
+          return {
+            success: true,
+            pending_admin_curation: true,
+            complex_install: true,
+            note: `"${itemType}" is a complex installation that needs an admin-curated quote (system sizing, materials list, labour, certificate of compliance). DO NOT show tier options. Tell the client: "Solar geyser installation needs a custom quote — our admin will review your photos and budget and send you a full itemised quotation here on WhatsApp shortly." Then call submit_rfq immediately so the admin can prepare the full quote.`,
+          };
+        }
 
         // Mark that the bot attempted material options for this session so the
         // submit_rfq gate knows it can proceed even if this call returns
@@ -5644,7 +5687,7 @@ app.post('/webhook', async (req, res) => {
 });
 
 // Health check
-app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'rfq-action-guard-v24', commit: process.env.RENDER_GIT_COMMIT || 'unknown', deployedAt: process.env.RENDER_DEPLOY_TIME || new Date().toISOString() }));
+app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'rfq-complex-install-v25', commit: process.env.RENDER_GIT_COMMIT || 'unknown', deployedAt: process.env.RENDER_DEPLOY_TIME || new Date().toISOString() }));
 
 // Diagnostic: run buildersSearchOptions live and report what happens.
 // GET /diag/builders?q=shower+mixer&limit=3
