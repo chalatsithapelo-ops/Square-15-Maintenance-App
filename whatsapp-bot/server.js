@@ -4330,11 +4330,16 @@ async function executeWaTool(name, args, session) {
       if (!doc.exists) return { error: `RFQ "${rfqId}" not found.` };
 
       const data = doc.data();
-      if (!data.quoted_price && !data.ai_quote) {
+      if (!data.quoted_price && !data.ai_quote && !data.admin_quote_total && !data.rfq_total) {
         return { error: 'This RFQ does not have a quote yet. Please wait for the quote to be generated.' };
       }
 
-      const price = data.quoted_price || (data.ai_quote ? data.ai_quote.grand_total : '0');
+      // Prefer admin-amended totals (set when admin reviews/amends the quote)
+      // over the raw AI quoted_price so the client is charged the correct amount.
+      const price = data.admin_quote_total
+        || data.rfq_total
+        || data.quoted_price
+        || (data.ai_quote ? data.ai_quote.grand_total : '0');
       const priceNum = parseFloat(price);
       const depositAmount = Math.round(priceNum * 0.35 * 100) / 100;
       const balanceAmount = Math.round((priceNum - depositAmount) * 100) / 100;
@@ -4497,9 +4502,10 @@ async function executeWaTool(name, args, session) {
 
       return {
         success: true,
-        message: `Quote accepted! RFQ ${data.rfq_no || rfqId} — Total: R${priceNum.toFixed(2)}.\n\n⏳ *Next step:* An artisan needs to accept your job before payment. We'll notify you as soon as one accepts.\n\n🔒 *Your money is protected:* When it's time to pay, your payment is held in a secure escrow account. The artisan does NOT receive your money until you confirm you are satisfied with the completed work.\n\n💰 *Payment options (after artisan accepts):*\n• Full amount: R${priceNum.toFixed(2)}\n• Deposit (35%): R${depositAmount.toFixed(2)} now, R${balanceAmount.toFixed(2)} after job completion`,
+        message: `Quote accepted! RFQ ${data.rfq_no || rfqId} — Total: R${priceNum.toFixed(2)}.\n\n📅 *When would you like the work done?* Please reply with your preferred date and time (e.g. "Friday morning" or "27 Apr 14:00"). I'll pass it to the artisan.\n\n⏳ *Next step:* An artisan needs to accept your job before payment. We'll notify you as soon as one accepts.\n\n🔒 *Your money is protected:* When it's time to pay, your payment is held in a secure escrow account. The artisan does NOT receive your money until you confirm you are satisfied with the completed work.\n\n💰 *Payment options (after artisan accepts):*\n• Full amount: R${priceNum.toFixed(2)}\n• Deposit (35%): R${depositAmount.toFixed(2)} now, R${balanceAmount.toFixed(2)} after job completion`,
         rfqId,
         price: `R${priceNum.toFixed(2)}`,
+        next_step: 'awaiting_preferred_schedule',
       };
     }
 
@@ -5487,7 +5493,7 @@ app.post('/webhook', async (req, res) => {
 });
 
 // Health check
-app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'rfq-catalog-seeded-v19', commit: process.env.RENDER_GIT_COMMIT || 'unknown', deployedAt: process.env.RENDER_DEPLOY_TIME || new Date().toISOString() }));
+app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'rfq-amend-relay-v20', commit: process.env.RENDER_GIT_COMMIT || 'unknown', deployedAt: process.env.RENDER_DEPLOY_TIME || new Date().toISOString() }));
 
 // Diagnostic: run buildersSearchOptions live and report what happens.
 // GET /diag/builders?q=shower+mixer&limit=3
