@@ -3129,23 +3129,9 @@ async function executeWaTool(name, args, session) {
       const cat = String(args.category || '').toLowerCase();
       const NEEDS_PARTS = ['plumb', 'electric', 'tile', 'tiling', 'carpent', 'lock', 'paint', 'roof', 'appliance'];
       const needsParts = NEEDS_PARTS.some(k => cat.includes(k));
-      // Complex / site-surveyed installations are NOT a "pick tier 1/2/3"
-      // material decision — they need an admin-curated full quote (system
-      // sizing, labour, certificate of compliance, etc.). Skip the
-      // show_material_options gate for these and route straight to admin.
-      const desc = String(args.description || '').toLowerCase();
-      const COMPLEX_INSTALL_KEYWORDS = [
-        'solar geyser', 'solar panel', 'solar system', 'solar inverter', 'pv install',
-        'heat pump', 'borehole', 'jojo tank', 'water tank install',
-        'full bathroom', 'bathroom renovation', 'kitchen renovation',
-        'rewire', 'rewiring', 'db board install', 'db board upgrade',
-        'gate motor install', 'electric fence install', 'cctv install',
-        'aircon install', 'air conditioner install', 'underfloor heating',
-        'pool pump install', 'pool install', 'roof replacement',
-      ];
-      const isComplexInstall = COMPLEX_INSTALL_KEYWORDS.some(k => desc.includes(k));
-      if (materialsResp === 'artisan' && needsParts && !hasShownOptions && !hasChoice && !hasAttempted && !isComplexInstall) {
-        const ITEM_HINTS = ['shower mixer', 'mixer', 'toilet cistern', 'cistern', 'tap', 'door lock', 'lock', 'ceiling light', 'light', 'geyser', 'tile', 'paint', 'basin', 'sink', 'plug point', 'plug', 'socket', 'breaker', 'earth leakage'];
+      if (materialsResp === 'artisan' && needsParts && !hasShownOptions && !hasChoice && !hasAttempted) {
+        const desc = String(args.description || '').toLowerCase();
+        const ITEM_HINTS = ['solar geyser', 'heat pump', 'shower mixer', 'mixer', 'toilet cistern', 'cistern', 'tap', 'door lock', 'lock', 'ceiling light', 'light', 'geyser', 'tile', 'paint', 'basin', 'sink', 'plug point', 'plug', 'socket', 'breaker', 'earth leakage'];
         const guess = ITEM_HINTS.find(h => desc.includes(h)) || (cat.includes('plumb') ? 'tap' : cat.includes('electric') ? 'ceiling light' : cat.includes('lock') ? 'door lock' : 'fixture');
         console.log(`[submit_rfq] GATE: artisan materials but show_material_options never attempted. Requiring one attempt (guess: ${guess})`);
         return {
@@ -3153,11 +3139,8 @@ async function executeWaTool(name, args, session) {
           error: 'Call show_material_options once before filing this RFQ so the client can choose the material tier.',
           required_next_action: 'call_show_material_options',
           suggested_itemType: guess,
-          instruction: `Call show_material_options with itemType="${guess}" exactly once. The client will see 3 options (Standard/Mid-range/Premium). Wait for their reply and pass the chosen label as materialChoice to submit_rfq.`,
+          instruction: `Call show_material_options with itemType="${guess}" exactly once. The client will see 3 real Builders Warehouse products (low/mid/high price tier) with photos, prices and product links. Wait for their reply and pass the chosen label as materialChoice to submit_rfq.`,
         };
-      }
-      if (isComplexInstall) {
-        console.log(`[submit_rfq] Complex install detected ("${COMPLEX_INSTALL_KEYWORDS.find(k => desc.includes(k))}") — bypassing material picker, routing to admin curation.`);
       }
 
       // ── IDEMPOTENCY GUARD ──
@@ -3529,32 +3512,6 @@ async function executeWaTool(name, args, session) {
         const cat = String(args.category || '').toLowerCase().trim();
         if (!itemType) return { success: false, error: 'itemType required' };
 
-        // Complex / site-surveyed installations are NOT a "pick tier 1/2/3"
-        // material decision. A solar geyser, heat pump, full bathroom reno, etc.
-        // needs an admin-curated quote (system sizing, certificate of compliance,
-        // labour, etc.). Do NOT show fake catalog options for these — instead
-        // return a hint so the AI moves straight to submit_rfq → admin review.
-        const COMPLEX_INSTALL_KEYWORDS_MO = [
-          'solar geyser', 'solar panel', 'solar system', 'solar inverter', 'solar',
-          'heat pump', 'borehole', 'jojo', 'water tank',
-          'full bathroom', 'bathroom renovation', 'kitchen renovation',
-          'rewire', 'rewiring', 'db board upgrade', 'db board install',
-          'gate motor', 'electric fence', 'cctv',
-          'aircon', 'air conditioner', 'underfloor heating',
-          'pool pump', 'pool install', 'roof replacement',
-        ];
-        const isComplex = COMPLEX_INSTALL_KEYWORDS_MO.some(k => itemType.includes(k));
-        if (isComplex) {
-          session.materialOptionsAttempted = true;
-          console.log(`[show_material_options] Complex install "${itemType}" — skipping catalog, routing to admin curation.`);
-          return {
-            success: true,
-            pending_admin_curation: true,
-            complex_install: true,
-            note: `"${itemType}" is a complex installation that needs an admin-curated quote (system sizing, materials list, labour, certificate of compliance). DO NOT show tier options. Tell the client: "Solar geyser installation needs a custom quote — our admin will review your photos and budget and send you a full itemised quotation here on WhatsApp shortly." Then call submit_rfq immediately so the admin can prepare the full quote.`,
-          };
-        }
-
         // Mark that the bot attempted material options for this session so the
         // submit_rfq gate knows it can proceed even if this call returns
         // pending_admin_curation.
@@ -3591,52 +3548,20 @@ async function executeWaTool(name, args, session) {
           }
         } catch (e) { console.warn('[show_material_options] live search failed:', e.message); }
 
-        // 2) Admin-curated Firestore catalog (used when live search returned nothing)
-        if (!options.length && firestore) {
-          try {
-            const snap = await firestore.collection('materials_catalog')
-              .where('active', '==', true)
-              .limit(50).get();
-            for (const d of snap.docs) {
-              const m = d.data() || {};
-              const keywords = [
-                String(m.item_type || '').toLowerCase(),
-                ...(Array.isArray(m.keywords) ? m.keywords.map(k => String(k).toLowerCase()) : []),
-              ].filter(Boolean);
-              const matched = keywords.some(k => k && (itemType.includes(k) || k.includes(itemType)));
-              if (!matched) continue;
-              const opts = Array.isArray(m.options) ? m.options : [];
-              for (const opt of opts.slice(0, 4)) {
-                options.push({
-                  label: String(opt.label || '').trim(),
-                  price: Number(opt.price || 0),
-                  image_url: String(opt.image_url || '').trim(),
-                  note: String(opt.note || '').trim(),
-                  product_url: String(opt.product_url || '').trim(),
-                });
-              }
-              if (options.length >= 3) break;
-            }
-          } catch (e) { console.warn('[show_material_options] catalog read failed:', e.message); }
-        }
+        // 2) NO static catalog fallback. The materials_catalog Firestore
+        // collection used to substitute generic items (e.g. an electric geyser
+        // when the client asked for a SOLAR geyser), which produced misleading
+        // results. Builders Warehouse has the real product range — if live
+        // search couldn't reach it, hand off to admin who can hand-pick.
 
-        // 3) Last-resort built-in fallback: if live AND catalog both returned
-        // nothing, DO NOT send the client search-result URLs (that produced the
-        // April 2026 bug where clients got /search?text=... links instead of
-        // products). Instead return a friendly "admin will curate" note and
-        // let the AI push on with submit_rfq.
+        // 3) Last-resort: live Builders unreachable (bot-protection / network).
+        // DO NOT show fake/generic options. Hand off to admin so the client
+        // gets a real curated quote with real photos.
         if (!options.length) {
           return {
             success: true,
             pending_admin_curation: true,
-            note: `Live Builders search is currently unavailable from the server (bot-protection block). Tell the client: "No problem — I've logged your ${itemType} request. Our admin will hand-pick suitable options with real photos, prices and product links and send them with your quote shortly." Then call submit_rfq and move on. Do NOT hallucinate product URLs or prices.`,
-          };
-        }
-
-        if (!options.length) {
-          return {
-            success: false,
-            note: 'No material options available for that item yet. Ask the client to describe what they want (brand, style, budget) and include it in the RFQ description.',
+            note: `Builders live search returned no matches for "${itemType}" (or was blocked by bot-protection). Tell the client EXACTLY: "No problem — let me get our admin to hand-pick the right ${itemType} options for you. They'll send you photos, prices and product links here on WhatsApp shortly along with the full quote." Then call submit_rfq IMMEDIATELY so admin gets the request. Do NOT invent products, do NOT send images of unrelated items.`,
           };
         }
 
@@ -5110,7 +5035,17 @@ PHOTO REQUIREMENT (CRITICAL):
 - Before calling submit_rfq you MUST complete ALL of these steps IN ORDER:
   1. SCOPE CONFIRMATION — understand the issue. If photos were sent, analyse them and state your understanding in one short sentence (e.g. "Got it — the shower mixer is leaking at the wall connection, correct?"). Wait for the customer to confirm or correct you.
   2. MATERIALS-RESPONSIBILITY — ask exactly: "Will you be buying the materials yourself, or should our artisan source them for you?" Wait for the answer.
-  3. MATERIAL CHOICE (REQUIRED when artisan sources materials): when materialsResponsibility="artisan" AND category is plumbing / electrical / tiling / carpentry / locksmith / painting / roofing / appliance, you MUST call show_material_options EXACTLY ONCE with the best-guess itemType (e.g. "shower mixer", "toilet cistern", "tap", "door lock", "ceiling light", "geyser", "tile", "paint", "plug point", "circuit breaker") BEFORE submit_rfq. The client will see 3 options (Standard / Mid-range / Premium) with photos, prices and notes. Wait for them to reply with the option label, then pass that label as materialChoice to submit_rfq. If they say "any" / "you choose" / "whichever", pick the Mid-range option yourself and tell them "I've gone with the mid-range option."
+  3. MATERIAL CHOICE (REQUIRED when artisan sources materials): when materialsResponsibility="artisan" AND category is plumbing / electrical / tiling / carpentry / locksmith / painting / roofing / appliance, you MUST call show_material_options EXACTLY ONCE BEFORE submit_rfq. The tool does a LIVE Builders Warehouse search and sends the client the 3 real products (photos, current prices, direct product links).
+     ➤ CRITICAL: pass the MOST SPECIFIC itemType you can derive from the client's request — keep ALL the qualifying words. Examples:
+        • "I need a solar geyser installation" → itemType="solar geyser" (NOT "geyser")
+        • "Install a 200L electric geyser" → itemType="200l electric geyser"
+        • "Heat pump geyser" → itemType="heat pump geyser"
+        • "Replace shower mixer" → itemType="shower mixer"
+        • "Kitchen mixer tap" → itemType="kitchen mixer tap"
+        • "Toilet cistern" → itemType="toilet cistern"
+        • "Door lock for security gate" → itemType="security gate lock"
+        Stripping qualifiers (e.g. dropping "solar") will return the wrong products and lose the sale.
+     ➤ Wait for the client to reply with the option label, then pass that label as materialChoice to submit_rfq. If they say "any" / "you choose" / "whichever", pick the mid-priced option and tell them "I've gone with the mid-range option."
      ➤ If show_material_options returns success:false, tell the client "No problem — our admin will hand-pick suitable options when reviewing your quote." Then call submit_rfq immediately — the gate will not fire a second time.
      ➤ Never call show_material_options or browse_builders_materials more than ONCE per RFQ.
      ➤ CRITICAL IMAGE RULE: NEVER write markdown image links, NEVER invent URLs, NEVER use example.com. The tool sends real WhatsApp images — after a successful call, say "I've sent the options above — which one would you like?" in plain text.
@@ -5687,7 +5622,7 @@ app.post('/webhook', async (req, res) => {
 });
 
 // Health check
-app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'rfq-complex-install-v25', commit: process.env.RENDER_GIT_COMMIT || 'unknown', deployedAt: process.env.RENDER_DEPLOY_TIME || new Date().toISOString() }));
+app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'rfq-builders-only-v26', commit: process.env.RENDER_GIT_COMMIT || 'unknown', deployedAt: process.env.RENDER_DEPLOY_TIME || new Date().toISOString() }));
 
 // Diagnostic: run buildersSearchOptions live and report what happens.
 // GET /diag/builders?q=shower+mixer&limit=3
