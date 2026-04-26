@@ -1010,6 +1010,7 @@ const waTools = [
           materialsResponsibility: { type: 'string', enum: ['client', 'artisan'], description: 'Who provides materials' },
           clientBudget: { type: 'number', description: 'Client stated budget in ZAR (ask them before calling submit_rfq). Pass 0 if the client explicitly said they have no budget in mind.' },
           materialChoice: { type: 'string', description: 'If materialsResponsibility=artisan and you already called show_material_options and the client picked one, pass the chosen option label (e.g. "Mid-range shower mixer").' },
+          noPhotoReason: { type: 'string', description: 'Only set this if the customer explicitly says they cannot send a photo right now. Pass their stated reason (e.g. "client cannot take photo, away from site"). Otherwise leave blank — the bot will refuse the RFQ until at least one photo is received.' },
         },
         required: ['category', 'description', 'customerName', 'materialsResponsibility', 'clientBudget'],
       },
@@ -3241,6 +3242,25 @@ async function executeWaTool(name, args, session) {
       if (!firestore) return { error: 'Database unavailable' };
 
      try {
+      // ── PHOTO GATE: refuse to file an RFQ without at least one photo or
+      // an explicit "no_photo_reason" arg. The system prompt instructs the LLM
+      // to ALWAYS ask for a photo first, but this server-side check enforces
+      // the rule even when the model skips it.
+      const hasSessionPhotos = Array.isArray(session.photoUrls) && session.photoUrls.length > 0;
+      const noPhotoReason = String(args.noPhotoReason || args.no_photo_reason || '').trim();
+      if (!hasSessionPhotos && !noPhotoReason && !session.photoGateAcknowledged) {
+        session.photoGateAcknowledged = false;
+        console.log(`[submit_rfq] PHOTO GATE: refusing RFQ for ${session.phone} — no photo received yet`);
+        return {
+          success: false,
+          error: 'photo_required',
+          required_next_action: 'ask_for_photo',
+          instruction: "Before filing this RFQ, ask the customer to send a photo of the issue. Say something warm like: 'Could you please send me a quick photo of the spot where the work is needed? It helps our team scope the job and price it accurately.' If the customer explicitly says they cannot send a photo, call submit_rfq again with noPhotoReason set to their reason (e.g. 'client unable to take photo right now').",
+        };
+      }
+      // Mark gate as cleared so retries within the same session aren't re-blocked.
+      session.photoGateAcknowledged = true;
+
       // ── GATE (v27): when the artisan supplies materials AND the job needs
       // parts, the AI must have recorded at LEAST ONE material spec via
       // show_material_options before submit_rfq. The admin app then uses these
@@ -3396,11 +3416,56 @@ async function executeWaTool(name, args, session) {
       const materialsRespLc = String(args.materialsResponsibility || '').toLowerCase();
       const clientSuppliesMaterials = materialsRespLc === 'client';
 
+      // Extract any image analysis context from the conversation history.
+      // Declared early so both the artisan-materials draft path and the legacy
+      // labour-only path can use it.
+      let imageContext = '';
+      for (const m of session.messages) {
+        if (typeof m.content === 'string' && m.role === 'assistant' && m.content.length > 50) {
+          if (m.content.toLowerCase().includes('issue') || m.content.toLowerCase().includes('damage') ||
+              m.content.toLowerCase().includes('repair') || m.content.toLowerCase().includes('install')) {
+            imageContext += m.content.substring(0, 300) + ' ';
+          }
+        }
+      }
+
       if (!clientSuppliesMaterials) {
-        // ── ARTISAN-MATERIALS PATH: file RFQ with material_specs[], let admin curate ──
+        // ── ARTISAN-MATERIALS PATH: file RFQ with material_specs[] AND a real AI
+        // draft quote so the admin RFQ Review screen shows a draft total +
+        // materials BOM the admin can amend (instead of a hard-coded R0
+        // placeholder). Admin still has to review/amend & send to client.
         try {
-          // Seed materialsBOM placeholders from material_specs so the admin's
-          // RFQ dialog already shows one row per item to be picked.
+          // Build an enriched description that includes captured spec details so
+          // the AI prompt can produce a meaningful BOM even when the customer's
+          // raw description was short.
+          const specBlurb = recordedSpecs
+            .map(s => {
+              const brand = s.brand_preference && s.brand_preference !== 'any' ? ` (${s.brand_preference})` : '';
+              const qty = Number(s.qty) > 0 ? `${s.qty} ` : '';
+              return `${qty}${s.itemType || 'item'}${brand}: ${s.spec_summary || ''}`.trim();
+            })
+            .filter(Boolean)
+            .join('; ');
+          const enrichedDescription = [
+            args.description || '',
+            specBlurb ? `Materials needed: ${specBlurb}` : '',
+          ].filter(Boolean).join(' — ');
+
+          let aiDraft = null;
+          try {
+            console.log(`[submit_rfq] Generating AI DRAFT quote for ${rfqNo} (artisan materials, ${recordedSpecs.length} specs)...`);
+            aiDraft = await generateAIQuote(
+              args.category || '',
+              enrichedDescription,
+              'artisan',
+              imageContext ? imageContext.trim() : ''
+            );
+          } catch (genErr) {
+            console.error('[submit_rfq] AI draft generation threw:', genErr.message);
+          }
+
+          // Seed materialsBOM placeholders from material_specs as fallback when
+          // AI draft is unavailable or empty.
           const materialsBOMPlaceholder = recordedSpecs.map(s => ({
             name: s.itemType || 'item',
             description: [s.spec_summary, s.brand_preference && s.brand_preference !== 'any' ? `brand: ${s.brand_preference}` : ''].filter(Boolean).join(' — '),
@@ -3410,41 +3475,72 @@ async function executeWaTool(name, args, session) {
             line_total: 0,
             source: 'pending_admin_pick',
           }));
-          const placeholderQuote = {
-            laborHours: 0,
-            laborCost: 0,
-            materialsBOM: materialsBOMPlaceholder,
-            materials_subtotal: 0,
-            materials_with_markup: 0,
-            materials_responsibility: 'artisan',
-            equipmentCost: 0,
-            subtotal: 0,
-            contingency: 0,
-            grand_total: 0,
-            total: 0,
-            estimatedCost: 0,
-            breakdown: [
-              ...materialsBOMPlaceholder.map(m => ({
-                description: `Material: ${m.name || 'item'}`,
-                cost: 0,
-                source: 'pending_admin_pick',
-              })),
-              { description: 'Labor (to be finalised by admin)', cost: 0, source: 'pending_admin_review' },
-            ],
-            scope_of_work: args.description || '',
-            estimated_duration: 'To be confirmed by admin',
-            disclaimer: 'Awaiting admin to pick each material on Builders Warehouse and finalise pricing.',
-            generated_at: new Date().toISOString(),
-            source: 'whatsapp_spec_capture_v27',
-          };
-          await firestore.collection('futureBookings').doc(rfqId).update({
-            ai_quote: placeholderQuote,
-            quote_details: args.description || '',
+
+          // Decide which quote to persist: real AI draft (preferred) or placeholder.
+          const aiGrandTotal = aiDraft && Number.isFinite(Number(aiDraft.grand_total)) ? Number(aiDraft.grand_total) : 0;
+          let quoteToPersist;
+          if (aiDraft && aiGrandTotal > 0) {
+            // Tag as a draft so admin app can show "Draft — pending admin review".
+            quoteToPersist = {
+              ...aiDraft,
+              is_admin_draft: true,
+              draft_reason: 'artisan_supplies_materials',
+              source: (aiDraft.source || 'whatsapp_ai_builders') + '_draft',
+            };
+          } else {
+            quoteToPersist = {
+              laborHours: 0,
+              laborCost: 0,
+              materialsBOM: materialsBOMPlaceholder,
+              materials_subtotal: 0,
+              materials_with_markup: 0,
+              materials_responsibility: 'artisan',
+              equipmentCost: 0,
+              subtotal: 0,
+              contingency: 0,
+              grand_total: 0,
+              total: 0,
+              estimatedCost: 0,
+              breakdown: [
+                ...materialsBOMPlaceholder.map(m => ({
+                  description: `Material: ${m.name || 'item'}`,
+                  cost: 0,
+                  source: 'pending_admin_pick',
+                })),
+                { description: 'Labor (to be finalised by admin)', cost: 0, source: 'pending_admin_review' },
+              ],
+              scope_of_work: args.description || '',
+              estimated_duration: 'To be confirmed by admin',
+              disclaimer: 'Awaiting admin to pick each material on Builders Warehouse and finalise pricing.',
+              generated_at: new Date().toISOString(),
+              source: 'whatsapp_spec_capture_v27',
+              is_admin_draft: true,
+              draft_reason: 'ai_generation_unavailable',
+            };
+          }
+
+          // Persist draft + mirror totals onto the booking doc so admin RFQ list
+          // card shows the draft amount instead of R0.00. Admin still reviews
+          // before sending to client (rfq_status remains pending_admin_review).
+          const persistGt = aiGrandTotal > 0 ? aiGrandTotal : 0;
+          const updatePatch = {
+            ai_quote: quoteToPersist,
+            quote_details: quoteToPersist.scope_of_work || args.description || '',
             rfq_status: 'pending_admin_review',
             rfq_awaiting_admin_review_reason: 'artisan_supplies_materials',
-            // Don't overwrite cost/total_price/quoted_price with 0 — leave blank.
-          });
-          console.log(`[submit_rfq] ARTISAN-MATERIALS path: ${rfqNo} filed with ${recordedSpecs.length} material spec(s) for admin curation`);
+            updated_at: new Date().toISOString(),
+          };
+          if (persistGt > 0) {
+            updatePatch.quoted_price = persistGt.toFixed(2);
+            updatePatch.cost = persistGt.toFixed(2);
+            updatePatch.total = persistGt.toFixed(2);
+            updatePatch.total_price = persistGt.toFixed(2);
+            updatePatch.totalPrice = persistGt.toFixed(2);
+            updatePatch.rfq_total = persistGt;
+            updatePatch.admin_quote_total = persistGt;
+          }
+          await firestore.collection('futureBookings').doc(rfqId).update(updatePatch);
+          console.log(`[submit_rfq] ARTISAN-MATERIALS path: ${rfqNo} filed with ${recordedSpecs.length} spec(s), draft total=R${persistGt.toFixed(2)}`);
 
           try {
             await pushAdminNotification({
@@ -3475,18 +3571,6 @@ async function executeWaTool(name, args, session) {
         } catch (artisanPathErr) {
           console.error('[submit_rfq] artisan-path update failed:', artisanPathErr.message);
           // Fall through to legacy AI quote path on failure as a safety net.
-        }
-      }
-
-      // Extract any image analysis context from the conversation history
-      let imageContext = '';
-      for (const m of session.messages) {
-        if (typeof m.content === 'string' && m.role === 'assistant' && m.content.length > 50) {
-          // Capture assistant's image analysis summaries
-          if (m.content.toLowerCase().includes('issue') || m.content.toLowerCase().includes('damage') ||
-              m.content.toLowerCase().includes('repair') || m.content.toLowerCase().includes('install')) {
-            imageContext += m.content.substring(0, 300) + ' ';
-          }
         }
       }
 
