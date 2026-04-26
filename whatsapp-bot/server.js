@@ -2098,40 +2098,131 @@ async function executeWaTool(name, args, session) {
         console.error('[create_booking] Pricing lookup error:', e.message);
       }
 
-      // If no pricing found at all, convert to RFQ instead of creating R0 booking
+      // If no pricing found at all, convert to RFQ instead of creating R0 booking.
+      // Write to futureBookings with rfq_status='pending_admin_review' so the
+      // Admin → RFQ Requests screen (which streams futureBookings filtered by
+      // rfq_status) actually sees and can action the request.
       if (estimatedCost === '0' || pricingSource === 'none') {
-        console.log(`[create_booking] ⚠️ No pricing found for category="${args.category}" sub="${args.subcategory}" — converting to RFQ`);
-        const rfqId = `rfq_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+        console.log(`[create_booking] ⚠️ No pricing found for category="${args.category}" sub="${args.subcategory}" — converting to RFQ (admin review)`);
+        const rfqBookingId = bookingId; // already WA-XXXXX
+        const rfqShortNo = `RFQ-${Date.now().toString(36).toUpperCase()}`;
+        const customerName = args.customerName || args.client_name || '';
+        const customerPhone = session.phone || args.customerPhone || '';
+        const photoUrls = (session.photoUrls && session.photoUrls.length) ? session.photoUrls : [];
+
         const rfqDoc = {
-          id: rfqId,
+          // Identity
+          id: rfqBookingId,
+          bookingId: rfqBookingId,
+          order_no: orderNo,
+          rfq_no: rfqShortNo,
+
+          // RFQ flags read by admin_rfq_list_screen.dart / admin_rfq_review_screen.dart
+          is_rfq: 'yes',
+          rfq_status: 'pending_admin_review',
+          rfq_submitted_to: 'admin',
+          rfq_total: 0,
+          rfq_artisan_rejections: [],
+          rfq_artisan_rejection_count: 0,
+          rfq_client_rejections: [],
+
+          // Category / description (both naming styles for cross-app compat)
           category: args.category || '',
+          category_name: args.category || '',
+          categoryName: args.category || '',
           subcategory: args.subcategory || '',
-          description: args.description || '',
+          sub_category_name: args.subcategory || '',
+          description: args.description || args.subcategory || '',
+          problem_description: args.description || '',
+
+          // Client identity (admin list reads client_name / client_phone first)
+          client_name: customerName,
+          client_phone: customerPhone,
+          client_contact: customerPhone,
+          customerName: customerName,
+          customerPhone: customerPhone,
+          user_name: customerName,
+          user_phone: customerPhone,
+          user_id: session.linkedUserId || `wa_${customerPhone}`,
+
+          // Address / scheduling
           address: args.address || '',
-          customerName: args.customerName || '',
-          customerPhone: session.phone,
-          user_id: session.linkedUserId || `wa_${session.phone}`,
+          location: args.address || '',
+          scheduled_date: args.scheduled_date || '',
+          scheduled_time: args.scheduled_time || '',
+          materials_responsibility: args.materials_responsibility || '',
+
+          // Pricing — explicitly zero so admin sees draft state, not random fallback
+          cost: '0',
+          total: '0',
+          total_price: '0',
+          totalPrice: '0',
+          admin_quote_total: 0,
+
+          // Photos (multiple key styles for cross-screen compat)
+          image_urls: photoUrls,
+          work_images: photoUrls,
+          imageUrls: photoUrls,
+          images: photoUrls,
+          photos: photoUrls,
+
+          // Routing / source
           source: 'whatsapp',
-          status: 'pending',
-          work_images: session.photoUrls.length ? session.photoUrls : [],
-          created_at: new Date().toISOString(),
+          status: 'pending_admin_review',
+          payment_status: 'unpaid',
+
+          // Timestamps
+          created_at: now,
+          created_at_ts: admin.firestore.FieldValue.serverTimestamp(),
+          updated_at: now,
         };
-        await firestore.collection('rfq_requests').doc(rfqId).set(rfqDoc);
-        // Notify admin
-        await firestore.collection('notifications').add({
-          title: 'New RFQ from WhatsApp',
-          body: `Customer needs pricing for ${args.category} > ${args.subcategory}. No fixed price found.`,
-          type: 'rfq_request',
-          user_type: 'admin',
-          rfq_id: rfqId,
-          read: false,
-          created_at: admin.firestore.FieldValue.serverTimestamp(),
-        });
+
+        try {
+          // Primary collection used by admin RFQ list/review streams.
+          await firestore.collection('futureBookings').doc(rfqBookingId).set(rfqDoc, { merge: true });
+        } catch (e) {
+          console.error('[create_booking] futureBookings RFQ write failed:', e.message);
+        }
+
+        // Keep a parallel record in rfq_requests for any existing reporting/legacy paths.
+        try {
+          await firestore.collection('rfq_requests').doc(rfqBookingId).set({
+            ...rfqDoc,
+            futureBookingId: rfqBookingId,
+          }, { merge: true });
+        } catch (e) {
+          console.warn('[create_booking] rfq_requests mirror write failed:', e.message);
+        }
+
+        // Notify admin (link to the futureBookings doc so tap-through works).
+        try {
+          await firestore.collection('notifications').add({
+            title: 'New RFQ from WhatsApp',
+            body: `${customerName || 'Customer'} needs pricing for ${args.category || 'service'}${args.subcategory ? ' > ' + args.subcategory : ''}.`,
+            type: 'rfq_request',
+            user_type: 'admin',
+            booking_id: rfqBookingId,
+            rfq_id: rfqBookingId,
+            rfq_no: rfqShortNo,
+            source: 'whatsapp',
+            read: false,
+            view: false,
+            created_at: admin.firestore.FieldValue.serverTimestamp(),
+          });
+        } catch (e) {
+          console.warn('[create_booking] admin RFQ notification failed:', e.message);
+        }
+
+        // Track on session so follow-up messages can reference it.
+        session.lastRfqId = rfqBookingId;
+        session.lastRfqNo = rfqShortNo;
+
         return {
           success: true,
           rfq: true,
-          rfqId,
-          message: `We don't have a fixed price for "${args.subcategory || args.category}" yet. Your request has been sent to our team as a quote request (RFQ #${rfqId.substring(0, 8)}). An admin will review and provide a custom quote shortly. You'll be notified once pricing is ready.`,
+          rfqId: rfqBookingId,
+          rfq_no: rfqShortNo,
+          message: `We don't have a fixed price for "${args.subcategory || args.category}" yet. Your request has been sent to our team as a quote request (${rfqShortNo}). An admin will review and provide a custom quote shortly. You'll be notified once pricing is ready.`,
         };
       }
 
