@@ -5897,6 +5897,29 @@ app.get('/diag/builders', async (req, res) => {
   }
 });
 
+// ─── Builders product search (admin app picker) ───
+// Returns full options with non-truncated image_url + product_url.
+// Auth-protected so only trusted admin clients can hit it.
+app.get('/api/builders-search', requireInternalSecret, async (req, res) => {
+  const q = String(req.query.q || '').trim();
+  const limit = Math.min(8, Math.max(1, Number(req.query.limit) || 5));
+  if (!q) return res.json({ q, options: [] });
+  try {
+    const opts = await buildersSearchOptions(q, limit);
+    res.json({
+      q,
+      options: (opts || []).map(o => ({
+        label: o.label || '',
+        price: Number(o.price || 0),
+        image_url: o.image_url || '',
+        product_url: o.product_url || '',
+      })),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message, options: [] });
+  }
+});
+
 // ─── Diagnostic: test Firebase read/write (auth-protected) ───
 app.get('/debug/firebase-test', requireInternalSecret, async (req, res) => {
   const results = { firebase_init: false, project_id: null, read_ok: false, write_ok: false, delete_ok: false, sp_count: 0, tm_count: 0, wa_bookings: 0, errors: [] };
@@ -6625,20 +6648,28 @@ function startQuoteRelayListener() {
             await new Promise(r => setTimeout(r, 600));
           }
 
-          // Totals summary
+          // Totals summary — sent ONLY after every item image has been
+          // delivered, so the client sees the full materials list before
+          // being asked to confirm. Wording matches what the bot's LLM is
+          // trained to recognise ("has been reviewed" → YES = accept_rfq_quote).
           try {
             const subtotal = Number(aq.subtotal || 0);
             const vatAmount = Number(aq.vat_amount || 0);
             const total = Number(aq.total || data.admin_quote_total || data.cost || 0);
             const notes = String(aq.notes || '').trim();
             const lines = [];
-            lines.push(`📋 *Quote Total — ${rfqNo}*`);
+            lines.push(`Hi! Your quote request (${rfqNo}) has been reviewed.`);
+            lines.push('');
+            lines.push(`📋 *Quote Total*`);
             if (subtotal > 0)  lines.push(`Subtotal: R${subtotal.toFixed(2)}`);
             if (vatAmount > 0) lines.push(`VAT: R${vatAmount.toFixed(2)}`);
             lines.push(`*Total: R${total.toFixed(2)}*`);
-            if (notes) lines.push(`\n_${notes}_`);
+            if (notes) {
+              lines.push('');
+              lines.push(`Note from admin: _${notes}_`);
+            }
             lines.push('');
-            lines.push('Reply *ACCEPT* to proceed (35% deposit / full payment options follow), or tell me what you\'d like to change (e.g. "swap the geyser to a Kwikot brand").');
+            lines.push('Please reply *YES* to accept or *NO* to reject. If accepted, we will ask when you would like the work scheduled. You can also open the Square 15 app to review. If you would like to change something (e.g. swap an item or different brand), just tell me what to adjust.');
             await sendWhatsAppMessage(phone, lines.join('\n'));
           } catch (e) {
             console.warn('[quote-relay] totals send failed for', doc.id, '-', e.message);
