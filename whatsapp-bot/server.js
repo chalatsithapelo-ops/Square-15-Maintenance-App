@@ -6670,7 +6670,33 @@ function startQuoteRelayListener() {
             }
             lines.push('');
             lines.push('Please reply *YES* to accept or *NO* to reject. If accepted, we will ask when you would like the work scheduled. You can also open the Square 15 app to review. If you would like to change something (e.g. swap an item or different brand), just tell me what to adjust.');
-            await sendWhatsAppMessage(phone, lines.join('\n'));
+            const totalsMsg = lines.join('\n');
+            await sendWhatsAppMessage(phone, totalsMsg);
+
+            // ── Bridge admin-amended quote into the bot's session so the LLM
+            // recognises the next "yes" / "no" reply. Without this, the
+            // outgoing relay messages are invisible to GPT and the client's
+            // "yes" lands with no context, dead-ending the flow.
+            try {
+              const sessRef = firestore.collection('wa_sessions').doc(phone);
+              const sessSnap = await sessRef.get();
+              const sessData = sessSnap.exists ? (sessSnap.data() || {}) : {};
+              const prevMsgs = Array.isArray(sessData.messages) ? sessData.messages : [];
+              const stitched = prevMsgs.concat([
+                { role: 'assistant', content: totalsMsg },
+              ]).slice(-20); // keep recent window only
+              await sessRef.set({
+                phone,
+                messages: stitched,
+                lastRfqId: doc.id,
+                lastRfqNo: rfqNo,
+                lastRfqAt: Date.now(),
+                lastActivity: admin.firestore.FieldValue.serverTimestamp(),
+              }, { merge: true });
+              console.log(`[quote-relay] session bridged for ${phone} → lastRfqId=${doc.id}`);
+            } catch (e) {
+              console.warn('[quote-relay] session bridge failed for', doc.id, '-', e.message);
+            }
           } catch (e) {
             console.warn('[quote-relay] totals send failed for', doc.id, '-', e.message);
           }
