@@ -2177,6 +2177,35 @@ async function executeWaTool(name, args, session) {
           updated_at: now,
         };
 
+        // Generate AI draft quote (materials BOM, labour, contingency, grand total)
+        // so the admin RFQ Review screen shows a real draft instead of R0.00.
+        try {
+          console.log(`[create_booking] Generating AI draft quote for RFQ ${rfqBookingId}...`);
+          const aiQuote = await generateAIQuote(
+            args.category || '',
+            args.description || args.subcategory || '',
+            args.materials_responsibility || 'artisan',
+            ''
+          );
+          if (aiQuote && aiQuote.grand_total > 0) {
+            const gt = aiQuote.grand_total;
+            rfqDoc.ai_quote = aiQuote;
+            rfqDoc.quoted_price = gt.toString();
+            rfqDoc.quote_details = aiQuote.scope_of_work || '';
+            rfqDoc.rfq_total = gt;
+            rfqDoc.admin_quote_total = gt;
+            rfqDoc.cost = gt.toFixed(2);
+            rfqDoc.total = gt.toFixed(2);
+            rfqDoc.total_price = gt.toFixed(2);
+            rfqDoc.totalPrice = gt.toFixed(2);
+            console.log(`[create_booking] ✅ AI draft quote generated: R${gt.toFixed(2)} (${(aiQuote.materialsBOM || []).length} BOM items)`);
+          } else {
+            console.warn('[create_booking] AI quote generation returned null/zero — admin will price manually.');
+          }
+        } catch (e) {
+          console.error('[create_booking] AI quote generation error (non-fatal):', e.message);
+        }
+
         try {
           // Primary collection used by admin RFQ list/review streams.
           await firestore.collection('futureBookings').doc(rfqBookingId).set(rfqDoc, { merge: true });
