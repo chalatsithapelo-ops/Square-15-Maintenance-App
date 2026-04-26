@@ -728,6 +728,21 @@ setInterval(() => {
   }
 }, 10 * 60 * 1000); // every 10 minutes
 
+// ─── Per-phone async mutex ─────────────────────────────────────────────────
+// Prevents two webhook requests for the same phone from interleaving session
+// reads/writes (e.g. clobbering lastRfqId or messages[] history).
+const _phoneLocks = new Map(); // phone → Promise tail
+function withPhoneLock(phone, fn) {
+  const prev = _phoneLocks.get(phone) || Promise.resolve();
+  const next = prev.catch(() => {}).then(fn);
+  _phoneLocks.set(phone, next);
+  // Clean up when done so the Map doesn't grow unbounded.
+  next.finally(() => {
+    if (_phoneLocks.get(phone) === next) _phoneLocks.delete(phone);
+  });
+  return next;
+}
+
 // ── Artisan acceptance timeout: re-dispatch or escalate after 30 minutes ──
 setInterval(async () => {
   const firestore = db();
@@ -4198,8 +4213,12 @@ async function executeWaTool(name, args, session) {
         client_schedule_via: 'whatsapp',
       };
 
-      try { await firestore.collection('futureBookings').doc(bid).set(update, { merge: true }); } catch (e) { console.warn('[wa-tool] set_preferred_schedule futureBookings failed:', e.message); }
-      try { await firestore.collection('tasksManagement').doc(bid).set(update, { merge: true }); } catch (e) { console.warn('[wa-tool] set_preferred_schedule tasksManagement failed:', e.message); }
+      let _fbOk = false, _tmOk = false;
+      try { await firestore.collection('futureBookings').doc(bid).set(update, { merge: true }); _fbOk = true; } catch (e) { console.warn('[wa-tool] set_preferred_schedule futureBookings failed:', e.message); }
+      try { await firestore.collection('tasksManagement').doc(bid).set(update, { merge: true }); _tmOk = true; } catch (e) { console.warn('[wa-tool] set_preferred_schedule tasksManagement failed:', e.message); }
+      if (!_fbOk && !_tmOk) {
+        return { error: 'Could not save your preferred schedule right now. Please try again in a moment.' };
+      }
 
       // Notify admin
       try {
@@ -4220,7 +4239,8 @@ async function executeWaTool(name, args, session) {
         for (const aid of ids) {
           try {
             const aDoc = await firestore.collection('serviceProvider').doc(String(aid)).get();
-            const token = aDoc.exists ? (aDoc.data().fcm_token || aDoc.data().deviceToken || '') : '';
+            const ad = aDoc.exists ? (aDoc.data() || {}) : {};
+            const token = ad.fcm_token || ad.deviceToken || '';
             if (!token) continue;
             await admin.messaging().send({
               token,
@@ -6598,7 +6618,9 @@ function startQuoteRelayListener() {
           if (data.whatsapp_quote_relayed === true) continue;
           // Only relay once admin_quote.items has been written by the admin app.
           const aq = data.admin_quote || {};
-          const items = Array.isArray(aq.items) ? aq.items : [];
+          const itemsRaw = Array.isArray(aq.items) ? aq.items : [];
+          // Filter out empty / malformed items so we don't send junk "Item 1 — R0" captions.
+          const items = itemsRaw.filter(it => it && typeof it === 'object' && (it.description || it.name));
           if (!items.length) continue;
 
           const phone = String(data.user_phone || '').replace(/\D/g, '');
