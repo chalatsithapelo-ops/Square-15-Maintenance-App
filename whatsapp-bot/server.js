@@ -5608,32 +5608,20 @@ async function handleMessage(session, userMessage, imageDataUrl) {
         const rfqId = session.lastRfqId;
         if (isAffirmative) {
           console.log(`[quote-intercept] ${session.phone}: YES on quote → accept_rfq_quote(${rfqId})`);
-          // Synthesize a tool-call assistant message + tool result so the
-          // session history stays valid, then return the formatted reply.
-          const toolCallId = 'call_intercept_' + Date.now();
-          session.messages.push({
-            role: 'assistant',
-            content: null,
-            tool_calls: [{
-              id: toolCallId,
-              type: 'function',
-              function: { name: 'accept_rfq_quote', arguments: JSON.stringify({ rfqId }) },
-            }],
-          });
           session._lastToolsCalled.push('accept_rfq_quote');
-          const toolResult = await executeWaTool('accept_rfq_quote', { rfqId }, session);
-          session.messages.push({
-            role: 'tool',
-            tool_call_id: toolCallId,
-            content: typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult),
-          });
-          // accept_rfq_quote returns a customer-facing text reply (string).
-          let reply = typeof toolResult === 'string'
-            ? toolResult
-            : (toolResult && (toolResult.message || toolResult.reply)) || '';
+          let reply = '';
+          try {
+            const toolResult = await executeWaTool('accept_rfq_quote', { rfqId }, session);
+            reply = typeof toolResult === 'string'
+              ? toolResult
+              : (toolResult && (toolResult.message || toolResult.reply || toolResult.error)) || '';
+          } catch (toolErr) {
+            console.error(`[quote-intercept] accept_rfq_quote threw:`, toolErr && toolErr.stack || toolErr);
+            reply = '';
+          }
           if (!reply) {
-            reply = 'Thanks — your quote is accepted. When would you like the work scheduled? (e.g. "Friday morning" or "tomorrow at 2pm")';
-          } else if (!/when would you like|schedule/i.test(reply)) {
+            reply = `Thanks — I've recorded your acceptance of RFQ ${rfqId}. When would you like the work scheduled? (e.g. "Friday morning" or "tomorrow at 2pm")`;
+          } else if (!/when would you like|preferred|schedule/i.test(reply)) {
             reply = `${reply}\n\nWhen would you like the work scheduled? (e.g. "Friday morning" or "tomorrow at 2pm")`;
           }
           session.messages.push({ role: 'assistant', content: reply });
@@ -5673,27 +5661,18 @@ async function handleMessage(session, userMessage, imageDataUrl) {
         if (parsed && parsed.date) {
           const rfqId = session.lastRfqId;
           console.log(`[schedule-intercept] ${session.phone}: "${userTextRaw}" → ${parsed.date} ${parsed.time || ''} for ${rfqId}`);
-          const toolCallId = 'call_sched_' + Date.now();
           const argsObj = { bookingId: rfqId, preferredDate: parsed.date, preferredTime: parsed.time || '', notes: '' };
-          session.messages.push({
-            role: 'assistant',
-            content: null,
-            tool_calls: [{
-              id: toolCallId,
-              type: 'function',
-              function: { name: 'set_preferred_schedule', arguments: JSON.stringify(argsObj) },
-            }],
-          });
           session._lastToolsCalled.push('set_preferred_schedule');
-          const toolResult = await executeWaTool('set_preferred_schedule', argsObj, session);
-          session.messages.push({
-            role: 'tool',
-            tool_call_id: toolCallId,
-            content: typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult),
-          });
-          let reply = (toolResult && toolResult.message) ||
-            (toolResult && toolResult.error) ||
-            `Got it — scheduled for ${parsed.date}${parsed.time ? ' at ' + parsed.time : ''}.`;
+          let reply = '';
+          try {
+            const toolResult = await executeWaTool('set_preferred_schedule', argsObj, session);
+            reply = (toolResult && (toolResult.message || toolResult.error)) || '';
+          } catch (toolErr) {
+            console.error(`[schedule-intercept] set_preferred_schedule threw:`, toolErr && toolErr.stack || toolErr);
+          }
+          if (!reply) {
+            reply = `Got it — I've noted your preferred schedule: ${parsed.date}${parsed.time ? ' at ' + parsed.time : ''}. We'll pass it to the artisan once they accept your job.`;
+          }
           session.messages.push({ role: 'assistant', content: reply });
           return reply;
         }
@@ -5742,26 +5721,18 @@ async function handleMessage(session, userMessage, imageDataUrl) {
         const shouldIntercept = wantsDeposit || wantsFull || (wantsPayGeneric && (paymentType === 'deposit' || paymentType === 'full'));
         if (shouldIntercept) {
           console.log(`[payment-intercept] ${session.phone}: "${userTextRaw}" → request_payment_link(${bid}, ${paymentType})`);
-          const toolCallId = 'call_pay_' + Date.now();
           const argsObj = { bookingId: bid, paymentType };
-          session.messages.push({
-            role: 'assistant',
-            content: null,
-            tool_calls: [{
-              id: toolCallId,
-              type: 'function',
-              function: { name: 'request_payment_link', arguments: JSON.stringify(argsObj) },
-            }],
-          });
           session._lastToolsCalled.push('request_payment_link');
-          const toolResult = await executeWaTool('request_payment_link', argsObj, session);
-          session.messages.push({
-            role: 'tool',
-            tool_call_id: toolCallId,
-            content: typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult),
-          });
-          let reply = (toolResult && (toolResult.message || toolResult.error)) ||
-            'Generating your payment link…';
+          let reply = '';
+          try {
+            const toolResult = await executeWaTool('request_payment_link', argsObj, session);
+            reply = (toolResult && (toolResult.message || toolResult.error)) || '';
+          } catch (toolErr) {
+            console.error(`[payment-intercept] request_payment_link threw:`, toolErr && toolErr.stack || toolErr);
+          }
+          if (!reply) {
+            reply = 'I had trouble generating your payment link. Please try again in a moment, or open the Square 15 app to pay.';
+          }
           session.messages.push({ role: 'assistant', content: reply });
           return reply;
         }
