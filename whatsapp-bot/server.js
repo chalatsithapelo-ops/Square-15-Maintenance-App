@@ -7194,6 +7194,152 @@ function startQuoteRelayListener() {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Admin-assignment → WhatsApp relay
+// Fires when admin (a) broadcasts the RFQ to all artisans, (b) assigns it
+// to a specific artisan, or (c) accepts internally. The customer must be told
+// over WhatsApp that admin has acted; previously they were left in silence.
+// Idempotent via `whatsapp_admin_assigned_relayed` flag.
+// ─────────────────────────────────────────────────────────────────────────────
+let _adminAssignmentRelayUnsubscribe = null;
+function startAdminAssignmentRelayListener() {
+  try {
+    const firestore = db();
+    if (!firestore) {
+      console.warn('[admin-assign-relay] firestore not ready, skipping listener init');
+      return;
+    }
+    if (_adminAssignmentRelayUnsubscribe) {
+      try { _adminAssignmentRelayUnsubscribe(); } catch (_) {}
+      _adminAssignmentRelayUnsubscribe = null;
+    }
+    // Watch RFQs whose admin-review timestamp has been set. Filtering on
+    // rfq_status would miss the internal-acceptance path which sets it to
+    // 'accepted_converted'. Instead we rely on rfq_admin_reviewed_at being
+    // a non-empty marker that admin has performed an assignment action.
+    _adminAssignmentRelayUnsubscribe = firestore
+      .collection('futureBookings')
+      .where('rfq_status', 'in', [
+        'pending_artisan_acceptance',
+        'accepted_converted',
+      ])
+      .onSnapshot(async (snap) => {
+        for (const change of snap.docChanges()) {
+          if (change.type !== 'added' && change.type !== 'modified') continue;
+          const doc = change.doc;
+          const data = doc.data() || {};
+          if (data.whatsapp_admin_assigned_relayed === true) continue;
+          // Must be an RFQ (otherwise we're triggering on unrelated bookings)
+          const isRfq = (data.is_rfq === 'yes') || (data.order_type === 'rfq')
+            || !!data.rfq_no || !!data.admin_quote;
+          if (!isRfq) continue;
+
+          const phoneRaw = String(data.user_phone || data.phone || '').replace(/\D/g, '');
+          if (!phoneRaw) {
+            console.warn('[admin-assign-relay] no phone for', doc.id, '- skipping');
+            continue;
+          }
+          let phone = phoneRaw;
+          if (phone.startsWith('0')) phone = '27' + phone.slice(1);
+
+          const rfqNo = data.rfq_no || data.order_no || doc.id;
+          const rfqStatus = String(data.rfq_status || '').toLowerCase();
+          const assignType = String(data.rfq_assigned_type || '').toLowerCase();
+          const artisanName = String(data.rfq_assigned_artisan_name || '').trim();
+          const broadcast = data.rfq_broadcast === true;
+          const costNum = parseFloat(String(data.cost || '0').replace(/[^0-9.]/g, '')) || 0;
+          const costStr = costNum > 0 ? `R${costNum.toFixed(2)}` : '';
+          const schedDate = String(data.scheduled_date || data.date || '').trim();
+          const schedTime = String(data.scheduled_time || '').trim();
+          const firstName = String(data.user_name || '').split(' ')[0];
+          const greet = firstName ? `Hi ${firstName}!` : 'Hi!';
+
+          // Build the message based on which assignment path admin took.
+          let msg = '';
+          let kind = '';
+          if (rfqStatus === 'pending_artisan_acceptance' && artisanName) {
+            kind = 'specific';
+            msg = `${greet} ✅ Good news — your quote (${rfqNo}) has been assigned to *${artisanName}*.\n\n`;
+            msg += `📋 *Job:* ${data.category_name || data.description || 'your maintenance request'}\n`;
+            if (costStr) msg += `💰 *Cost:* ${costStr}\n`;
+            if (schedDate) msg += `📅 *Scheduled:* ${schedDate}${schedTime ? ' at ' + schedTime : ''}\n`;
+            msg += `\nWe'll notify you the moment ${artisanName} accepts. 🛠️`;
+          } else if (rfqStatus === 'pending_artisan_acceptance' && broadcast) {
+            kind = 'broadcast';
+            msg = `${greet} ✅ Your quote (${rfqNo}) has been broadcast to our network of available artisans.\n\n`;
+            msg += `📋 *Job:* ${data.category_name || data.description || 'your maintenance request'}\n`;
+            if (costStr) msg += `💰 *Cost:* ${costStr}\n`;
+            if (schedDate) msg += `📅 *Scheduled:* ${schedDate}${schedTime ? ' at ' + schedTime : ''}\n`;
+            msg += `\nWe'll notify you the moment an artisan accepts. 🛠️`;
+          } else if (assignType === 'internal' || (rfqStatus === 'accepted_converted' && data.status === 'pending_payment')) {
+            kind = 'internal';
+            msg = `${greet} ✅ Your quote (${rfqNo}) has been accepted by our *Square 15 internal team*.\n\n`;
+            msg += `📋 *Job:* ${data.category_name || data.description || 'your maintenance request'}\n`;
+            if (costStr) msg += `💰 *Cost:* ${costStr}\n`;
+            if (schedDate) msg += `📅 *Scheduled:* ${schedDate}${schedTime ? ' at ' + schedTime : ''}\n`;
+            // Payment options (mirrors /api/artisan-accepted)
+            if (costNum > 0) {
+              const depositAmt = (Math.round(costNum * 0.35 * 100) / 100).toFixed(2);
+              const balanceAmt = (costNum - parseFloat(depositAmt)).toFixed(2);
+              msg += `\n💳 *Ready to pay? Choose an option:*\n`;
+              msg += `1️⃣ *Full amount:* ${costStr}\n`;
+              msg += `2️⃣ *Deposit (35%):* R${depositAmt} now (R${balanceAmt} due after job)\n`;
+              msg += `\nReply *"pay full"* or *"pay deposit"* to get your secure payment link.\n`;
+              msg += `\n🔒 Your payment is held in escrow until you confirm satisfaction.`;
+            } else {
+              msg += `\nOur team will be in touch shortly to confirm the next steps.`;
+            }
+          } else {
+            // Unknown / not-yet-actionable state — skip without marking relayed.
+            continue;
+          }
+
+          // Mark relayed BEFORE sending so a slow WA call doesn't double-fire.
+          try {
+            await firestore.collection('futureBookings').doc(doc.id).update({
+              whatsapp_admin_assigned_relayed: true,
+              whatsapp_admin_assigned_relayed_at: admin.firestore.FieldValue.serverTimestamp(),
+              whatsapp_admin_assigned_kind: kind,
+            });
+          } catch (e) {
+            console.warn('[admin-assign-relay] flag update failed for', doc.id, '-', e.message);
+            continue;
+          }
+
+          try {
+            await sendWhatsAppMessage(phone, msg);
+            console.log(`[admin-assign-relay] sent (${kind}) for ${rfqNo} → ${phone}`);
+          } catch (e) {
+            console.error('[admin-assign-relay] WA send failed for', doc.id, '-', e.message);
+          }
+
+          // Push to linked customer app as well.
+          try {
+            await notifyLinkedCustomer(firestore, {
+              phone: phoneRaw,
+              userId: data.user_id || data.userId || '',
+              title: kind === 'internal' ? 'Quote Accepted — Choose Payment'
+                : kind === 'specific' ? `Assigned to ${artisanName}`
+                : 'Quote Sent to Artisans',
+              body: kind === 'internal'
+                ? `Your quote ${rfqNo} (${costStr}) was accepted by Square 15. Tap to choose payment.`
+                : kind === 'specific'
+                  ? `${artisanName} has been assigned your quote ${rfqNo}. Awaiting their acceptance.`
+                  : `Your quote ${rfqNo} has been broadcast to artisans. We'll notify you on acceptance.`,
+              data: { type: 'rfq_admin_assigned', booking_id: doc.id, kind },
+            });
+          } catch (_) {}
+        }
+      }, (err) => {
+        console.error('[admin-assign-relay] listener error:', err && err.message);
+      });
+
+    console.log('[admin-assign-relay] listener started (futureBookings where rfq_admin_reviewed_at != "").');
+  } catch (e) {
+    console.error('[admin-assign-relay] init failed:', e && e.message);
+  }
+}
+
 
 app.listen(PORT, () => {
   console.log(`[whatsapp-bot] listening on :${PORT}`);
@@ -7202,6 +7348,7 @@ app.listen(PORT, () => {
   // Start the quote relay listener after Firebase is up. Wrapped in setTimeout
   // so initFirebase has a moment to complete its async init.
   setTimeout(() => { try { startQuoteRelayListener(); } catch (e) { console.error('[quote-relay] start failed:', e.message); } }, 2000);
+  setTimeout(() => { try { startAdminAssignmentRelayListener(); } catch (e) { console.error('[admin-assign-relay] start failed:', e.message); } }, 2500);
 
   // One-time cleanup: remove stale service_prices from pricingGuidance documents.
   // Keep labor_cost_per_hour, material_multiplier, outsourced_labor_rate (used by RFQ).
