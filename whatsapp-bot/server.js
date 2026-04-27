@@ -5626,6 +5626,74 @@ async function handleMessage(session, userMessage, imageDataUrl) {
       console.warn('[schedule-intercept] failed:', e && e.message);
     }
 
+    // ── HARD INTERCEPT: payment choice ("pay deposit" / "pay full" / "deposit" / "full") ──
+    // After artisan acceptance, the bot prompts the customer to choose
+    // deposit or full. GPT sometimes drops the tool call and replies
+    // generically. Detect explicit payment phrases and call
+    // request_payment_link directly.
+    try {
+      const userTextRaw = (typeof userMessage === 'string' ? userMessage : '').trim();
+      const userTextLower = userTextRaw.toLowerCase();
+      // Explicit payment phrases only — do NOT trigger on bare "yes/no".
+      const wantsDeposit = /\b(pay\s+(?:the\s+)?deposit|deposit\s+please|just\s+(?:the\s+)?deposit|^deposit$|35%|^pay\s+35)\b/i.test(userTextRaw)
+        || /^deposit\b/i.test(userTextLower);
+      const wantsFull = /\b(pay\s+(?:in\s+)?full|full\s+payment|pay\s+everything|pay\s+all|^full$|pay\s+the\s+full|pay\s+balance|pay\s+the\s+balance|balance\s+please|^balance$)\b/i.test(userTextRaw)
+        || /^full\b/i.test(userTextLower);
+      const wantsPayGeneric = /^(pay|pay\s+now|payment\s+link|send\s+(?:me\s+)?(?:the\s+)?(?:payment|link)|i\s+want\s+to\s+pay|ready\s+to\s+pay)\b/i.test(userTextLower);
+
+      if ((wantsDeposit || wantsFull || wantsPayGeneric) && (session.lastBookingId || session.lastRfqId)) {
+        const bid = session.lastBookingId || session.lastRfqId;
+        // If generic, look back at the last assistant message for default
+        let paymentType = wantsDeposit ? 'deposit' : (wantsFull ? 'full' : 'full');
+        if (wantsPayGeneric && !wantsDeposit && !wantsFull) {
+          // Default to full unless we already issued a deposit-pending state.
+          // Safer: ask before guessing. Skip intercept and let GPT clarify.
+          // Only intercept generic if the customer literally already said "deposit"/"full" earlier.
+          let priorChoice = '';
+          for (let i = session.messages.length - 1; i >= 0 && i > session.messages.length - 10; i--) {
+            const m = session.messages[i];
+            if (m && m.role === 'user' && typeof m.content === 'string') {
+              if (/\bdeposit\b/i.test(m.content)) { priorChoice = 'deposit'; break; }
+              if (/\bfull\b/i.test(m.content)) { priorChoice = 'full'; break; }
+            }
+          }
+          if (!priorChoice) {
+            // Don't intercept — let GPT ask the question.
+          } else {
+            paymentType = priorChoice;
+          }
+        }
+        const shouldIntercept = wantsDeposit || wantsFull || (wantsPayGeneric && (paymentType === 'deposit' || paymentType === 'full'));
+        if (shouldIntercept) {
+          console.log(`[payment-intercept] ${session.phone}: "${userTextRaw}" → request_payment_link(${bid}, ${paymentType})`);
+          const toolCallId = 'call_pay_' + Date.now();
+          const argsObj = { bookingId: bid, paymentType };
+          session.messages.push({
+            role: 'assistant',
+            content: null,
+            tool_calls: [{
+              id: toolCallId,
+              type: 'function',
+              function: { name: 'request_payment_link', arguments: JSON.stringify(argsObj) },
+            }],
+          });
+          session._lastToolsCalled.push('request_payment_link');
+          const toolResult = await executeWaTool('request_payment_link', argsObj, session);
+          session.messages.push({
+            role: 'tool',
+            tool_call_id: toolCallId,
+            content: typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult),
+          });
+          let reply = (toolResult && (toolResult.message || toolResult.error)) ||
+            'Generating your payment link…';
+          session.messages.push({ role: 'assistant', content: reply });
+          return reply;
+        }
+      }
+    } catch (e) {
+      console.warn('[payment-intercept] failed:', e && e.message);
+    }
+
     let response;
     try {
       response = await openai.chat.completions.create({
