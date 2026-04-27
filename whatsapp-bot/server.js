@@ -5528,11 +5528,12 @@ async function handleMessage(session, userMessage, imageDataUrl) {
         .test(userTextLower);
       const isRejection = /^(no|nope|nah|reject|cancel|❌)\b/i.test(userTextLower);
 
-      // Fallback: if session.lastRfqId missing but the last assistant
-      // message looks like a quote, fetch the most recent rfq_sent for this
-      // phone from Firestore. This handles the case where the quote-relay
-      // listener bridged data to firestore but the in-memory session
-      // pre-existed and never picked it up.
+      // Fallback: if session.lastRfqId missing but the user said yes/no,
+      // fetch the most recent rfq_sent for this phone from Firestore. This
+      // handles the case where the quote-relay listener bridged data to
+      // firestore but the in-memory session pre-existed and never picked
+      // it up, OR the bridge ran in a different worker process.
+      let recoveredFromFirestore = false;
       if (!session.lastRfqId && (isAffirmative || isRejection)) {
         try {
           const firestore = db();
@@ -5542,6 +5543,7 @@ async function handleMessage(session, userMessage, imageDataUrl) {
             if (sessDoc.exists && sessDoc.data().lastRfqId) {
               session.lastRfqId = sessDoc.data().lastRfqId;
               session.lastBookingId = session.lastBookingId || sessDoc.data().lastBookingId || sessDoc.data().lastRfqId;
+              recoveredFromFirestore = true;
               console.log(`[quote-intercept] recovered lastRfqId=${session.lastRfqId} from wa_sessions`);
               // Also pull recent assistant messages so looksLikeQuote regex matches
               if (Array.isArray(sessDoc.data().messages) && sessDoc.data().messages.length) {
@@ -5555,8 +5557,13 @@ async function handleMessage(session, userMessage, imageDataUrl) {
                 }
               }
             } else {
-              // Find most recent rfq_sent for this phone
-              const phoneVariants = [session.phone, session.phone.replace(/^27/, '0'), '+' + session.phone];
+              // Find most recent rfq_sent for this phone (try several formats).
+              const phoneVariants = Array.from(new Set([
+                session.phone,
+                session.phone.replace(/^27/, '0'),
+                '+' + session.phone,
+                session.phone.replace(/^0/, '27'),
+              ]));
               let foundRfq = null;
               for (const ph of phoneVariants) {
                 const snap = await firestore.collection('futureBookings')
@@ -5570,6 +5577,7 @@ async function handleMessage(session, userMessage, imageDataUrl) {
               if (foundRfq) {
                 session.lastRfqId = foundRfq;
                 session.lastBookingId = foundRfq;
+                recoveredFromFirestore = true;
                 console.log(`[quote-intercept] recovered lastRfqId=${foundRfq} from futureBookings query`);
               }
             }
@@ -5585,7 +5593,18 @@ async function handleMessage(session, userMessage, imageDataUrl) {
         /has been reviewed/i.test(lastAssistantText) ||
         /AI Quote\s*[—-]\s*RFQ/i.test(lastAssistantText);
 
-      if (looksLikeQuoteNow && (isAffirmative || isRejection) && session.lastRfqId) {
+      // Trigger condition:
+      //   - We have an RFQ id (either from session or just recovered) AND
+      //   - User said yes/no AND
+      //   - EITHER the prior assistant message looked like a quote, OR we
+      //     just recovered from Firestore (which proves an RFQ awaits)
+      const shouldInterceptQuote = (isAffirmative || isRejection) &&
+        session.lastRfqId &&
+        (looksLikeQuoteNow || recoveredFromFirestore);
+
+      console.log(`[quote-intercept] phone=${session.phone} userText="${userTextRaw.slice(0,40)}" affirm=${isAffirmative} reject=${isRejection} lastRfqId=${session.lastRfqId || '(none)'} looksLikeQuote=${looksLikeQuoteNow} recovered=${recoveredFromFirestore} → ${shouldInterceptQuote ? 'INTERCEPT' : 'skip'}`);
+
+      if (shouldInterceptQuote) {
         const rfqId = session.lastRfqId;
         if (isAffirmative) {
           console.log(`[quote-intercept] ${session.phone}: YES on quote → accept_rfq_quote(${rfqId})`);
@@ -5628,7 +5647,7 @@ async function handleMessage(session, userMessage, imageDataUrl) {
         }
       }
     } catch (e) {
-      console.warn('[quote-intercept] failed:', e && e.message);
+      console.warn('[quote-intercept] failed:', e && e.message, e && e.stack);
     }
 
     // ── HARD INTERCEPT: schedule reply after quote acceptance ──
