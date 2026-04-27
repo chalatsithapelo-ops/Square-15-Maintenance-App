@@ -5528,7 +5528,64 @@ async function handleMessage(session, userMessage, imageDataUrl) {
         .test(userTextLower);
       const isRejection = /^(no|nope|nah|reject|cancel|❌)\b/i.test(userTextLower);
 
-      if (looksLikeQuote && (isAffirmative || isRejection) && session.lastRfqId) {
+      // Fallback: if session.lastRfqId missing but the last assistant
+      // message looks like a quote, fetch the most recent rfq_sent for this
+      // phone from Firestore. This handles the case where the quote-relay
+      // listener bridged data to firestore but the in-memory session
+      // pre-existed and never picked it up.
+      if (!session.lastRfqId && (isAffirmative || isRejection)) {
+        try {
+          const firestore = db();
+          if (firestore) {
+            // Try wa_sessions first (cheaper)
+            const sessDoc = await firestore.collection('wa_sessions').doc(session.phone).get();
+            if (sessDoc.exists && sessDoc.data().lastRfqId) {
+              session.lastRfqId = sessDoc.data().lastRfqId;
+              session.lastBookingId = session.lastBookingId || sessDoc.data().lastBookingId || sessDoc.data().lastRfqId;
+              console.log(`[quote-intercept] recovered lastRfqId=${session.lastRfqId} from wa_sessions`);
+              // Also pull recent assistant messages so looksLikeQuote regex matches
+              if (Array.isArray(sessDoc.data().messages) && sessDoc.data().messages.length) {
+                const lastFew = sessDoc.data().messages.slice(-5);
+                for (const m of lastFew) {
+                  if (m && m.role === 'assistant' && typeof m.content === 'string' &&
+                      /\*Quote Total\*|has been reviewed|AI Quote/i.test(m.content)) {
+                    lastAssistantText = m.content;
+                    break;
+                  }
+                }
+              }
+            } else {
+              // Find most recent rfq_sent for this phone
+              const phoneVariants = [session.phone, session.phone.replace(/^27/, '0'), '+' + session.phone];
+              let foundRfq = null;
+              for (const ph of phoneVariants) {
+                const snap = await firestore.collection('futureBookings')
+                  .where('source', '==', 'whatsapp')
+                  .where('user_phone', '==', ph)
+                  .where('status', '==', 'rfq_sent')
+                  .orderBy('updated_at', 'desc')
+                  .limit(1).get().catch(() => ({ empty: true, docs: [] }));
+                if (!snap.empty && snap.docs.length) { foundRfq = snap.docs[0].id; break; }
+              }
+              if (foundRfq) {
+                session.lastRfqId = foundRfq;
+                session.lastBookingId = foundRfq;
+                console.log(`[quote-intercept] recovered lastRfqId=${foundRfq} from futureBookings query`);
+              }
+            }
+          }
+        } catch (e) {
+          console.warn('[quote-intercept] lastRfqId recovery failed:', e.message);
+        }
+      }
+
+      // Re-evaluate looksLikeQuote in case we just pulled the quote text from firestore
+      const looksLikeQuoteNow =
+        /\*Quote Total\*/i.test(lastAssistantText) ||
+        /has been reviewed/i.test(lastAssistantText) ||
+        /AI Quote\s*[—-]\s*RFQ/i.test(lastAssistantText);
+
+      if (looksLikeQuoteNow && (isAffirmative || isRejection) && session.lastRfqId) {
         const rfqId = session.lastRfqId;
         if (isAffirmative) {
           console.log(`[quote-intercept] ${session.phone}: YES on quote → accept_rfq_quote(${rfqId})`);
@@ -7074,6 +7131,17 @@ function startQuoteRelayListener() {
                 lastActivity: admin.firestore.FieldValue.serverTimestamp(),
               }, { merge: true });
               console.log(`[quote-relay] session bridged for ${phone} → lastRfqId=${doc.id}`);
+              // Also update in-memory session if one already exists, so the
+              // next inbound message sees lastRfqId without needing a Firestore round-trip.
+              try {
+                const liveSess = sessions.get(phone);
+                if (liveSess) {
+                  liveSess.lastRfqId = doc.id;
+                  liveSess.lastBookingId = doc.id;
+                  liveSess.messages = stitched;
+                  console.log(`[quote-relay] in-memory session also updated for ${phone}`);
+                }
+              } catch (_) {}
             } catch (e) {
               console.warn('[quote-relay] session bridge failed for', doc.id, '-', e.message);
             }
