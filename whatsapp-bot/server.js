@@ -1977,7 +1977,7 @@ function formatQuoteForWhatsApp(quote, rfqNo) {
   lines.push('');
   lines.push(`\u26A0\uFE0F ${quote.disclaimer}`);
   lines.push('');
-  lines.push('Reply *ACCEPT* to approve or *NEGOTIATE* to discuss changes.');
+  lines.push('Reply *YES* to accept or *NO* to negotiate / discuss changes. (You can also say "accept", "approve", "proceed" — or tell me what you\'d like to change.)');
 
   return lines.join('\n');
 }
@@ -5193,8 +5193,8 @@ RFQ FLOW (CRITICAL — Follow this exactly):
 4. The AI quote includes: labour hours × rate, materials BOM with markup (1.5×), equipment, and 15% contingency
 5. Present the full quote breakdown to the customer (it's included in the submit_rfq response)
 6. Ask if they want to ACCEPT or NEGOTIATE the quote
-7. If ACCEPT → call accept_rfq_quote → after success, ASK the client when they want the work done (date + optional time) and IMMEDIATELY call set_preferred_schedule with their answer (convert "Friday morning" / "tomorrow at 2pm" / "next Monday" into a real YYYY-MM-DD + HH:MM in 2026). NEVER call reschedule_booking for this — that tool is only for changing an already-set schedule.
-8. If NEGOTIATE → call reject_rfq_quote with their feedback → admin reviews
+7. If ACCEPT (the customer says "yes", "accept", "approve", "proceed", "sounds good", "let's do it", "go ahead", "ok", or any clear affirmation right after you presented a quote) → call accept_rfq_quote IMMEDIATELY → after success, ASK the client when they want the work done (date + optional time) and IMMEDIATELY call set_preferred_schedule with their answer (convert "Friday morning" / "tomorrow at 2pm" / "next Monday" into a real YYYY-MM-DD + HH:MM in 2026). NEVER call reschedule_booking for this — that tool is only for changing an already-set schedule. NEVER reply with "how can I assist you further" after a quote was just shown — a bare "yes" in that context ALWAYS means accept the quote.
+8. If NEGOTIATE (the customer says "no", "reject", "negotiate", "too expensive", "change", "lower", or any clear push-back) → call reject_rfq_quote with their feedback → admin reviews
 9. Customer can check RFQ status anytime with check_rfq_status
 
 ⚠️ IMPORTANT — REVISED QUOTES FROM ADMIN:
