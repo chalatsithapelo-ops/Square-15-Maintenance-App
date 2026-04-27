@@ -769,9 +769,16 @@ function parseScheduleFromText(input) {
 
   // 5) Time parsing
   let time = '';
-  let timeMatch = txt.match(/\b(\d{1,2}):(\d{2})\b/);
+  // HH:MM with optional am/pm suffix (e.g. "10:00am", "2:30 pm", "14:00").
+  // The original regex used \b after \d{2}, which fails for "10:00am" because
+  // there is no word boundary between '0' and 'a' (both are word chars).
+  let timeMatch = txt.match(/\b(\d{1,2}):(\d{2})\s*(am|pm)?\b/);
   if (timeMatch) {
-    const hh = parseInt(timeMatch[1], 10), mm = parseInt(timeMatch[2], 10);
+    let hh = parseInt(timeMatch[1], 10);
+    const mm = parseInt(timeMatch[2], 10);
+    const ampm = timeMatch[3];
+    if (ampm === 'pm' && hh < 12) hh += 12;
+    if (ampm === 'am' && hh === 12) hh = 0;
     if (hh >= 0 && hh < 24 && mm >= 0 && mm < 60) time = `${pad(hh)}:${pad(mm)}`;
   }
   if (!time) {
@@ -4330,18 +4337,34 @@ async function executeWaTool(name, args, session) {
         return { error: 'Could not save your preferred schedule right now. Please try again in a moment.' };
       }
 
-      // Notify admin
+      // Notify admin (Firestore + FCM tray push so admin sees it offline)
+      const isWaitingAssignment = (data.rfq_status || '') === 'rfq_approved_waiting_assignment'
+        || (data.requires_admin_assignment === true);
       try {
         await firestore.collection('notifications').add({
-          title: 'Client preferred schedule set',
-          body: `Client picked ${dateStr}${timeStr ? ' ' + timeStr : ''} for RFQ ${data.rfq_no || bid}.${notes ? ' Note: ' + notes : ''}`,
+          title: isWaitingAssignment
+            ? '📅 Client picked schedule — assign artisan'
+            : 'Client preferred schedule set',
+          body: `Client picked ${dateStr}${timeStr ? ' ' + timeStr : ''} for RFQ ${data.rfq_no || bid}.${notes ? ' Note: ' + notes : ''}${isWaitingAssignment ? ' Open RFQ Requests → Waiting Assignment to assign.' : ''}`,
           type: 'rfq_schedule_set',
           user_type: 'admin',
           booking_id: bid,
+          priority: isWaitingAssignment ? 'high' : 'normal',
           read: false,
           created_at: admin.firestore.FieldValue.serverTimestamp(),
         });
       } catch (e) { console.warn('[wa-tool] set_preferred_schedule admin notify failed:', e.message); }
+      try {
+        await pushAdminNotification({
+          title: isWaitingAssignment
+            ? '📅 Client picked schedule (>R12K) — assign artisan'
+            : '📅 Client picked a date',
+          body: `RFQ ${data.rfq_no || bid}: ${dateStr}${timeStr ? ' ' + timeStr : ''}${notes ? ' — ' + notes : ''}`,
+          type: 'rfq_schedule_set',
+          bookingId: bid,
+          extraData: { scheduled_date: dateStr, scheduled_time: timeStr, rfq_status: (data.rfq_status || '') },
+        });
+      } catch (e) { console.warn('[wa-tool] set_preferred_schedule FCM admin failed:', e.message); }
 
       // Notify assigned artisan(s) via FCM if any
       try {
@@ -4815,10 +4838,23 @@ async function executeWaTool(name, args, session) {
       const depositAmount = Math.round(priceNum * 0.35 * 100) / 100;
       const balanceAmount = Math.round((priceNum - depositAmount) * 100) / 100;
 
+      // R12K cap: bookings >= R12000 must NOT auto-dispatch. Admin assigns
+      // manually (internal team or external artisan). Use the dedicated
+      // 'rfq_approved_waiting_assignment' status so the admin RFQ list's
+      // "Waiting Assignment" filter surfaces the booking immediately.
+      const overR12K = priceNum >= 12000;
+      const rfqStatusOnAccept = overR12K
+        ? 'rfq_approved_waiting_assignment'
+        : 'accepted_converted';
+      const statusOnAccept = overR12K
+        ? 'rfq_approved_waiting_assignment'
+        : 'pending_artisan_acceptance';
+
       await firestore.collection('futureBookings').doc(rfqId).update({
-        rfq_status: 'accepted_converted',
-        status: 'pending_artisan_acceptance',
+        rfq_status: rfqStatusOnAccept,
+        status: statusOnAccept,
         artisan_confirmed: 'pending',
+        requires_admin_assignment: overR12K,
         // Sync the canonical cost fields with the (possibly admin-amended) price
         // so /api/artisan-accepted, the admin app, and the artisan app all
         // surface the same total to the client.
@@ -4846,7 +4882,7 @@ async function executeWaTool(name, args, session) {
         description: data.description || data.problem_description || '',
         problem_description: data.problem_description || data.description || '',
         address: data.address || '',
-        status: 'pending_artisan_acceptance',
+        status: statusOnAccept,
         artisan_confirmed: 'pending',
         accept: '',
         payment_status: 'unpaid',
@@ -4859,7 +4895,8 @@ async function executeWaTool(name, args, session) {
         balance_paid: false,
         source: 'whatsapp_rfq',
         is_rfq: 'yes',
-        rfq_status: 'accepted_converted',
+        rfq_status: rfqStatusOnAccept,
+        requires_admin_assignment: overR12K,
         service_provider_id: data.service_provider_id || '',
         service_provider_name: data.service_provider_name || '',
         scheduled_date: data.scheduled_date || '',
@@ -4871,23 +4908,29 @@ async function executeWaTool(name, args, session) {
 
       // Notify admin to assign an artisan
       await firestore.collection('notifications').add({
-        title: 'RFQ Quote Accepted — Assign Artisan',
-        body: `Customer accepted quote for RFQ ${data.rfq_no || rfqId} (R${priceNum.toFixed(2)}). Please assign an artisan.`,
-        type: 'rfq_accepted',
+        title: overR12K
+          ? '⚠️ RFQ Accepted (>R12K) — Assign Artisan Manually'
+          : 'RFQ Quote Accepted — Assign Artisan',
+        body: overR12K
+          ? `Customer accepted quote for RFQ ${data.rfq_no || rfqId} (R${priceNum.toFixed(2)}) — over R12K cap. Please assign internally or externally from RFQ Requests → Waiting Assignment.`
+          : `Customer accepted quote for RFQ ${data.rfq_no || rfqId} (R${priceNum.toFixed(2)}). Please assign an artisan.`,
+        type: overR12K ? 'rfq_accepted_admin_review' : 'rfq_accepted',
         user_type: 'admin',
         booking_id: rfqId,
+        rfq_status: rfqStatusOnAccept,
+        priority: overR12K ? 'high' : 'normal',
         read: false,
         created_at: admin.firestore.FieldValue.serverTimestamp(),
       });
       // FCM push so admin phones tray lights up even when app is closed
       const materialsRespForPush = (data.materials_responsibility || '').toString().trim().toLowerCase();
-      const overCap = priceNum >= 12000;
+      const overCap = overR12K;
       await pushAdminNotification({
-        title: overCap ? '⚠️ RFQ Accepted — Needs Admin Review (> R12K)' : 'RFQ Quote Accepted',
-        body: `R${priceNum.toFixed(2)} — ${data.user_name || 'Client'} accepted RFQ ${data.rfq_no || rfqId}. ${overCap ? 'Over R12K cap — please review & dispatch manually.' : 'Will auto-dispatch to artisans.'}`,
+        title: overCap ? '⚠️ RFQ Accepted — Needs Admin Assignment (> R12K)' : 'RFQ Quote Accepted',
+        body: `R${priceNum.toFixed(2)} — ${data.user_name || 'Client'} accepted RFQ ${data.rfq_no || rfqId}. ${overCap ? 'Over R12K cap — open Admin > RFQ Requests > Waiting Assignment to assign internally or externally.' : 'Will auto-dispatch to artisans.'}`,
         type: overCap ? 'rfq_accepted_admin_review' : 'rfq_accepted',
         bookingId: rfqId,
-        extraData: { price: String(priceNum), materials_responsibility: materialsRespForPush, over_12k: overCap ? '1' : '0' },
+        extraData: { price: String(priceNum), materials_responsibility: materialsRespForPush, over_12k: overCap ? '1' : '0', rfq_status: rfqStatusOnAccept },
       });
 
       // ── Auto-dispatch: route directly to artisans when conditions met ──
