@@ -694,6 +694,109 @@ async function notifyWebhookProcessingFailure(phone, err, userText = '') {
 const sessions = new Map();
 const SESSION_TTL_MS = 30 * 60 * 1000; // 30 min
 
+// ─── Natural-language schedule parser ───
+// Returns { date: 'YYYY-MM-DD', time: 'HH:MM' | '' } or null.
+// Handles: today, tomorrow, weekday names ("Friday", "next Monday"),
+// time-of-day hints ("morning"=08:00, "afternoon"=13:00, "evening"=17:00),
+// numeric times ("at 2pm", "14:00"), and DD/MM[/YYYY] dates.
+function parseScheduleFromText(input) {
+  if (!input || typeof input !== 'string') return null;
+  const txt = input.trim().toLowerCase();
+  if (!txt) return null;
+
+  const now = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  const fmt = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  const weekdayMap = { sun: 0, sunday: 0, mon: 1, monday: 1, tue: 2, tues: 2, tuesday: 2, wed: 3, weds: 3, wednesday: 3, thu: 4, thur: 4, thurs: 4, thursday: 4, fri: 5, friday: 5, sat: 6, saturday: 6 };
+  const monthMap = { jan: 0, january: 0, feb: 1, february: 1, mar: 2, march: 2, apr: 3, april: 3, may: 4, jun: 5, june: 5, jul: 6, july: 6, aug: 7, august: 7, sep: 8, sept: 8, september: 8, oct: 9, october: 9, nov: 10, november: 10, dec: 11, december: 11 };
+
+  let date = null;
+
+  // 1) "today" / "tomorrow"
+  if (/\btoday\b/.test(txt)) {
+    date = new Date(now);
+  } else if (/\btomorrow\b/.test(txt)) {
+    date = new Date(now); date.setDate(date.getDate() + 1);
+  }
+
+  // 2) Weekday names (with optional "next")
+  if (!date) {
+    const wkMatch = txt.match(/\b(next\s+)?(sun|mon|tue|tues|wed|weds|thu|thur|thurs|fri|sat|sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/);
+    if (wkMatch) {
+      const target = weekdayMap[wkMatch[2]];
+      const cur = now.getDay();
+      let delta = (target - cur + 7) % 7;
+      if (delta === 0) delta = 7; // "Friday" said on Friday → next Friday
+      if (wkMatch[1] && delta < 7) delta += 7; // "next" → following week if same week
+      date = new Date(now); date.setDate(date.getDate() + delta);
+    }
+  }
+
+  // 3) "27 Apr" / "Apr 27" / "27 April 2026"
+  if (!date) {
+    let m = txt.match(/\b(\d{1,2})\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|january|february|march|april|june|july|august|september|october|november|december)(?:\s+(\d{2,4}))?\b/);
+    if (!m) m = txt.match(/\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|january|february|march|april|june|july|august|september|october|november|december)\s+(\d{1,2})(?:[, ]+(\d{2,4}))?\b/);
+    if (m) {
+      let day, mon, yr;
+      if (/^\d/.test(m[1])) { day = parseInt(m[1], 10); mon = monthMap[m[2]]; yr = m[3] ? parseInt(m[3], 10) : now.getFullYear(); }
+      else { mon = monthMap[m[1]]; day = parseInt(m[2], 10); yr = m[3] ? parseInt(m[3], 10) : now.getFullYear(); }
+      if (yr < 100) yr += 2000;
+      const candidate = new Date(yr, mon, day);
+      if (!isNaN(candidate.getTime())) {
+        // If date is already in the past, bump to next year.
+        const today0 = new Date(now); today0.setHours(0, 0, 0, 0);
+        if (candidate < today0) candidate.setFullYear(candidate.getFullYear() + 1);
+        date = candidate;
+      }
+    }
+  }
+
+  // 4) DD/MM or DD/MM/YYYY
+  if (!date) {
+    const m = txt.match(/\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\b/);
+    if (m) {
+      const day = parseInt(m[1], 10), mon = parseInt(m[2], 10) - 1;
+      let yr = m[3] ? parseInt(m[3], 10) : now.getFullYear();
+      if (yr < 100) yr += 2000;
+      const candidate = new Date(yr, mon, day);
+      if (!isNaN(candidate.getTime())) {
+        const today0 = new Date(now); today0.setHours(0, 0, 0, 0);
+        if (candidate < today0) candidate.setFullYear(candidate.getFullYear() + 1);
+        date = candidate;
+      }
+    }
+  }
+
+  // 5) Time parsing
+  let time = '';
+  let timeMatch = txt.match(/\b(\d{1,2}):(\d{2})\b/);
+  if (timeMatch) {
+    const hh = parseInt(timeMatch[1], 10), mm = parseInt(timeMatch[2], 10);
+    if (hh >= 0 && hh < 24 && mm >= 0 && mm < 60) time = `${pad(hh)}:${pad(mm)}`;
+  }
+  if (!time) {
+    timeMatch = txt.match(/\b(\d{1,2})\s*(am|pm)\b/);
+    if (timeMatch) {
+      let hh = parseInt(timeMatch[1], 10);
+      if (timeMatch[2] === 'pm' && hh < 12) hh += 12;
+      if (timeMatch[2] === 'am' && hh === 12) hh = 0;
+      time = `${pad(hh)}:00`;
+    }
+  }
+  if (!time) {
+    if (/\b(morning)\b/.test(txt)) time = '08:00';
+    else if (/\b(noon|midday)\b/.test(txt)) time = '12:00';
+    else if (/\b(afternoon)\b/.test(txt)) time = '13:00';
+    else if (/\b(evening|tonight)\b/.test(txt)) time = '17:00';
+  }
+
+  if (!date) return null;
+  // Don't accept past dates
+  const today0 = new Date(now); today0.setHours(0, 0, 0, 0);
+  if (date < today0) return null;
+  return { date: fmt(date), time };
+}
+
 function getSession(phone) {
   let s = sessions.get(phone);
   if (s && Date.now() - s.lastActivity > SESSION_TTL_MS) {
@@ -5471,6 +5574,58 @@ async function handleMessage(session, userMessage, imageDataUrl) {
       console.warn('[quote-intercept] failed:', e && e.message);
     }
 
+    // ── HARD INTERCEPT: schedule reply after quote acceptance ──
+    // Right after accept_rfq_quote, our bot asked "When would you like the
+    // work scheduled?". The customer's next reply is almost always a date
+    // phrase ("Friday morning", "tomorrow at 2pm", "27 Apr"). GPT
+    // sometimes fails to call set_preferred_schedule and the flow stalls.
+    // We parse common phrases ourselves and call the tool directly.
+    try {
+      let lastAssistantText = '';
+      for (let i = session.messages.length - 1; i >= 0; i--) {
+        const m = session.messages[i];
+        if (m && m.role === 'assistant' && typeof m.content === 'string' && m.content.trim()) {
+          lastAssistantText = m.content;
+          break;
+        }
+      }
+      const askedSchedule =
+        /when would you like|preferred date|preferred schedule|when would you like the work/i.test(lastAssistantText);
+      if (askedSchedule && session.lastRfqId) {
+        const userTextRaw = (typeof userMessage === 'string' ? userMessage : '').trim();
+        const parsed = parseScheduleFromText(userTextRaw);
+        if (parsed && parsed.date) {
+          const rfqId = session.lastRfqId;
+          console.log(`[schedule-intercept] ${session.phone}: "${userTextRaw}" → ${parsed.date} ${parsed.time || ''} for ${rfqId}`);
+          const toolCallId = 'call_sched_' + Date.now();
+          const argsObj = { bookingId: rfqId, preferredDate: parsed.date, preferredTime: parsed.time || '', notes: '' };
+          session.messages.push({
+            role: 'assistant',
+            content: null,
+            tool_calls: [{
+              id: toolCallId,
+              type: 'function',
+              function: { name: 'set_preferred_schedule', arguments: JSON.stringify(argsObj) },
+            }],
+          });
+          session._lastToolsCalled.push('set_preferred_schedule');
+          const toolResult = await executeWaTool('set_preferred_schedule', argsObj, session);
+          session.messages.push({
+            role: 'tool',
+            tool_call_id: toolCallId,
+            content: typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult),
+          });
+          let reply = (toolResult && toolResult.message) ||
+            (toolResult && toolResult.error) ||
+            `Got it — scheduled for ${parsed.date}${parsed.time ? ' at ' + parsed.time : ''}.`;
+          session.messages.push({ role: 'assistant', content: reply });
+          return reply;
+        }
+      }
+    } catch (e) {
+      console.warn('[schedule-intercept] failed:', e && e.message);
+    }
+
     let response;
     try {
       response = await openai.chat.completions.create({
@@ -6788,8 +6943,9 @@ function startQuoteRelayListener() {
             const lineTotal = Number(it.line_total || (qty * unitPrice));
             const imageUrl = String(it.image_url || '').trim();
             const productUrl = String(it.product_url || it.sourceKey || '').trim();
-            const productLink = productUrl && /^https?:\/\//i.test(productUrl) ? `\n🔗 ${productUrl}` : '';
-            const caption = `*${i + 1}. ${desc}*\n${qty} ${unit} × R${unitPrice.toFixed(0)} = R${lineTotal.toFixed(2)}${productLink}`;
+            // Note: we intentionally do NOT include the product URL in the
+            // caption — the client doesn't need to know the supplier.
+            const caption = `*${i + 1}. ${desc}*\n${qty} ${unit} × R${unitPrice.toFixed(0)} = R${lineTotal.toFixed(2)}`;
 
             let delivered = false;
             if (imageUrl && /^https?:\/\//i.test(imageUrl)) {
