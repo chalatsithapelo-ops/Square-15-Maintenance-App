@@ -1797,9 +1797,16 @@ Return a JSON object with EXACTLY this structure:
   ]
 }
 
-CRITICAL: Every material in materialsBOM MUST be a real product available on builders.co.za (Builders Warehouse).
-Do NOT include specialty items or proprietary accessories that Builders does not stock.
-Use realistic South African pricing (ZAR). Include ALL materials needed. Return ONLY the JSON object.`;
+CRITICAL — MATERIALS COMPLETENESS:
+- The materialsBOM MUST list EVERY consumable, fitting, fixing and installation accessory needed to complete the job from start to finish — not just the main item.
+- Think like a plumber/electrician/installer doing the job: what would they put in their van besides the main product? Brackets, valves, pipes, fittings, fasteners, sealants, tapes, insulation, electrical cable, isolators, conduit, plaster, paint, grout, silicone, screws, anchors, etc. — include ALL of them.
+- For SOLAR GEYSER INSTALLATION (200 L example): main collector + tank, mounting frame/brackets, vacuum tubes (if not integrated), high-pressure valve / pressure relief valve, vacuum breaker, expansion vessel, drip tray, electrical isolator + 2.5 mm² flex cable, 22 mm copper pipe + 22 mm fittings (elbows, tees, nuts), 22 mm pipe insulation lagging, mixing/tempering valve, gate valves, non-return valve, Teflon/PTFE tape, plumbing sealant, roof flashing, lag bolts/anchors, silicone, drain pipe + fittings.
+- For GEYSER REPLACEMENT: vacuum breaker, drip tray, isolators, drain valve, flexi connectors, copper pipe + fittings, lagging, PTFE tape, silicone, brackets.
+- For PLUMBING: pipe + fittings, valves, traps, brackets, PTFE tape, sealant, silicone.
+- For ELECTRICAL: cable, conduit, isolators, glands, lugs, breakers, terminals, cable ties, insulation tape.
+- Aim for 8–15 line items for any complex installation. Missing items make the quote inaccurate.
+- Every material in materialsBOM MUST be a real product available on builders.co.za (Builders Warehouse). Do NOT include specialty items or proprietary accessories that Builders does not stock.
+- Use realistic South African 2026 retail pricing (ZAR). Use specific brand names where relevant (Cobra, Plumbsure, Apollo, Kwikot, Cedar, Major Tech, ACDC, Abro, Sika, Den Braven). Return ONLY the JSON object.`;
 
   try {
     console.log(`[ai-quote] step=openai_request category=${category} matResp=${materialsResponsibility}`);
@@ -5945,6 +5952,52 @@ app.get('/api/builders-search', requireInternalSecret, async (req, res) => {
     });
   } catch (e) {
     res.status(500).json({ error: e.message, options: [] });
+  }
+});
+
+// ─── Diagnostic: fetch a Builders product page directly to test if Render IP is blocked ───
+// GET /diag/builders-product?url=https://www.builders.co.za/.../p/744580
+app.get('/diag/builders-product', async (req, res) => {
+  const url = String(req.query.url || '').trim();
+  if (!url || !/^https?:\/\/(www\.)?builders\.co\.za\//i.test(url)) {
+    return res.status(400).json({ error: 'url must be a https://www.builders.co.za/... URL' });
+  }
+  try {
+    const r = await buildersFetch(url, { headers: buildersHeaders({ referer: 'https://www.builders.co.za/' }), timeoutMs: 20000 });
+    const html = await r.text().catch(() => '');
+    const blocked = !r.ok || /\/blocked\?/.test(html) || /perimeterx|captcha\.js/i.test(html);
+    const ogTitle = (html.match(/property="og:title"\s+content="([^"]{3,200})"/i) || [])[1] || '';
+    const ogImage = extractOgImageFromHtml(html) || '';
+    const price = extractRetailPriceFromHtml(html) || 0;
+    res.json({
+      url, http_status: r.status, http_ok: r.ok, html_len: html.length,
+      looks_blocked: blocked, og_title: ogTitle, og_image: ogImage, price,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── Hydrate a pasted Builders product URL into a picker option ───
+// GET /api/builders-hydrate?url=...   (admin-authenticated)
+// Returns { label, price, image_url, product_url } if it can be fetched.
+app.get('/api/builders-hydrate', requireInternalSecret, async (req, res) => {
+  const url = String(req.query.url || '').trim();
+  if (!url || !/^https?:\/\/(www\.)?builders\.co\.za\//i.test(url)) {
+    return res.status(400).json({ error: 'url must be a https://www.builders.co.za/... product URL' });
+  }
+  try {
+    const r = await buildersFetch(url, { headers: buildersHeaders({ referer: 'https://www.builders.co.za/' }), timeoutMs: 20000 });
+    if (!r.ok) return res.status(502).json({ error: `upstream ${r.status}` });
+    const html = await r.text().catch(() => '');
+    if (!html || /\/blocked\?/.test(html)) return res.status(502).json({ error: 'upstream blocked' });
+    const ogTitle = (html.match(/property="og:title"\s+content="([^"]{3,200})"/i) || [])[1] || '';
+    const image_url = extractOgImageFromHtml(html) || '';
+    const price = extractRetailPriceFromHtml(html) || 0;
+    if (!ogTitle && !price) return res.status(502).json({ error: 'could not parse product page' });
+    res.json({ label: ogTitle, price, image_url, product_url: url });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
