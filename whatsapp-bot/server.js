@@ -5398,6 +5398,79 @@ async function handleMessage(session, userMessage, imageDataUrl) {
       });
     }
 
+    // ── HARD INTERCEPT: quote acceptance / rejection ──
+    // If the LAST assistant message we sent was a quote ("📋 *Quote Total*"
+    // or "has been reviewed" or "AI Quote — RFQ-…") and the customer's
+    // current reply is a clear yes/accept or no/reject, GPT has historically
+    // ignored its own system rules and replied "How can I assist you
+    // further?" — dead-ending the flow. We bypass GPT in this exact case
+    // and call accept_rfq_quote / submit_rfq_amendment directly.
+    try {
+      // Find the most recent assistant *text* message (skip tool calls).
+      let lastAssistantText = '';
+      for (let i = session.messages.length - 1; i >= 0; i--) {
+        const m = session.messages[i];
+        if (m && m.role === 'assistant' && typeof m.content === 'string' && m.content.trim()) {
+          lastAssistantText = m.content;
+          break;
+        }
+      }
+      const looksLikeQuote =
+        /\*Quote Total\*/i.test(lastAssistantText) ||
+        /has been reviewed/i.test(lastAssistantText) ||
+        /AI Quote\s*[—-]\s*RFQ/i.test(lastAssistantText);
+      const userTextRaw = (typeof userMessage === 'string' ? userMessage : '').trim();
+      const userTextLower = userTextRaw.toLowerCase();
+      const isAffirmative = /^(yes|y|yeah|yep|yup|sure|ok|okay|accept|approve|approved|confirm|confirmed|proceed|go ahead|sounds good|let'?s do it|👍|✅)\b/i
+        .test(userTextLower);
+      const isRejection = /^(no|nope|nah|reject|cancel|❌)\b/i.test(userTextLower);
+
+      if (looksLikeQuote && (isAffirmative || isRejection) && session.lastRfqId) {
+        const rfqId = session.lastRfqId;
+        if (isAffirmative) {
+          console.log(`[quote-intercept] ${session.phone}: YES on quote → accept_rfq_quote(${rfqId})`);
+          // Synthesize a tool-call assistant message + tool result so the
+          // session history stays valid, then return the formatted reply.
+          const toolCallId = 'call_intercept_' + Date.now();
+          session.messages.push({
+            role: 'assistant',
+            content: null,
+            tool_calls: [{
+              id: toolCallId,
+              type: 'function',
+              function: { name: 'accept_rfq_quote', arguments: JSON.stringify({ rfqId }) },
+            }],
+          });
+          session._lastToolsCalled.push('accept_rfq_quote');
+          const toolResult = await executeWaTool('accept_rfq_quote', { rfqId }, session);
+          session.messages.push({
+            role: 'tool',
+            tool_call_id: toolCallId,
+            content: typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult),
+          });
+          // accept_rfq_quote returns a customer-facing text reply (string).
+          let reply = typeof toolResult === 'string'
+            ? toolResult
+            : (toolResult && (toolResult.message || toolResult.reply)) || '';
+          if (!reply) {
+            reply = 'Thanks — your quote is accepted. When would you like the work scheduled? (e.g. "Friday morning" or "tomorrow at 2pm")';
+          } else if (!/when would you like|schedule/i.test(reply)) {
+            reply = `${reply}\n\nWhen would you like the work scheduled? (e.g. "Friday morning" or "tomorrow at 2pm")`;
+          }
+          session.messages.push({ role: 'assistant', content: reply });
+          return reply;
+        }
+        if (isRejection) {
+          console.log(`[quote-intercept] ${session.phone}: NO on quote → noting rejection`);
+          const reply = 'No problem — what would you like to change? You can ask to swap a brand, remove an item, or adjust quantities, and I\'ll log it for our admin to update the quote.';
+          session.messages.push({ role: 'assistant', content: reply });
+          return reply;
+        }
+      }
+    } catch (e) {
+      console.warn('[quote-intercept] failed:', e && e.message);
+    }
+
     let response;
     try {
       response = await openai.chat.completions.create({
