@@ -8170,6 +8170,154 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
   const depositAlreadyPaid = taskData.deposit_paid === true;
   const balanceAlreadyPaid = taskData.balance_paid === true;
 
+  // ────────────────────────────────────────────────────────────────────
+  // ── PAYMENT AMOUNT VERIFICATION (financial-integrity guard) ──
+  // The amount actually paid via PayFast (amountGross) MUST match the
+  // amount we recorded as expected (deposit_amount / balance_remaining / cost)
+  // within a small tolerance. Mismatches must NOT auto-confirm — they
+  // indicate a tampered/stale link, manual override, or quote change after
+  // payment was initiated. Such cases are flagged for admin review.
+  // ────────────────────────────────────────────────────────────────────
+  const paidAmount = parseFloat(amountGross);
+  if (!isNaN(paidAmount) && paidAmount > 0) {
+    const totalCostNum = parseFloat(taskData.cost || taskData.total_cost || '0') || 0;
+    let expectedAmount = 0;
+    let expectedLabel = 'unknown';
+
+    if (isDepositBooking && !depositAlreadyPaid) {
+      // Customer is paying the deposit
+      expectedAmount = parseFloat(taskData.deposit_amount || '0')
+        || (totalCostNum > 0 ? Math.round(totalCostNum * 0.35 * 100) / 100 : 0);
+      expectedLabel = 'deposit';
+    } else if (isDepositBooking && depositAlreadyPaid && !balanceAlreadyPaid) {
+      // Customer is paying the balance after deposit
+      expectedAmount = parseFloat(taskData.balance_remaining || taskData.balance_amount || '0')
+        || (totalCostNum > 0 ? Math.round((totalCostNum - (parseFloat(taskData.deposit_amount || '0') || totalCostNum * 0.35)) * 100) / 100 : 0);
+      expectedLabel = 'balance';
+    } else {
+      // Full payment
+      expectedAmount = totalCostNum;
+      expectedLabel = 'full';
+    }
+
+    if (expectedAmount > 0) {
+      // Tolerance: max(R1.00 absolute, 1% relative) — covers gateway rounding
+      const diff = Math.abs(paidAmount - expectedAmount);
+      const tolerance = Math.max(1.00, expectedAmount * 0.01);
+      if (diff > tolerance) {
+        console.error(`🚨 [processPayment] AMOUNT MISMATCH for ${bookingId}: expected ${expectedLabel} R${expectedAmount.toFixed(2)} but PayFast received R${paidAmount.toFixed(2)} (diff R${diff.toFixed(2)}, tolerance R${tolerance.toFixed(2)})`);
+
+          // Flag the booking for admin review — DO NOT mark as paid
+          const mismatchFields = {
+            payment_amount_mismatch: true,
+            payment_amount_mismatch_at: now,
+            payment_amount_expected: expectedAmount.toFixed(2),
+            payment_amount_paid: paidAmount.toFixed(2),
+            payment_amount_difference: diff.toFixed(2),
+            payment_amount_expected_label: expectedLabel,
+            payment_status: 'under_review',
+            paymentStatus: 'under_review',
+            payfast_payment_id: pfPaymentId || '',
+            payfast_itn_amount: paidAmount.toFixed(2),
+            payfast_itn_received_at: now,
+            payment_review_reason: `${expectedLabel} expected R${expectedAmount.toFixed(2)} but received R${paidAmount.toFixed(2)}`,
+            updated_at: now,
+            // Reset the idempotency lock that was set earlier so admin can re-process after correction
+            payment_verified: false,
+            payment_verified_at: admin.firestore.FieldValue.delete(),
+            payment_verified_via: admin.firestore.FieldValue.delete(),
+          };
+          try {
+            await taskRef.update(mismatchFields);
+          } catch (e) {
+            console.warn(`[processPayment] mismatch flag write failed: ${e.message}`);
+          }
+          // Mirror to futureBookings
+          try {
+            const fbMismatchId = taskData.future_booking_id || bookingId;
+            const fbMismatchRef = admin.firestore().collection('futureBookings').doc(fbMismatchId);
+            const fbMismatchSnap = await fbMismatchRef.get();
+            if (fbMismatchSnap.exists) await fbMismatchRef.update(mismatchFields);
+          } catch (_) {}
+
+          // Audit log: write a transactionLog entry with status='review' so finance can find it
+          try {
+            const txId = crypto.randomUUID();
+            await admin.firestore().collection('transactionLogs').doc(txId).set({
+              id: txId,
+              amount: paidAmount.toFixed(2),
+              expected_amount: expectedAmount.toFixed(2),
+              difference: diff.toFixed(2),
+              transaction_at: now,
+              status: 'review',
+              review_reason: 'amount_mismatch',
+              expected_label: expectedLabel,
+              user_id: taskData.user_id || taskData.userId || '',
+              type: 'payfast',
+              subtype: 'payment_mismatch',
+              direction: 'in',
+              cash_movement: false,
+              schema_version: 2,
+              tasks_management_id: bookingId,
+              payfast_payment_id: pfPaymentId || '',
+              payfast_itn_status: 'COMPLETE',
+              verified_via: calledFrom || 'payment_callback',
+              item_name: itemName || taskData.item_name || taskData.service_type || '',
+            });
+            console.log(`📝 [processPayment] Mismatch transactionLog created: ${txId}`);
+          } catch (txErr) {
+            console.warn(`[processPayment] Mismatch transactionLog failed: ${txErr.message}`);
+          }
+
+          // Notify admin (in-app + FCM)
+          try {
+            await admin.firestore().collection('notifications').add({
+              title: '🚨 Payment amount mismatch — manual review required',
+              body: `Booking ${taskData.order_no || bookingId}: expected ${expectedLabel} R${expectedAmount.toFixed(2)} but received R${paidAmount.toFixed(2)} (diff R${diff.toFixed(2)}). PayFast ID: ${pfPaymentId || 'unknown'}. Booking is on hold pending admin action.`,
+              type: 'payment_mismatch',
+              user_type: 'admin',
+              priority: 'high',
+              booking_id: bookingId,
+              tasks_management_id: bookingId,
+              read: false,
+              view: false,
+              created_at: now,
+            });
+          } catch (_) {}
+
+          // Send WA notification to customer (do NOT confirm payment received)
+          const taskSrcMM = (taskData.source || '').toString().toLowerCase();
+          if (taskSrcMM.startsWith('whatsapp') || bookingId.startsWith('WA-')) {
+            const phoneMM = (taskData.phone || taskData.customer_phone || taskData.customerPhone || taskData.contact || taskData.user_phone || taskData.client_phone || '').toString().trim();
+            if (phoneMM) {
+              try {
+                const waBotMM = env('WHATSAPP_BOT_URL') || 'https://square15-whatsapp-bot.onrender.com';
+                await fetch(`${waBotMM}/api/booking-status-update`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json', 'x-internal-secret': process.env.INTERNAL_API_SECRET || '' },
+                  body: JSON.stringify({
+                    bookingId: taskData.future_booking_id || bookingId,
+                    status: 'payment_under_review',
+                    message: `⚠️ *Payment received but on hold*\n\nWe received R${paidAmount.toFixed(2)} for booking #${taskData.order_no || bookingId}, but our records show the expected ${expectedLabel} amount is R${expectedAmount.toFixed(2)}.\n\nOur team has been notified and will review this within 1 business hour. Your funds are safe — no further action is needed from you right now. We'll message you once it's resolved. 🙏`,
+                  }),
+                  signal: AbortSignal.timeout(10000),
+                });
+              } catch (waMmErr) {
+                console.warn(`[processPayment] mismatch WA notification failed: ${waMmErr.message}`);
+              }
+            }
+          }
+
+          return { processed: false, reason: 'amount_mismatch', expected: expectedAmount.toFixed(2), paid: paidAmount.toFixed(2) };
+      }
+      console.log(`[processPayment] Amount verified for ${bookingId}: ${expectedLabel} expected R${expectedAmount.toFixed(2)}, paid R${paidAmount.toFixed(2)} (within tolerance R${tolerance.toFixed(2)})`);
+    } else {
+      console.warn(`[processPayment] Could not determine expected amount for ${bookingId} (${expectedLabel}) — proceeding without verification`);
+    }
+  } else {
+    console.warn(`[processPayment] amountGross missing/invalid for ${bookingId}: "${amountGross}" — proceeding without verification`);
+  }
+
   const updateData = {
     payment_verified: true,
     payment_verified_at: now,
@@ -8314,15 +8462,23 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
     if (phone) {
       try {
         const waBot = env('WHATSAPP_BOT_URL') || 'https://square15-whatsapp-bot.onrender.com';
-        // Calculate correct display amount based on payment type
+        // Calculate correct display amount based on payment type.
+        // SAFETY: prefer the recorded expected amount over the gateway-reported amountGross,
+        // because amountGross is untrusted user-facing data and a wrong value could mislead
+        // the customer about what was actually paid. Verification above ensures these match
+        // (within tolerance) before we reach this point.
         const totalCostVal = parseFloat(taskData.total_cost) || parseFloat(taskData.cost) || 0;
         let rawPayAmt;
         if (isDepositPayment) {
-          rawPayAmt = parseFloat(amountGross) || parseFloat(taskData.deposit_amount) || Math.round(totalCostVal * 0.35 * 100) / 100;
+          rawPayAmt = parseFloat(updateData.deposit_amount) || parseFloat(taskData.deposit_amount)
+            || (totalCostVal > 0 ? Math.round(totalCostVal * 0.35 * 100) / 100 : 0)
+            || parseFloat(amountGross) || 0;
         } else if (isBalancePayment) {
-          rawPayAmt = parseFloat(amountGross) || parseFloat(taskData.balance_remaining) || parseFloat(taskData.balance_amount) || Math.round(totalCostVal * 0.65 * 100) / 100;
+          rawPayAmt = parseFloat(taskData.balance_remaining) || parseFloat(taskData.balance_amount)
+            || (totalCostVal > 0 ? Math.round(totalCostVal * 0.65 * 100) / 100 : 0)
+            || parseFloat(amountGross) || 0;
         } else {
-          rawPayAmt = parseFloat(amountGross) || totalCostVal || parseFloat(taskData.price) || 0;
+          rawPayAmt = totalCostVal || parseFloat(taskData.price) || parseFloat(amountGross) || 0;
         }
         const displayAmount = rawPayAmt > 0 ? rawPayAmt.toFixed(2) : '0.00';
         let waMessage;
@@ -8373,13 +8529,18 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
         }
         const orderLabel = taskData.order_no || fbId;
         const totalForArtisan = parseFloat(taskData.total_cost) || parseFloat(taskData.cost) || 0;
+        // SAFETY: same priority — prefer recorded expected amount over amountGross
         let artisanPayAmt;
         if (isDepositPayment) {
-          artisanPayAmt = parseFloat(amountGross) || parseFloat(taskData.deposit_amount) || Math.round(totalForArtisan * 0.35 * 100) / 100;
+          artisanPayAmt = parseFloat(updateData.deposit_amount) || parseFloat(taskData.deposit_amount)
+            || (totalForArtisan > 0 ? Math.round(totalForArtisan * 0.35 * 100) / 100 : 0)
+            || parseFloat(amountGross) || 0;
         } else if (isBalancePayment) {
-          artisanPayAmt = parseFloat(amountGross) || parseFloat(taskData.balance_remaining) || parseFloat(taskData.balance_amount) || Math.round(totalForArtisan * 0.65 * 100) / 100;
+          artisanPayAmt = parseFloat(taskData.balance_remaining) || parseFloat(taskData.balance_amount)
+            || (totalForArtisan > 0 ? Math.round(totalForArtisan * 0.65 * 100) / 100 : 0)
+            || parseFloat(amountGross) || 0;
         } else {
-          artisanPayAmt = parseFloat(amountGross) || totalForArtisan || 0;
+          artisanPayAmt = totalForArtisan || parseFloat(amountGross) || 0;
         }
         const artisanDisplayAmt = artisanPayAmt > 0 ? artisanPayAmt.toFixed(2) : '?';
         const title = isBalancePayment ? 'Balance Payment Received' : isDepositPayment ? 'Deposit Received' : 'Payment Received';
