@@ -7553,6 +7553,84 @@ function startAdminAssignmentRelayListener() {
   }
 }
 
+// ─── Listener: WhatsApp acceptance message when artisan accepts via app ───
+// The artisan app writes `artisan_confirmed='yes'` + `status='pending_payment'`
+// directly to Firestore (it doesn't POST to /api/artisan-accepted). Without
+// this listener, WhatsApp clients are stuck on "I've notified the artisan".
+function startArtisanAcceptanceListener() {
+  try {
+    const firestore = db();
+    if (!firestore) return;
+    firestore.collection('futureBookings')
+      .where('artisan_confirmed', '==', 'yes')
+      .onSnapshot(async (snap) => {
+        for (const change of snap.docChanges()) {
+          if (change.type !== 'added' && change.type !== 'modified') continue;
+          const doc = change.doc;
+          const data = doc.data() || {};
+          const src = (data.source || data.accepted_via || '').toString().toLowerCase();
+          const isWa = src.includes('whatsapp') || String(doc.id).startsWith('RFQ-') || String(doc.id).startsWith('WA-');
+          if (!isWa) continue;
+          if (data.wa_artisan_acceptance_sent_at) continue;
+          const customerPhone = data.user_phone || data.customerPhone || data.contact || data.client_phone || data.phone || '';
+          if (!customerPhone) continue;
+
+          const rfqId = doc.id;
+          const orderNo = data.order_no || data.rfq_no || rfqId;
+          const artisanName = data.service_provider_name || data.artisan_name || data.artisanName || 'Your artisan';
+          const cost = data.cost || data.total_price || data.quoted_price || data.admin_quote_total || data.rfq_total || '';
+          const costNum = parseFloat(cost) || 0;
+          const costStr = costNum > 0 ? `R${costNum.toFixed(2)}` : '';
+          const descStr = data.description || data.problem_description || data.subcategory || data.category_name || 'your maintenance request';
+
+          let to = customerPhone.replace(/[^0-9]/g, '');
+          if (to.startsWith('0')) to = '27' + to.slice(1);
+
+          let msg = `✅ *Great news!* ${artisanName} has accepted your booking (#${orderNo})!\n\n`;
+          msg += `📋 *Job:* ${descStr}\n`;
+          if (costStr) msg += `💰 *Cost:* ${costStr}\n`;
+          msg += `\n${artisanName} will contact you to confirm the schedule and arrive at your location.\n`;
+          if (costNum > 0) {
+            const depositAmt = (Math.round(costNum * 0.35 * 100) / 100).toFixed(2);
+            const balanceAmt = (costNum - parseFloat(depositAmt)).toFixed(2);
+            msg += `\n💳 *Ready to pay? Choose an option:*\n`;
+            msg += `1️⃣ *Full amount:* ${costStr}\n`;
+            msg += `2️⃣ *Deposit (35%):* R${depositAmt} now (R${balanceAmt} due after job)\n`;
+            msg += `\nReply *"pay full"* or *"pay deposit"* to get your secure payment link.\n`;
+            msg += `\n🔒 Your payment is held in escrow until you confirm satisfaction with the completed work.`;
+          }
+
+          try {
+            await sendWhatsAppMessage(to, msg);
+            await doc.ref.update({ wa_artisan_acceptance_sent_at: new Date().toISOString() });
+            console.log(`[artisan-accept-listener] sent acceptance WA to ${to} for ${rfqId} (artisan=${artisanName})`);
+            try {
+              await firestore.collection('tasksManagement').doc(rfqId).set({
+                accept: '1',
+                artisan_confirmed: 'yes',
+                status: 'pending_payment',
+                service_provider_id: data.service_provider_id || '',
+                service_provider_name: artisanName,
+                phone: customerPhone, customerPhone, contact: customerPhone, user_phone: customerPhone, client_phone: customerPhone,
+                user_id: data.user_id || data.userId || '',
+                cost: costNum.toFixed(2), total_cost: costNum.toFixed(2),
+                description: descStr,
+                updated_at: new Date().toISOString(),
+              }, { merge: true });
+            } catch (_) {}
+          } catch (e) {
+            console.warn(`[artisan-accept-listener] WA send failed for ${rfqId}:`, e.message);
+          }
+        }
+      }, (err) => {
+        console.error('[artisan-accept-listener] listener error:', err && err.message);
+      });
+    console.log('[artisan-accept-listener] listener started (futureBookings where artisan_confirmed == "yes").');
+  } catch (e) {
+    console.error('[artisan-accept-listener] init failed:', e && e.message);
+  }
+}
+
 // ─── Listener: escalate to admin when >= 3 artisans reject the RFQ ───
 function startArtisanRejectionEscalationListener() {
   try {
@@ -7630,6 +7708,7 @@ app.listen(PORT, () => {
   setTimeout(() => { try { startQuoteRelayListener(); } catch (e) { console.error('[quote-relay] start failed:', e.message); } }, 2000);
   setTimeout(() => { try { startAdminAssignmentRelayListener(); } catch (e) { console.error('[admin-assign-relay] start failed:', e.message); } }, 2500);
   setTimeout(() => { try { startArtisanRejectionEscalationListener(); } catch (e) { console.error('[reject-escalate] start failed:', e.message); } }, 3000);
+  setTimeout(() => { try { startArtisanAcceptanceListener(); } catch (e) { console.error('[artisan-accept-listener] start failed:', e.message); } }, 3500);
 
   // One-time cleanup: remove stale service_prices from pricingGuidance documents.
   // Keep labor_cost_per_hour, material_multiplier, outsourced_labor_rate (used by RFQ).
