@@ -2205,26 +2205,107 @@ async function executeWaTool(name, args, session) {
 
         // SOLE SOURCE: tasks collection (admin-managed fixed prices)
         // pricingGuidance is NOT used (stale default data, deleted).
+        //
+        // STRICT matching guards (added Apr 28 2026 after R480 "varnish door
+        // frame Labour only" was wrongly returned for "shower door
+        // installation"):
+        //   1. Drop stopwords like "install", "door", "shower" alone — a
+        //      single generic-word match is not enough.
+        //   2. Action verb of the query must align with the task's action
+        //      (install ≠ varnish ≠ replace ≠ repair).
+        //   3. Require score >= 70 (multi-word hit OR substring containment).
+        //   4. Reject "labour only" / "labor only" tasks unless the customer
+        //      explicitly asked for labour-only pricing — otherwise they get
+        //      a wrong "all-in" expectation.
+        const _STOPWORDS = new Set([
+          'repair','repairs','repairing','fix','fixing','fixes',
+          'install','installation','installing','installs',
+          'replace','replacement','replacing',
+          'service','services','servicing','maintain','maintenance',
+          'general','standard','basic','simple',
+          'work','works','job','jobs','task','tasks',
+          'problem','problems','issue','issues',
+          'need','needs','want','wants',
+          'please','help','quote','price','pricing','cost',
+          'home','house','room','door','window','wall','floor','frame',
+        ]);
+        const _distinctive = (words) => words.filter(w => !_STOPWORDS.has(w) && !_STOPWORDS.has(_stem(w)));
+        const _ACTIONS = {
+          install: ['install','installation','installing','installs','fit','fitting','mount','mounting','setup'],
+          replace: ['replace','replacement','replacing','swap','change'],
+          repair:  ['repair','repairs','repairing','fix','fixing','mend'],
+          paint:   ['paint','painting','varnish','varnishing','enamel'],
+          inspect: ['inspect','inspection','check','assess','assessment','report'],
+          clean:   ['clean','cleaning','wash','washing','scrub'],
+          unblock: ['unblock','unblocking','clear','clearing'],
+          service: ['service','servicing','maintain','maintenance'],
+        };
+        const _actionOf = (text) => {
+          const tokens = (text || '').toLowerCase().split(/[^a-z]+/).filter(Boolean);
+          for (const tk of tokens) {
+            for (const [grp, verbs] of Object.entries(_ACTIONS)) {
+              if (verbs.includes(tk)) return grp;
+            }
+          }
+          return null;
+        };
+
         if (subQuery) {
           const taskSnap = await firestore.collection('tasks').limit(200).get();
           let bestMatch = null;
+          const qAction = _actionOf(subQuery);
+          const qWordsAll = subNorm.split(/\s+/).filter(w => w.length >= 3);
+          const qDistinctive = _distinctive(qWordsAll);
           for (const td of taskSnap.docs) {
             const d = td.data();
             const status = (d.status || '').toLowerCase();
             if (status && status !== 'publish' && status !== 'active') continue;
             const name = (d.name || d.title || d.task_name || '').toString();
             const cost = parseFloat(d.client_rate || d.cost || d.clientRate || d.price || d.amount || 0);
-            if (name && cost > 0 && _fuzzyMatch(subNorm, _normalize(name))) {
-              const score = _matchScore(subNorm, _normalize(name));
-              if (!bestMatch || score > bestMatch.score) {
-                bestMatch = { name, cost, score };
-              }
+            if (!name || !(cost > 0)) continue;
+
+            const tNorm = _normalize(name);
+            if (!_fuzzyMatch(subNorm, tNorm)) continue;
+
+            // Action compatibility: install ≠ varnish ≠ replace ≠ repair
+            const sAction = _actionOf(name);
+            if (qAction && sAction && qAction !== sAction) {
+              console.log(`[create_booking] Reject "${name}" — action mismatch (q=${qAction} vs s=${sAction})`);
+              continue;
+            }
+
+            // "Labour only" / "labor only" tasks require explicit ask.
+            const isLabourOnly = /\b(labour|labor)\s*only\b/i.test(name);
+            const askedLabourOnly = /\b(labour|labor)\s*only\b/i.test(subQuery);
+            if (isLabourOnly && !askedLabourOnly) {
+              console.log(`[create_booking] Reject "${name}" — labour-only task but customer didn't ask for labour-only`);
+              continue;
+            }
+
+            // Distinctive overlap: at least one non-generic shared word.
+            const tWordsAll = tNorm.split(/\s+/).filter(w => w.length >= 3);
+            const tDistinctive = _distinctive(tWordsAll);
+            const sharedDistinctive = qDistinctive.filter(w => tDistinctive.includes(w) || tWordsAll.includes(w));
+            if (qDistinctive.length > 0 && sharedDistinctive.length === 0) {
+              console.log(`[create_booking] Reject "${name}" — no distinctive word overlap with "${subQuery}"`);
+              continue;
+            }
+
+            const score = _matchScore(subNorm, tNorm);
+            if (score < 70) {
+              console.log(`[create_booking] Reject "${name}" R${cost} — score ${score} < 70 (too generic)`);
+              continue;
+            }
+            if (!bestMatch || score > bestMatch.score) {
+              bestMatch = { name, cost, score };
             }
           }
           if (bestMatch) {
             estimatedCost = bestMatch.cost.toString();
             pricingSource = 'fixed';
             console.log(`[create_booking] Best price match: "${bestMatch.name}" R${bestMatch.cost} (score=${bestMatch.score})`);
+          } else {
+            console.log(`[create_booking] No fixed-price task matched "${subQuery}" — will RFQ`);
           }
         }
       } catch (e) {
@@ -2950,6 +3031,7 @@ async function executeWaTool(name, args, session) {
         // Try to match subcategory against tasks — pick BEST match
         if (subQuery) {
           const qAction = actionOf(subQuery);
+          const askedLabourOnly = /\b(lab[ou]r)\s*only\b/i.test(subQuery);
           let bestMatch = null;
           const rejected = [];
           for (const t of taskResults) {
@@ -2960,7 +3042,23 @@ async function executeWaTool(name, args, session) {
               rejected.push({ name: t.name, sAction, qAction });
               continue;
             }
+            // "Labour only" tasks must not be returned unless the customer
+            // explicitly asked for labour-only pricing — otherwise they'll
+            // think the price covers materials too.
+            const isLabourOnly = /\b(lab[ou]r)\s*only\b/i.test(t.name);
+            if (isLabourOnly && !askedLabourOnly) {
+              rejected.push({ name: t.name, reason: 'labour-only-not-asked' });
+              continue;
+            }
             const score = matchScore(subNorm, tNorm);
+            // Score floor: 70 = multi-word hit OR substring containment.
+            // Single-word generic matches (60) are too noisy and produce
+            // wrong prices like R480 for "shower door" matching "varnish
+            // door frame".
+            if (score < 70) {
+              rejected.push({ name: t.name, reason: `score-${score}` });
+              continue;
+            }
             if (!bestMatch || score > bestMatch.score) {
               bestMatch = { ...t, score };
             }
@@ -2970,7 +3068,7 @@ async function executeWaTool(name, args, session) {
             matchedPrice = bestMatch.cost;
             categoryName = bestMatch.category_name || categoryName;
           } else if (rejected.length) {
-            console.log(`[lookup_pricing] action-mismatch rejected ${rejected.length} candidate(s) for "${subQuery}" (qAction=${qAction}):`, rejected.map(r => `${r.name}[${r.sAction}]`).join(', '));
+            console.log(`[lookup_pricing] rejected ${rejected.length} candidate(s) for "${subQuery}" (qAction=${qAction}):`, rejected.map(r => `${r.name}[${r.sAction || r.reason}]`).join(', '));
           }
         }
 
