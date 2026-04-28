@@ -5071,17 +5071,21 @@ async function executeWaTool(name, args, session) {
         const autoReason = clientBuysMaterials ? 'client_buys_materials_under_12k' : 'under_12k';
         const cat = (data.category || data.category_name || '').toLowerCase().replace(/\s+/g, '_');
         try {
-          // Query without inequality filter — Firestore != excludes docs
-          // where the field doesn't exist, hiding most artisans.
+          // Fetch ALL artisans and gate in code — many artisan docs have no
+          // `status` field at all, which an inequality/in filter would hide.
+          // We only refuse explicit non-eligible statuses.
           const artisanSnap = await firestore.collection('serviceProvider')
-            .where('status', 'in', ['publish', 'published', 'approved', 'approve'])
-            .limit(50)
+            .limit(200)
             .get();
+          const REJECT_STATUSES = new Set(['pending', 'rejected', 'reject', 'suspended', 'inactive', 'disabled']);
           const matchedArtisans = [];
           for (const artDoc of artisanSnap.docs) {
             const ad = artDoc.data() || {};
             // Skip suspended artisans (checked in code, not query)
             if (ad.is_suspended === true) continue;
+            // Reject only explicitly bad statuses; missing/undefined status is OK
+            const st = (ad.status == null) ? '' : String(ad.status).toLowerCase();
+            if (st && REJECT_STATUSES.has(st)) continue;
             // Check active status — only the manual toggle gates dispatch
             const activeField = ad.active;
             if (activeField != null && !isTruthyValue(activeField)) continue;
@@ -5091,6 +5095,7 @@ async function executeWaTool(name, args, session) {
             matchedArtisans.push({ id: artDoc.id, name: aName, token: (ad.fcm_token || ad.deviceToken || '').toString().trim() });
             if (matchedArtisans.length >= 3) break;
           }
+          console.log(`[wa-tool] auto-dispatch RFQ ${rfqId} cat="${cat}" — scanned ${artisanSnap.size}, matched ${matchedArtisans.length}`);
           if (matchedArtisans.length > 0) {
             const artisanIds = matchedArtisans.map(a => a.id);
             const artisanNames = {};
@@ -5138,6 +5143,37 @@ async function executeWaTool(name, args, session) {
 
       if (autoDispatched) {
         console.log(`[wa-tool] RFQ ${rfqId} auto-dispatched to artisans (under R12K or client buys materials)`);
+      } else {
+        // No auto-dispatch happened — either over R12K (already flagged) or
+        // under R12K with zero matching artisans. Either way, force the RFQ
+        // into admin "Waiting Assignment" so it doesn't dead-end.
+        try {
+          await firestore.collection('futureBookings').doc(rfqId).update({
+            rfq_status: 'rfq_approved_waiting_assignment',
+            status: 'rfq_approved_waiting_assignment',
+            requires_admin_assignment: true,
+            rfq_no_artisans_matched: !overR12K, // distinguish "over cap" vs "no eligible artisans"
+            updated_at: new Date().toISOString(),
+          });
+          await firestore.collection('tasksManagement').doc(rfqId).set({
+            rfq_status: 'rfq_approved_waiting_assignment',
+            status: 'rfq_approved_waiting_assignment',
+            requires_admin_assignment: true,
+            updated_at: new Date().toISOString(),
+          }, { merge: true });
+          await pushAdminNotification({
+            title: overR12K
+              ? '⚠️ RFQ Accepted (>R12K) — Assign Artisan Manually'
+              : '⚠️ RFQ Accepted — No Artisans Matched, Assign Manually',
+            body: `R${priceNum.toFixed(2)} — ${data.user_name || 'Client'} accepted RFQ ${data.rfq_no || rfqId}. Open Admin > RFQ Requests > Waiting Assignment.`,
+            type: 'rfq_accepted_admin_review',
+            bookingId: rfqId,
+            extraData: { price: String(priceNum), rfq_status: 'rfq_approved_waiting_assignment', over_12k: overR12K ? '1' : '0', no_artisans: overR12K ? '0' : '1' },
+          });
+          console.log(`[wa-tool] RFQ ${rfqId} flagged for admin manual assignment (overR12K=${overR12K})`);
+        } catch (e) {
+          console.warn(`[wa-tool] failed to flag RFQ ${rfqId} for admin assignment:`, e.message);
+        }
       }
 
       // Store for quick payment follow-up
@@ -7517,6 +7553,73 @@ function startAdminAssignmentRelayListener() {
   }
 }
 
+// ─── Listener: escalate to admin when >= 3 artisans reject the RFQ ───
+function startArtisanRejectionEscalationListener() {
+  try {
+    const firestore = db();
+    if (!firestore) return;
+    firestore.collection('futureBookings')
+      .where('rfq_artisan_rejection_count', '>=', 3)
+      .onSnapshot(async (snap) => {
+        for (const change of snap.docChanges()) {
+          if (change.type !== 'added' && change.type !== 'modified') continue;
+          const doc = change.doc;
+          const data = doc.data() || {};
+          // Skip if already escalated or already assigned to a single artisan
+          if (data.rfq_3_rejections_escalated === true) continue;
+          if (data.status === 'pending_admin_review') continue;
+          if (data.rfq_status === 'rfq_approved_waiting_assignment') continue;
+
+          const rfqId = doc.id;
+          const rejCount = data.rfq_artisan_rejection_count || 0;
+          console.log(`[reject-escalate] RFQ ${rfqId} reached ${rejCount} rejections — escalating to admin`);
+          try {
+            await doc.ref.update({
+              rfq_status: 'rfq_approved_waiting_assignment',
+              status: 'pending_admin_review',
+              requires_admin_assignment: true,
+              rfq_3_rejections_escalated: true,
+              rfq_3_rejections_escalated_at: new Date().toISOString(),
+              updated_at: new Date().toISOString(),
+            });
+            try {
+              await firestore.collection('tasksManagement').doc(rfqId).set({
+                status: 'pending_admin_review',
+                rfq_status: 'rfq_approved_waiting_assignment',
+                requires_admin_assignment: true,
+                updated_at: new Date().toISOString(),
+              }, { merge: true });
+            } catch (_) {}
+            // Push admin
+            const priceN = parseFloat(data.admin_quote_total || data.rfq_total || data.quoted_price || data.cost || 0);
+            await pushAdminNotification({
+              title: '⚠️ 3 Artisans Rejected — Manual Action Needed',
+              body: `RFQ ${data.rfq_no || rfqId} (R${priceN.toFixed(2)}) has been rejected by ${rejCount} artisans. Open Admin > RFQ Requests > Waiting Assignment to amend the quote or assign manually.`,
+              type: 'rfq_3_rejections',
+              bookingId: rfqId,
+              extraData: { price: String(priceN), rejection_count: String(rejCount) },
+            });
+            // Notify customer they may experience a delay
+            const custPhone = data.customerPhone || data.contact || data.user_phone || '';
+            if (custPhone) {
+              try {
+                await sendWhatsAppMessage(custPhone,
+                  `Hi — quick update on your booking ${data.rfq_no || rfqId}. Our team is reviewing the assignment to make sure the right artisan handles your job. We'll be back to you shortly. 🙏`);
+              } catch (_) {}
+            }
+          } catch (e) {
+            console.warn(`[reject-escalate] update failed for ${rfqId}:`, e.message);
+          }
+        }
+      }, (err) => {
+        console.error('[reject-escalate] listener error:', err && err.message);
+      });
+    console.log('[reject-escalate] listener started (futureBookings where rfq_artisan_rejection_count >= 3).');
+  } catch (e) {
+    console.error('[reject-escalate] init failed:', e && e.message);
+  }
+}
+
 
 app.listen(PORT, () => {
   console.log(`[whatsapp-bot] listening on :${PORT}`);
@@ -7526,6 +7629,7 @@ app.listen(PORT, () => {
   // so initFirebase has a moment to complete its async init.
   setTimeout(() => { try { startQuoteRelayListener(); } catch (e) { console.error('[quote-relay] start failed:', e.message); } }, 2000);
   setTimeout(() => { try { startAdminAssignmentRelayListener(); } catch (e) { console.error('[admin-assign-relay] start failed:', e.message); } }, 2500);
+  setTimeout(() => { try { startArtisanRejectionEscalationListener(); } catch (e) { console.error('[reject-escalate] start failed:', e.message); } }, 3000);
 
   // One-time cleanup: remove stale service_prices from pricingGuidance documents.
   // Keep labor_cost_per_hour, material_multiplier, outsourced_labor_rate (used by RFQ).
