@@ -7918,6 +7918,75 @@ function startJobLifecycleListener() {
   }
 }
 
+// ─── Listener: artisan "Buying Material" toggle on tasksManagement ──────────
+// Fires when tasksManagement.buying_material flips to 'true'. Sends the
+// "🛒 buying materials" WA message regardless of whether the artisan-side
+// HTTP push to /api/job-status-update succeeded. Idempotent via
+// wa_buying_material_sent_at on the same doc.
+function startBuyingMaterialListener() {
+  try {
+    const firestore = db();
+    if (!firestore) return;
+    firestore.collection('tasksManagement')
+      .where('buying_material', '==', 'true')
+      .onSnapshot(async (snap) => {
+        for (const change of snap.docChanges()) {
+          if (change.type !== 'modified' && change.type !== 'added') continue;
+          const doc = change.doc;
+          const data = doc.data() || {};
+          if (data.wa_buying_material_sent_at) continue;
+          const src = String(data.source || '').toLowerCase();
+          const isWa = src.includes('whatsapp') || String(doc.id).startsWith('RFQ-') || String(doc.id).startsWith('WA-');
+          if (!isWa) continue;
+
+          // Resolve customer phone (prefer futureBookings since tasksManagement
+          // sometimes lacks user_phone for WA-originated bookings).
+          let phoneRaw = data.user_phone || data.customerPhone || data.phone || '';
+          let artisanName = data.service_provider_name || data.artisan_name || '';
+          let orderNo = data.order_no || data.rfq_no || doc.id;
+          if (!phoneRaw || !artisanName) {
+            try {
+              const fbDoc = await firestore.collection('futureBookings').doc(doc.id).get();
+              if (fbDoc.exists) {
+                const fb = fbDoc.data() || {};
+                if (!phoneRaw) phoneRaw = fb.user_phone || fb.customerPhone || fb.phone || '';
+                if (!artisanName) artisanName = fb.service_provider_name || fb.artisan_name || '';
+                if (!orderNo || orderNo === doc.id) orderNo = fb.order_no || fb.rfq_no || orderNo;
+              }
+            } catch (_) {}
+          }
+          if (!phoneRaw) continue;
+          let to = phoneRaw.replace(/[^0-9]/g, '');
+          if (to.startsWith('0')) to = '27' + to.slice(1);
+
+          const name = artisanName || 'Your artisan';
+          const ref = orderNo;
+          const msg = `🛒 *${name} is buying materials!*\n\nYour artisan is purchasing the materials needed for booking #${ref}. They will head to your site once ready.\n\nWe'll keep you updated on progress. 🔧`;
+
+          // Mark BEFORE send to prevent duplicates
+          try {
+            await doc.ref.update({ wa_buying_material_sent_at: new Date().toISOString() });
+          } catch (e) {
+            console.warn(`[buying-material] flag update failed for ${doc.id}:`, e.message);
+            continue;
+          }
+
+          try {
+            await sendWhatsAppMessage(to, msg);
+            console.log(`[buying-material] sent WA to ${to} for ${doc.id}`);
+          } catch (e) {
+            console.warn(`[buying-material] WA send failed for ${doc.id}:`, e.message);
+          }
+        }
+      }, (err) => {
+        console.error('[buying-material] listener error:', err && err.message);
+      });
+    console.log('[buying-material] listener started (tasksManagement where buying_material == "true").');
+  } catch (e) {
+    console.error('[buying-material] init failed:', e && e.message);
+  }
+}
+
 
 app.listen(PORT, () => {
   console.log(`[whatsapp-bot] listening on :${PORT}`);
@@ -7931,6 +8000,7 @@ app.listen(PORT, () => {
   setTimeout(() => { try { startArtisanAcceptanceListener(); } catch (e) { console.error('[artisan-accept-listener] start failed:', e.message); } }, 3500);
   setTimeout(() => { try { startBalancePromptListener(); } catch (e) { console.error('[balance-prompt] start failed:', e.message); } }, 4000);
   setTimeout(() => { try { startJobLifecycleListener(); } catch (e) { console.error('[job-lifecycle] start failed:', e.message); } }, 4500);
+  setTimeout(() => { try { startBuyingMaterialListener(); } catch (e) { console.error('[buying-material] start failed:', e.message); } }, 5000);
 
   // One-time cleanup: remove stale service_prices from pricingGuidance documents.
   // Keep labor_cost_per_hour, material_multiplier, outsourced_labor_rate (used by RFQ).
