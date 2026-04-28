@@ -8717,19 +8717,35 @@ h1{color:${color};margin:0 0 16px}p{color:#555;line-height:1.6;margin:0}</style>
         return;
       }
       console.log(`[ozow-result] Processing payment for ${booking_id} (fallback — ITN may or may not arrive)`);
-      // Resolve amount from tasksManagement or futureBookings
-      let fallbackAmount = preData.cost || preData.total_cost || '';
+      // Resolve amount based on payment_type — DO NOT default to total cost,
+      // or a deposit payment will be recorded as the full amount (financial bug).
       let fallbackItem = preData.description || preData.item_name || '';
-      if (!fallbackAmount) {
+      let preDoc = preData;
+      if (!preDoc || !Object.keys(preDoc).length) {
         try {
           const fbFallback = await admin.firestore().collection('futureBookings').doc(booking_id).get();
           if (fbFallback.exists) {
-            const fbd = fbFallback.data() || {};
-            fallbackAmount = fbd.cost || fbd.total_cost || '0';
-            if (!fallbackItem) fallbackItem = fbd.description || fbd.item_name || '';
+            preDoc = fbFallback.data() || {};
+            if (!fallbackItem) fallbackItem = preDoc.description || preDoc.item_name || '';
           }
         } catch (_) {}
       }
+      // Decide the expected amount from the recorded payment_type / payment_status
+      const totalCostFb = parseFloat(preDoc.cost || preDoc.total_cost || '0') || 0;
+      const isDepositFb = preDoc.payment_type === 'deposit' || preDoc.payment_status === 'deposit_pending';
+      const depositPaidFb = preDoc.deposit_paid === true;
+      const balancePendingFb = preDoc.payment_status === 'balance_pending';
+      let fallbackAmount;
+      if (isDepositFb && !depositPaidFb) {
+        fallbackAmount = (parseFloat(preDoc.deposit_amount || '0')
+          || (totalCostFb > 0 ? Math.round(totalCostFb * 0.35 * 100) / 100 : 0)).toFixed(2);
+      } else if (depositPaidFb || balancePendingFb) {
+        fallbackAmount = (parseFloat(preDoc.balance_remaining || preDoc.balance_amount || '0')
+          || (totalCostFb > 0 ? Math.round(totalCostFb * 0.65 * 100) / 100 : 0)).toFixed(2);
+      } else {
+        fallbackAmount = (totalCostFb > 0 ? totalCostFb : 0).toFixed(2);
+      }
+      console.log(`[ozow-result] Resolved fallbackAmount=R${fallbackAmount} (payment_type=${preDoc.payment_type || 'full'}, deposit_paid=${depositPaidFb})`);
       const result = await processSuccessfulPayment(booking_id, {
         amountGross: fallbackAmount || '',
         pfPaymentId: '',
