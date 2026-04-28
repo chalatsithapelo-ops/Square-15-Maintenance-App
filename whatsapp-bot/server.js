@@ -8006,6 +8006,109 @@ function startBuyingMaterialListener() {
   }
 }
 
+// ─── Listener: artisan before/after photo uploads ───────────────────────────
+// Fires when tasksManagement.artisan_images flips to "1" (before-work photo
+// uploaded) or "2" (after-work photo uploaded). Sends the appropriate WA
+// message with the actual photo as an image attachment, regardless of whether
+// the artisan-side HTTP push succeeded. Idempotent via
+// wa_artisan_images_<n>_sent_at flags. Resolves WA source via the
+// future_booking_id link (TM bridge docs typically have source='future_booking'
+// even for WA-originated bookings).
+function startArtisanPhotoListener() {
+  try {
+    const firestore = db();
+    if (!firestore) return;
+    firestore.collection('tasksManagement')
+      .onSnapshot(async (snap) => {
+        for (const change of snap.docChanges()) {
+          if (change.type !== 'modified' && change.type !== 'added') continue;
+          const doc = change.doc;
+          const data = doc.data() || {};
+          const ai = String(data.artisan_images || '').trim();
+          if (ai !== '1' && ai !== '2') continue;
+          const flagKey = ai === '1' ? 'wa_artisan_images_1_sent_at' : 'wa_artisan_images_2_sent_at';
+          if (data[flagKey]) continue;
+
+          // Resolve WA source via future_booking_id link if not directly WA
+          const src = String(data.source || '').toLowerCase();
+          let isWa = src.includes('whatsapp') || String(doc.id).startsWith('RFQ-') || String(doc.id).startsWith('WA-');
+          let phoneRaw = data.user_phone || data.customerPhone || data.phone || '';
+          let artisanName = data.service_provider_name || data.artisan_name || '';
+          let orderNo = data.order_no || data.rfq_no || doc.id;
+          const fbLinkId = String(data.future_booking_id || '').trim();
+          if (fbLinkId) {
+            try {
+              const fbDoc = await firestore.collection('futureBookings').doc(fbLinkId).get();
+              if (fbDoc.exists) {
+                const fb = fbDoc.data() || {};
+                const fbSrc = String(fb.source || '').toLowerCase();
+                if (fbSrc.includes('whatsapp') || fbLinkId.startsWith('RFQ-') || fbLinkId.startsWith('WA-')) {
+                  isWa = true;
+                }
+                if (!phoneRaw) phoneRaw = fb.user_phone || fb.customerPhone || fb.phone || '';
+                if (!artisanName) artisanName = fb.service_provider_name || fb.artisan_name || '';
+                if (!orderNo || orderNo === doc.id) orderNo = fb.order_no || fb.rfq_no || orderNo;
+              }
+            } catch (_) {}
+          }
+          if (!isWa) continue;
+          if (!phoneRaw) continue;
+          let to = phoneRaw.replace(/[^0-9]/g, '');
+          if (to.startsWith('0')) to = '27' + to.slice(1);
+
+          // Resolve photo URL from artisanTaskImages doc
+          let imageUrl = '';
+          const imageDocId = String(data.artisan_image_doc_id || '').trim();
+          if (imageDocId) {
+            try {
+              const imgDoc = await firestore.collection('artisanTaskImages').doc(imageDocId).get();
+              if (imgDoc.exists) {
+                const img = imgDoc.data() || {};
+                imageUrl = ai === '1'
+                  ? String(img.before_work || img.beforeWork || '')
+                  : String(img.after_work || img.afterWork || '');
+              }
+            } catch (_) {}
+          }
+
+          const name = artisanName || 'Your artisan';
+          const ref = orderNo;
+          const msg = ai === '1'
+            ? `📸 *${name} has arrived!*\n\nYour artisan has arrived at the site and taken a before-work photo for booking #${ref}. Work is about to begin.\n\nWe'll keep you updated on progress. 🔧`
+            : `📸 *Work completed!*\n\nYour artisan has finished the job and uploaded an after-work photo for booking #${ref}.\n\nPlease review the work in the Square 15 app. ✅`;
+
+          // Mark BEFORE send to prevent duplicates
+          try {
+            await doc.ref.update({ [flagKey]: new Date().toISOString() });
+          } catch (e) {
+            console.warn(`[artisan-photo] flag update failed for ${doc.id}:`, e.message);
+            continue;
+          }
+
+          try {
+            await sendWhatsAppMessage(to, msg);
+            if (imageUrl) {
+              const caption = ai === '1'
+                ? `📸 Before-work photo for booking #${ref}`
+                : `📸 After-work photo for booking #${ref}`;
+              try { await sendWhatsAppImage(to, imageUrl, caption); } catch (e) {
+                console.warn(`[artisan-photo] image send failed:`, e.message);
+              }
+            }
+            console.log(`[artisan-photo] sent ai=${ai} WA to ${to} for ${doc.id}`);
+          } catch (e) {
+            console.warn(`[artisan-photo] WA send failed for ${doc.id}:`, e.message);
+          }
+        }
+      }, (err) => {
+        console.error('[artisan-photo] listener error:', err && err.message);
+      });
+    console.log('[artisan-photo] listener started (tasksManagement.artisan_images changes).');
+  } catch (e) {
+    console.error('[artisan-photo] init failed:', e && e.message);
+  }
+}
+
 
 app.listen(PORT, () => {
   console.log(`[whatsapp-bot] listening on :${PORT}`);
@@ -8020,6 +8123,7 @@ app.listen(PORT, () => {
   setTimeout(() => { try { startBalancePromptListener(); } catch (e) { console.error('[balance-prompt] start failed:', e.message); } }, 4000);
   setTimeout(() => { try { startJobLifecycleListener(); } catch (e) { console.error('[job-lifecycle] start failed:', e.message); } }, 4500);
   setTimeout(() => { try { startBuyingMaterialListener(); } catch (e) { console.error('[buying-material] start failed:', e.message); } }, 5000);
+  setTimeout(() => { try { startArtisanPhotoListener(); } catch (e) { console.error('[artisan-photo] start failed:', e.message); } }, 5500);
 
   // One-time cleanup: remove stale service_prices from pricingGuidance documents.
   // Keep labor_cost_per_hour, material_multiplier, outsourced_labor_rate (used by RFQ).
