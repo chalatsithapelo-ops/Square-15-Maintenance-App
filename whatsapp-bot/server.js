@@ -7812,6 +7812,112 @@ function startBalancePromptListener() {
   }
 }
 
+// ─── Listener: artisan job-lifecycle status changes (futureBookings.status) ───
+// The artisan app's "Go to Site" / "Complete" buttons update Firestore + POST
+// to /api/job-status-update. The HTTP call can fail silently (Render free-tier
+// sleep, network blip, missing/stale internal secret). This listener is a
+// safety net: when futureBookings.status changes to a lifecycle event for a
+// WA-originated booking, the customer gets the WhatsApp message regardless.
+// Idempotent via wa_lifecycle_<status>_sent_at flags, so it can co-exist with
+// the HTTP path without sending duplicates.
+function startJobLifecycleListener() {
+  try {
+    const firestore = db();
+    if (!firestore) return;
+    const LIFECYCLE_STATUSES = ['progress', 'in_progress', 'completed', 'done', 'closed', 'cancelled', 'canceled'];
+    firestore.collection('futureBookings')
+      .onSnapshot(async (snap) => {
+        for (const change of snap.docChanges()) {
+          if (change.type !== 'modified' && change.type !== 'added') continue;
+          const doc = change.doc;
+          const data = doc.data() || {};
+          const status = String(data.status || '').toLowerCase();
+          if (!LIFECYCLE_STATUSES.includes(status)) continue;
+          // Only WA-originated bookings
+          const src = String(data.source || '').toLowerCase();
+          const isWa = src.includes('whatsapp') || String(doc.id).startsWith('RFQ-') || String(doc.id).startsWith('WA-');
+          if (!isWa) continue;
+          // Normalise: 'in_progress'→'progress', 'done'/'closed'→'completed', 'canceled'→'cancelled'
+          let normStatus = status;
+          if (status === 'in_progress') normStatus = 'progress';
+          else if (status === 'done' || status === 'closed') normStatus = 'completed';
+          else if (status === 'canceled') normStatus = 'cancelled';
+
+          const flagKey = `wa_lifecycle_${normStatus}_sent_at`;
+          if (data[flagKey]) continue; // already sent
+          const phoneRaw = data.user_phone || data.customerPhone || data.contact || data.client_phone || data.phone || '';
+          if (!phoneRaw) continue;
+          let to = phoneRaw.replace(/[^0-9]/g, '');
+          if (to.startsWith('0')) to = '27' + to.slice(1);
+
+          const orderNo = data.order_no || data.rfq_no || doc.id;
+          const artisanName = data.service_provider_name || data.artisan_name || data.artisanName || 'Your artisan';
+          const ref = orderNo;
+
+          // Skip the deposit-paid 'completed' branch — it's already handled by
+          // startBalancePromptListener which sends a balance-due message.
+          if (normStatus === 'completed' && data.payment_status === 'deposit_paid' && data.balance_paid !== true) {
+            try { await doc.ref.update({ [flagKey]: new Date().toISOString() }); } catch (_) {}
+            continue;
+          }
+
+          let msg;
+          switch (normStatus) {
+            case 'progress':
+              msg = `🚗 *${artisanName} is on the way!*\n\nYour artisan is heading to your location for booking #${ref}. You can track their location in the Square 15 app.\n\nPlease ensure access to the site is available. 🏠`;
+              break;
+            case 'completed':
+              msg = `✅ *Job completed!*\n\nThe work for booking #${ref} has been completed by ${artisanName}.\n\n🙏 *Thank you for choosing Square 15!* We truly appreciate your trust in our service.\n\nPlease review the work and rate your artisan. ⭐`;
+              break;
+            case 'cancelled':
+              msg = `❌ *Booking cancelled*\n\nYour booking #${ref} has been cancelled. If you need help or have questions, just reply here. 🙏`;
+              break;
+            default:
+              continue;
+          }
+
+          // Mark BEFORE sending to prevent duplicate fires from rapid Firestore re-emits
+          try {
+            await doc.ref.update({ [flagKey]: new Date().toISOString() });
+          } catch (e) {
+            console.warn(`[job-lifecycle] flag update failed for ${doc.id}:`, e.message);
+            continue;
+          }
+
+          try {
+            await sendWhatsAppMessage(to, msg);
+            console.log(`[job-lifecycle] sent "${normStatus}" WA to ${to} for ${doc.id}`);
+            // Sync tasksManagement so other consumers (admin app, payment processor) see the same status
+            try {
+              await firestore.collection('tasksManagement').doc(doc.id).set({
+                status: normStatus === 'progress' ? 'progress' : (normStatus === 'completed' ? 'completed' : 'cancelled'),
+                updated_at: new Date().toISOString(),
+              }, { merge: true });
+            } catch (_) {}
+            // Track pending rating in sessions so bot prompts on next message
+            if (normStatus === 'completed') {
+              const session = sessions.get(to);
+              if (session) {
+                session.pendingRatingBookingId = doc.id;
+                session.messages.push({
+                  role: 'system',
+                  content: `[SYSTEM STATUS UPDATE] Booking #${ref} (${doc.id}): status changed to "completed".`,
+                });
+              }
+            }
+          } catch (e) {
+            console.warn(`[job-lifecycle] WA send failed for ${doc.id}:`, e.message);
+          }
+        }
+      }, (err) => {
+        console.error('[job-lifecycle] listener error:', err && err.message);
+      });
+    console.log('[job-lifecycle] listener started (futureBookings status changes for WA-originated bookings).');
+  } catch (e) {
+    console.error('[job-lifecycle] init failed:', e && e.message);
+  }
+}
+
 
 app.listen(PORT, () => {
   console.log(`[whatsapp-bot] listening on :${PORT}`);
@@ -7824,6 +7930,7 @@ app.listen(PORT, () => {
   setTimeout(() => { try { startArtisanRejectionEscalationListener(); } catch (e) { console.error('[reject-escalate] start failed:', e.message); } }, 3000);
   setTimeout(() => { try { startArtisanAcceptanceListener(); } catch (e) { console.error('[artisan-accept-listener] start failed:', e.message); } }, 3500);
   setTimeout(() => { try { startBalancePromptListener(); } catch (e) { console.error('[balance-prompt] start failed:', e.message); } }, 4000);
+  setTimeout(() => { try { startJobLifecycleListener(); } catch (e) { console.error('[job-lifecycle] start failed:', e.message); } }, 4500);
 
   // One-time cleanup: remove stale service_prices from pricingGuidance documents.
   // Keep labor_cost_per_hour, material_multiplier, outsourced_labor_rate (used by RFQ).
