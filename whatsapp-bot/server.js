@@ -3072,16 +3072,22 @@ async function executeWaTool(name, args, session) {
           }
         }
 
-        // Build list of all available fixed prices for context
+        // Build list of all available fixed prices for context.
+        // Filter out labour-only tasks (they confuse GPT into quoting a
+        // labour-only price as if it were the all-in price). Also cap the
+        // list size so GPT can't cherry-pick a price for an unrelated job.
         const allFixedPrices = [];
+        const askedLabourOnlyForList = /\b(lab[ou]r)\s*only\b/i.test(subQuery);
         for (const t of taskResults) {
           const catId = normalize(t.category_id);
           const catNameNorm = normalize(t.category_name);
           const catSlugNorm = normalize(catSlug);
-          if (!catSlug || catId === catSlugNorm || catId.includes(catSlugNorm) || catSlugNorm.includes(catId)
-              || catNameNorm === catSlugNorm || catNameNorm.includes(catSlugNorm) || catSlugNorm.includes(catNameNorm)) {
-            allFixedPrices.push({ service: t.name, fixedPrice: `R${t.cost.toFixed(2)}` });
-          }
+          const catMatch = !catSlug || catId === catSlugNorm || catId.includes(catSlugNorm) || catSlugNorm.includes(catId)
+              || catNameNorm === catSlugNorm || catNameNorm.includes(catSlugNorm) || catSlugNorm.includes(catNameNorm);
+          if (!catMatch) continue;
+          const isLabourOnlyT = /\b(lab[ou]r)\s*only\b/i.test(t.name);
+          if (isLabourOnlyT && !askedLabourOnlyForList) continue;
+          allFixedPrices.push({ service: t.name, fixedPrice: `R${t.cost.toFixed(2)}` });
         }
 
         if (matchedService && matchedPrice) {
@@ -3090,21 +3096,19 @@ async function executeWaTool(name, args, session) {
             service: matchedService,
             fixedPrice: `R${matchedPrice.toFixed(2)}`,
             category: categoryName,
-            allServicesInCategory: allFixedPrices,
-            note: 'This is a FIXED price. Use this exact amount when creating the booking.',
+            note: 'This is a FIXED price for the matched service. Use this exact amount when creating the booking. Do NOT pick any other price.',
           };
         }
 
-        if (allFixedPrices.length > 0) {
-          return {
-            matched: false,
-            category: categoryName,
-            availableServices: allFixedPrices,
-            note: 'No exact match for the requested service. These are the fixed-price services available. If the customer\'s job doesn\'t match any fixed-price service, suggest submitting an RFQ instead.',
-          };
-        }
-
-        return { matched: false, estimate: 'No fixed pricing found for this category.', note: 'Suggest the customer submit an RFQ for a detailed quote.' };
+        // No match → DO NOT hand GPT a price list to pick from.
+        // The bot must call submit_rfq instead. Returning availableServices
+        // here causes hallucinated quotes (e.g. "shower door = R480" picked
+        // from "varnish door frame Labour only").
+        return {
+          matched: false,
+          category: categoryName,
+          note: 'NO FIXED PRICE EXISTS for this exact service. You MUST NOT quote any price to the customer. You MUST call submit_rfq so admin can produce a curated quote. Do NOT invent a price, do NOT pick a price from any other service in this category, do NOT use prior conversation memory.',
+        };
       } catch (e) {
         console.error('[lookup_pricing] Error:', e.message);
         return { matched: false, estimate: 'Pricing lookup failed. Please try again.', note: 'Suggest the customer submit an RFQ for a detailed quote.' };
@@ -5500,9 +5504,11 @@ CRITICAL PRICING RULES:
 - You MUST call lookup_pricing BEFORE calling create_booking, EVERY TIME, NO EXCEPTIONS.
 - When calling lookup_pricing, pass the specific service as subcategory (e.g. category="plumbing", subcategory="toilet unblocking").
 - If lookup_pricing returns matched=true with a fixedPrice, use that EXACT price — do NOT estimate or use a different amount.
-- If lookup_pricing returns matched=false and no fixedPrice service matches, tell the customer: "This job needs a detailed quote" and use submit_rfq instead of create_booking.
-- NEVER guess or make up a price. Only use prices returned by lookup_pricing.
-- If create_booking returns an estimated cost of R0.00, it means no fixed price was found — inform the customer and suggest an RFQ.
+- If lookup_pricing returns matched=false, you are FORBIDDEN from quoting any price. You MUST call submit_rfq instead so admin can produce a curated quote.
+- ⛔ NEVER invent a price. NEVER cherry-pick a price from another service in the category list. NEVER recall a price from session memory. NEVER guess.
+- ⛔ "Labour only" / "Labor only" priced services in the catalog are NOT all-in prices. Never present a "Labour only" price as the cost of a job that includes materials.
+- ⛔ A reply that contains a "R{number}" amount that did NOT come from a tool result on this turn is a BUG. The only way you may state a Rand amount is if (a) lookup_pricing returned matched=true on this turn, or (b) submit_rfq / accept_rfq_quote / check_rfq_status returned a quote on this turn.
+- If create_booking returns an estimated cost of R0.00, it means no fixed price was found — DO NOT quote a price; tell the customer the job needs an RFQ and call submit_rfq.
 
 PRICE CONFIRMATION (CRITICAL — NEVER SKIP):
 - After calling lookup_pricing, you MUST present the price to the customer and WAIT for their explicit confirmation BEFORE calling create_booking.
