@@ -7010,7 +7010,42 @@ app.post('/api/job-status-update', requireInternalSecret, async (req, res) => {
     };
 
     const msg = statusMessages[status] || `📋 Your booking #${ref} status has been updated to: *${status}*`;
+
+    // Idempotency: skip duplicates if the corresponding listener has already sent the message.
+    // This prevents the same notification from being delivered twice when both the HTTP push
+    // (from the artisan app) and the Firestore listener fire for the same event.
+    try {
+      const tmRef = firestore.collection('tasksManagement').doc(mainBookingId);
+      const tmCur = await tmRef.get();
+      const tmData = tmCur.exists ? tmCur.data() : {};
+      let alreadySent = false;
+      let httpFlagKey = '';
+      if (status === 'before_photo' && tmData.wa_artisan_images_1_sent_at) { alreadySent = true; httpFlagKey = 'wa_artisan_images_1_sent_at'; }
+      else if (status === 'after_photo' && tmData.wa_artisan_images_2_sent_at) { alreadySent = true; httpFlagKey = 'wa_artisan_images_2_sent_at'; }
+      else if (status === 'buying_material' && tmData.wa_buying_material_sent_at) { alreadySent = true; httpFlagKey = 'wa_buying_material_sent_at'; }
+      else if (status === 'progress' && tmData.wa_lifecycle_progress_sent_at) { alreadySent = true; httpFlagKey = 'wa_lifecycle_progress_sent_at'; }
+      else if (status === 'completed' && tmData.wa_lifecycle_completed_sent_at) { alreadySent = true; httpFlagKey = 'wa_lifecycle_completed_sent_at'; }
+      if (alreadySent) {
+        console.log(`[api/job-status-update] Skipping duplicate "${status}" send for ${mainBookingId} (flag ${httpFlagKey} already set)`);
+        return res.json({ success: true, to, status, skipped: 'already_sent' });
+      }
+    } catch (e) {
+      console.warn('[api/job-status-update] idempotency check failed:', e.message);
+    }
+
     await sendWhatsAppMessage(to, msg);
+
+    // Set the flag IMMEDIATELY after sending so any concurrent listener pass skips
+    try {
+      const tmRef2 = firestore.collection('tasksManagement').doc(mainBookingId);
+      const flagPatch = {};
+      if (status === 'before_photo') flagPatch.wa_artisan_images_1_sent_at = new Date().toISOString();
+      else if (status === 'after_photo') flagPatch.wa_artisan_images_2_sent_at = new Date().toISOString();
+      else if (status === 'buying_material') flagPatch.wa_buying_material_sent_at = new Date().toISOString();
+      else if (status === 'progress') flagPatch.wa_lifecycle_progress_sent_at = new Date().toISOString();
+      else if (status === 'completed') flagPatch.wa_lifecycle_completed_sent_at = new Date().toISOString();
+      if (Object.keys(flagPatch).length) await tmRef2.set(flagPatch, { merge: true });
+    } catch (_) {}
 
     // Send the before/after photo as an image message if provided
     if (imageUrl && (status === 'before_photo' || status === 'after_photo')) {
@@ -7765,23 +7800,54 @@ function startBalancePromptListener() {
           if (data.balance_paid === true) continue;
           if (data.wa_balance_prompt_sent_at) continue;
 
-          // Only WA-originated bookings
+          // Resolve WA source via futureBookings link (TM bridge docs typically have
+          // source='future_booking' even for WA-originated bookings)
           const src = String(data.source || '').toLowerCase();
-          const isWa = src.includes('whatsapp') || String(doc.id).startsWith('RFQ-') || String(doc.id).startsWith('WA-');
+          let isWa = src.includes('whatsapp') || String(doc.id).startsWith('RFQ-') || String(doc.id).startsWith('WA-');
+          let phoneRaw = data.user_phone || data.customerPhone || data.contact || data.client_phone || data.phone || '';
+          let artisanName = data.service_provider_name || data.artisan_name || '';
+          let orderNo = data.order_no || data.rfq_no || doc.id;
+          const fbLinkId = String(data.future_booking_id || '').trim();
+          if (fbLinkId) {
+            try {
+              const fbDoc = await firestore.collection('futureBookings').doc(fbLinkId).get();
+              if (fbDoc.exists) {
+                const fb = fbDoc.data() || {};
+                const fbSrc = String(fb.source || '').toLowerCase();
+                if (fbSrc.includes('whatsapp') || fbLinkId.startsWith('RFQ-') || fbLinkId.startsWith('WA-')) {
+                  isWa = true;
+                }
+                if (!phoneRaw) phoneRaw = fb.user_phone || fb.customerPhone || fb.contact || fb.client_phone || fb.phone || '';
+                if (!artisanName) artisanName = fb.service_provider_name || fb.artisan_name || '';
+                if (!orderNo || orderNo === doc.id) orderNo = fb.order_no || fb.rfq_no || orderNo;
+              }
+            } catch (_) {}
+          }
           if (!isWa) continue;
-
-          const phoneRaw = data.user_phone || data.customerPhone || data.contact || data.client_phone || data.phone || '';
           if (!phoneRaw) continue;
           let to = phoneRaw.replace(/[^0-9]/g, '');
           if (to.startsWith('0')) to = '27' + to.slice(1);
 
-          const totalCost = parseFloat(data.cost || data.total_cost || '0');
-          const depositAmt = parseFloat(data.deposit_amount || '0') || Math.round(totalCost * 0.35 * 100) / 100;
-          const balanceAmt = parseFloat(data.balance_remaining || data.balance_amount || '0') || Math.round((totalCost - depositAmt) * 100) / 100;
+          // Pull cost fields, falling back to FB if TM doesn't have them
+          let totalCost = parseFloat(data.cost || data.total_cost || '0');
+          let depositAmt = parseFloat(data.deposit_amount || '0');
+          let balanceAmt = parseFloat(data.balance_remaining || data.balance_amount || '0');
+          if ((!totalCost || !balanceAmt) && fbLinkId) {
+            try {
+              const fbDoc = await firestore.collection('futureBookings').doc(fbLinkId).get();
+              if (fbDoc.exists) {
+                const fb = fbDoc.data() || {};
+                if (!totalCost) totalCost = parseFloat(fb.cost || fb.total_cost || fb.total || fb.totalPrice || '0');
+                if (!depositAmt) depositAmt = parseFloat(fb.deposit_amount || '0');
+                if (!balanceAmt) balanceAmt = parseFloat(fb.balance_remaining || fb.balance_amount || '0');
+              }
+            } catch (_) {}
+          }
+          if (!depositAmt) depositAmt = Math.round(totalCost * 0.35 * 100) / 100;
+          if (!balanceAmt) balanceAmt = Math.round((totalCost - depositAmt) * 100) / 100;
           if (balanceAmt <= 0) continue;
 
-          const orderNo = data.order_no || data.rfq_no || doc.id;
-          const artisanName = data.service_provider_name || data.artisan_name || 'your artisan';
+          if (!artisanName) artisanName = 'your artisan';
 
           const msg = `✅ *Job complete!* ${artisanName} has marked booking #${orderNo} as completed.\n\n` +
             `💳 *Outstanding balance:* R${balanceAmt.toFixed(2)}\n` +
@@ -8109,6 +8175,101 @@ function startArtisanPhotoListener() {
   }
 }
 
+// ─── Listener: rating prompt after job is fully paid ───────────────────────
+// Fires when tasksManagement reaches a fully-paid + completed state (either
+// balance_paid flips to true on a deposit booking, or payment_status === 'paid'
+// for full-payment bookings) and no rating has been collected yet. Sends a
+// "please rate your artisan" message asking the customer for a 1-5 star rating.
+// Idempotent via wa_rating_request_sent_at.
+function startRatingPromptListener() {
+  try {
+    const firestore = db();
+    if (!firestore) return;
+    firestore.collection('tasksManagement')
+      .onSnapshot(async (snap) => {
+        for (const change of snap.docChanges()) {
+          if (change.type !== 'modified' && change.type !== 'added') continue;
+          const doc = change.doc;
+          const data = doc.data() || {};
+          if (data.wa_rating_request_sent_at) continue;
+          if (data.rating) continue;
+          const status = String(data.status || '').toLowerCase();
+          if (!['completed', 'done', 'closed'].includes(status)) continue;
+          const paymentStatus = String(data.payment_status || '').toLowerCase();
+          const fullyPaid = data.balance_paid === true
+            || paymentStatus === 'paid'
+            || paymentStatus === 'fully_paid'
+            || paymentStatus === 'balance_paid';
+          if (!fullyPaid) continue;
+
+          // Resolve WA source via futureBookings link
+          const src = String(data.source || '').toLowerCase();
+          let isWa = src.includes('whatsapp') || String(doc.id).startsWith('RFQ-') || String(doc.id).startsWith('WA-');
+          let phoneRaw = data.user_phone || data.customerPhone || data.contact || data.client_phone || data.phone || '';
+          let artisanName = data.service_provider_name || data.artisan_name || '';
+          let orderNo = data.order_no || data.rfq_no || doc.id;
+          const fbLinkId = String(data.future_booking_id || '').trim();
+          if (fbLinkId) {
+            try {
+              const fbDoc = await firestore.collection('futureBookings').doc(fbLinkId).get();
+              if (fbDoc.exists) {
+                const fb = fbDoc.data() || {};
+                const fbSrc = String(fb.source || '').toLowerCase();
+                if (fbSrc.includes('whatsapp') || fbLinkId.startsWith('RFQ-') || fbLinkId.startsWith('WA-')) {
+                  isWa = true;
+                }
+                if (!phoneRaw) phoneRaw = fb.user_phone || fb.customerPhone || fb.contact || fb.client_phone || fb.phone || '';
+                if (!artisanName) artisanName = fb.service_provider_name || fb.artisan_name || '';
+                if (!orderNo || orderNo === doc.id) orderNo = fb.order_no || fb.rfq_no || orderNo;
+              }
+            } catch (_) {}
+          }
+          if (!isWa) continue;
+          if (!phoneRaw) continue;
+          let to = phoneRaw.replace(/[^0-9]/g, '');
+          if (to.startsWith('0')) to = '27' + to.slice(1);
+
+          const name = artisanName || 'your artisan';
+          const ref = orderNo;
+          const msg = `🎉 *Booking #${ref} fully paid — thank you!*\n\n` +
+            `We hope you're happy with the work ${name} completed.\n\n` +
+            `⭐ *Please rate your artisan from 1 to 5 stars:*\n` +
+            `Just reply with a number (1 = poor, 5 = excellent).\n\n` +
+            `Your honest feedback helps us maintain quality service and helps other customers choose great artisans. 🙏`;
+
+          // Mark BEFORE send to prevent duplicate fires
+          try {
+            await doc.ref.update({ wa_rating_request_sent_at: new Date().toISOString() });
+          } catch (e) {
+            console.warn(`[rating-prompt] flag update failed for ${doc.id}:`, e.message);
+            continue;
+          }
+
+          try {
+            await sendWhatsAppMessage(to, msg);
+            // Track pending rating in session so the AI knows to capture the next number reply
+            const session = sessions.get(to);
+            if (session) {
+              session.pendingRatingBookingId = doc.id;
+              session.messages.push({
+                role: 'system',
+                content: `[PENDING RATING] Booking #${ref} (${doc.id}) is fully paid and awaiting a 1-5 star rating from the customer. If their next message is a number 1-5, treat it as a rating and call submit_rating.`,
+              });
+            }
+            console.log(`[rating-prompt] sent rating request to ${to} for ${doc.id}`);
+          } catch (e) {
+            console.warn(`[rating-prompt] WA send failed for ${doc.id}:`, e.message);
+          }
+        }
+      }, (err) => {
+        console.error('[rating-prompt] listener error:', err && err.message);
+      });
+    console.log('[rating-prompt] listener started (tasksManagement completed + fully paid).');
+  } catch (e) {
+    console.error('[rating-prompt] init failed:', e && e.message);
+  }
+}
+
 
 app.listen(PORT, () => {
   console.log(`[whatsapp-bot] listening on :${PORT}`);
@@ -8124,6 +8285,7 @@ app.listen(PORT, () => {
   setTimeout(() => { try { startJobLifecycleListener(); } catch (e) { console.error('[job-lifecycle] start failed:', e.message); } }, 4500);
   setTimeout(() => { try { startBuyingMaterialListener(); } catch (e) { console.error('[buying-material] start failed:', e.message); } }, 5000);
   setTimeout(() => { try { startArtisanPhotoListener(); } catch (e) { console.error('[artisan-photo] start failed:', e.message); } }, 5500);
+  setTimeout(() => { try { startRatingPromptListener(); } catch (e) { console.error('[rating-prompt] start failed:', e.message); } }, 6000);
 
   // One-time cleanup: remove stale service_prices from pricingGuidance documents.
   // Keep labor_cost_per_hour, material_multiplier, outsourced_labor_rate (used by RFQ).
