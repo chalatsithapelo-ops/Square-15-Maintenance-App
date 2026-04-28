@@ -5742,6 +5742,78 @@ async function handleMessage(session, userMessage, imageDataUrl) {
   }
 
   try {
+    // ── HARD INTERCEPT: numeric rating reply (1-5) when a rating is pending ──
+    // The customer was asked to rate their artisan. They reply with just "5"
+    // (or "★★★★★" / "5 stars" / "5/5"). GPT sometimes ignores its own
+    // pendingRating system hint and treats this as a brand-new conversation,
+    // greeting them again. Bypass GPT entirely and submit the rating directly.
+    try {
+      const rawText = (typeof userMessage === 'string' ? userMessage : '').trim();
+      // Restore pendingRatingBookingId from Firestore if listener seeded it after
+      // the in-memory session was last persisted (common after Render cold start).
+      if (!session.pendingRatingBookingId) {
+        try {
+          const firestore = db();
+          if (firestore) {
+            const phoneNorm = String(session.phone || '').replace(/[^0-9]/g, '');
+            const last9 = phoneNorm.slice(-9);
+            // Query TM docs for this user_phone, then filter for unrated + rating prompt sent
+            const q = await firestore.collection('tasksManagement')
+              .where('user_phone', '==', phoneNorm)
+              .limit(50).get();
+            for (const d of q.docs) {
+              const td = d.data() || {};
+              if (td.rating) continue;
+              if (!td.wa_rating_request_sent_at) continue;
+              session.pendingRatingBookingId = d.id;
+              console.log(`[rating-intercept] restored pendingRatingBookingId=${d.id} for ${session.phone} from Firestore`);
+              break;
+            }
+            // Fallback: also check tail-match in case stored phone differs
+            if (!session.pendingRatingBookingId && last9) {
+              const q2 = await firestore.collection('tasksManagement')
+                .orderBy('wa_rating_request_sent_at', 'desc').limit(20).get();
+              for (const d of q2.docs) {
+                const td = d.data() || {};
+                if (td.rating) continue;
+                const tmPhone = String(td.user_phone || td.customerPhone || td.phone || '').replace(/[^0-9]/g, '');
+                if (tmPhone && tmPhone.endsWith(last9)) {
+                  session.pendingRatingBookingId = d.id;
+                  console.log(`[rating-intercept] restored pendingRatingBookingId=${d.id} (tail-match) for ${session.phone}`);
+                  break;
+                }
+              }
+            }
+          }
+        } catch (e) { /* ignore */ }
+      }
+      const ratingMatch = rawText.match(/^\s*([1-5])\s*(?:star|stars|\/5|out of 5|⭐+)?\s*$/i)
+        || rawText.match(/^(⭐{1,5})$/);
+      if (ratingMatch && session.pendingRatingBookingId) {
+        let stars = 0;
+        if (ratingMatch[1] && /^\d$/.test(ratingMatch[1])) stars = parseInt(ratingMatch[1], 10);
+        else if (ratingMatch[1] && /⭐/.test(ratingMatch[1])) stars = (ratingMatch[1].match(/⭐/g) || []).length;
+        if (stars >= 1 && stars <= 5) {
+          console.log(`[rating-intercept] direct submit: ${stars} stars for ${session.pendingRatingBookingId}`);
+          // Fake a tool call so the existing rate_booking handler runs with proper auth/dedup
+          const toolResult = await executeWaTool('rate_booking',
+            { bookingId: session.pendingRatingBookingId, rating: stars },
+            session
+          );
+          if (toolResult && toolResult.message) {
+            session.messages.push({ role: 'assistant', content: toolResult.message });
+            return toolResult.message;
+          }
+          if (toolResult && toolResult.error) {
+            // Fall through to AI on error so customer gets a meaningful reply
+            console.warn(`[rating-intercept] tool returned error: ${toolResult.error}`);
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('[rating-intercept] failed:', e.message);
+    }
+
     // Inject pending-rating hint so the AI knows to prompt the customer
     const sysMessages = [{ role: 'system', content: SYSTEM_PROMPT }];
     if (session.pendingRatingBookingId) {
@@ -8255,6 +8327,16 @@ function startRatingPromptListener() {
                 role: 'system',
                 content: `[PENDING RATING] Booking #${ref} (${doc.id}) is fully paid and awaiting a 1-5 star rating from the customer. If their next message is a number 1-5, treat it as a rating and call submit_rating.`,
               });
+            }
+            // Persist pendingRatingBookingId to Firestore so it survives bot cold-starts
+            try {
+              await firestore.collection('wa_sessions').doc(to).set({
+                pendingRatingBookingId: doc.id,
+                phone: to,
+                lastActivity: admin.firestore.FieldValue.serverTimestamp(),
+              }, { merge: true });
+            } catch (e) {
+              console.warn(`[rating-prompt] wa_sessions persist failed for ${to}:`, e.message);
             }
             console.log(`[rating-prompt] sent rating request to ${to} for ${doc.id}`);
           } catch (e) {
