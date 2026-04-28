@@ -7936,15 +7936,33 @@ function startBuyingMaterialListener() {
           const data = doc.data() || {};
           if (data.wa_buying_material_sent_at) continue;
           const src = String(data.source || '').toLowerCase();
-          const isWa = src.includes('whatsapp') || String(doc.id).startsWith('RFQ-') || String(doc.id).startsWith('WA-');
-          if (!isWa) continue;
+          let isWa = src.includes('whatsapp') || String(doc.id).startsWith('RFQ-') || String(doc.id).startsWith('WA-');
 
           // Resolve customer phone (prefer futureBookings since tasksManagement
           // sometimes lacks user_phone for WA-originated bookings).
           let phoneRaw = data.user_phone || data.customerPhone || data.phone || '';
           let artisanName = data.service_provider_name || data.artisan_name || '';
           let orderNo = data.order_no || data.rfq_no || doc.id;
-          if (!phoneRaw || !artisanName) {
+          // tasksManagement bridge docs often have source='future_booking' even
+          // though the underlying booking is from WhatsApp. Resolve via the
+          // future_booking_id link to make the WA-source decision authoritative.
+          const fbLinkId = String(data.future_booking_id || '').trim();
+          if (fbLinkId) {
+            try {
+              const fbDoc = await firestore.collection('futureBookings').doc(fbLinkId).get();
+              if (fbDoc.exists) {
+                const fb = fbDoc.data() || {};
+                const fbSrc = String(fb.source || '').toLowerCase();
+                if (fbSrc.includes('whatsapp') || fbLinkId.startsWith('RFQ-') || fbLinkId.startsWith('WA-')) {
+                  isWa = true;
+                }
+                if (!phoneRaw) phoneRaw = fb.user_phone || fb.customerPhone || fb.phone || '';
+                if (!artisanName) artisanName = fb.service_provider_name || fb.artisan_name || '';
+                if (!orderNo || orderNo === doc.id) orderNo = fb.order_no || fb.rfq_no || orderNo;
+              }
+            } catch (_) {}
+          } else if (!phoneRaw || !artisanName) {
+            // Fallback: try doc id direct (legacy WA-* ids share id with futureBookings)
             try {
               const fbDoc = await firestore.collection('futureBookings').doc(doc.id).get();
               if (fbDoc.exists) {
@@ -7955,6 +7973,7 @@ function startBuyingMaterialListener() {
               }
             } catch (_) {}
           }
+          if (!isWa) continue;
           if (!phoneRaw) continue;
           let to = phoneRaw.replace(/[^0-9]/g, '');
           if (to.startsWith('0')) to = '27' + to.slice(1);
