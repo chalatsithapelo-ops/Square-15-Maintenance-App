@@ -8056,12 +8056,12 @@ function startArtisanPhotoListener() {
           let to = phoneRaw.replace(/[^0-9]/g, '');
           if (to.startsWith('0')) to = '27' + to.slice(1);
 
-          // Resolve photo URL from artisanTaskImages doc
+          // Resolve photo URL from artisanTasksImages doc
           let imageUrl = '';
           const imageDocId = String(data.artisan_image_doc_id || '').trim();
           if (imageDocId) {
             try {
-              const imgDoc = await firestore.collection('artisanTaskImages').doc(imageDocId).get();
+              const imgDoc = await firestore.collection('artisanTasksImages').doc(imageDocId).get();
               if (imgDoc.exists) {
                 const img = imgDoc.data() || {};
                 imageUrl = ai === '1'
