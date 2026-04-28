@@ -2110,6 +2110,28 @@ async function executeWaTool(name, args, session) {
     if (user) session.linkedUserId = user.id;
   }
 
+  // ── Sanitize obvious GPT placeholder strings in args (e.g. "[Customer's
+  // Name]", "{address}", "<your phone>"). Replace with empty string so
+  // downstream code falls back to session-derived values.
+  try {
+    const PLACEHOLDER_RE = /^[\s]*[\[\{<].*[\]\}>][\s]*$/;
+    for (const [k, v] of Object.entries(args || {})) {
+      if (typeof v === 'string' && PLACEHOLDER_RE.test(v)) {
+        console.warn(`[tool:${name}] stripping placeholder arg ${k}="${v}"`);
+        args[k] = '';
+      }
+    }
+    // Also reject obviously templated names like "Customer's Name", "Your Name".
+    if (typeof args.customerName === 'string') {
+      const lc = args.customerName.toLowerCase().trim();
+      if (lc === "customer's name" || lc === 'customer name' || lc === 'your name'
+          || lc === 'client name' || lc === "client's name" || lc === 'name' || lc === 'full name') {
+        console.warn(`[tool:${name}] stripping templated customerName="${args.customerName}"`);
+        args.customerName = '';
+      }
+    }
+  } catch (_) {}
+
   switch (name) {
 
     // ═══════════════════════════════════════════
@@ -5990,7 +6012,58 @@ async function handleMessage(session, userMessage, imageDataUrl) {
     }
 
     const reply = assistantMessage.content || "I'm sorry, I couldn't process that. Please try again.";
-    session.messages.push({ role: 'assistant', content: reply });
+
+    // ─────────────────────────────────────────────────────────────────────
+    // HALLUCINATED-PRICE GUARD (Apr 28 2026)
+    // Symptom: GPT recalls a price from PRIOR turns (e.g. yesterday's R480
+    // shower-door reply) even though no pricing tool was called this turn,
+    // or all pricing tools returned matched=false. The customer sees a
+    // confident but fabricated quote.
+    //
+    // Rule: a reply is allowed to contain "R{number}" ONLY if at least one
+    // tool was called THIS TURN that legitimately returned a Rand amount —
+    // namely lookup_pricing(matched=true), create_booking(success), or any
+    // RFQ tool returning a quote. Otherwise we rewrite the reply with a
+    // safe RFQ-prompt.
+    // ─────────────────────────────────────────────────────────────────────
+    let safeReply = reply;
+    try {
+      const PRICE_RE = /\bR\s*\d{1,3}(?:[ ,]\d{3})*(?:\.\d{1,2})?\b/i;
+      if (PRICE_RE.test(reply)) {
+        const PRICE_TOOLS = new Set([
+          'lookup_pricing','create_booking','submit_rfq','accept_rfq_quote',
+          'check_rfq_status','reject_rfq_quote','request_payment_link',
+          'check_booking_status','check_payment','check_wallet_balance',
+          'list_my_bookings','show_material_options','explain_quote',
+          'apply_promo_code','reschedule_booking','cancel_booking',
+        ]);
+        const calledThisTurn = Array.isArray(session._lastToolsCalled)
+          ? session._lastToolsCalled.filter(n => PRICE_TOOLS.has(n)) : [];
+        // Did any of those tools return a positive Rand amount this turn?
+        // Walk back through session.messages to the last tool round.
+        let toolReturnedPrice = false;
+        for (let i = session.messages.length - 1; i >= 0; i--) {
+          const m = session.messages[i];
+          if (m.role === 'assistant' && Array.isArray(m.tool_calls)) break; // older round
+          if (m.role !== 'tool') continue;
+          const txt = typeof m.content === 'string' ? m.content : '';
+          if (PRICE_RE.test(txt)) { toolReturnedPrice = true; break; }
+          // Numeric grand_total / fixedPrice fields.
+          if (/"(grand_total|fixedPrice|cost|total|quoted_price|amount)"\s*:\s*("?R?\s*\d|[1-9]\d*)/i.test(txt)) {
+            toolReturnedPrice = true; break;
+          }
+        }
+        if (!toolReturnedPrice) {
+          console.warn(`[hallucination-guard] Stripping R-price from reply (tools this turn: ${calledThisTurn.join(',') || 'none'})`);
+          console.warn(`[hallucination-guard] Original reply: ${reply.substring(0,200)}`);
+          safeReply = "Just to be sure — I don't have a fixed price for that exact job in our catalog. Let me file a quick RFQ so our admin can put together a proper quote for you. Could you confirm: are you happy for our artisan to source the materials, or would you prefer to buy them yourself?";
+        }
+      }
+    } catch (guardErr) {
+      console.warn('[hallucination-guard] error (allowing reply):', guardErr.message);
+    }
+
+    session.messages.push({ role: 'assistant', content: safeReply });
 
     // Persist session to Firestore (fire-and-forget)
     const firestore = db();
@@ -6029,7 +6102,7 @@ async function handleMessage(session, userMessage, imageDataUrl) {
       }).catch(() => {});
     }
 
-    return reply;
+    return safeReply;
   } catch (err) {
     console.error('[handleMessage] Error:', err.message);
     try {
