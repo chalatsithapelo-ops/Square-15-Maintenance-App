@@ -3260,17 +3260,42 @@ async function executeWaTool(name, args, session) {
         return { error: `An artisan hasn't accepted this job yet. You'll be notified when an artisan accepts, and then you can proceed to payment. Your booking ${d.order_no || bid} is in the queue.` };
       }
 
+      // ── Pre-flight double-submit guards ──
+      // Block deposit retry while one is already pending
+      if (isDeposit && d.payment_status === 'deposit_pending') {
+        return {
+          message: `A deposit payment is already in progress for this booking. Please complete the existing payment or wait a moment before requesting a new one.`,
+          bookingId: bid,
+        };
+      }
+      // Block full-payment retry while one was generated in the last 2 minutes
+      // (uses full_pending_at timestamp; if older than 2 min, allow re-issue).
+      if (!isDeposit && !isDepositPaid) {
+        const fullPendingAt = d.full_pending_at ? Date.parse(d.full_pending_at) : 0;
+        if (fullPendingAt && (Date.now() - fullPendingAt) < 120000) {
+          return {
+            message: `A full payment link was just sent for this booking. Please use the existing link, or wait 2 minutes to request a new one.`,
+            bookingId: bid,
+          };
+        }
+      }
+
       // Generate real payment link via backend
       let paymentUrl = '';
       try {
         const backendUrl = process.env.LIVEKIT_BACKEND_URL || 'https://square15-livekit-backend.onrender.com';
+        // Resolve customer name from canonical fields, then session, then a sensible default.
+        const resolvedCustomerName = (
+          d.user_name || d.userName || d.customer_name || d.customerName || d.name ||
+          session.linkedUserName || session.customerName || ''
+        ).toString().trim();
         const resp = await fetch(`${backendUrl}/api/payment/whatsapp-initiate`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'x-internal-secret': process.env.INTERNAL_API_SECRET || '' },
           body: JSON.stringify({
             amount: cost.toFixed(2),
             booking_id: bid,
-            customer_name: d.customerName || d.name || '',
+            customer_name: resolvedCustomerName,
             customer_phone: session.phone,
             description: d.description || d.subcategory || d.category_name || `Booking ${bid}`,
           }),
@@ -3284,31 +3309,51 @@ async function executeWaTool(name, args, session) {
         console.warn('[wa-tool] payment link generation failed:', e.message);
       }
 
-      // Update Firestore with payment type choice
-      if (isDeposit) {
-        // Check if deposit payment is already pending to prevent double-charge
-        if (d.payment_status === 'deposit_pending') {
-          return {
-            message: `A deposit payment is already in progress for this booking. Please complete or cancel the existing payment before requesting a new one.`,
-            bookingId: bid,
+      // ── Persist payment-type choice to Firestore (mirror to both collections) ──
+      // Skip persistence if we couldn't generate the link (admin-fallback path).
+      if (paymentUrl) {
+        const nowIso = new Date().toISOString();
+        let pendingFields;
+        if (isDeposit) {
+          pendingFields = {
+            payment_type: 'deposit',
+            deposit_amount: cost,
+            balance_amount: balanceAfterDeposit,
+            balance_remaining: balanceAfterDeposit,
+            payment_status: 'deposit_pending',
+            // Clear any stale full-payment marker
+            full_pending_at: admin.firestore.FieldValue.delete(),
+            updated_at: nowIso,
           };
+        } else if (isDepositPaid) {
+          // Balance-after-deposit payment
+          pendingFields = {
+            payment_status: 'balance_pending',
+            balance_pending_at: nowIso,
+            updated_at: nowIso,
+          };
+        } else {
+          // Full payment (clear any stale deposit-pending fields if user changed mind)
+          pendingFields = {
+            payment_type: 'full',
+            full_pending_at: nowIso,
+            updated_at: nowIso,
+          };
+          // If a previous deposit_pending was set, clear it so the ITN/result handler
+          // doesn't mislabel this full payment as a deposit.
+          if (d.payment_status === 'deposit_pending') {
+            pendingFields.payment_status = 'unpaid';
+            pendingFields.deposit_amount = admin.firestore.FieldValue.delete();
+            pendingFields.balance_amount = admin.firestore.FieldValue.delete();
+            pendingFields.balance_remaining = admin.firestore.FieldValue.delete();
+          }
         }
-        const depositFields = {
-          payment_type: 'deposit',
-          deposit_amount: cost,
-          balance_amount: balanceAfterDeposit,
-          balance_remaining: balanceAfterDeposit,
-          payment_status: 'deposit_pending',
-          updated_at: new Date().toISOString(),
-        };
         try {
-          // Write to the doc we found (futureBookings or tasksManagement)
-          await doc.ref.set(depositFields, { merge: true });
-          // Also write to the OTHER collection so processSuccessfulPayment can read it
+          await doc.ref.set(pendingFields, { merge: true });
           const otherCollection = doc.ref.parent.id === 'futureBookings' ? 'tasksManagement' : 'futureBookings';
           const otherDoc = await firestore.collection(otherCollection).doc(bid).get();
           if (otherDoc.exists) {
-            await otherDoc.ref.set(depositFields, { merge: true });
+            await otherDoc.ref.set(pendingFields, { merge: true });
           }
         } catch (e) {
           console.error('[wa-tool] Failed to persist payment type:', e.message);
@@ -7698,6 +7743,75 @@ function startArtisanRejectionEscalationListener() {
   }
 }
 
+// ─── Listener: prompt customer to pay balance when artisan completes a deposit-paid job ───
+// When a booking with payment_status='deposit_paid' transitions to status='completed' (or 'done'/'closed'),
+// send a WhatsApp message asking the customer to pay the outstanding balance.
+// Idempotent via wa_balance_prompt_sent_at flag.
+function startBalancePromptListener() {
+  try {
+    const firestore = db();
+    if (!firestore) return;
+    // Watch tasksManagement (where artisan marks completion). We filter status in-code
+    // because Firestore can't combine multiple "in" filters efficiently here.
+    firestore.collection('tasksManagement')
+      .where('payment_status', '==', 'deposit_paid')
+      .onSnapshot(async (snap) => {
+        for (const change of snap.docChanges()) {
+          if (change.type !== 'added' && change.type !== 'modified') continue;
+          const doc = change.doc;
+          const data = doc.data() || {};
+          const status = String(data.status || '').toLowerCase();
+          if (!['completed', 'done', 'closed'].includes(status)) continue;
+          if (data.balance_paid === true) continue;
+          if (data.wa_balance_prompt_sent_at) continue;
+
+          // Only WA-originated bookings
+          const src = String(data.source || '').toLowerCase();
+          const isWa = src.includes('whatsapp') || String(doc.id).startsWith('RFQ-') || String(doc.id).startsWith('WA-');
+          if (!isWa) continue;
+
+          const phoneRaw = data.user_phone || data.customerPhone || data.contact || data.client_phone || data.phone || '';
+          if (!phoneRaw) continue;
+          let to = phoneRaw.replace(/[^0-9]/g, '');
+          if (to.startsWith('0')) to = '27' + to.slice(1);
+
+          const totalCost = parseFloat(data.cost || data.total_cost || '0');
+          const depositAmt = parseFloat(data.deposit_amount || '0') || Math.round(totalCost * 0.35 * 100) / 100;
+          const balanceAmt = parseFloat(data.balance_remaining || data.balance_amount || '0') || Math.round((totalCost - depositAmt) * 100) / 100;
+          if (balanceAmt <= 0) continue;
+
+          const orderNo = data.order_no || data.rfq_no || doc.id;
+          const artisanName = data.service_provider_name || data.artisan_name || 'your artisan';
+
+          const msg = `✅ *Job complete!* ${artisanName} has marked booking #${orderNo} as completed.\n\n` +
+            `💳 *Outstanding balance:* R${balanceAmt.toFixed(2)}\n` +
+            `(Deposit of R${depositAmt.toFixed(2)} already paid — total R${totalCost.toFixed(2)})\n\n` +
+            `Reply *"pay balance"* to receive your secure payment link.\n\n` +
+            `After paying, please rate your artisan to help others choose great service. ⭐`;
+
+          try {
+            await sendWhatsAppMessage(to, msg);
+            await doc.ref.update({ wa_balance_prompt_sent_at: new Date().toISOString() });
+            // Mirror flag on futureBookings so we don't re-prompt from a parallel listener
+            try {
+              await firestore.collection('futureBookings').doc(doc.id).set({
+                wa_balance_prompt_sent_at: new Date().toISOString(),
+              }, { merge: true });
+            } catch (_) {}
+            console.log(`[balance-prompt] sent balance prompt for ${doc.id} to ${to} (R${balanceAmt.toFixed(2)})`);
+          } catch (e) {
+            console.warn(`[balance-prompt] WA send failed for ${doc.id}:`, e.message);
+          }
+        }
+      }, (err) => {
+        console.error('[balance-prompt] listener error:', err && err.message);
+      });
+    console.log('[balance-prompt] listener started (tasksManagement where payment_status == "deposit_paid").');
+  } catch (e) {
+    console.error('[balance-prompt] init failed:', e && e.message);
+  }
+}
+
 
 app.listen(PORT, () => {
   console.log(`[whatsapp-bot] listening on :${PORT}`);
@@ -7709,6 +7823,7 @@ app.listen(PORT, () => {
   setTimeout(() => { try { startAdminAssignmentRelayListener(); } catch (e) { console.error('[admin-assign-relay] start failed:', e.message); } }, 2500);
   setTimeout(() => { try { startArtisanRejectionEscalationListener(); } catch (e) { console.error('[reject-escalate] start failed:', e.message); } }, 3000);
   setTimeout(() => { try { startArtisanAcceptanceListener(); } catch (e) { console.error('[artisan-accept-listener] start failed:', e.message); } }, 3500);
+  setTimeout(() => { try { startBalancePromptListener(); } catch (e) { console.error('[balance-prompt] start failed:', e.message); } }, 4000);
 
   // One-time cleanup: remove stale service_prices from pricingGuidance documents.
   // Keep labor_cost_per_hour, material_multiplier, outsourced_labor_rate (used by RFQ).
