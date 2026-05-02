@@ -5231,8 +5231,15 @@ async function executeWaTool(name, args, session) {
             const COUNTRY_NAME_TO_CODE = { 'SOUTH AFRICA': 'ZA', 'LESOTHO': 'LS', 'BOTSWANA': 'BW', 'NAMIBIA': 'NA', 'ZIMBABWE': 'ZW', 'ESWATINI': 'SZ', 'SWAZILAND': 'SZ' };
               const artCountryCode = COUNTRY_NAME_TO_CODE[artCountry] || artCountry;
             const servedCodes = served.map(s => COUNTRY_NAME_TO_CODE[s] || s);
+            // Fallback: artisans without ANY country field default to ZA
+            // (the platform's home market). Without this, every artisan in
+            // production silently fails non-ZA dispatch because no one has
+            // populated `country` yet.
+            const artisanHasNoCountry = !artCountryCode && servedCodes.length === 0;
+            const effectiveArtCountry = artisanHasNoCountry ? 'ZA' : artCountryCode;
+            const effectiveServed = artisanHasNoCountry ? ['ZA'] : servedCodes;
             const matchesCustomerCountry = inferredCountry && (
-              artCountryCode === inferredCountry || servedCodes.includes(inferredCountry)
+              effectiveArtCountry === inferredCountry || effectiveServed.includes(inferredCountry)
             );
             if (matchesCustomerCountry) sameCountryArtisans.push(aRecord);
             else otherArtisans.push(aRecord);
@@ -6983,7 +6990,7 @@ app.post('/api/artisan-accepted', requireInternalSecret, async (req, res) => {
 
     // Normalise phone to international format (27...)
     let to = customerPhone.replace(/[^0-9]/g, '');
-    if (to.startsWith('0')) to = '27' + to.slice(1);
+    if (to.length === 10 && to.startsWith('0')) to = '27' + to.slice(1); // ZA local 10-digit only; E.164 numbers (>= 11 digits) left untouched
 
     // Send artisan acceptance message (no payment link yet — customer chooses full/deposit first)
     const name = artisanName || 'Your artisan';
@@ -7071,7 +7078,7 @@ app.post('/api/booking-status-update', requireInternalSecret, async (req, res) =
     if (!customerPhone) return res.status(404).json({ error: 'No customer phone found' });
 
     let to = customerPhone.replace(/[^0-9]/g, '');
-    if (to.startsWith('0')) to = '27' + to.slice(1);
+    if (to.length === 10 && to.startsWith('0')) to = '27' + to.slice(1); // ZA local 10-digit only; E.164 numbers (>= 11 digits) left untouched
 
     // Default status messages
     const statusMessages = {
@@ -7140,7 +7147,7 @@ app.post('/api/send-rfq-response', requireInternalSecret, async (req, res) => {
     }
     // Normalise to international format (27…)
     let to = phone.replace(/[^0-9]/g, '');
-    if (to.startsWith('0')) to = '27' + to.slice(1);
+    if (to.length === 10 && to.startsWith('0')) to = '27' + to.slice(1); // ZA local 10-digit only; E.164 numbers (>= 11 digits) left untouched
     if (to.length < 10 || to.length > 15) {
       return res.status(400).json({ error: 'Invalid phone number length' });
     }
@@ -7182,7 +7189,7 @@ app.post('/api/job-status-update', requireInternalSecret, async (req, res) => {
     if (!customerPhone) return res.status(404).json({ error: 'No customer phone found' });
 
     let to = customerPhone.replace(/[^0-9]/g, '');
-    if (to.startsWith('0')) to = '27' + to.slice(1);
+    if (to.length === 10 && to.startsWith('0')) to = '27' + to.slice(1); // ZA local 10-digit only; E.164 numbers (>= 11 digits) left untouched
 
     const name = artisanName || 'Your artisan';
     const ref = orderNo || mainBookingId;
@@ -7522,6 +7529,10 @@ app.use((err, req, res, next) => {
 // followed by a totals summary. Idempotent — a `whatsapp_quote_relayed=true`
 // flag prevents double-relay if the listener fires multiple times.
 let _quoteRelayUnsubscribe = null;
+const _quoteRelayInFlight = new Set();
+const _adminAssignRelayInFlight = new Set();
+const _balancePromptInFlight = new Set();
+const _lifecycleInFlight = new Set();
 function startQuoteRelayListener() {
   try {
     const firestore = db();
@@ -7559,19 +7570,20 @@ function startQuoteRelayListener() {
           }
           const rfqNo = data.rfq_no || data.order_no || doc.id;
 
-          try {
-            await firestore.collection('futureBookings').doc(doc.id).update({
-              whatsapp_quote_relayed: true,
-              whatsapp_quote_relayed_at: admin.firestore.FieldValue.serverTimestamp(),
-            });
-          } catch (e) {
-            console.warn('[quote-relay] could not mark relayed flag for', doc.id, '—', e.message);
-            continue;
-          }
+          // ── SEND-FIRST, MARK-AFTER (2026-05-02) ──
+          // Prior code marked `whatsapp_quote_relayed=true` BEFORE sending so
+          // a transient WhatsApp / Cloud API failure caused silent message
+          // loss with no retry. We now send everything first; only mark on
+          // success. To avoid duplicate sends if two onSnapshot deliveries
+          // race, take a soft in-memory lock keyed by doc id.
+          if (_quoteRelayInFlight.has(doc.id)) continue;
+          _quoteRelayInFlight.add(doc.id);
 
+          let relaySucceeded = false;
           try {
-            await sendWhatsAppMessage(phone, `Hi${data.user_name ? ' ' + String(data.user_name).split(' ')[0] : ''}! Your quote for ${rfqNo} is ready. Here are the items our admin has selected:`);
-          } catch (_) {}
+            try {
+              await sendWhatsAppMessage(phone, `Hi${data.user_name ? ' ' + String(data.user_name).split(' ')[0] : ''}! Your quote for ${rfqNo} is ready. Here are the items our admin has selected:`);
+            } catch (_) {}
 
           // Send each item as a separate WhatsApp image + caption.
           for (let i = 0; i < items.length; i++) {
@@ -7660,11 +7672,29 @@ function startQuoteRelayListener() {
             } catch (e) {
               console.warn('[quote-relay] session bridge failed for', doc.id, '-', e.message);
             }
+            relaySucceeded = true;
           } catch (e) {
             console.warn('[quote-relay] totals send failed for', doc.id, '-', e.message);
           }
 
-          console.log(`[quote-relay] RFQ ${rfqNo} → ${phone}: ${items.length} item(s) delivered.`);
+          // Mark relayed only after successful delivery so transient WA-API
+          // failures self-heal on the next snapshot tick.
+          if (relaySucceeded) {
+            try {
+              await firestore.collection('futureBookings').doc(doc.id).update({
+                whatsapp_quote_relayed: true,
+                whatsapp_quote_relayed_at: admin.firestore.FieldValue.serverTimestamp(),
+              });
+            } catch (e) {
+              console.warn('[quote-relay] could not mark relayed flag for', doc.id, '—', e.message);
+            }
+            console.log(`[quote-relay] RFQ ${rfqNo} → ${phone}: ${items.length} item(s) delivered.`);
+          } else {
+            console.warn(`[quote-relay] RFQ ${rfqNo} → ${phone}: NOT marked — will retry on next change.`);
+          }
+          } finally {
+            _quoteRelayInFlight.delete(doc.id);
+          }
         }
       }, (err) => {
         console.error('[quote-relay] listener error:', err && err.message);
@@ -7776,23 +7806,29 @@ function startAdminAssignmentRelayListener() {
             continue;
           }
 
-          // Mark relayed BEFORE sending so a slow WA call doesn't double-fire.
+          // Send-then-mark with in-flight lock to prevent duplicate sends
+          // when onSnapshot fires twice for the same change.
+          if (_adminAssignRelayInFlight.has(doc.id)) continue;
+          _adminAssignRelayInFlight.add(doc.id);
           try {
-            await firestore.collection('futureBookings').doc(doc.id).update({
-              whatsapp_admin_assigned_relayed: true,
-              whatsapp_admin_assigned_relayed_at: admin.firestore.FieldValue.serverTimestamp(),
-              whatsapp_admin_assigned_kind: kind,
-            });
-          } catch (e) {
-            console.warn('[admin-assign-relay] flag update failed for', doc.id, '-', e.message);
-            continue;
-          }
-
-          try {
-            await sendWhatsAppMessage(phone, msg);
-            console.log(`[admin-assign-relay] sent (${kind}) for ${rfqNo} → ${phone}`);
-          } catch (e) {
-            console.error('[admin-assign-relay] WA send failed for', doc.id, '-', e.message);
+            try {
+              await sendWhatsAppMessage(phone, msg);
+              console.log(`[admin-assign-relay] sent (${kind}) for ${rfqNo} → ${phone}`);
+            } catch (e) {
+              console.error('[admin-assign-relay] WA send failed for', doc.id, '-', e.message);
+              continue;
+            }
+            try {
+              await firestore.collection('futureBookings').doc(doc.id).update({
+                whatsapp_admin_assigned_relayed: true,
+                whatsapp_admin_assigned_relayed_at: admin.firestore.FieldValue.serverTimestamp(),
+                whatsapp_admin_assigned_kind: kind,
+              });
+            } catch (e) {
+              console.warn('[admin-assign-relay] flag update failed for', doc.id, '-', e.message);
+            }
+          } finally {
+            _adminAssignRelayInFlight.delete(doc.id);
           }
 
           // Push to linked customer app as well.
@@ -7853,7 +7889,7 @@ function startArtisanAcceptanceListener() {
           const descStr = data.description || data.problem_description || data.subcategory || data.category_name || 'your maintenance request';
 
           let to = customerPhone.replace(/[^0-9]/g, '');
-          if (to.startsWith('0')) to = '27' + to.slice(1);
+          if (to.length === 10 && to.startsWith('0')) to = '27' + to.slice(1); // ZA local 10-digit only; E.164 numbers (>= 11 digits) left untouched
 
           let msg = `✅ *Great news!* ${artisanName} has accepted your booking (#${orderNo})!\n\n`;
           msg += `📋 *Job:* ${descStr}\n`;
@@ -8015,7 +8051,7 @@ function startBalancePromptListener() {
           if (!isWa) continue;
           if (!phoneRaw) continue;
           let to = phoneRaw.replace(/[^0-9]/g, '');
-          if (to.startsWith('0')) to = '27' + to.slice(1);
+          if (to.length === 10 && to.startsWith('0')) to = '27' + to.slice(1); // ZA local 10-digit only; E.164 numbers (>= 11 digits) left untouched
 
           // Pull cost fields, falling back to FB if TM doesn't have them
           let totalCost = parseFloat(data.cost || data.total_cost || '0');
@@ -8103,7 +8139,7 @@ function startJobLifecycleListener() {
           const phoneRaw = data.user_phone || data.customerPhone || data.contact || data.client_phone || data.phone || '';
           if (!phoneRaw) continue;
           let to = phoneRaw.replace(/[^0-9]/g, '');
-          if (to.startsWith('0')) to = '27' + to.slice(1);
+          if (to.length === 10 && to.startsWith('0')) to = '27' + to.slice(1); // ZA local 10-digit only; E.164 numbers (>= 11 digits) left untouched
 
           const orderNo = data.order_no || data.rfq_no || doc.id;
           const artisanName = data.service_provider_name || data.artisan_name || data.artisanName || 'Your artisan';
@@ -8131,17 +8167,23 @@ function startJobLifecycleListener() {
               continue;
           }
 
-          // Mark BEFORE sending to prevent duplicate fires from rapid Firestore re-emits
+          // Send-then-mark with in-flight lock so we don't lose messages on
+          // transient WA failures and don't double-send on rapid re-emits.
+          if (_lifecycleInFlight.has(doc.id + ':' + normStatus)) continue;
+          _lifecycleInFlight.add(doc.id + ':' + normStatus);
           try {
-            await doc.ref.update({ [flagKey]: new Date().toISOString() });
-          } catch (e) {
-            console.warn(`[job-lifecycle] flag update failed for ${doc.id}:`, e.message);
-            continue;
-          }
-
-          try {
-            await sendWhatsAppMessage(to, msg);
-            console.log(`[job-lifecycle] sent "${normStatus}" WA to ${to} for ${doc.id}`);
+            try {
+              await sendWhatsAppMessage(to, msg);
+              console.log(`[job-lifecycle] sent "${normStatus}" WA to ${to} for ${doc.id}`);
+            } catch (e) {
+              console.warn(`[job-lifecycle] WA send failed for ${doc.id}:`, e.message);
+              continue;
+            }
+            try {
+              await doc.ref.update({ [flagKey]: new Date().toISOString() });
+            } catch (e) {
+              console.warn(`[job-lifecycle] flag update failed for ${doc.id}:`, e.message);
+            }
             // Sync tasksManagement so other consumers (admin app, payment processor) see the same status
             try {
               await firestore.collection('tasksManagement').doc(doc.id).set({
@@ -8160,8 +8202,8 @@ function startJobLifecycleListener() {
                 });
               }
             }
-          } catch (e) {
-            console.warn(`[job-lifecycle] WA send failed for ${doc.id}:`, e.message);
+          } finally {
+            _lifecycleInFlight.delete(doc.id + ':' + normStatus);
           }
         }
       }, (err) => {
@@ -8231,7 +8273,7 @@ function startBuyingMaterialListener() {
           if (!isWa) continue;
           if (!phoneRaw) continue;
           let to = phoneRaw.replace(/[^0-9]/g, '');
-          if (to.startsWith('0')) to = '27' + to.slice(1);
+          if (to.length === 10 && to.startsWith('0')) to = '27' + to.slice(1); // ZA local 10-digit only; E.164 numbers (>= 11 digits) left untouched
 
           const name = artisanName || 'Your artisan';
           const ref = orderNo;
@@ -8309,7 +8351,7 @@ function startArtisanPhotoListener() {
           if (!isWa) continue;
           if (!phoneRaw) continue;
           let to = phoneRaw.replace(/[^0-9]/g, '');
-          if (to.startsWith('0')) to = '27' + to.slice(1);
+          if (to.length === 10 && to.startsWith('0')) to = '27' + to.slice(1); // ZA local 10-digit only; E.164 numbers (>= 11 digits) left untouched
 
           // Resolve photo URL from artisanTasksImages doc
           let imageUrl = '';
@@ -8416,7 +8458,7 @@ function startRatingPromptListener() {
           if (!isWa) continue;
           if (!phoneRaw) continue;
           let to = phoneRaw.replace(/[^0-9]/g, '');
-          if (to.startsWith('0')) to = '27' + to.slice(1);
+          if (to.length === 10 && to.startsWith('0')) to = '27' + to.slice(1); // ZA local 10-digit only; E.164 numbers (>= 11 digits) left untouched
 
           const name = artisanName || 'your artisan';
           const ref = orderNo;
