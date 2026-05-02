@@ -3511,6 +3511,23 @@ async function executeWaTool(name, args, session) {
       // Get user balance (atomic transaction)
       try {
         await firestore.runTransaction(async (txn) => {
+          // Re-read booking inside the transaction so a rapid double-tap
+          // (two `pay_with_wallet` calls within the same second) cannot
+          // both pass the outer `payment_status` check and double-debit.
+          const tmRef = firestore.collection('tasksManagement').doc(bid);
+          const fbRef = firestore.collection('futureBookings').doc(bid);
+          const freshTm = await txn.get(tmRef);
+          const freshFb = await txn.get(fbRef);
+          const freshBook = freshTm.exists ? freshTm.data() : (freshFb.exists ? freshFb.data() : null);
+          if (freshBook) {
+            if (freshBook.payment_status === 'paid') {
+              throw new Error('ALREADY_PAID');
+            }
+            if (freshBook.payment_status === 'deposit_paid' && freshBook.balance_paid === true) {
+              throw new Error('ALREADY_PAID');
+            }
+          }
+
           const userRef = firestore.collection('users').doc(session.linkedUserId);
           const userSnap = await txn.get(userRef);
           if (!userSnap.exists) throw new Error('User not found');
@@ -3520,7 +3537,7 @@ async function executeWaTool(name, args, session) {
 
           const newBalance = balance - chargeAmount;
           txn.update(userRef, { balance: newBalance.toFixed(2) });
-          txn.update(firestore.collection('tasksManagement').doc(bid), {
+          txn.update(tmRef, {
             payment_status: newPaymentStatus,
             paymentStatus: newPaymentStatus,
             payment_method: 'wallet',
@@ -3529,9 +3546,7 @@ async function executeWaTool(name, args, session) {
           });
 
           // Also update futureBookings if exists
-          const fbRef = firestore.collection('futureBookings').doc(bid);
-          const fbSnap = await txn.get(fbRef);
-          if (fbSnap.exists) {
+          if (freshFb.exists) {
             txn.update(fbRef, {
               payment_status: newPaymentStatus,
               wallet_deducted: true,
@@ -3555,6 +3570,9 @@ async function executeWaTool(name, args, session) {
 
         return { success: true, message: `${isDepositPaid ? 'Balance' : 'Full'} ${paymentLabel} successful via wallet! Your booking ${bid} is now fully paid.`, paid: `R${chargeAmount.toFixed(2)}` };
       } catch (e) {
+        if (e && e.message === 'ALREADY_PAID') {
+          return { message: 'This booking is already paid.' };
+        }
         return { error: e.message || 'Payment failed. Please try again.' };
       }
     }
@@ -6376,7 +6394,11 @@ async function handleMessage(session, userMessage, imageDataUrl) {
         promoDiscountType: session.promoDiscountType || null,
         promoId: session.promoId || null,
         lastActivity: admin.firestore.FieldValue.serverTimestamp(),
-      }).catch(() => {});
+      }).catch(e => {
+        // Surface persist failures so we know when sessions silently die on
+        // Render restart (was previously swallowed with `.catch(() => {})`).
+        console.error(`[session-persist] CRITICAL: ${session.phone} persist failed: ${e && e.message}`);
+      });
     }
 
     return safeReply;
@@ -6557,6 +6579,12 @@ app.post('/webhook', async (req, res) => {
     const _contactName = value?.contacts?.[0]?.profile?.name || null;
 
     for (const msg of value.messages) {
+      // Defensive: malformed payloads from Meta have crashed the worker before.
+      // Skip anything that isn't a well-formed object with `from` + `type`.
+      if (!msg || typeof msg !== 'object' || typeof msg.from !== 'string' || typeof msg.type !== 'string') {
+        console.warn('[webhook] skipping malformed message:', JSON.stringify(msg).slice(0, 200));
+        continue;
+      }
       const from = msg.from; // phone number
       let userText = '';
 
@@ -6588,7 +6616,8 @@ app.post('/webhook', async (req, res) => {
 
       switch (msg.type) {
         case 'text':
-          userText = msg.text.body;
+          userText = (msg.text && typeof msg.text.body === 'string') ? msg.text.body : '';
+          if (!userText) { continue; }
           break;
         case 'interactive':
           // Button replies and list replies
