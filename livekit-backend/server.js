@@ -8873,6 +8873,35 @@ app.post('/api/payment/itn', async (req, res) => {
 
     // 3. Process payment using shared helper (handles Firestore + WhatsApp + artisan + tx log)
     if (paymentStatus === 'COMPLETE' && customStr1) {
+      // Replay protection: a captured ITN payload (or accidental double
+      // delivery from PayFast) must NOT trigger payment crediting twice.
+      // We dedupe by `pf_payment_id` in a dedicated collection. The first
+      // request to write the doc wins; subsequent identical IDs are ignored.
+      if (pfPaymentId) {
+        const ledgerRef = admin.firestore().collection('paymentItnLedger').doc(pfPaymentId);
+        try {
+          await admin.firestore().runTransaction(async (txn) => {
+            const snap = await txn.get(ledgerRef);
+            if (snap.exists) {
+              throw new Error('ITN_ALREADY_PROCESSED');
+            }
+            txn.set(ledgerRef, {
+              pf_payment_id: pfPaymentId,
+              task_id: customStr1,
+              amount: amountGross,
+              status: paymentStatus,
+              processed_at: new Date().toISOString(),
+              source: 'payfast_itn',
+            });
+          });
+        } catch (replayErr) {
+          if (replayErr && replayErr.message === 'ITN_ALREADY_PROCESSED') {
+            console.warn(`[ITN] replay detected for pf_payment_id=${pfPaymentId} task=${customStr1} — skipping`);
+            return res.status(200).send('OK');
+          }
+          throw replayErr;
+        }
+      }
       const result = await processSuccessfulPayment(customStr1, {
         amountGross,
         pfPaymentId,
