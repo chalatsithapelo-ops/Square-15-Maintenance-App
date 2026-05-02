@@ -3419,6 +3419,16 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       if (cost <= 0) return { ok: false, status: 400, error: 'no_confirmed_price' };
 
       const paymentType = payload.payment_type || 'full';
+
+      // Hard validation: a balance payment is only meaningful AFTER deposit
+      // has been paid. Without this guard a caller could request
+      // payment_type='balance' on a fresh booking and the implicit branch
+      // below would silently fall back to charging the full amount or 65%
+      // — confusing the customer and breaking transactionLogs accounting.
+      if (paymentType === 'balance' && bData.deposit_paid !== true) {
+        return { ok: false, status: 400, error: 'cannot_pay_balance_before_deposit' };
+      }
+
       let payAmount;
       if (bData.deposit_paid === true && bData.balance_paid !== true) {
         payAmount = parseFloat(bData.balance_amount || (cost * 0.65));
