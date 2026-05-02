@@ -8923,6 +8923,17 @@ app.post('/api/token', authMiddleware, async (req, res) => {
       });
     }
 
+    // Bind the LiveKit participant identity to the authenticated caller.
+    // Previously the client could pass any `participantName`, allowing two
+    // users to claim the same identity in a room or impersonate another
+    // user's display name. We now suffix the caller's UID so identities
+    // are always traceable and unique per-caller.
+    const callerUid = req.user && req.user.uid;
+    if (!callerUid) {
+      return res.status(401).json({ error: 'Unauthorized', message: 'auth context missing' });
+    }
+    const safeIdentity = `${String(participantName).slice(0, 40)}__${callerUid}`;
+
     const env = validateLiveKitEnv(res);
     if (!env) return;
 
@@ -8931,7 +8942,7 @@ app.post('/api/token', authMiddleware, async (req, res) => {
       env.apiKey,
       env.apiSecret,
       {
-        identity: participantName,
+        identity: safeIdentity,
         name: participantName,
         metadata: metadata || '',
         ttl: '15m',
