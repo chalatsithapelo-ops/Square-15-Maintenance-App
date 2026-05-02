@@ -2154,6 +2154,29 @@ async function executeWaTool(name, args, session) {
     case 'create_booking': {
       if (!firestore) return { error: 'Database unavailable. Please try again later.' };
 
+      // ── ADDRESS GATE (2026-04-14): never let a booking be created without a
+      // service address. The OpenAI tool schema marks address required, but the
+      // model occasionally calls the tool with an empty string. Enforce here.
+      // International-aware: Square 15 serves SA + Lesotho/Botswana/Namibia etc.,
+      // so we require an explicit address rather than guessing from phone country.
+      {
+        let addressArg = String(args.address || '').trim();
+        const sessionAddr = String(session.sharedAddress || '').trim();
+        if (!addressArg && sessionAddr) {
+          args.address = sessionAddr;
+          addressArg = sessionAddr;
+        }
+        if (!addressArg) {
+          console.log(`[create_booking] ADDRESS GATE: refusing booking for ${session.phone} — no service address`);
+          return {
+            success: false,
+            error: 'address_required',
+            required_next_action: 'ask_for_address',
+            instruction: "Before creating this booking, you MUST ask the customer for the FULL service address — street, suburb/area, city, AND country if the customer is outside South Africa (Square 15 also serves Lesotho, Botswana, Namibia, Zimbabwe, Eswatini and beyond). Example: 'Could you please share the full address where the work needs to be done? (street, area, city — and country if outside South Africa). You can also drop a WhatsApp location pin if that's easier.' Do NOT call create_booking again until they reply with an address.",
+          };
+        }
+      }
+
       const bookingId = `WA-${Date.now().toString(36).toUpperCase()}`;
       const orderNo = `SQ15-${bookingId}`;
       const now = new Date().toISOString();
@@ -3561,6 +3584,30 @@ async function executeWaTool(name, args, session) {
       }
       // Mark gate as cleared so retries within the same session aren't re-blocked.
       session.photoGateAcknowledged = true;
+
+      // ── ADDRESS GATE (2026-04-14): never let an RFQ be filed without a service
+      // address. The system prompt instructs the LLM to ALWAYS ask, but the AI
+      // sometimes skips when the customer is brief — so enforce server-side too.
+      // Square 15 operates internationally (SA, Lesotho, Botswana, Namibia, etc.)
+      // so we require an explicit address rather than guessing from the phone country.
+      {
+        let addressArg = String(args.address || '').trim();
+        const sessionAddr = String(session.sharedAddress || '').trim();
+        if (!addressArg && sessionAddr) {
+          // AI omitted but customer shared a location pin/address earlier — fold it in.
+          args.address = sessionAddr;
+          addressArg = sessionAddr;
+        }
+        if (!addressArg) {
+          console.log(`[submit_rfq] ADDRESS GATE: refusing RFQ for ${session.phone} — no service address`);
+          return {
+            success: false,
+            error: 'address_required',
+            required_next_action: 'ask_for_address',
+            instruction: "Before filing this RFQ, you MUST ask the customer for the FULL service address — street, suburb/area, city, AND country if the customer is outside South Africa (Square 15 also serves Lesotho, Botswana, Namibia, Zimbabwe, Eswatini and beyond). Example: 'Could you please share the full address where the work needs to be done? (street, area, city — and country if outside South Africa). You can also drop a WhatsApp location pin if that's easier.' Do NOT call submit_rfq again until they reply with an address.",
+          };
+        }
+      }
 
       // ── GATE (v27): when the artisan supplies materials AND the job needs
       // parts, the AI must have recorded at LEAST ONE material spec via
@@ -5115,6 +5162,41 @@ async function executeWaTool(name, args, session) {
       if (underThreshold) {
         const autoReason = clientBuysMaterials ? 'client_buys_materials_under_12k' : 'under_12k';
         const cat = (data.category || data.category_name || '').toLowerCase().replace(/\s+/g, '_');
+        // ── International dispatch (2026-04-14): prefer artisans in the same
+        // country/region as the customer. Country derived from (1) explicit
+        // customer_country field, (2) phone E.164 prefix.
+        const customerCountry = (function deriveCountry() {
+          const explicit = String(data.customer_country || data.country || '').trim().toUpperCase();
+          if (explicit) return explicit;
+          const phoneDigits = String(data.user_phone || data.client_phone || data.customerPhone || '').replace(/[^0-9]/g, '');
+          // Order matters — longer prefixes first
+          const PREFIXES = [
+            { p: '266', c: 'LS' }, { p: '267', c: 'BW' }, { p: '264', c: 'NA' },
+            { p: '263', c: 'ZW' }, { p: '268', c: 'SZ' }, { p: '258', c: 'MZ' },
+            { p: '260', c: 'ZM' }, { p: '265', c: 'MW' }, { p: '255', c: 'TZ' },
+            { p: '254', c: 'KE' }, { p: '27',  c: 'ZA' }, { p: '1',   c: 'US' },
+            { p: '44',  c: 'GB' },
+          ];
+          for (const { p, c } of PREFIXES) {
+            if (phoneDigits.startsWith(p)) return c;
+          }
+          return '';
+        })();
+        const addressLower = String(data.address || data.provided_address || '').toLowerCase();
+        const COUNTRY_KEYWORDS = {
+          LS: ['lesotho', 'maseru', 'maputsoe', 'leribe', 'mafeteng'],
+          BW: ['botswana', 'gaborone', 'francistown', 'maun'],
+          NA: ['namibia', 'windhoek', 'swakopmund', 'walvis bay'],
+          ZW: ['zimbabwe', 'harare', 'bulawayo'],
+          SZ: ['eswatini', 'swaziland', 'mbabane', 'manzini'],
+          ZA: ['south africa', 'johannesburg', 'cape town', 'durban', 'pretoria', 'sandton', 'soweto', 'gauteng', 'limpopo', 'mpumalanga', 'free state'],
+        };
+        let inferredCountry = customerCountry;
+        if (!inferredCountry) {
+          for (const [code, kws] of Object.entries(COUNTRY_KEYWORDS)) {
+            if (kws.some(k => addressLower.includes(k))) { inferredCountry = code; break; }
+          }
+        }
         try {
           // Fetch ALL artisans and gate in code — many artisan docs have no
           // `status` field at all, which an inequality/in filter would hide.
@@ -5123,7 +5205,8 @@ async function executeWaTool(name, args, session) {
             .limit(200)
             .get();
           const REJECT_STATUSES = new Set(['pending', 'rejected', 'reject', 'suspended', 'inactive', 'disabled']);
-          const matchedArtisans = [];
+          const sameCountryArtisans = [];
+          const otherArtisans = [];
           for (const artDoc of artisanSnap.docs) {
             const ad = artDoc.data() || {};
             // Skip suspended artisans (checked in code, not query)
@@ -5137,10 +5220,38 @@ async function executeWaTool(name, args, session) {
             const cats = (ad.categories || ad.category || '').toString().toLowerCase();
             if (cats && cat && !cats.includes(cat) && cat !== 'general_maintenance') continue;
             const aName = ad.name || ad.userName || ad.full_name || artDoc.id;
-            matchedArtisans.push({ id: artDoc.id, name: aName, token: (ad.fcm_token || ad.deviceToken || '').toString().trim() });
-            if (matchedArtisans.length >= 3) break;
+            const aRecord = { id: artDoc.id, name: aName, token: (ad.fcm_token || ad.deviceToken || '').toString().trim() };
+            // Country fields: country (code or name), countries_served (array or comma string), region, city
+            const artCountry = String(ad.country || ad.country_code || '').trim().toUpperCase();
+            const served = (function () {
+              const v = ad.countries_served || ad.serviceCountries || ad.regions || '';
+              if (Array.isArray(v)) return v.map(s => String(s).trim().toUpperCase());
+              return String(v).split(/[,;]/).map(s => s.trim().toUpperCase()).filter(Boolean);
+            })();
+            const COUNTRY_NAME_TO_CODE = { 'SOUTH AFRICA': 'ZA', 'LESOTHO': 'LS', 'BOTSWANA': 'BW', 'NAMIBIA': 'NA', 'ZIMBABWE': 'ZW', 'ESWATINI': 'SZ', 'SWAZILAND': 'SZ' };
+              const artCountryCode = COUNTRY_NAME_TO_CODE[artCountry] || artCountry;
+            const servedCodes = served.map(s => COUNTRY_NAME_TO_CODE[s] || s);
+            const matchesCustomerCountry = inferredCountry && (
+              artCountryCode === inferredCountry || servedCodes.includes(inferredCountry)
+            );
+            if (matchesCustomerCountry) sameCountryArtisans.push(aRecord);
+            else otherArtisans.push(aRecord);
           }
-          console.log(`[wa-tool] auto-dispatch RFQ ${rfqId} cat="${cat}" — scanned ${artisanSnap.size}, matched ${matchedArtisans.length}`);
+          // Prefer same-country; only fall back to others if zero same-country matches.
+          // For SA (ZA) — the largest pool — keep historical behaviour: if customer
+          // is ZA or unknown, treat all matched artisans as eligible.
+          let matchedArtisans;
+          if (inferredCountry && inferredCountry !== 'ZA' && sameCountryArtisans.length > 0) {
+            matchedArtisans = sameCountryArtisans.slice(0, 3);
+          } else if (inferredCountry && inferredCountry !== 'ZA') {
+            // No same-country artisan — escalate to admin instead of blasting SA artisans.
+            matchedArtisans = [];
+            console.log(`[wa-tool] auto-dispatch RFQ ${rfqId} country=${inferredCountry} — no in-country artisan; escalating to admin`);
+          } else {
+            // ZA or unknown — historical broad dispatch (cap 3)
+            matchedArtisans = sameCountryArtisans.concat(otherArtisans).slice(0, 3);
+          }
+          console.log(`[wa-tool] auto-dispatch RFQ ${rfqId} cat="${cat}" country="${inferredCountry || 'unknown'}" — scanned ${artisanSnap.size}, in-country ${sameCountryArtisans.length}, dispatched ${matchedArtisans.length}`);
           if (matchedArtisans.length > 0) {
             const artisanIds = matchedArtisans.map(a => a.id);
             const artisanNames = {};
@@ -5519,7 +5630,13 @@ async function executeWaTool(name, args, session) {
 const SYSTEM_PROMPT = `You are Lizzy, the Square 15 Facility Solutions AI assistant on WhatsApp.
 You are an AI-powered assistant (not a human). When greeting a customer for the first time, introduce yourself clearly:
 "Hi! I'm Lizzy, your AI assistant from Square 15 Facility Solutions. I can help you book maintenance services, get quotes, track jobs, and process payments — all right here on WhatsApp. How can I help you today?"
-You help South African homeowners and tenants with property maintenance services.
+You help homeowners, tenants and businesses across Southern Africa (South Africa, Lesotho, Botswana, Namibia, Zimbabwe, Eswatini) and beyond — wherever Square 15 has artisans available. Square 15 dispatches the nearest qualified artisan based on the SERVICE address, not the customer's phone country. So treat every booking as potentially cross-border and ALWAYS confirm the full service address (with country if outside South Africa) before submitting an RFQ or creating a booking.
+
+⛔ ABSOLUTE ADDRESS RULE (NEVER SKIP):
+- BEFORE calling create_booking or submit_rfq you MUST have a real service address (street + suburb/area + city — AND country if outside South Africa).
+- If the customer hasn't given an address yet, ASK FIRST in a warm conversational way: "Could you please share the full address where the work needs to be done? (street, area, city — and country if outside South Africa). You can also drop a WhatsApp location pin if that's easier."
+- NEVER assume the customer is in South Africa. NEVER fill the address with placeholders like "TBD", "same as account", "client home", "Johannesburg", or guesses. NEVER reuse a stale address from a different booking unless the customer confirms it.
+- If the server returns error="address_required", ask for the address and wait — do NOT retry the tool call without one.
 
 YOUR FULL CAPABILITIES:
 📋 BOOKINGS:
