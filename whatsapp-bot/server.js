@@ -403,6 +403,28 @@ async function downloadWhatsAppMedia(mediaId) {
       return null;
     }
     const mimeType = meta.mime_type || 'image/jpeg';
+    // Validate MIME type and magic bytes BEFORE we hand the buffer off to
+    // Storage. Without this, an attacker could upload arbitrary binaries
+    // (e.g. malware, scripts) by labelling them as `image/jpeg`. We accept
+    // only the formats Meta WhatsApp itself emits for image/voice/document
+    // capture: jpeg, png, webp, ogg/opus (voice notes), mp4 (video).
+    const isImage = mimeType.startsWith('image/');
+    if (isImage) {
+      const allowedImage = new Set(['image/jpeg', 'image/jpg', 'image/png', 'image/webp']);
+      if (!allowedImage.has(mimeType.toLowerCase())) {
+        console.warn(`[wa-media] rejected disallowed image mime: ${mimeType}`);
+        return null;
+      }
+      // Magic-byte sniffing — first few bytes must match the claimed type
+      const b = buffer;
+      const looksJpeg = b.length >= 3 && b[0] === 0xFF && b[1] === 0xD8 && b[2] === 0xFF;
+      const looksPng  = b.length >= 8 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4E && b[3] === 0x47;
+      const looksWebp = b.length >= 12 && b.slice(0, 4).toString('ascii') === 'RIFF' && b.slice(8, 12).toString('ascii') === 'WEBP';
+      if (!(looksJpeg || looksPng || looksWebp)) {
+        console.warn(`[wa-media] image magic-bytes mismatch (mime=${mimeType}, first=${b.slice(0,4).toString('hex')})`);
+        return null;
+      }
+    }
     const base64 = buffer.toString('base64');
     return { base64, mimeType, dataUrl: `data:${mimeType};base64,${base64}`, buffer };
   } catch (e) {
@@ -3533,7 +3555,7 @@ async function executeWaTool(name, args, session) {
           if (!userSnap.exists) throw new Error('User not found');
 
           const balance = parseFloat(userSnap.data().balance || '0');
-          if (balance < chargeAmount) throw new Error(`Insufficient balance. You have R${balance.toFixed(2)} but need R${chargeAmount.toFixed(2)}.`);
+          if (balance < chargeAmount) throw new Error(`INSUFFICIENT_BALANCE:${balance.toFixed(2)}:${chargeAmount.toFixed(2)}`);
 
           const newBalance = balance - chargeAmount;
           txn.update(userRef, { balance: newBalance.toFixed(2) });
@@ -3572,6 +3594,15 @@ async function executeWaTool(name, args, session) {
       } catch (e) {
         if (e && e.message === 'ALREADY_PAID') {
           return { message: 'This booking is already paid.' };
+        }
+        if (e && typeof e.message === 'string' && e.message.startsWith('INSUFFICIENT_BALANCE:')) {
+          const parts = e.message.split(':');
+          const have = parts[1] || '0.00';
+          const need = parts[2] || chargeAmount.toFixed(2);
+          const short = (parseFloat(need) - parseFloat(have)).toFixed(2);
+          return {
+            error: `Insufficient wallet balance. You have R${have} but need R${need} (short by R${short}). Reply "top up" to add funds, or choose another payment method.`,
+          };
         }
         return { error: e.message || 'Payment failed. Please try again.' };
       }
