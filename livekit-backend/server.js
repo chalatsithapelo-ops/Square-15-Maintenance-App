@@ -7272,37 +7272,44 @@ app.post('/api/admin/payout', authMiddleware, assistantLimiter, async (req, res)
 
       console.log(`💰 Admin refund R${payoutAmount.toFixed(2)} credited to client ${recipient_id} wallet`);
     } else {
-      // Credit artisan balance
+      // Credit artisan balance — wrapped in a transaction so the read+update
+      // of `serviceProvider.balance` and the matching transactionLogs entry
+      // commit atomically. Previously a concurrent payout could read the
+      // same `currentBalance` twice and overwrite each other's update,
+      // silently losing one credit.
+      let postBalance;
+      let preBalance;
       const artisanRef = db.collection('serviceProvider').doc(recipient_id);
-      const artisanSnap = await artisanRef.get();
-      const artisanData = artisanSnap.data() || {};
-      const currentBalance = parseFloat(artisanData.balance || '0');
-      const newBalance = currentBalance + payoutAmount;
-
-      await artisanRef.update({
-        balance: newBalance.toFixed(2),
-        balance_from: 'admin_card',
-        updated_at: now,
-      });
-
-      await db.collection('transactionLogs').doc(txId).set({
-        id: txId,
-        amount: payoutAmount.toFixed(2),
-        transaction_at: now,
-        status: 'success',
-        service_provider_id: recipient_id,
-        service_provider_name: recipientName,
-        type: 'admin_card_artisan_payout',
-        subtype: 'artisan_payout',
-        direction: 'out',
-        cash_movement: true,
-        schema_version: 2,
-        reason: reason || 'admin_card_payout',
-        balance_after: newBalance.toFixed(2),
-        previous_balance: currentBalance.toFixed(2),
-        admin_id: adminUid,
-        payment_method: 'admin_saved_card',
-        ...(booking_id ? { tasks_management_id: booking_id } : {}),
+      let artisanData = {};
+      await db.runTransaction(async (tx) => {
+        const artisanSnap = await tx.get(artisanRef);
+        artisanData = artisanSnap.data() || {};
+        preBalance = parseFloat(artisanData.balance || '0');
+        postBalance = preBalance + payoutAmount;
+        tx.update(artisanRef, {
+          balance: postBalance.toFixed(2),
+          balance_from: 'admin_card',
+          updated_at: now,
+        });
+        tx.set(db.collection('transactionLogs').doc(txId), {
+          id: txId,
+          amount: payoutAmount.toFixed(2),
+          transaction_at: now,
+          status: 'success',
+          service_provider_id: recipient_id,
+          service_provider_name: recipientName,
+          type: 'admin_card_artisan_payout',
+          subtype: 'artisan_payout',
+          direction: 'out',
+          cash_movement: true,
+          schema_version: 2,
+          reason: reason || 'admin_card_payout',
+          balance_after: postBalance.toFixed(2),
+          previous_balance: preBalance.toFixed(2),
+          admin_id: adminUid,
+          payment_method: 'admin_saved_card',
+          ...(booking_id ? { tasks_management_id: booking_id } : {}),
+        });
       });
 
       // Update booking artisan payment status if booking_id provided
