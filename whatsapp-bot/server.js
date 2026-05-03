@@ -486,6 +486,49 @@ async function downloadWhatsAppMedia(mediaId, opts = {}) {
   }
 }
 
+// ─── BHV-15: delete photos from Firebase Storage by public download URL ───
+// Used when a booking/RFQ is cancelled so abandoned photos don't accumulate.
+// Best-effort: never throws; logs counts. Accepts an array of URLs (any shape).
+async function deleteStoragePhotos(urls, context) {
+  try {
+    if (!Array.isArray(urls) || urls.length === 0) return { deleted: 0, skipped: 0 };
+    const bucketName = 'promaintapp-b618a.firebasestorage.app';
+    const bucket = admin.storage().bucket(bucketName);
+    let deleted = 0, skipped = 0;
+    // Dedup
+    const seen = new Set();
+    for (const raw of urls) {
+      const u = String(raw || '').trim();
+      if (!u || seen.has(u)) { skipped++; continue; }
+      seen.add(u);
+      // Match: https://storage.googleapis.com/<bucket>/<path>
+      // Tolerate alternative bucket alias forms (firebasestorage.googleapis.com etc.).
+      let path = null;
+      const m1 = u.match(/^https?:\/\/storage\.googleapis\.com\/[^/]+\/(.+?)(?:\?.*)?$/i);
+      if (m1) path = decodeURIComponent(m1[1]);
+      else {
+        const m2 = u.match(/^https?:\/\/firebasestorage\.googleapis\.com\/v0\/b\/[^/]+\/o\/([^?]+)/i);
+        if (m2) path = decodeURIComponent(m2[1]);
+      }
+      if (!path || !path.startsWith('booking_images/')) { skipped++; continue; }
+      try {
+        await bucket.file(path).delete({ ignoreNotFound: true });
+        deleted++;
+      } catch (e) {
+        skipped++;
+        console.warn(`[storage-cleanup] delete failed ${path}:`, e.message);
+      }
+    }
+    if (deleted || skipped) {
+      console.log(`[storage-cleanup] ${context || 'cleanup'}: deleted=${deleted} skipped=${skipped} of ${urls.length}`);
+    }
+    return { deleted, skipped };
+  } catch (e) {
+    console.warn('[storage-cleanup] fatal:', e.message);
+    return { deleted: 0, skipped: 0, error: e.message };
+  }
+}
+
 // ─── Upload image buffer to Firebase Storage and return download URL ───
 
 async function uploadImageToStorage(buffer, mimeType) {
@@ -4568,6 +4611,20 @@ async function executeWaTool(name, args, session) {
         created_at: admin.firestore.FieldValue.serverTimestamp(),
       });
 
+      // BHV-15: drop the customer photos from Firebase Storage now that the
+      // booking is dead — the artisan won't see them and admin doesn't need
+      // them after cancellation. Best-effort, never blocks the response.
+      try {
+        const photoFields = [d.image_urls, d.work_images, d.imageUrls, d.images, d.photos, d.photoUrls];
+        const allUrls = [];
+        for (const f of photoFields) {
+          if (Array.isArray(f)) allUrls.push(...f);
+        }
+        if (allUrls.length > 0) {
+          deleteStoragePhotos(allUrls, `cancel_booking ${bid}`).catch(() => {});
+        }
+      } catch (e) { console.warn('[wa-tool] cancel photo-cleanup setup failed:', e.message); }
+
       return {
         success: true,
         message: `Booking ${bid} has been cancelled.${refundMsg}`,
@@ -5926,6 +5983,13 @@ You help homeowners, tenants and businesses across Southern Africa (South Africa
 - If the customer hasn't given an address yet, ASK FIRST in a warm conversational way: "Could you please share the full address where the work needs to be done? (street, area, city — and country if outside South Africa). You can also drop a WhatsApp location pin if that's easier."
 - NEVER assume the customer is in South Africa. NEVER fill the address with placeholders like "TBD", "same as account", "client home", "Johannesburg", or guesses. NEVER reuse a stale address from a different booking unless the customer confirms it.
 - If the server returns error="address_required", ask for the address and wait — do NOT retry the tool call without one.
+
+⛔ AMBIGUOUS ADDRESS DISAMBIGUATION (BHV-4 — NEVER SKIP):
+- Several suburb / town names exist in MULTIPLE countries and dispatching to the wrong one wastes a callout. Treat these as ambiguous unless the customer also names an unmistakable South African city or province, OR explicitly says "South Africa" / "ZA" / "RSA":
+  Hatfield (ZA Pretoria / UK / US), Newlands (ZA Cape Town / Ireland / NZ), Richmond (ZA / UK / US / Canada), Wellington (ZA Cape Winelands / NZ capital), Cambridge (ZA East London / UK / US / NZ), Kensington (ZA / UK / Australia), Greenwich, Chelsea, Brighton, Manchester, Bedford, Windsor, Oxford, Auckland, Hamilton, Dover, Sandton-Park (Sandton itself is unique to ZA — NOT ambiguous).
+- If the customer's address contains an ambiguous name without a clearly ZA city/province (Johannesburg, Pretoria, Cape Town, Durban, Gauteng, Western Cape, KZN, Eastern Cape, Limpopo, Mpumalanga, North West, Free State, Northern Cape) AND no explicit country, you MUST ask once: "Just to confirm — is this address in South Africa, or in another country? (We dispatch the nearest artisan based on the service location.)" Wait for the answer before calling create_booking or submit_rfq.
+- If the customer says it IS South Africa (or names a ZA city), proceed normally. If they say another country, capture that country in the address string when you call the tool.
+- Do NOT ask this question if the address already includes a ZA city, province, postal code (4-digit ZA codes start 0001-9999 with specific ranges), or "South Africa".
 
 YOUR FULL CAPABILITIES:
 📋 BOOKINGS:
