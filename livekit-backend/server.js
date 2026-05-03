@@ -3312,8 +3312,10 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       const itemName = `Square 15 Booking ${bData.order_no || bData.rfq_no || bid} ${itemSuffix}`;
 
       // Build PayFast URL with proper notify/return/cancel URLs (critical for ITN webhook)
-      const returnUrl = `${backendUrl}/api/payment/ozow-result?status=success&booking_id=${encodeURIComponent(bid)}`;
-      const cancelUrl = `${backendUrl}/api/payment/ozow-result?status=cancel&booking_id=${encodeURIComponent(bid)}`;
+      // LK-3: sign return-url so the GET fallback can verify the booking_id wasn't spoofed.
+      const _sig = signPaymentCallback(bid);
+      const returnUrl = `${backendUrl}/api/payment/ozow-result?status=success&booking_id=${encodeURIComponent(bid)}${_sig}`;
+      const cancelUrl = `${backendUrl}/api/payment/ozow-result?status=cancel&booking_id=${encodeURIComponent(bid)}${_sig}`;
       const notifyUrl = `${backendUrl}/api/payment/itn`;
 
       const paymentData = {
@@ -6294,6 +6296,53 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
+// ─────────────────────────────────────────────────────────────────────────
+// LK-3 FIX (May 2026): sign PayFast return-url callbacks to prevent an
+// attacker from spoofing `?status=success&booking_id=X` and causing the
+// server-side fallback to mark someone else's booking as paid. We append
+// `&t=<HMAC>&exp=<ms>` to every return/cancel URL we generate, then verify
+// it in the GET /api/payment/ozow-result handler. Tokens use HMAC-SHA256
+// keyed off PAYMENT_CALLBACK_SECRET (preferred) or PAYFAST_PASSPHRASE.
+// Tokens are valid for 90 minutes (covers slow checkouts + clock skew).
+// Fail-closed: an unsigned/invalid callback still renders the status page
+// but does NOT trigger the payment-processing fallback.
+// ─────────────────────────────────────────────────────────────────────────
+const PAYMENT_CALLBACK_TTL_MS = 90 * 60 * 1000;
+function _paymentCallbackSecret() {
+  return env('PAYMENT_CALLBACK_SECRET') || env('PAYFAST_PASSPHRASE') || '';
+}
+function signPaymentCallback(bookingId) {
+  const secret = _paymentCallbackSecret();
+  if (!secret) {
+    console.warn('[payment-callback] no PAYMENT_CALLBACK_SECRET/PAYFAST_PASSPHRASE — callbacks will be unsigned and rejected');
+    return '';
+  }
+  const exp = Date.now() + PAYMENT_CALLBACK_TTL_MS;
+  const sig = crypto.createHmac('sha256', secret)
+    .update(`${bookingId}:${exp}`)
+    .digest('hex')
+    .slice(0, 32);
+  return `&t=${sig}&exp=${exp}`;
+}
+function verifyPaymentCallback(bookingId, t, exp) {
+  if (!t || !exp) return { ok: false, reason: 'missing_token' };
+  const expNum = Number(exp);
+  if (!Number.isFinite(expNum)) return { ok: false, reason: 'bad_exp' };
+  if (expNum < Date.now()) return { ok: false, reason: 'expired' };
+  const secret = _paymentCallbackSecret();
+  if (!secret) return { ok: false, reason: 'no_secret' };
+  const expected = crypto.createHmac('sha256', secret)
+    .update(`${bookingId}:${expNum}`)
+    .digest('hex')
+    .slice(0, 32);
+  // Constant-time compare
+  const a = Buffer.from(expected, 'utf8');
+  const b = Buffer.from(String(t), 'utf8');
+  if (a.length !== b.length) return { ok: false, reason: 'bad_sig' };
+  if (!crypto.timingSafeEqual(a, b)) return { ok: false, reason: 'bad_sig' };
+  return { ok: true };
+}
+
 // ── GET checkout page — renders auto-submit POST form to PayFast ──
 app.get('/api/payment/checkout/:sessionId', (req, res) => {
   const session = paymentSessions.get(req.params.sessionId);
@@ -6368,8 +6417,10 @@ app.post('/api/payment/whatsapp-initiate', assistantLimiter, async (req, res) =>
     }
 
     const itemName = description || `Square 15 Booking ${booking_id}`;
-    const returnUrl = `${backendUrl}/api/payment/ozow-result?status=success&booking_id=${encodeURIComponent(booking_id)}`;
-    const cancelUrl = `${backendUrl}/api/payment/ozow-result?status=cancel&booking_id=${encodeURIComponent(booking_id)}`;
+    // LK-3: sign callback to prevent spoofed booking_id in fallback handler.
+    const _sig = signPaymentCallback(booking_id);
+    const returnUrl = `${backendUrl}/api/payment/ozow-result?status=success&booking_id=${encodeURIComponent(booking_id)}${_sig}`;
+    const cancelUrl = `${backendUrl}/api/payment/ozow-result?status=cancel&booking_id=${encodeURIComponent(booking_id)}${_sig}`;
     const notifyUrl = `${backendUrl}/api/payment/itn`;
 
     // PayFast requires parameters in a SPECIFIC order for signature verification:
@@ -6459,9 +6510,11 @@ app.post('/api/payment/initiate', authMiddleware, assistantLimiter, async (req, 
     }
 
     // Default return/cancel URLs point to our result page
+    // LK-3: sign callback to prevent spoofed booking_id in fallback handler.
     const taskId = custom_str1 || '';
-    const defaultReturn = `${backendUrl}/api/payment/ozow-result?status=success&booking_id=${encodeURIComponent(taskId)}`;
-    const defaultCancel = `${backendUrl}/api/payment/ozow-result?status=cancel&booking_id=${encodeURIComponent(taskId)}`;
+    const _sigDefault = signPaymentCallback(taskId);
+    const defaultReturn = `${backendUrl}/api/payment/ozow-result?status=success&booking_id=${encodeURIComponent(taskId)}${_sigDefault}`;
+    const defaultCancel = `${backendUrl}/api/payment/ozow-result?status=cancel&booking_id=${encodeURIComponent(taskId)}${_sigDefault}`;
     const defaultNotify = `${backendUrl}/api/payment/itn`;
 
     // PayFast requires parameters in a SPECIFIC order for signature verification:
@@ -7904,8 +7957,13 @@ app.post('/api/admin/save-card', authMiddleware, async (req, res) => {
     const paymentData = {};
     paymentData.merchant_id = merchantId;
     paymentData.merchant_key = merchantKey;
-    paymentData.return_url = `${backendUrl}/api/payment/ozow-result?status=success&booking_id=admin_card_save`;
-    paymentData.cancel_url = `${backendUrl}/api/payment/ozow-result?status=cancel&booking_id=admin_card_save`;
+    // LK-3: admin card-save uses the synthetic booking_id 'admin_card_save'; sign it too
+    // so the GET handler accepts it (the handler skips processing for this id).
+    {
+      const _sigAdmin = signPaymentCallback('admin_card_save');
+      paymentData.return_url = `${backendUrl}/api/payment/ozow-result?status=success&booking_id=admin_card_save${_sigAdmin}`;
+      paymentData.cancel_url = `${backendUrl}/api/payment/ozow-result?status=cancel&booking_id=admin_card_save${_sigAdmin}`;
+    }
     paymentData.notify_url = `${backendUrl}/api/payment/itn`;
     if (adminName) paymentData.name_first = adminName.split(' ')[0];
     if (adminEmail) paymentData.email_address = adminEmail;
@@ -8696,7 +8754,7 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
 // Shows a success/cancel page AND triggers Firestore + WhatsApp update as fallback.
 // The ITN webhook may not reach Render (free tier sleep), so this is the reliable path.
 app.get('/api/payment/ozow-result', async (req, res) => {
-  const { status, booking_id } = req.query;
+  const { status, booking_id, t, exp } = req.query;
   const isSuccess = status === 'success';
   // Sanitise user-controlled booking_id to prevent XSS
   const safeBookingId = String(booking_id || '').replace(/[<>"'&]/g, '');
@@ -8724,7 +8782,35 @@ h1{color:${color};margin:0 0 16px}p{color:#555;line-height:1.6;margin:0}</style>
   // ── FALLBACK: Process payment directly since ITN may not reach Render (free tier sleep) ──
   // processSuccessfulPayment has idempotency (ALREADY_VERIFIED transaction), so calling from
   // both ozow-result AND ITN is safe — only the first one processes.
+  //
+  // LK-3 (May 2026): we MUST verify the signed callback token before processing
+  // payment, otherwise an attacker can hit this URL with any booking_id and
+  // mark it paid. Fail-closed: invalid/missing token → render the page (above)
+  // but DO NOT call processSuccessfulPayment.
   if (isSuccess && booking_id) {
+    // Skip admin card-save synthetic id (no payment to process — PayFast handles tokenisation server-side)
+    if (booking_id === 'admin_card_save') {
+      console.log('[ozow-result] admin_card_save callback — no booking processing needed');
+      return;
+    }
+    const sigCheck = verifyPaymentCallback(booking_id, t, exp);
+    if (!sigCheck.ok) {
+      console.warn(`[ozow-result] SECURITY: rejecting unsigned/invalid callback for booking_id="${safeBookingId}" reason=${sigCheck.reason} ip=${req.ip || req.headers['x-forwarded-for'] || 'unknown'} ua="${String(req.headers['user-agent'] || '').slice(0, 80)}"`);
+      try {
+        await admin.firestore().collection('error_logs').add({
+          error_type: 'payment_callback_rejected',
+          severity: 'high',
+          source: 'livekit_backend',
+          description: `Rejected /api/payment/ozow-result callback (no/invalid signature). reason=${sigCheck.reason}, booking_id=${safeBookingId}`,
+          booking_id: safeBookingId,
+          ip: req.ip || req.headers['x-forwarded-for'] || 'unknown',
+          user_agent: String(req.headers['user-agent'] || '').slice(0, 200),
+          created_at: admin.firestore.FieldValue.serverTimestamp(),
+          read: false,
+        });
+      } catch (_) {}
+      return; // page already sent — do NOT process payment
+    }
     try {
       const preCheck = await admin.firestore().collection('tasksManagement').doc(booking_id).get();
       const preData = preCheck.exists ? preCheck.data() : {};
