@@ -146,7 +146,10 @@ async function notifyLinkedCustomer(firestore, { phone, userId, title, body, dat
       if (t && !seen.has(t)) { seen.add(t); tokens.push(t); }
     }
 
-    // Send FCM push
+    // Send FCM push (HIGH-9: track total failure so admin sees it)
+    let fcmOk = 0;
+    let fcmFail = 0;
+    let lastFcmErr = '';
     for (const tok of tokens) {
       try {
         await admin.messaging().send({
@@ -155,10 +158,26 @@ async function notifyLinkedCustomer(firestore, { phone, userId, title, body, dat
           data: { ...data, user_type: 'customer' },
           android: { priority: 'high', notification: { channelId: 'order_request_channel', sound: 'sound' } },
         });
+        fcmOk += 1;
         console.log(`[push] Customer ${custUserId} notified via ${tok.substring(0, 15)}...`);
       } catch (fcmErr) {
-        console.warn(`[push] Customer FCM failed: ${fcmErr.message}`);
+        fcmFail += 1;
+        lastFcmErr = fcmErr.message || String(fcmErr);
+        console.warn(`[push] Customer FCM failed: ${lastFcmErr}`);
       }
+    }
+    const allFcmFailed = tokens.length > 0 && fcmOk === 0;
+    if (allFcmFailed) {
+      try {
+        await logErrorToAdmin(
+          'fcm_total_failure',
+          `Customer push failed on ALL ${tokens.length} tokens for user ${custUserId}: ${lastFcmErr}`,
+          'whatsapp_bot.notifyLinkedCustomer',
+          lastFcmErr,
+          (data && data.booking_id) || '',
+          'high'
+        );
+      } catch (_) {}
     }
 
     // Write in-app notification
@@ -171,6 +190,10 @@ async function notifyLinkedCustomer(firestore, { phone, userId, title, body, dat
       booking_id: data.booking_id || '',
       read: false,
       view: false,
+      push_delivery: tokens.length === 0 ? 'no_token' : (allFcmFailed ? 'failed' : (fcmFail > 0 ? 'partial' : 'sent')),
+      push_tokens_total: tokens.length,
+      push_tokens_ok: fcmOk,
+      push_tokens_fail: fcmFail,
       created_at: new Date().toISOString(),
     });
   } catch (err) {
@@ -223,22 +246,35 @@ async function sendWhatsAppImage(to, imageUrl, caption) {
   }
 
   // Pre-flight: make sure the URL resolves and returns an image content-type.
-  // WhatsApp rejects broken/non-image URLs silently from the client's POV.
-  try {
-    const head = await fetch(imageUrl, { method: 'HEAD', signal: AbortSignal.timeout(6000), redirect: 'follow' });
-    if (!head.ok) {
-      console.warn('[wa-image] HEAD failed', head.status, imageUrl);
-      return { ok: false, error: `head_${head.status}` };
+  // LOW-20: retry HEAD once on 5xx so a transient upstream blip doesn't
+  // drop the product image entirely. 4xx is fatal (no retry).
+  let headOkOrFatal = false;
+  let lastHeadErr = '';
+  for (let attempt = 0; attempt < 2 && !headOkOrFatal; attempt++) {
+    try {
+      const head = await fetch(imageUrl, { method: 'HEAD', signal: AbortSignal.timeout(6000), redirect: 'follow' });
+      if (head.ok) {
+        const ct = String(head.headers.get('content-type') || '').toLowerCase();
+        if (!ct.startsWith('image/')) {
+          console.warn('[wa-image] wrong content-type:', ct, imageUrl);
+          return { ok: false, error: `bad_ct_${ct}` };
+        }
+        headOkOrFatal = true;
+        break;
+      }
+      lastHeadErr = `head_${head.status}`;
+      if (head.status < 500) {
+        console.warn('[wa-image] HEAD failed', head.status, imageUrl);
+        return { ok: false, error: lastHeadErr };
+      }
+      console.warn(`[wa-image] HEAD ${head.status} (attempt ${attempt + 1}/2), retrying:`, imageUrl);
+    } catch (e) {
+      lastHeadErr = 'head_error';
+      console.warn(`[wa-image] HEAD error (attempt ${attempt + 1}/2):`, e.message, imageUrl);
     }
-    const ct = String(head.headers.get('content-type') || '').toLowerCase();
-    if (!ct.startsWith('image/')) {
-      console.warn('[wa-image] wrong content-type:', ct, imageUrl);
-      return { ok: false, error: `bad_ct_${ct}` };
-    }
-  } catch (e) {
-    console.warn('[wa-image] HEAD error:', e.message, imageUrl);
-    return { ok: false, error: 'head_error' };
+    if (!headOkOrFatal && attempt === 0) await new Promise(r => setTimeout(r, 500));
   }
+  if (!headOkOrFatal) return { ok: false, error: lastHeadErr || 'head_error' };
 
   try {
     const res = await fetch(`${WA_API}/${phoneId}/messages`, {
@@ -358,8 +394,12 @@ async function logChatMessage(phone, direction, text, opts = {}) {
       toolsCalled: opts.toolsCalled || [],
       bookingRef: opts.bookingRef || null,
     };
-    // Write message doc (fire-and-forget)
-    chatRef.collection('messages').add(msgData).catch(() => {});
+    // HIGH-8: log write failures so admin sees chat-history loss instead of
+    // the prior silent .catch(()=>{}).
+    chatRef.collection('messages').add(msgData).catch(err => {
+      console.warn('[chatLog] message add failed:', err.message);
+      logErrorToAdmin('chat_log_write_failure', `wa_chat_logs message add failed for ${phone}: ${err.message}`, 'whatsapp_bot.logChatMessage', err.message, opts.bookingRef || '', 'medium').catch(() => {});
+    });
     // Update conversation summary
     chatRef.set({
       phone,
@@ -368,7 +408,10 @@ async function logChatMessage(phone, direction, text, opts = {}) {
       lastActivity: admin.firestore.FieldValue.serverTimestamp(),
       linkedUserId: opts.linkedUserId || null,
       displayName: opts.displayName || null,
-    }, { merge: true }).catch(() => {});
+    }, { merge: true }).catch(err => {
+      console.warn('[chatLog] summary set failed:', err.message);
+      logErrorToAdmin('chat_log_write_failure', `wa_chat_logs summary set failed for ${phone}: ${err.message}`, 'whatsapp_bot.logChatMessage', err.message, opts.bookingRef || '', 'medium').catch(() => {});
+    });
   } catch (e) {
     console.error('[chatLog] Error:', e.message);
   }
@@ -376,7 +419,7 @@ async function logChatMessage(phone, direction, text, opts = {}) {
 
 // ─── Download media from WhatsApp Cloud API ───
 
-async function downloadWhatsAppMedia(mediaId) {
+async function downloadWhatsAppMedia(mediaId, opts = {}) {
   const token = process.env.WHATSAPP_ACCESS_TOKEN;
   if (!token || !mediaId) return null;
   try {
@@ -397,9 +440,17 @@ async function downloadWhatsAppMedia(mediaId) {
     });
     if (!dlRes.ok) { console.error('[wa-media] download failed:', dlRes.status); return null; }
     const buffer = Buffer.from(await dlRes.arrayBuffer());
-    // Reject files larger than 10MB to prevent memory exhaustion
+    // LOW-21: tell the customer why their file was dropped instead of
+    // failing silently. Caller passes { phone } when known.
     if (buffer.length > 10 * 1024 * 1024) {
-      console.warn(`[wa-media] Buffer too large (${(buffer.length / 1024 / 1024).toFixed(1)}MB), skipping`);
+      const sizeMb = (buffer.length / 1024 / 1024).toFixed(1);
+      console.warn(`[wa-media] Buffer too large (${sizeMb}MB), skipping`);
+      if (opts.phone) {
+        try {
+          await sendWhatsAppMessage(opts.phone,
+            `⚠️ That file is too large (${sizeMb}MB). Please send a smaller image or short video (under 10MB).`);
+        } catch (_) {}
+      }
       return null;
     }
     const mimeType = meta.mime_type || 'image/jpeg';
@@ -900,14 +951,34 @@ setInterval(async () => {
       const rejCount = data.rfq_artisan_rejection_count || 0;
       console.log(`[timeout] Booking ${doc.id} stuck ${Math.round((Date.now() - assignedAt.getTime()) / 60000)}min, rejections=${rejCount}`);
 
-      // Escalate to admin after timeout
-      await doc.ref.update({
-        status: 'pending_admin_review',
-        rfq_status: 'timeout_escalated',
-        rfq_timeout_at: new Date().toISOString(),
-        rfq_timeout_reason: `No artisan accepted within 30 minutes (${rejCount} rejections)`,
-        updated_at: new Date().toISOString(),
-      });
+      // HIGH-7: race-guard the escalation against manual admin assignment
+      // happening at the same moment. Only flip to admin_review if the doc
+      // is STILL in pending_artisan_acceptance.
+      let escalated = false;
+      try {
+        await firestore.runTransaction(async (txn) => {
+          const fresh = await txn.get(doc.ref);
+          if (!fresh.exists) return;
+          const fd = fresh.data() || {};
+          const curStatus = String(fd.status || '').toLowerCase();
+          if (curStatus !== 'pending_artisan_acceptance') {
+            console.log(`[timeout] Booking ${doc.id} no longer pending_artisan_acceptance (now=${curStatus}) — skipping escalation`);
+            return;
+          }
+          txn.update(doc.ref, {
+            status: 'pending_admin_review',
+            rfq_status: 'timeout_escalated',
+            rfq_timeout_at: new Date().toISOString(),
+            rfq_timeout_reason: `No artisan accepted within 30 minutes (${rejCount} rejections)`,
+            updated_at: new Date().toISOString(),
+          });
+          escalated = true;
+        });
+      } catch (txErr) {
+        console.warn(`[timeout] transaction failed for ${doc.id}:`, txErr.message);
+        continue;
+      }
+      if (!escalated) continue;
       // Mirror to tasksManagement
       try {
         await firestore.collection('tasksManagement').doc(doc.id).update({
@@ -955,8 +1026,38 @@ async function restoreSessionFromFirestore(session) {
     const lastTs = data.lastActivity?.toMillis?.() || data.lastActivity || 0;
     if (Date.now() - lastTs > SESSION_TTL_MS) return;
     // Restore conversation history
+    const PHOTO_TTL_MS = 10 * 60 * 1000;
+    const RFQ_PTR_TTL_MS = 20 * 60 * 1000;
+    const ageMs = Date.now() - lastTs;
     if (Array.isArray(data.messages) && data.messages.length > 0) {
-      session.messages = data.messages;
+      let restored = data.messages;
+      // BHV-7: prune stale photo-analysis context. If photoUrls have aged
+      // out (>10 min), the assistant's earlier vision read of those photos
+      // ("I see a frameless shower door…") is misleading — the customer's
+      // next photo batch is likely a different product. Drop the
+      // image-bearing user message AND the assistant reply immediately
+      // following it, so the matcher runs fresh against the new photos.
+      if (ageMs > PHOTO_TTL_MS) {
+        const isImageMsg = (m) => m && m.role === 'user' && Array.isArray(m.content)
+          && m.content.some(c => c && c.type === 'text' && typeof c.text === 'string' && c.text.includes('[image sent]'));
+        const filtered = [];
+        let droppedAny = false;
+        for (let i = 0; i < restored.length; i++) {
+          const m = restored[i];
+          if (isImageMsg(m)) {
+            droppedAny = true;
+            // Also skip the next assistant message (the vision analysis reply).
+            if (restored[i + 1] && restored[i + 1].role === 'assistant') i += 1;
+            continue;
+          }
+          filtered.push(m);
+        }
+        if (droppedAny) {
+          console.log(`[session] BHV-7: pruned stale photo-analysis context (age ${Math.round(ageMs/1000)}s > ${PHOTO_TTL_MS/1000}s); ${restored.length - filtered.length} msg(s) dropped`);
+        }
+        restored = filtered;
+      }
+      session.messages = restored;
       // Drop orphaned tool messages at the start
       while (session.messages.length > 0 && session.messages[0].role === 'tool') {
         session.messages.shift();
@@ -964,21 +1065,30 @@ async function restoreSessionFromFirestore(session) {
     }
     // Restore linked account
     if (data.linkedUserId) session.linkedUserId = data.linkedUserId;
-    // Restore photo URLs and last booking ID
-    if (Array.isArray(data.photoUrls) && data.photoUrls.length > 0) {
+    // HIGH-4: per-field TTL on volatile context (photos, RFQ pointer).
+    // Without this we restore 29-min-old photo URLs (likely deleted from
+    // Storage already) and stale lastRfqId pointers from cancelled RFQs.
+    if (ageMs <= PHOTO_TTL_MS && Array.isArray(data.photoUrls) && data.photoUrls.length > 0) {
       session.photoUrls = data.photoUrls;
     }
     if (data.lastBookingId) session.lastBookingId = data.lastBookingId;
     if (data.lastBookingCost) session.lastBookingCost = data.lastBookingCost;
-    if (data.lastRfqId) session.lastRfqId = data.lastRfqId;
+    if (ageMs <= RFQ_PTR_TTL_MS && data.lastRfqId) session.lastRfqId = data.lastRfqId;
     if (data.pendingRatingBookingId) session.pendingRatingBookingId = data.pendingRatingBookingId;
     if (data.sharedAddress) session.sharedAddress = data.sharedAddress;
     if (data.sharedLatitude) session.sharedLatitude = data.sharedLatitude;
     if (data.sharedLongitude) session.sharedLongitude = data.sharedLongitude;
-    if (data.promoCode) {
+    // BHV-10: TTL on promo restore. Promos can be disabled by admin between
+    // sessions; if a session is older than 30 min, force the customer to
+    // re-apply so we re-validate against the live promo_codes collection.
+    const PROMO_TTL_MS = 30 * 60 * 1000;
+    if (ageMs <= PROMO_TTL_MS && data.promoCode) {
       session.promoCode = data.promoCode;
       session.promoDiscount = data.promoDiscount || 0;
       session.promoDiscountType = data.promoDiscountType || 'fixed';
+      if (data.promoId) session.promoId = data.promoId;
+    } else if (data.promoCode) {
+      console.log(`[session] Promo ${data.promoCode} not restored (age ${Math.round(ageMs/1000)}s > ${PROMO_TTL_MS/1000}s TTL) — customer must re-apply`);
     }
     console.log(`[session] Restored ${session.phone} from Firestore (${session.messages.length} msgs, ${session.photoUrls.length} photos)`);
   } catch (e) {
@@ -1021,6 +1131,196 @@ async function findUserByPhone(phone) {
   }
 
   return null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// SHARED FIXED-PRICE MATCHER (BHV-2 — May 3 2026)
+// Single source of truth for matching a customer's job description against
+// the admin-managed `tasks` collection. Previously duplicated in BOTH
+// `case 'lookup_pricing'` AND `case 'create_booking'` with subtly different
+// helper names and a third copy in livekit-backend. The R480 "shower door
+// installation" bug took TWO commits to fix because the second copy was
+// missed. From now on, every call site uses this function.
+//
+// Inputs:
+//   subcategory  — the customer's specific job phrase ("shower door installation")
+//   description  — fallback if subcategory empty
+//   category     — slug or name (used for synonym expansion only)
+//   taskResults  — pre-fetched array of {name, cost, category_id, category_name}
+//
+// Output: { matched: bool, name?, cost?, score?, action?, sharedCount?,
+//           category_name?, rejected: [...debug info] }
+//
+// Guards (DO NOT WEAKEN — every guard exists because of a real customer incident):
+//  1. Stopword filter: generic words ("repair","door","shower" alone) don't count.
+//  2. Action verb compatibility: install ≠ replace ≠ repair ≠ paint.
+//  3. "Labour only" tasks require explicit ask.
+//  4. Score floor: 70 normal, 85 for install/replace.
+//  5. Hardware-install guard (May 3 2026): install/replace requires substring
+//     containment OR ≥2 distinctive shared words.
+//  6. Suspicious-low-cost gate (May 3 2026): install/replace match < R800 → discard.
+// ─────────────────────────────────────────────────────────────────────────
+const _MATCHER_STOPWORDS = new Set([
+  'repair','repairs','repairing','fix','fixing','fixes',
+  'install','installation','installing','installs',
+  'replace','replacement','replacing','replaces','swap','swapping','change',
+  'service','services','servicing','maintain','maintenance',
+  'general','standard','basic','simple',
+  'work','works','job','jobs','task','tasks',
+  'problem','problems','issue','issues',
+  'need','needs','want','wants',
+  'please','help','quote','price','pricing','cost',
+  'home','house','room','door','window','wall','floor','frame',
+]);
+const _MATCHER_SYNONYMS = {
+  plumbing:    ['toilet','cistern','basin','bath','tap','pipe','drain','geyser','shower','sink','plumb','blocked','leak','water','bathroom','kitchen'],
+  electrical:  ['light','switch','socket','wire','wiring','breaker','db board','plug','circuit','electric','power','volt'],
+  painting:    ['paint','wall','ceiling','enamel','pva','varnish','roof','garage','door'],
+  cleaning:    ['clean','wash','deep clean','carpet','window','scrub'],
+  tiling:      ['tile','floor','grout','ceramic'],
+  carpentry:   ['wood','cabinet','shelf','cupboard','door','frame','carpenter'],
+  solar:       ['panel','pv','inverter','battery','geyser','energy'],
+  maintenance: ['repair','fix','maintain','service','general'],
+  bathroom:    ['toilet','cistern','basin','bath','shower','tap','plumb','blocked','drain'],
+  kitchen:     ['tap','mixer','sink','faucet','cupboard'],
+  door:        ['lock','handle','hinge','frame','door'],
+  window:      ['glass','pane','frame','window'],
+  installation:['install','setup','mount','fit'],
+};
+const _MATCHER_ACTIONS = {
+  install:  ['install','installation','installing','installs','fit','fitting','mount','mounting','setup','set'],
+  replace:  ['replace','replacement','replacing','replaces','swap','swapping','change'],
+  repair:   ['repair','repairs','repairing','fix','fixing','fixes','mend','mending'],
+  inspect:  ['inspect','inspection','inspecting','check','checking','assess','assessment','report'],
+  clean:    ['clean','cleaning','wash','washing','scrub','scrubbing'],
+  unblock:  ['unblock','unblocking','clear','clearing'],
+  service:  ['service','servicing','maintain','maintenance'],
+  paint:    ['paint','painting','varnish','varnishing','enamel'],
+};
+
+function _matcherNormalize(s) { return String(s || '').toLowerCase().replace(/[_\-]+/g, ' ').trim(); }
+function _matcherStem(w) { return w.replace(/(ing|ed|tion|ment|ness|able|ible|er|est|ly|s)$/i, ''); }
+function _matcherDistinctive(words) { return words.filter(w => !_MATCHER_STOPWORDS.has(w) && !_MATCHER_STOPWORDS.has(_matcherStem(w))); }
+function _matcherActionOf(text) {
+  const tokens = String(text || '').toLowerCase().split(/[^a-z]+/).filter(Boolean);
+  for (const tk of tokens) {
+    for (const [grp, verbs] of Object.entries(_MATCHER_ACTIONS)) {
+      if (verbs.includes(tk)) return grp;
+    }
+  }
+  return null;
+}
+function _matcherFuzzy(qNorm, sNorm) {
+  if (sNorm === qNorm) return true;
+  const containHas = (phrase) => _matcherDistinctive(phrase.split(/\s+/).filter(w => w.length >= 3)).length >= 1;
+  if (sNorm.includes(qNorm) && qNorm.length >= 4 && containHas(qNorm)) return true;
+  if (qNorm.includes(sNorm) && sNorm.length >= 4 && containHas(sNorm)) return true;
+  const qW = qNorm.split(/\s+/).filter(w => w.length >= 4);
+  const sW = sNorm.split(/\s+/).filter(w => w.length >= 4);
+  const qD = _matcherDistinctive(qW);
+  const sD = _matcherDistinctive(sW);
+  if (qD.some(w => sD.includes(w))) return true;
+  const qS = qD.map(_matcherStem).filter(s => s.length >= 4);
+  const sS = sD.map(_matcherStem).filter(s => s.length >= 4);
+  if (qS.some(qs => sS.includes(qs))) return true;
+  return false;
+}
+function _matcherScore(qNorm, sNorm) {
+  if (sNorm === qNorm) return 100;
+  if (sNorm.includes(qNorm)) return 90;
+  if (qNorm.includes(sNorm)) return 85;
+  const qW = qNorm.split(/\s+/).filter(w => w.length >= 3);
+  const sW = sNorm.split(/\s+/).filter(w => w.length >= 3);
+  const wordHits = qW.filter(w => sNorm.includes(w)).length + sW.filter(w => qNorm.includes(w)).length;
+  if (wordHits >= 2) return 70 + wordHits;
+  if (wordHits === 1) return 60;
+  const qS = qW.map(_matcherStem), sS = sW.map(_matcherStem);
+  const stemHits = qS.filter(qs => sS.some(ss => qs === ss || qs.includes(ss) || ss.includes(qs))).length;
+  if (stemHits > 0) return 40 + stemHits;
+  return 20;
+}
+
+/**
+ * Find a fixed-price task matching the customer's request.
+ * Returns { matched, name, cost, ... } or { matched: false, rejected: [...] }.
+ */
+function findFixedPriceMatch({ subcategory, description, taskResults }) {
+  const subQuery = String(subcategory || description || '').toLowerCase();
+  if (!subQuery) return { matched: false, rejected: [] };
+  const subNorm = _matcherNormalize(subQuery);
+  const qAction = _matcherActionOf(subQuery);
+  const askedLabourOnly = /\b(lab[ou]r)\s*only\b/i.test(subQuery);
+  const qWordsAll = subNorm.split(/\s+/).filter(w => w.length >= 3);
+  const qDistinctive = _matcherDistinctive(qWordsAll);
+  const isHardwareInstall = qAction === 'install' || qAction === 'replace';
+
+  let bestMatch = null;
+  const rejected = [];
+  for (const t of taskResults || []) {
+    if (!t || !t.name || !(t.cost > 0)) continue;
+    const tNorm = _matcherNormalize(t.name);
+
+    if (!_matcherFuzzy(subNorm, tNorm)) continue;
+
+    const sAction = _matcherActionOf(t.name);
+    if (qAction && sAction && qAction !== sAction) {
+      rejected.push({ name: t.name, reason: `action-mismatch q=${qAction} s=${sAction}` });
+      continue;
+    }
+
+    const isLabourOnly = /\b(lab[ou]r)\s*only\b/i.test(t.name);
+    if (isLabourOnly && !askedLabourOnly) {
+      rejected.push({ name: t.name, reason: 'labour-only-not-asked' });
+      continue;
+    }
+
+    const tWordsAll = tNorm.split(/\s+/).filter(w => w.length >= 3);
+    const tDistinctive = _matcherDistinctive(tWordsAll);
+    const sharedDistinctive = qDistinctive.filter(w => tDistinctive.includes(w) || tWordsAll.includes(w));
+
+    if (qDistinctive.length > 0 && sharedDistinctive.length === 0) {
+      rejected.push({ name: t.name, reason: 'no-distinctive-overlap' });
+      continue;
+    }
+
+    if (isHardwareInstall) {
+      const containment = tNorm.includes(subNorm) || subNorm.includes(tNorm);
+      if (!containment && sharedDistinctive.length < 2) {
+        rejected.push({ name: t.name, reason: `hw-install-needs-2-distinctive-or-containment (had ${sharedDistinctive.length})` });
+        continue;
+      }
+    }
+
+    const score = _matcherScore(subNorm, tNorm);
+    const minScore = isHardwareInstall ? 85 : 70;
+    if (score < minScore) {
+      rejected.push({ name: t.name, reason: `score-${score}-min-${minScore}` });
+      continue;
+    }
+
+    if (!bestMatch || score > bestMatch.score) {
+      bestMatch = {
+        name: t.name,
+        cost: t.cost,
+        score,
+        action: qAction,
+        sharedCount: sharedDistinctive.length,
+        category_id: t.category_id || '',
+        category_name: t.category_name || '',
+      };
+    }
+  }
+
+  // Suspicious-low-cost gate for install/replace.
+  if (bestMatch && (bestMatch.action === 'install' || bestMatch.action === 'replace') && bestMatch.cost < 800) {
+    rejected.push({ name: bestMatch.name, reason: `suspicious-low-cost-R${bestMatch.cost}-for-${bestMatch.action}` });
+    bestMatch = null;
+  }
+
+  if (bestMatch) {
+    return { matched: true, ...bestMatch, rejected };
+  }
+  return { matched: false, rejected };
 }
 
 // ─── OpenAI tools for WhatsApp conversation ───
@@ -2210,169 +2510,33 @@ async function executeWaTool(name, args, session) {
         const catSlug = (args.category || '').toLowerCase().replace(/\s+/g, '_');
         const subQuery = (args.subcategory || args.description || '').toLowerCase();
 
-        // Reuse fuzzy matching helpers (stem, synonyms, fuzzyMatch)
-        const _normalize = (s) => s.toLowerCase().replace(/[_\-]+/g, ' ').trim();
-        const _stem = (w) => w.replace(/(ing|ed|tion|ment|ness|able|ible|er|est|ly|s)$/i, '');
-        const _synonyms = {
-          plumbing:    ['toilet', 'cistern', 'basin', 'bath', 'tap', 'pipe', 'drain', 'geyser', 'shower', 'sink', 'plumb', 'blocked', 'leak', 'water', 'bathroom', 'kitchen'],
-          electrical:  ['light', 'switch', 'socket', 'wire', 'wiring', 'breaker', 'db board', 'plug', 'circuit', 'electric', 'power', 'volt'],
-          painting:    ['paint', 'wall', 'ceiling', 'enamel', 'pva', 'varnish', 'roof', 'garage', 'door'],
-          cleaning:    ['clean', 'wash', 'deep clean', 'carpet', 'window', 'scrub'],
-          tiling:      ['tile', 'floor', 'grout', 'ceramic'],
-          carpentry:   ['wood', 'cabinet', 'shelf', 'cupboard', 'door', 'frame', 'carpenter'],
-          solar:       ['panel', 'pv', 'inverter', 'battery', 'geyser', 'energy'],
-          maintenance: ['repair', 'fix', 'maintain', 'service', 'general'],
-          bathroom:    ['toilet', 'cistern', 'basin', 'bath', 'shower', 'tap', 'plumb', 'blocked', 'drain'],
-          kitchen:     ['tap', 'mixer', 'sink', 'faucet', 'cupboard'],
-          door:        ['lock', 'handle', 'hinge', 'frame', 'door'],
-          window:      ['glass', 'pane', 'frame', 'window'],
-          installation:['install', 'setup', 'mount', 'fit'],
-        };
-        const _fuzzyMatch = (qNorm, sNorm) => {
-          if (sNorm.includes(qNorm) || qNorm.includes(sNorm)) return true;
-          const qW = qNorm.split(/\s+/).filter(w => w.length >= 3);
-          const sW = sNorm.split(/\s+/).filter(w => w.length >= 3);
-          if (qW.some(w => sNorm.includes(w)) || sW.some(w => qNorm.includes(w))) return true;
-          const qS = qW.map(_stem), sS = sW.map(_stem);
-          if (qS.some(qs => sS.some(ss => qs === ss || qs.includes(ss) || ss.includes(qs)))) return true;
-          const expanded = new Set(qW.concat(qS));
-          for (const w of qW.concat(qS)) {
-            if (_synonyms[w]) _synonyms[w].forEach(s => expanded.add(s));
-            // Bidirectional: if word appears in a category's synonyms, add the category key + all siblings
-            for (const [key, syns] of Object.entries(_synonyms)) {
-              if (syns.includes(w)) {
-                expanded.add(key);
-                syns.forEach(s => expanded.add(s));
-              }
-            }
-          }
-          const exp = [...expanded];
-          if (exp.some(qe => sW.some(sw => sw.includes(qe) || qe.includes(sw)))
-              || exp.some(qe => sS.some(ss => ss.includes(qe) || qe.includes(ss)))) return true;
-          return false;
-        };
-        const subNorm = _normalize(subQuery);
-
-        // Score a match by specificity (higher = better)
-        const _matchScore = (qNorm, sNorm) => {
-          if (sNorm === qNorm) return 100;                                   // exact
-          if (sNorm.includes(qNorm)) return 90;                              // query is substring of task
-          if (qNorm.includes(sNorm)) return 85;                              // task is substring of query
-          const qW = qNorm.split(/\s+/).filter(w => w.length >= 3);
-          const sW = sNorm.split(/\s+/).filter(w => w.length >= 3);
-          // Count how many query words appear literally in the task name
-          const wordHits = qW.filter(w => sNorm.includes(w)).length + sW.filter(w => qNorm.includes(w)).length;
-          if (wordHits >= 2) return 70 + wordHits;                           // multiple word hits
-          if (wordHits === 1) return 60;                                     // single word hit
-          const qS = qW.map(_stem), sS = sW.map(_stem);
-          const stemHits = qS.filter(qs => sS.some(ss => qs === ss || qs.includes(ss) || ss.includes(qs))).length;
-          if (stemHits > 0) return 40 + stemHits;                            // stem match
-          return 20;                                                         // synonym-only match
-        };
-
-        // SOLE SOURCE: tasks collection (admin-managed fixed prices)
-        // pricingGuidance is NOT used (stale default data, deleted).
-        //
-        // STRICT matching guards (added Apr 28 2026 after R480 "varnish door
-        // frame Labour only" was wrongly returned for "shower door
-        // installation"):
-        //   1. Drop stopwords like "install", "door", "shower" alone — a
-        //      single generic-word match is not enough.
-        //   2. Action verb of the query must align with the task's action
-        //      (install ≠ varnish ≠ replace ≠ repair).
-        //   3. Require score >= 70 (multi-word hit OR substring containment).
-        //   4. Reject "labour only" / "labor only" tasks unless the customer
-        //      explicitly asked for labour-only pricing — otherwise they get
-        //      a wrong "all-in" expectation.
-        const _STOPWORDS = new Set([
-          'repair','repairs','repairing','fix','fixing','fixes',
-          'install','installation','installing','installs',
-          'replace','replacement','replacing',
-          'service','services','servicing','maintain','maintenance',
-          'general','standard','basic','simple',
-          'work','works','job','jobs','task','tasks',
-          'problem','problems','issue','issues',
-          'need','needs','want','wants',
-          'please','help','quote','price','pricing','cost',
-          'home','house','room','door','window','wall','floor','frame',
-        ]);
-        const _distinctive = (words) => words.filter(w => !_STOPWORDS.has(w) && !_STOPWORDS.has(_stem(w)));
-        const _ACTIONS = {
-          install: ['install','installation','installing','installs','fit','fitting','mount','mounting','setup'],
-          replace: ['replace','replacement','replacing','swap','change'],
-          repair:  ['repair','repairs','repairing','fix','fixing','mend'],
-          paint:   ['paint','painting','varnish','varnishing','enamel'],
-          inspect: ['inspect','inspection','check','assess','assessment','report'],
-          clean:   ['clean','cleaning','wash','washing','scrub'],
-          unblock: ['unblock','unblocking','clear','clearing'],
-          service: ['service','servicing','maintain','maintenance'],
-        };
-        const _actionOf = (text) => {
-          const tokens = (text || '').toLowerCase().split(/[^a-z]+/).filter(Boolean);
-          for (const tk of tokens) {
-            for (const [grp, verbs] of Object.entries(_ACTIONS)) {
-              if (verbs.includes(tk)) return grp;
-            }
-          }
-          return null;
-        };
-
         if (subQuery) {
+          // BHV-2: shared matcher (defined at module top) — same code path as
+          // lookup_pricing. All hardware-install / labour-only / suspicious
+          // -low-cost guards live in findFixedPriceMatch.
           const taskSnap = await firestore.collection('tasks').limit(200).get();
-          let bestMatch = null;
-          const qAction = _actionOf(subQuery);
-          const qWordsAll = subNorm.split(/\s+/).filter(w => w.length >= 3);
-          const qDistinctive = _distinctive(qWordsAll);
+          const taskResults = [];
           for (const td of taskSnap.docs) {
             const d = td.data();
             const status = (d.status || '').toLowerCase();
             if (status && status !== 'publish' && status !== 'active') continue;
             const name = (d.name || d.title || d.task_name || '').toString();
             const cost = parseFloat(d.client_rate || d.cost || d.clientRate || d.price || d.amount || 0);
-            if (!name || !(cost > 0)) continue;
-
-            const tNorm = _normalize(name);
-            if (!_fuzzyMatch(subNorm, tNorm)) continue;
-
-            // Action compatibility: install ≠ varnish ≠ replace ≠ repair
-            const sAction = _actionOf(name);
-            if (qAction && sAction && qAction !== sAction) {
-              console.log(`[create_booking] Reject "${name}" — action mismatch (q=${qAction} vs s=${sAction})`);
-              continue;
-            }
-
-            // "Labour only" / "labor only" tasks require explicit ask.
-            const isLabourOnly = /\b(labour|labor)\s*only\b/i.test(name);
-            const askedLabourOnly = /\b(labour|labor)\s*only\b/i.test(subQuery);
-            if (isLabourOnly && !askedLabourOnly) {
-              console.log(`[create_booking] Reject "${name}" — labour-only task but customer didn't ask for labour-only`);
-              continue;
-            }
-
-            // Distinctive overlap: at least one non-generic shared word.
-            const tWordsAll = tNorm.split(/\s+/).filter(w => w.length >= 3);
-            const tDistinctive = _distinctive(tWordsAll);
-            const sharedDistinctive = qDistinctive.filter(w => tDistinctive.includes(w) || tWordsAll.includes(w));
-            if (qDistinctive.length > 0 && sharedDistinctive.length === 0) {
-              console.log(`[create_booking] Reject "${name}" — no distinctive word overlap with "${subQuery}"`);
-              continue;
-            }
-
-            const score = _matchScore(subNorm, tNorm);
-            if (score < 70) {
-              console.log(`[create_booking] Reject "${name}" R${cost} — score ${score} < 70 (too generic)`);
-              continue;
-            }
-            if (!bestMatch || score > bestMatch.score) {
-              bestMatch = { name, cost, score };
+            if (name && cost > 0) {
+              taskResults.push({ name, cost, category_id: d.categoryId || d.category_id || '', category_name: d.category_name || d.categoryName || '' });
             }
           }
-          if (bestMatch) {
-            estimatedCost = bestMatch.cost.toString();
+          const result = findFixedPriceMatch({ subcategory: subQuery, taskResults });
+          if (result.matched) {
+            estimatedCost = result.cost.toString();
             pricingSource = 'fixed';
-            console.log(`[create_booking] Best price match: "${bestMatch.name}" R${bestMatch.cost} (score=${bestMatch.score})`);
+            console.log(`[create_booking] Best price match: "${result.name}" R${result.cost} (score=${result.score})`);
           } else {
-            console.log(`[create_booking] No fixed-price task matched "${subQuery}" — will RFQ`);
+            if (result.rejected && result.rejected.length) {
+              console.log(`[create_booking] No match for "${subQuery}"; rejected ${result.rejected.length}:`, result.rejected.slice(0, 5).map(r => `${r.name}[${r.reason}]`).join(', '));
+            } else {
+              console.log(`[create_booking] No fixed-price task matched "${subQuery}" — will RFQ`);
+            }
           }
         }
       } catch (e) {
@@ -2949,92 +3113,12 @@ async function executeWaTool(name, args, session) {
       try {
         const catSlug = (args.category || '').toLowerCase().replace(/\s+/g, '_');
         const subQuery = (args.subcategory || '').toLowerCase();
-
-        // Fuzzy matching helpers
-        const normalize = (s) => s.toLowerCase().replace(/[_\-]+/g, ' ').trim();
-        const stem = (w) => w.replace(/(ing|ed|tion|ment|ness|able|ible|er|est|ly|s)$/i, '');
-        // Comprehensive 14-category synonym map (matches livekit-backend)
-        const SYNONYMS = {
-          plumbing:    ['toilet', 'cistern', 'basin', 'bath', 'tap', 'pipe', 'drain', 'geyser', 'shower', 'sink', 'plumb', 'blocked', 'leak', 'water', 'bathroom', 'kitchen'],
-          electrical:  ['light', 'switch', 'socket', 'wire', 'wiring', 'breaker', 'db board', 'plug', 'circuit', 'electric', 'power', 'volt'],
-          painting:    ['paint', 'wall', 'ceiling', 'enamel', 'pva', 'varnish', 'roof', 'garage', 'door'],
-          cleaning:    ['clean', 'wash', 'deep clean', 'carpet', 'window', 'scrub'],
-          tiling:      ['tile', 'floor', 'grout', 'ceramic'],
-          carpentry:   ['wood', 'cabinet', 'shelf', 'cupboard', 'door', 'frame', 'carpenter'],
-          solar:       ['panel', 'pv', 'inverter', 'battery', 'geyser', 'energy'],
-          maintenance: ['repair', 'fix', 'maintain', 'service', 'general'],
-          bathroom:    ['toilet', 'cistern', 'basin', 'bath', 'shower', 'tap', 'plumb', 'blocked', 'drain'],
-          kitchen:     ['tap', 'mixer', 'sink', 'faucet', 'cupboard'],
-          door:        ['lock', 'handle', 'hinge', 'frame', 'door'],
-          window:      ['glass', 'pane', 'frame', 'window'],
-          installation:['install', 'setup', 'mount', 'fit'],
-        };
-        const expandWithSynonyms = (words) => {
-          const expanded = new Set(words);
-          for (const w of words) {
-            const stemmed = stem(w);
-            expanded.add(stemmed);
-            // Bidirectional: if word matches a category key, add all its synonyms
-            if (SYNONYMS[w]) SYNONYMS[w].forEach(s => expanded.add(s));
-            if (SYNONYMS[stemmed]) SYNONYMS[stemmed].forEach(s => expanded.add(s));
-            // Reverse: if word appears in a category's synonyms, add the category key + all siblings
-            for (const [key, syns] of Object.entries(SYNONYMS)) {
-              if (syns.includes(w) || syns.includes(stemmed)) {
-                expanded.add(key);
-                syns.forEach(s => expanded.add(s));
-              }
-            }
-          }
-          return [...expanded];
-        };
-        // STRICT fuzzyMatch: only accept DIRECT overlap on a DISTINCTIVE (non-generic) word.
-        // Previous version still matched "shower repair" against "toilet repair" via the
-        // generic word "repair", returning a misleading fixed price. We now exclude a
-        // stopword list of generic action/filler words when scoring word overlap.
-        // Synonyms are still used for category filtering below, but NOT for picking the
-        // specific matched service.
-        const STOPWORDS = new Set([
-          'repair', 'repairs', 'repairing',
-          'fix', 'fixing', 'fixes',
-          'install', 'installation', 'installing', 'installs',
-          'replace', 'replacement', 'replacing',
-          'service', 'services', 'servicing',
-          'maintain', 'maintenance',
-          'general', 'standard', 'basic', 'simple',
-          'work', 'works', 'job', 'jobs', 'task', 'tasks',
-          'problem', 'problems', 'issue', 'issues',
-          'need', 'needs', 'want', 'wants',
-          'please', 'help', 'quote', 'price', 'pricing', 'cost',
-          'home', 'house', 'room',
-        ]);
-        const distinctive = (words) => words.filter(w => !STOPWORDS.has(w) && !STOPWORDS.has(stem(w)));
-        const fuzzyMatch = (queryNorm, svcNorm) => {
-          if (svcNorm === queryNorm) return true;
-          // Full-phrase containment only counts if the contained phrase has ≥1 distinctive word.
-          const containHas = (phrase) => distinctive(phrase.split(/\s+/).filter(w => w.length >= 3)).length >= 1;
-          if (svcNorm.includes(queryNorm) && queryNorm.length >= 4 && containHas(queryNorm)) return true;
-          if (queryNorm.includes(svcNorm) && svcNorm.length >= 4 && containHas(svcNorm)) return true;
-          const qWords = queryNorm.split(/\s+/).filter(w => w.length >= 4);
-          const sWords = svcNorm.split(/\s+/).filter(w => w.length >= 4);
-          const qDist = distinctive(qWords);
-          const sDist = distinctive(sWords);
-          // Require overlap on at least one DISTINCTIVE (non-generic) word.
-          if (qDist.some(w => sDist.includes(w))) return true;
-          // Or at least one shared stem of a distinctive word.
-          const qStems = qDist.map(stem).filter(s => s.length >= 4);
-          const sStems = sDist.map(stem).filter(s => s.length >= 4);
-          if (qStems.some(qs => sStems.includes(qs))) return true;
-          return false;
-        };
-        const subNorm = normalize(subQuery);
-
+        const normalize = _matcherNormalize; // local alias for the price-list builder below
         let matchedService = null;
         let matchedPrice = null;
         let categoryName = args.category || '';
 
         // ── SOLE SOURCE: tasks collection (admin-managed fixed prices) ──
-        // These are the prices set by the admin via the admin app categories.
-        // pricingGuidance collection is NOT used (stale default data, deleted).
         const taskResults = [];
         try {
           const taskSnap = await firestore.collection('tasks').limit(200).get();
@@ -3050,92 +3134,19 @@ async function executeWaTool(name, args, session) {
           }
         } catch (e) { console.warn('[wa-tool] tasks lookup failed:', e.message); }
 
-        // Score a match by specificity (higher = better)
-        const matchScore = (qNorm, sNorm) => {
-          if (sNorm === qNorm) return 100;
-          if (sNorm.includes(qNorm)) return 90;
-          if (qNorm.includes(sNorm)) return 85;
-          const qW = qNorm.split(/\s+/).filter(w => w.length >= 3);
-          const sW = sNorm.split(/\s+/).filter(w => w.length >= 3);
-          const wordHits = qW.filter(w => sNorm.includes(w)).length + sW.filter(w => qNorm.includes(w)).length;
-          if (wordHits >= 2) return 70 + wordHits;
-          if (wordHits === 1) return 60;
-          const qS = qW.map(stem), sS = sW.map(stem);
-          const stemHits = qS.filter(qs => sS.some(ss => qs === ss || qs.includes(ss) || ss.includes(qs))).length;
-          if (stemHits > 0) return 40 + stemHits;
-          return 20;
-        };
-
-        // Action-verb guard: a query about INSTALLATION must not match a task
-        // about REPLACEMENT/INSPECTION/REPAIR (and vice versa). Different action
-        // = different job = different price. April 2026: "solar geyser
-        // installation" was wrongly matched to "geyser element replacement"
-        // (R450) because both share the noun "geyser". Reject such mismatches.
-        const ACTION_GROUPS = {
-          install:  ['install', 'installation', 'installing', 'installs', 'fit', 'fitting', 'mount', 'mounting', 'setup', 'set'],
-          replace:  ['replace', 'replacement', 'replacing', 'replaces', 'swap', 'swapping', 'change'],
-          repair:   ['repair', 'repairs', 'repairing', 'fix', 'fixing', 'fixes', 'mend', 'mending'],
-          inspect:  ['inspect', 'inspection', 'inspecting', 'check', 'checking', 'assess', 'assessment', 'report'],
-          clean:    ['clean', 'cleaning', 'wash', 'washing', 'scrub', 'scrubbing'],
-          unblock:  ['unblock', 'unblocking', 'clear', 'clearing'],
-          service:  ['service', 'servicing', 'maintain', 'maintenance'],
-          paint:    ['paint', 'painting'],
-        };
-        const actionOf = (text) => {
-          const tokens = (text || '').toLowerCase().split(/[^a-z]+/).filter(Boolean);
-          for (const tk of tokens) {
-            for (const [grp, verbs] of Object.entries(ACTION_GROUPS)) {
-              if (verbs.includes(tk)) return grp;
-            }
-          }
-          return null;
-        };
-        const actionsCompatible = (qAction, sAction) => {
-          if (!qAction || !sAction) return true; // unknown on either side → don't block
-          return qAction === sAction;
-        };
-
-        // Try to match subcategory against tasks — pick BEST match
+        // BHV-2: delegate matching to the SHARED helper (defined at module
+        // top). All matching guards (stopwords, action-verb compat,
+        // hardware-install containment/distinctive rules, R800 sanity gate)
+        // live there. Any future tweak applies to BOTH lookup_pricing and
+        // create_booking automatically.
         if (subQuery) {
-          const qAction = actionOf(subQuery);
-          const askedLabourOnly = /\b(lab[ou]r)\s*only\b/i.test(subQuery);
-          let bestMatch = null;
-          const rejected = [];
-          for (const t of taskResults) {
-            const tNorm = normalize(t.name);
-            if (!fuzzyMatch(subNorm, tNorm)) continue;
-            const sAction = actionOf(t.name);
-            if (!actionsCompatible(qAction, sAction)) {
-              rejected.push({ name: t.name, sAction, qAction });
-              continue;
-            }
-            // "Labour only" tasks must not be returned unless the customer
-            // explicitly asked for labour-only pricing — otherwise they'll
-            // think the price covers materials too.
-            const isLabourOnly = /\b(lab[ou]r)\s*only\b/i.test(t.name);
-            if (isLabourOnly && !askedLabourOnly) {
-              rejected.push({ name: t.name, reason: 'labour-only-not-asked' });
-              continue;
-            }
-            const score = matchScore(subNorm, tNorm);
-            // Score floor: 70 = multi-word hit OR substring containment.
-            // Single-word generic matches (60) are too noisy and produce
-            // wrong prices like R480 for "shower door" matching "varnish
-            // door frame".
-            if (score < 70) {
-              rejected.push({ name: t.name, reason: `score-${score}` });
-              continue;
-            }
-            if (!bestMatch || score > bestMatch.score) {
-              bestMatch = { ...t, score };
-            }
-          }
-          if (bestMatch) {
-            matchedService = bestMatch.name;
-            matchedPrice = bestMatch.cost;
-            categoryName = bestMatch.category_name || categoryName;
-          } else if (rejected.length) {
-            console.log(`[lookup_pricing] rejected ${rejected.length} candidate(s) for "${subQuery}" (qAction=${qAction}):`, rejected.map(r => `${r.name}[${r.sAction || r.reason}]`).join(', '));
+          const result = findFixedPriceMatch({ subcategory: subQuery, taskResults });
+          if (result.matched) {
+            matchedService = result.name;
+            matchedPrice = result.cost;
+            categoryName = result.category_name || categoryName;
+          } else if (result.rejected && result.rejected.length) {
+            console.log(`[lookup_pricing] rejected ${result.rejected.length} candidate(s) for "${subQuery}":`, result.rejected.map(r => `${r.name}[${r.reason || r.sAction || ''}]`).join(', '));
           }
         }
 
@@ -3242,6 +3253,45 @@ async function executeWaTool(name, args, session) {
       const bid = args.bookingId || session.lastBookingId;
       if (!bid) return { error: 'Please provide a booking ID.' };
 
+      // HIGH-3: validate session.linkedUserId before letting it influence
+      // the payment context. A stale linkedUserId could otherwise credit
+      // the wrong app account.
+      if (session.linkedUserId && !String(session.linkedUserId).startsWith('wa_')) {
+        try {
+          const linkedDoc = await firestore.collection('users').doc(session.linkedUserId).get();
+          if (!linkedDoc.exists) {
+            console.warn(`[request_payment_link] stale linkedUserId ${session.linkedUserId} (no user doc) — clearing`);
+            session.linkedUserId = null;
+          } else {
+            const u = linkedDoc.data() || {};
+            const phoneFields = [u.phone, u.phoneNumber, u.phone_number, u.contact, u.mobile];
+            const sessDigits = String(session.phone || '').replace(/\D/g, '');
+            const matches = phoneFields.some(p => {
+              const pd = String(p == null ? '' : p).replace(/\D/g, '');
+              if (!pd || !sessDigits) return false;
+              const tail = (s) => s.length >= 9 ? s.slice(-9) : s;
+              return tail(pd) === tail(sessDigits);
+            });
+            if (!matches) {
+              console.warn(`[request_payment_link] linkedUserId ${session.linkedUserId} phone mismatch with session phone ${session.phone} — clearing`);
+              try {
+                await logErrorToAdmin(
+                  'linked_user_phone_mismatch',
+                  `Session linkedUserId ${session.linkedUserId} does not match WA phone ${session.phone}`,
+                  'whatsapp_bot.request_payment_link',
+                  '',
+                  bid,
+                  'high'
+                );
+              } catch (_) {}
+              session.linkedUserId = null;
+            }
+          }
+        } catch (e) {
+          console.warn('[request_payment_link] linkedUserId validation failed:', e.message);
+        }
+      }
+
       let doc = await firestore.collection('futureBookings').doc(bid).get();
       if (!doc.exists) doc = await firestore.collection('tasksManagement').doc(bid).get();
       if (!doc.exists) return { error: `Booking "${bid}" not found.` };
@@ -3306,12 +3356,16 @@ async function executeWaTool(name, args, session) {
       }
 
       // ── Pre-flight double-submit guards ──
-      // Block deposit retry while one is already pending
+      // HIGH-10: deposit_pending without a TTL leaves the booking stuck if
+      // the previous link generation crashed. Allow retry after 5 minutes.
       if (isDeposit && d.payment_status === 'deposit_pending') {
-        return {
-          message: `A deposit payment is already in progress for this booking. Please complete the existing payment or wait a moment before requesting a new one.`,
-          bookingId: bid,
-        };
+        const depPendingAt = d.deposit_pending_at ? Date.parse(d.deposit_pending_at) : 0;
+        if (depPendingAt && (Date.now() - depPendingAt) < 300000) {
+          return {
+            message: `A deposit payment is already in progress for this booking. Please complete the existing payment or wait a few minutes before requesting a new one.`,
+            bookingId: bid,
+          };
+        }
       }
       // Block full-payment retry while one was generated in the last 2 minutes
       // (uses full_pending_at timestamp; if older than 2 min, allow re-issue).
@@ -3366,6 +3420,7 @@ async function executeWaTool(name, args, session) {
             balance_amount: balanceAfterDeposit,
             balance_remaining: balanceAfterDeposit,
             payment_status: 'deposit_pending',
+            deposit_pending_at: nowIso,
             // Clear any stale full-payment marker
             full_pending_at: admin.firestore.FieldValue.delete(),
             updated_at: nowIso,
@@ -5093,27 +5148,112 @@ async function executeWaTool(name, args, session) {
         return { error: 'This RFQ does not have a quote yet. Please wait for the quote to be generated.' };
       }
 
+      // LOW-19: idempotency — don't re-run auto-dispatch on duplicate accept.
+      const ALREADY_ACCEPTED = new Set([
+        'accepted_converted', 'pending_artisan_acceptance', 'rfq_approved_waiting_assignment',
+        'rfq_approved', 'pending_payment', 'paid', 'deposit_paid', 'in_progress', 'completed',
+      ]);
+      const existingRfqStatus = String(data.rfq_status || '').toLowerCase();
+      const existingStatus = String(data.status || '').toLowerCase();
+      if (ALREADY_ACCEPTED.has(existingRfqStatus) || ALREADY_ACCEPTED.has(existingStatus)) {
+        const priceAlready = parseFloat(data.admin_quote_total || data.rfq_total || data.quoted_price || data.cost || '0');
+        session.lastBookingId = rfqId;
+        session.lastBookingCost = priceAlready;
+        return {
+          success: true,
+          message: `Quote for RFQ ${data.rfq_no || rfqId} is already accepted. We'll let you know as soon as an artisan accepts.`,
+          rfqId,
+          deduped: true,
+        };
+      }
+      const TERMINAL_BAD_RFQ = new Set(['rejected', 'cancelled', 'canceled', 'closed', 'expired']);
+      if (TERMINAL_BAD_RFQ.has(existingRfqStatus) || TERMINAL_BAD_RFQ.has(existingStatus)) {
+        return { error: `This quote can no longer be accepted (status: ${existingStatus || existingRfqStatus}).` };
+      }
+
       // Prefer admin-amended totals (set when admin reviews/amends the quote)
       // over the raw AI quoted_price so the client is charged the correct amount.
       const price = data.admin_quote_total
         || data.rfq_total
         || data.quoted_price
         || (data.ai_quote ? data.ai_quote.grand_total : '0');
-      const priceNum = parseFloat(price);
+      const baseCost = parseFloat(price);
+
+      // BHV-1: apply customer's promo code if present. The previous flow
+      // silently dropped session.promoCode on the RFQ path — only
+      // create_booking honoured it. Now mirror that logic here so RFQ
+      // customers get their discount too. After applying, re-derive
+      // deposit/balance from the discounted total.
+      let priceNum = baseCost;
+      let promoApplied = null;
+      if (session.promoCode && session.promoDiscount > 0) {
+        let discount;
+        if (session.promoDiscountType === 'percentage') {
+          discount = Math.round(baseCost * session.promoDiscount / 100 * 100) / 100;
+        } else {
+          discount = Number(session.promoDiscount);
+        }
+        discount = Math.min(discount, baseCost);
+        if (discount > 0) {
+          priceNum = Math.round(Math.max(0, baseCost - discount) * 100) / 100;
+          promoApplied = { code: session.promoCode, discount, type: session.promoDiscountType || 'fixed' };
+          console.log(`[wa-tool] accept_rfq_quote: applied promo ${session.promoCode} -R${discount} (base R${baseCost} -> R${priceNum})`);
+        }
+      }
       const depositAmount = Math.round(priceNum * 0.35 * 100) / 100;
       const balanceAmount = Math.round((priceNum - depositAmount) * 100) / 100;
+
+      // HIGH-6: sanity-check admin-amended totals against the AI baseline.
+      // We don't block — admin may legitimately re-quote — but we surface
+      // any 0.5×–2.0× deviations to error_logs so suspicious typos get caught.
+      try {
+        const aiBase = parseFloat((data.ai_quote && data.ai_quote.grand_total) || data.quoted_price || '0');
+        const adminTotal = parseFloat(data.admin_quote_total || '0');
+        if (aiBase > 0 && adminTotal > 0) {
+          const ratio = adminTotal / aiBase;
+          if (ratio < 0.5 || ratio > 2.0) {
+            await logErrorToAdmin(
+              'admin_quote_outlier',
+              `RFQ ${rfqId}: admin_quote_total R${adminTotal.toFixed(2)} is ${ratio.toFixed(2)}× the AI baseline R${aiBase.toFixed(2)}. Customer accepted at R${priceNum.toFixed(2)}.`,
+              'whatsapp_bot.accept_rfq_quote',
+              '',
+              rfqId,
+              'medium'
+            );
+          }
+        }
+        if (priceNum <= 0 || priceNum > 1000000) {
+          await logErrorToAdmin(
+            'accepted_price_out_of_range',
+            `RFQ ${rfqId} accepted with implausible price R${priceNum}. Review before payment.`,
+            'whatsapp_bot.accept_rfq_quote',
+            '',
+            rfqId,
+            'high'
+          );
+        }
+      } catch (_) {}
 
       // R12K cap: bookings >= R12000 must NOT auto-dispatch. Admin assigns
       // manually (internal team or external artisan). Use the dedicated
       // 'rfq_approved_waiting_assignment' status so the admin RFQ list's
       // "Waiting Assignment" filter surfaces the booking immediately.
+      //
+      // CRITICAL-2 (state-race fix): start ALL accepted RFQs in
+      // 'rfq_approved_waiting_assignment'. The auto-dispatch block below
+      // promotes under-R12K bookings to 'pending_artisan_acceptance' ONLY
+      // AFTER it has confirmed at least one matched artisan and written
+      // their IDs. If the auto-dispatch update fails or matches zero
+      // artisans, the RFQ stays in waiting_assignment — admin can always
+      // see and reassign it. Previously the initial write was
+      // pending_artisan_acceptance, so a failure of the second update left
+      // the RFQ stuck in a "pending artisan" terminal state with no
+      // artisans actually assigned (and no admin-list visibility).
       const overR12K = priceNum >= 12000;
       const rfqStatusOnAccept = overR12K
         ? 'rfq_approved_waiting_assignment'
         : 'accepted_converted';
-      const statusOnAccept = overR12K
-        ? 'rfq_approved_waiting_assignment'
-        : 'pending_artisan_acceptance';
+      const statusOnAccept = 'rfq_approved_waiting_assignment';
 
       await firestore.collection('futureBookings').doc(rfqId).update({
         rfq_status: rfqStatusOnAccept,
@@ -5128,6 +5268,11 @@ async function executeWaTool(name, args, session) {
         quoted_price: priceNum.toFixed(2),
         deposit_amount: depositAmount.toFixed(2),
         balance_amount: balanceAmount.toFixed(2),
+        // BHV-1: persist promo so admin app + artisan app + reconciliation
+        // can all see what discount was honoured.
+        base_cost: baseCost.toFixed(2),
+        promo_code: promoApplied ? promoApplied.code : null,
+        promo_discount: promoApplied ? promoApplied.discount : 0,
         payment_type: '',
         deposit_paid: false,
         balance_paid: false,
@@ -5155,6 +5300,10 @@ async function executeWaTool(name, args, session) {
         total_cost: priceNum.toFixed(2),
         deposit_amount: depositAmount.toFixed(2),
         balance_amount: balanceAmount.toFixed(2),
+        // BHV-1: mirror promo to tasksManagement.
+        base_cost: baseCost.toFixed(2),
+        promo_code: promoApplied ? promoApplied.code : null,
+        promo_discount: promoApplied ? promoApplied.discount : 0,
         payment_type: '',
         deposit_paid: false,
         balance_paid: false,
@@ -5256,18 +5405,35 @@ async function executeWaTool(name, args, session) {
           const REJECT_STATUSES = new Set(['pending', 'rejected', 'reject', 'suspended', 'inactive', 'disabled']);
           const sameCountryArtisans = [];
           const otherArtisans = [];
+          let categoryRejected = 0;
+          let countryRejected = 0;
+          let suspendedRejected = 0;
+          let inactiveRejected = 0;
+          let zaCountryFallbackUsed = 0;
           for (const artDoc of artisanSnap.docs) {
             const ad = artDoc.data() || {};
             // Skip suspended artisans (checked in code, not query)
-            if (ad.is_suspended === true) continue;
+            if (ad.is_suspended === true) { suspendedRejected += 1; continue; }
             // Reject only explicitly bad statuses; missing/undefined status is OK
             const st = (ad.status == null) ? '' : String(ad.status).toLowerCase();
-            if (st && REJECT_STATUSES.has(st)) continue;
+            if (st && REJECT_STATUSES.has(st)) { suspendedRejected += 1; continue; }
             // Check active status — only the manual toggle gates dispatch
             const activeField = ad.active;
-            if (activeField != null && !isTruthyValue(activeField)) continue;
-            const cats = (ad.categories || ad.category || '').toString().toLowerCase();
-            if (cats && cat && !cats.includes(cat) && cat !== 'general_maintenance') continue;
+            if (activeField != null && !isTruthyValue(activeField)) { inactiveRejected += 1; continue; }
+            const cats = (ad.categories || ad.category || '').toString().toLowerCase().trim();
+            // MED-13: stop letting `general_maintenance` RFQs blast every
+            // artisan regardless of specialisation. Require an explicit
+            // category match (or that the artisan declares
+            // general_maintenance themselves).
+            // BHV-3: empty/missing categories means the artisan hasn't
+            // declared a specialty — reject for any specific category job.
+            // Previously `if (cats && cat)` skipped the check entirely when
+            // cats=='', so a plumber-with-empty-categories matched every job.
+            if (cat) {
+              if (!cats) { categoryRejected += 1; continue; }
+              const explicitMatch = cats.includes(cat) || cats.includes('general_maintenance');
+              if (!explicitMatch) { categoryRejected += 1; continue; }
+            }
             const aName = ad.name || ad.userName || ad.full_name || artDoc.id;
             const aRecord = { id: artDoc.id, name: aName, token: (ad.fcm_token || ad.deviceToken || '').toString().trim() };
             // Country fields: country (code or name), countries_served (array or comma string), region, city
@@ -5287,11 +5453,12 @@ async function executeWaTool(name, args, session) {
             const artisanHasNoCountry = !artCountryCode && servedCodes.length === 0;
             const effectiveArtCountry = artisanHasNoCountry ? 'ZA' : artCountryCode;
             const effectiveServed = artisanHasNoCountry ? ['ZA'] : servedCodes;
+            if (artisanHasNoCountry) zaCountryFallbackUsed += 1;
             const matchesCustomerCountry = inferredCountry && (
               effectiveArtCountry === inferredCountry || effectiveServed.includes(inferredCountry)
             );
             if (matchesCustomerCountry) sameCountryArtisans.push(aRecord);
-            else otherArtisans.push(aRecord);
+            else { countryRejected += 1; otherArtisans.push(aRecord); }
           }
           // Prefer same-country; only fall back to others if zero same-country matches.
           // For SA (ZA) — the largest pool — keep historical behaviour: if customer
@@ -5303,50 +5470,90 @@ async function executeWaTool(name, args, session) {
             // No same-country artisan — escalate to admin instead of blasting SA artisans.
             matchedArtisans = [];
             console.log(`[wa-tool] auto-dispatch RFQ ${rfqId} country=${inferredCountry} — no in-country artisan; escalating to admin`);
+            // HIGH-5: surface this to error_logs so admin sees the gap.
+            try {
+              await logErrorToAdmin(
+                'no_in_country_artisan',
+                `RFQ ${rfqId} customer in ${inferredCountry}: 0 artisans declared this country. Escalated to admin.`,
+                'whatsapp_bot.accept_rfq_quote',
+                '',
+                rfqId,
+                'high'
+              );
+            } catch (_) {}
           } else {
             // ZA or unknown — historical broad dispatch (cap 3)
             matchedArtisans = sameCountryArtisans.concat(otherArtisans).slice(0, 3);
           }
-          console.log(`[wa-tool] auto-dispatch RFQ ${rfqId} cat="${cat}" country="${inferredCountry || 'unknown'}" — scanned ${artisanSnap.size}, in-country ${sameCountryArtisans.length}, dispatched ${matchedArtisans.length}`);
+          // MED-18: surface dispatch funnel so admin can tune eligibility.
+          console.log(`[wa-tool] auto-dispatch RFQ ${rfqId} cat="${cat}" country="${inferredCountry || 'unknown'}" — scanned=${artisanSnap.size}, in-country=${sameCountryArtisans.length}, other-country=${otherArtisans.length}, dispatched=${matchedArtisans.length}, filtered{cat=${categoryRejected}, suspended=${suspendedRejected}, inactive=${inactiveRejected}, country=${countryRejected}}, za-country-fallback=${zaCountryFallbackUsed}`);
           if (matchedArtisans.length > 0) {
             const artisanIds = matchedArtisans.map(a => a.id);
             const artisanNames = {};
             matchedArtisans.forEach(a => { artisanNames[a.id] = a.name; });
 
-            await firestore.collection('futureBookings').doc(rfqId).update({
-              rfq_status: 'pending_artisan_acceptance',
-              status: 'pending_artisan_acceptance',
-              rfq_submitted_to: 'artisan',
-              rfq_assigned_artisan_ids: artisanIds,
-              rfq_assigned_artisan_names: artisanNames,
-              rfq_auto_assigned: true,
-              rfq_auto_assign_reason: autoReason,
-              rfq_auto_assigned_at: new Date().toISOString(),
-              rfq_artisan_rejection_count: 0,
-              rfq_artisan_rejections: [],
-              artisan_name: matchedArtisans[0].name,
-            });
-
-            await firestore.collection('tasksManagement').doc(rfqId).update({
-              status: 'pending_artisan_acceptance',
-              rfq_assigned_artisan_ids: artisanIds,
-              rfq_auto_assigned: true,
-              rfq_auto_assign_reason: autoReason,
-            });
-
-            for (const art of matchedArtisans) {
-              if (!art.token) continue;
+            // MED-14: batch the futureBookings + tasksManagement updates so
+            // the dispatch state can never be half-written.
+            let dispatchBatchOk = false;
+            try {
+              const dispatchBatch = firestore.batch();
+              dispatchBatch.update(
+                firestore.collection('futureBookings').doc(rfqId),
+                {
+                  rfq_status: 'pending_artisan_acceptance',
+                  status: 'pending_artisan_acceptance',
+                  rfq_submitted_to: 'artisan',
+                  rfq_assigned_artisan_ids: artisanIds,
+                  rfq_assigned_artisan_names: artisanNames,
+                  rfq_auto_assigned: true,
+                  rfq_auto_assign_reason: autoReason,
+                  rfq_auto_assigned_at: new Date().toISOString(),
+                  rfq_artisan_rejection_count: 0,
+                  rfq_artisan_rejections: [],
+                  artisan_name: matchedArtisans[0].name,
+                }
+              );
+              dispatchBatch.update(
+                firestore.collection('tasksManagement').doc(rfqId),
+                {
+                  status: 'pending_artisan_acceptance',
+                  rfq_status: 'pending_artisan_acceptance',
+                  rfq_assigned_artisan_ids: artisanIds,
+                  rfq_auto_assigned: true,
+                  rfq_auto_assign_reason: autoReason,
+                }
+              );
+              await dispatchBatch.commit();
+              dispatchBatchOk = true;
+            } catch (batchErr) {
+              console.warn('[wa-tool] dispatch batch commit failed:', batchErr.message);
               try {
-                await admin.messaging().send({
-                  token: art.token,
-                  notification: { title: '🔔 New RFQ Job Available', body: `RFQ ${data.rfq_no || rfqId} — R${priceNum.toFixed(2)}. Tap to view and accept.` },
-                  data: { type: 'rfq_accepted', booking_id: rfqId },
-                  android: { notification: { channelId: 'order_request_channel', sound: 'sound' } },
-                });
-              } catch (fcmErr) { console.warn(`[wa-tool] FCM to artisan ${art.id} failed:`, fcmErr.message); }
+                await logErrorToAdmin(
+                  'dispatch_batch_failure',
+                  `RFQ ${rfqId} auto-dispatch batch commit failed: ${batchErr.message}. RFQ left in waiting_assignment.`,
+                  'whatsapp_bot.accept_rfq_quote',
+                  batchErr.message,
+                  rfqId,
+                  'high'
+                );
+              } catch (_) {}
             }
-            autoDispatched = true;
-            console.log(`[wa-tool] Auto-dispatched RFQ ${rfqId} to ${artisanIds.length} artisans (${autoReason})`);
+
+            if (dispatchBatchOk) {
+              for (const art of matchedArtisans) {
+                if (!art.token) continue;
+                try {
+                  await admin.messaging().send({
+                    token: art.token,
+                    notification: { title: '🔔 New RFQ Job Available', body: `RFQ ${data.rfq_no || rfqId} — R${priceNum.toFixed(2)}. Tap to view and accept.` },
+                    data: { type: 'rfq_accepted', booking_id: rfqId },
+                    android: { notification: { channelId: 'order_request_channel', sound: 'sound' } },
+                  });
+                } catch (fcmErr) { console.warn(`[wa-tool] FCM to artisan ${art.id} failed:`, fcmErr.message); }
+              }
+              autoDispatched = true;
+              console.log(`[wa-tool] Auto-dispatched RFQ ${rfqId} to ${artisanIds.length} artisans (${autoReason})`);
+            }
           } else {
             console.log(`[wa-tool] No artisans matched for RFQ ${rfqId} — admin will assign manually`);
           }
@@ -5388,13 +5595,39 @@ async function executeWaTool(name, args, session) {
         }
       }
 
+      // BHV-1: record promo redemption + clear from session.
+      if (promoApplied) {
+        try {
+          await firestore.collection('promo_redemptions').add({
+            promo_id: session.promoId || null,
+            promo_code: promoApplied.code,
+            user_id: session.linkedUserId || session.phone,
+            task_management_id: rfqId,
+            booking_id: rfqId,
+            job_amount: baseCost,
+            discount_amount: promoApplied.discount,
+            source: 'whatsapp_rfq',
+            created_at: new Date().toISOString(),
+          });
+          if (session.promoId) {
+            await firestore.collection('promo_codes').doc(session.promoId).update({
+              used_count: admin.firestore.FieldValue.increment(1),
+            });
+          }
+          session.promoCode = null;
+          session.promoDiscount = 0;
+          session.promoDiscountType = null;
+          session.promoId = null;
+        } catch (e) { console.warn('[wa-tool] accept_rfq promo redemption tracking failed:', e.message); }
+      }
+
       // Store for quick payment follow-up
       session.lastBookingId = rfqId;
       session.lastBookingCost = priceNum;
 
       return {
         success: true,
-        message: `Quote accepted! RFQ ${data.rfq_no || rfqId} — Total: R${priceNum.toFixed(2)}.\n\n📅 *When would you like the work done?* Please reply with your preferred date and time (e.g. "Friday morning" or "27 Apr 14:00"). I'll pass it to the artisan.\n\n⏳ *Next step:* An artisan needs to accept your job before payment. We'll notify you as soon as one accepts.\n\n🔒 *Your money is protected:* When it's time to pay, your payment is held in a secure escrow account. The artisan does NOT receive your money until you confirm you are satisfied with the completed work.\n\n💰 *Payment options (after artisan accepts):*\n• Full amount: R${priceNum.toFixed(2)}\n• Deposit (35%): R${depositAmount.toFixed(2)} now, R${balanceAmount.toFixed(2)} after job completion`,
+        message: `Quote accepted! RFQ ${data.rfq_no || rfqId} — Total: R${priceNum.toFixed(2)}${promoApplied ? ` (promo ${promoApplied.code} -R${promoApplied.discount.toFixed(2)} applied)` : ''}.\n\n📅 *When would you like the work done?* Please reply with your preferred date and time (e.g. "Friday morning" or "27 Apr 14:00"). I'll pass it to the artisan.\n\n⏳ *Next step:* An artisan needs to accept your job before payment. We'll notify you as soon as one accepts.\n\n🔒 *Your money is protected:* When it's time to pay, your payment is held in a secure escrow account. The artisan does NOT receive your money until you confirm you are satisfied with the completed work.\n\n💰 *Payment options (after artisan accepts):*\n• Full amount: R${priceNum.toFixed(2)}\n• Deposit (35%): R${depositAmount.toFixed(2)} now, R${balanceAmount.toFixed(2)} after job completion`,
         rfqId,
         price: `R${priceNum.toFixed(2)}`,
         next_step: 'awaiting_preferred_schedule',
@@ -5868,7 +6101,9 @@ GUIDELINES:
 - SERVICE ADDRESS: The customer might already include the address in their first message (e.g. "I need a plumber at 15 Main Rd, Sandton"). If so, use that address — do NOT ask again. Only ask "Where does the service need to be done?" if no address was mentioned yet. Remember: the service location may differ from where the customer is right now. Do NOT ask for a location pin — just the text address is enough.
 - For complex jobs (renovations, full installations), suggest submitting an RFQ instead of a regular booking
 - Use South African Rands (R) for all pricing
+- MULTI-ISSUE HANDLING (BHV-5): If the customer mentions MORE THAN ONE distinct problem in a single message (e.g. "my tap is leaking AND my light is broken", "I need painting and tiling"), do NOT collapse them into one booking. Each problem usually needs a different artisan trade and a different price. Reply: "I see two issues — (1) [issue A] and (2) [issue B]. Each needs a separate booking so the right artisan attends. Which one would you like to handle first?" Then create_booking ONE issue at a time. After the first is confirmed, ask: "Would you like me to book the second one ([issue B]) now too?"
 - When a customer sends a photo, ANALYSE the image using your vision capabilities. Identify the maintenance issue (e.g. leaking pipe, broken socket, cracked wall), suggest the correct service category, call lookup_pricing to get the price, and present the price to the customer for confirmation. Do NOT create a booking until the customer confirms the price.
+- VISION CONFIDENCE GUARD (BHV-8): If the photo is blurry, dark, partial, ambiguous, or you are NOT highly confident what product/issue it shows, DO NOT call lookup_pricing or create_booking. Instead reply: "I can see something in the photo but I'm not 100% sure what — could you describe it in a sentence (e.g. 'frameless shower door', 'kitchen mixer tap'), or send a clearer photo?" Hardware-install jobs (shower door, geyser, ceiling fan, gate, light fitting) have prices that vary 10-40× by product spec — never guess. When in doubt, route to submit_rfq so admin can confirm the actual product before quoting.
 - For emergencies, emphasise urgency and prioritise booking creation (still ask for photo but don't delay)
 - When a booking is created, always mention the estimated cost and payment options
 - After job completion, encourage rating
@@ -6695,9 +6930,18 @@ app.post('/webhook', async (req, res) => {
           });
           continue;
         }
-        case 'document':
-          userText = '[Customer sent a document: ' + (msg.document?.filename || 'unknown') + ']';
-          break;
+        case 'document': {
+          // BHV-9: previously the placeholder text was passed to GPT but the
+          // customer received NO acknowledgement, leaving them confused.
+          // Send an explicit reply so they know to retry as text/photo.
+          const fname = msg.document?.filename || '';
+          await sendWhatsAppMessage(
+            from,
+            `Thanks${fname ? ` for "${fname}"` : ''}! I can't read documents (PDFs, Word, etc.) yet. Please describe your issue in a text message, or send a photo of the problem and I'll take it from there.`
+          );
+          logChatMessage(from, 'incoming', `[document: ${fname || 'unknown'}]`, { messageType: 'document', linkedUserId: session.linkedUserId, displayName: _contactName });
+          continue;
+        }
         case 'audio': {
           // Transcribe voice note via Whisper
           const audioTranscript = await transcribeAudio(msg.audio?.id);
@@ -6705,6 +6949,18 @@ app.post('/webhook', async (req, res) => {
             userText = audioTranscript.trim();
             console.log(`[msg] ${from}: [VOICE NOTE transcribed: "${userText.substring(0, 80)}"]`);
           } else {
+            // BHV-16: log empty/null transcripts (Whisper succeeded but
+            // returned nothing — usually unsupported language or audio too
+            // quiet). Without this, admin has no visibility into how often
+            // voice-note onboarding is failing.
+            logErrorToAdmin(
+              'transcription_error',
+              'Whisper returned empty transcript',
+              'whatsapp_bot',
+              JSON.stringify({ phone: from, audio_id: msg.audio?.id || null }),
+              null,
+              'low'
+            ).catch(() => {});
             await sendWhatsAppMessage(
               from,
               'I could not transcribe that voice note. Please try sending it again, or type your request in text.'
@@ -6722,10 +6978,27 @@ app.post('/webhook', async (req, res) => {
           if (msg.location.address) session.sharedAddress = msg.location.address;
           console.log(`[location] ${from}: saved lat=${session.sharedLatitude} lng=${session.sharedLongitude} addr=${session.sharedAddress || 'none'}`);
           break;
-        case 'sticker':
-          continue; // Ignore stickers
-        default:
-          userText = `[Customer sent a ${msg.type} message — ask them to describe their issue in text]`;
+        case 'sticker': {
+          // BHV-9: don't silently drop. Briefly acknowledge so the customer
+          // knows the bot is alive and what to send instead.
+          if (!session._stickerNudged) {
+            await sendWhatsAppMessage(
+              from,
+              'Cute sticker! 😊 To help with your maintenance request, please send a text describing the issue or a photo of the problem.'
+            );
+            session._stickerNudged = true; // only nudge once per session to avoid spam
+          }
+          continue;
+        }
+        default: {
+          // BHV-9: previously the placeholder text was passed to GPT but the
+          // customer never received any reply. Send an explicit one.
+          await sendWhatsAppMessage(
+            from,
+            `I can't process "${msg.type}" messages yet. Please send a text describing your issue or a photo of the problem.`
+          );
+          continue;
+        }
       }
 
       if (!userText.trim()) continue;
@@ -6984,12 +7257,18 @@ app.post('/api/artisan-accepted', requireInternalSecret, async (req, res) => {
 
     // Try futureBookings first (has the canonical data)
     const fbDoc = await firestore.collection('futureBookings').doc(mainBookingId).get();
+    let mainStatus = '';
+    let mainRfqStatus = '';
+    let mainAccept = '';
     if (fbDoc.exists) {
       const d = fbDoc.data();
       customerPhone = d.user_phone || d.customerPhone || d.contact || d.client_phone || d.phone || '';
       bookingCost = d.cost || '';
       bookingDescription = d.description || d.subcategory || d.category_name || '';
       orderNo = d.order_no || '';
+      mainStatus = String(d.status || '').toLowerCase();
+      mainRfqStatus = String(d.rfq_status || '').toLowerCase();
+      mainAccept = String(d.accept || '');
     }
 
     // Fallback to tasksManagement
@@ -7001,7 +7280,23 @@ app.post('/api/artisan-accepted', requireInternalSecret, async (req, res) => {
         bookingCost = d.cost || '';
         bookingDescription = d.description || d.subcategory || d.category_name || '';
         orderNo = d.order_no || '';
+        if (!mainStatus) mainStatus = String(d.status || '').toLowerCase();
+        if (!mainRfqStatus) mainRfqStatus = String(d.rfq_status || '').toLowerCase();
+        if (!mainAccept) mainAccept = String(d.accept || '');
       }
+    }
+
+    // ── Status guards (CRITICAL-1, CRITICAL idempotency) ──
+    // (a) Refuse to "resurrect" a booking the admin/customer killed.
+    const TERMINAL_BAD = new Set(['rejected', 'cancelled', 'canceled', 'closed']);
+    if (TERMINAL_BAD.has(mainStatus) || TERMINAL_BAD.has(mainRfqStatus)) {
+      console.warn(`[api/artisan-accepted] booking ${mainBookingId} is in terminal status (${mainStatus}/${mainRfqStatus}) — refusing late artisan-accept webhook`);
+      return res.status(409).json({ error: 'Booking is no longer active', status: mainStatus, rfq_status: mainRfqStatus });
+    }
+    // (b) Idempotency: webhook delivered twice → don't re-message customer.
+    if (mainAccept === '1' || mainStatus === 'pending_payment' || mainStatus === 'paid' || mainStatus === 'deposit_paid') {
+      console.log(`[api/artisan-accepted] booking ${mainBookingId} already accepted/paid (status=${mainStatus}, accept=${mainAccept}) — skipping duplicate notification`);
+      return res.json({ ok: true, deduped: true, status: mainStatus });
     }
 
     if (!customerPhone) {
@@ -7088,7 +7383,13 @@ app.post('/api/artisan-accepted', requireInternalSecret, async (req, res) => {
 
     res.json({ success: true, to, bookingId: mainBookingId });
   } catch (err) {
+    // MED-17: surface webhook failures to error_logs so admin sees stuck
+    // bookings instead of relying on Render console output.
     console.error('[api/artisan-accepted] error:', err.message);
+    try {
+      const bid = (req.body && req.body.bookingId) || '';
+      await logErrorToAdmin('webhook_artisan_accepted_failed', `/api/artisan-accepted threw: ${err.message}`, 'whatsapp_bot./api/artisan-accepted', err.message, bid, 'high');
+    } catch (_) {}
     res.status(500).json({ error: err.message });
   }
 });
@@ -7170,6 +7471,11 @@ app.post('/api/booking-status-update', requireInternalSecret, async (req, res) =
     res.json({ success: true, to, status });
   } catch (err) {
     console.error('[api/booking-status-update] error:', err.message);
+    try {
+      const bid = (req.body && req.body.bookingId) || '';
+      const st = (req.body && req.body.status) || '';
+      await logErrorToAdmin('webhook_booking_status_update_failed', `/api/booking-status-update threw on status=${st}: ${err.message}`, 'whatsapp_bot./api/booking-status-update', err.message, bid, 'high');
+    } catch (_) {}
     res.status(500).json({ error: err.message });
   }
 });
