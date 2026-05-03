@@ -5475,6 +5475,60 @@ async function executeWaTool(name, args, session) {
           }
         }
         try {
+          // CL-MATCH (May 2026): production artisans don't populate
+          // serviceProvider.categories — they register individual TASKS via
+          // userTasks instead. Build a fallback set of artisan IDs that have
+          // userTasks linking them to ANY task in this RFQ's category (or
+          // its sub-categories). We use this in the loop below: an artisan
+          // with empty `categories` but a matching userTasks record IS
+          // eligible.
+          const userTasksArtisanIds = new Set();
+          if (cat) {
+            try {
+              // Resolve category doc(s) matching this name (top-level + subs).
+              const catSnap = await firestore.collection('categories').get();
+              const catNameMatches = new Set();
+              for (const d of catSnap.docs) {
+                const dd = d.data() || {};
+                const nm = String(dd.name || '').toLowerCase().replace(/\s+/g, '_');
+                if (nm === cat) catNameMatches.add(d.id);
+              }
+              const subCatIds = new Set();
+              for (const d of catSnap.docs) {
+                const dd = d.data() || {};
+                const parent = String(dd.parent_id || '');
+                if (catNameMatches.has(parent)) subCatIds.add(d.id);
+              }
+              const allCatIds = new Set([...catNameMatches, ...subCatIds]);
+              if (allCatIds.size > 0) {
+                const taskSnap2 = await firestore.collection('tasks').get();
+                const matchingTaskIds = new Set();
+                for (const td of taskSnap2.docs) {
+                  const tdd = td.data() || {};
+                  const cid = String(tdd.categoryId || tdd.category_id || '');
+                  if (allCatIds.has(cid)) {
+                    matchingTaskIds.add(td.id);
+                    const legacyId = String(tdd.id || '');
+                    if (legacyId) matchingTaskIds.add(legacyId);
+                  }
+                }
+                if (matchingTaskIds.size > 0) {
+                  const utSnap = await firestore.collection('userTasks').get();
+                  for (const ud of utSnap.docs) {
+                    const udd = ud.data() || {};
+                    const tid = String(udd.task_id || udd.taskId || '');
+                    if (matchingTaskIds.has(tid)) {
+                      const aid = String(udd.user_id || udd.userId || '');
+                      if (aid) userTasksArtisanIds.add(aid);
+                    }
+                  }
+                  console.log(`[wa-tool] auto-dispatch: userTasks fallback resolved ${userTasksArtisanIds.size} artisan(s) for cat="${cat}"`);
+                }
+              }
+            } catch (utErr) {
+              console.warn('[wa-tool] auto-dispatch userTasks fallback failed:', utErr.message);
+            }
+          }
           // Fetch ALL artisans and gate in code — many artisan docs have no
           // `status` field at all, which an inequality/in filter would hide.
           // We only refuse explicit non-eligible statuses.
@@ -5509,9 +5563,15 @@ async function executeWaTool(name, args, session) {
             // Previously `if (cats && cat)` skipped the check entirely when
             // cats=='', so a plumber-with-empty-categories matched every job.
             if (cat) {
-              if (!cats) { categoryRejected += 1; continue; }
-              const explicitMatch = cats.includes(cat) || cats.includes('general_maintenance');
-              if (!explicitMatch) { categoryRejected += 1; continue; }
+              const utFallbackMatch = userTasksArtisanIds.has(artDoc.id);
+              if (!cats) {
+                // CL-MATCH: artisan didn't fill `categories` — accept iff
+                // they registered a userTask under this category.
+                if (!utFallbackMatch) { categoryRejected += 1; continue; }
+              } else {
+                const explicitMatch = cats.includes(cat) || cats.includes('general_maintenance');
+                if (!explicitMatch && !utFallbackMatch) { categoryRejected += 1; continue; }
+              }
             }
             const aName = ad.name || ad.userName || ad.full_name || artDoc.id;
             const aRecord = { id: artDoc.id, name: aName, token: (ad.fcm_token || ad.deviceToken || '').toString().trim() };
