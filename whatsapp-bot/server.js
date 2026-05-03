@@ -4697,6 +4697,15 @@ async function executeWaTool(name, args, session) {
       if (!doc.exists) return { error: `Booking "${bid}" not found.` };
 
       const data = doc.data() || {};
+      const assignedIds = Array.isArray(data.rfq_assigned_artisan_ids) ? data.rfq_assigned_artisan_ids : [];
+      const hasAssignedArtisan = assignedIds.length > 0;
+      // Defensive: if accept_rfq_quote left the RFQ in 'accepted_converted'
+      // because auto-dispatch matched zero artisans (or its fallback write
+      // failed silently), the admin's "Waiting Assignment" filter never
+      // surfaces it. Promote the status here so the admin sees the job in
+      // the right bucket and can assign manually.
+      const stuckAcceptedConverted =
+        (data.rfq_status || '') === 'accepted_converted' && !hasAssignedArtisan;
       const update = {
         scheduled_date: dateStr,
         scheduled_time: timeStr,
@@ -4705,6 +4714,14 @@ async function executeWaTool(name, args, session) {
         client_schedule_notes: notes,
         client_schedule_set_at: new Date().toISOString(),
         client_schedule_via: 'whatsapp',
+        ...(stuckAcceptedConverted
+          ? {
+              rfq_status: 'rfq_approved_waiting_assignment',
+              status: 'rfq_approved_waiting_assignment',
+              requires_admin_assignment: true,
+              rfq_no_artisans_matched: true,
+            }
+          : {}),
       };
 
       let _fbOk = false, _tmOk = false;
@@ -4715,7 +4732,8 @@ async function executeWaTool(name, args, session) {
       }
 
       // Notify admin (Firestore + FCM tray push so admin sees it offline)
-      const isWaitingAssignment = (data.rfq_status || '') === 'rfq_approved_waiting_assignment'
+      const isWaitingAssignment = stuckAcceptedConverted
+        || (data.rfq_status || '') === 'rfq_approved_waiting_assignment'
         || (data.requires_admin_assignment === true);
       try {
         await firestore.collection('notifications').add({
@@ -4745,7 +4763,7 @@ async function executeWaTool(name, args, session) {
 
       // Notify assigned artisan(s) via FCM if any
       try {
-        const ids = Array.isArray(data.rfq_assigned_artisan_ids) ? data.rfq_assigned_artisan_ids : [];
+        const ids = assignedIds;
         for (const aid of ids) {
           try {
             const aDoc = await firestore.collection('serviceProvider').doc(String(aid)).get();
@@ -4772,9 +4790,13 @@ async function executeWaTool(name, args, session) {
         ? `\n\n💰 *Payment options* (after artisan accepts):\n• Full: R${cost.toFixed(2)}\n• Deposit (35%): R${deposit.toFixed(2)} now, R${balance.toFixed(2)} after job completion\n\nReply "pay deposit" or "pay full" when an artisan accepts and you're ready, and I'll send a secure payment link.`
         : '';
 
+      const artisanNotice = hasAssignedArtisan
+        ? "⏳ I've notified the artisan. They'll confirm shortly."
+        : "⏳ Our team is matching you with the right artisan and will confirm shortly.";
+
       return {
         success: true,
-        message: `Got it — preferred schedule for RFQ ${data.rfq_no || bid}: *${dateStr}*${timeStr ? ' at *' + timeStr + '*' : ''}.${notes ? '\nNote: ' + notes : ''}\n\n⏳ I've notified the artisan. They'll confirm shortly.${payHint}`,
+        message: `Got it — preferred schedule for RFQ ${data.rfq_no || bid}: *${dateStr}*${timeStr ? ' at *' + timeStr + '*' : ''}.${notes ? '\nNote: ' + notes : ''}\n\n${artisanNotice}${payHint}`,
         bookingId: bid,
         scheduledDate: dateStr,
         scheduledTime: timeStr,
