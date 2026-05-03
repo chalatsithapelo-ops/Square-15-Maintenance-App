@@ -9141,6 +9141,67 @@ app.post('/api/token', authMiddleware, rateLimitBy('livekit_token', 30, 5 * 60 *
 });
 
 /**
+ * Proxy for the in-app "Lizzy" chat bot. Keeps the Groq API key server-side.
+ * POST /api/chat-bot
+ * Body: { question: string }
+ * Auth: Firebase ID token required.
+ * Rate limit: 60/uid/5min (interactive chat — generous but not abusable).
+ */
+app.post('/api/chat-bot', authMiddleware, rateLimitBy('chat_bot', 60, 5 * 60 * 1000), async (req, res) => {
+  try {
+    const groqKey = process.env.GROQ_API_KEY;
+    if (!groqKey) {
+      return res.status(503).json({ error: 'chat_bot_unconfigured', message: 'GROQ_API_KEY not set in server env' });
+    }
+    const question = String((req.body && req.body.question) || '').trim();
+    if (!question) {
+      return res.status(400).json({ error: 'missing_question', message: 'question is required' });
+    }
+    if (question.length > 2000) {
+      return res.status(400).json({ error: 'question_too_long', message: 'Maximum 2000 characters' });
+    }
+
+    const fetchFn = (typeof fetch === 'function') ? fetch : require('node-fetch');
+    const upstream = await fetchFn('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${groqKey}`,
+      },
+      body: JSON.stringify({
+        model: 'llama-3.3-70b-versatile',
+        messages: [
+          {
+            role: 'system',
+            content:
+              'You are Lizzy, the AI assistant for Square 15 Facility Solutions, a property maintenance company in South Africa. ' +
+              'You help clients with information about plumbing, electrical, painting, carpentry, roofing, tiling, locksmith, and other maintenance services. ' +
+              'Be helpful, friendly, and concise. Amounts are in South African Rand (R). ' +
+              "For booking or account actions, suggest the user use the full AI Chat or the app's booking flow.",
+          },
+          { role: 'user', content: question },
+        ],
+        max_tokens: 1000,
+        temperature: 0.7,
+      }),
+    });
+
+    if (!upstream.ok) {
+      const txt = await upstream.text().catch(() => '');
+      console.warn('[chat_bot] Groq upstream error', upstream.status, txt.slice(0, 300));
+      return res.status(502).json({ error: 'upstream_error', status: upstream.status });
+    }
+
+    const data = await upstream.json();
+    const answer = ((data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '').trim();
+    return res.json({ answer: answer || "Sorry, I didn't understand that." });
+  } catch (e) {
+    console.error('[chat_bot] error:', e && e.message);
+    return res.status(500).json({ error: 'chat_bot_error', message: e && e.message });
+  }
+});
+
+/**
  * Create a new AI voice agent room
  * POST /api/create-room
  * Body: { roomName?: string }
