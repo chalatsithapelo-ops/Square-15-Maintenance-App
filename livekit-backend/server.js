@@ -616,6 +616,46 @@ function authMiddleware(req, res, next) {
   });
 }
 
+// LK-14: lightweight in-memory rate limiter. Keyed by `${uid||ip}:${bucket}`.
+// Sliding window — drops timestamps older than `windowMs`. Returns true if
+// the request should proceed, false if it should be 429'd. No external dep.
+const _rateBuckets = new Map();
+function rateLimit(bucket, key, max, windowMs) {
+  try {
+    const now = Date.now();
+    const k = `${bucket}:${key}`;
+    let arr = _rateBuckets.get(k);
+    if (!arr) { arr = []; _rateBuckets.set(k, arr); }
+    // Drop expired entries
+    while (arr.length && (now - arr[0]) > windowMs) arr.shift();
+    if (arr.length >= max) return { ok: false, retryAfterMs: windowMs - (now - arr[0]) };
+    arr.push(now);
+    // Periodic GC: every ~1000 calls, sweep empty buckets
+    if (_rateBuckets.size > 5000) {
+      for (const [bk, ts] of _rateBuckets) {
+        if (!ts.length || (now - ts[ts.length - 1]) > windowMs * 2) _rateBuckets.delete(bk);
+      }
+    }
+    return { ok: true };
+  } catch (_) { return { ok: true }; } // fail-open on limiter bug
+}
+
+// Express middleware factory: rate-limit by authenticated UID (preferred) or IP.
+function rateLimitBy(bucket, max, windowMs) {
+  return function (req, res, next) {
+    const key = (req.user && req.user.uid) || req.ip || req.headers['x-forwarded-for'] || 'anon';
+    const r = rateLimit(bucket, String(key), max, windowMs);
+    if (!r.ok) {
+      return res.status(429).json({
+        error: 'Too Many Requests',
+        message: `Rate limit exceeded for ${bucket}. Try again in ${Math.ceil(r.retryAfterMs / 1000)}s.`,
+        retry_after_ms: r.retryAfterMs,
+      });
+    }
+    next();
+  };
+}
+
 async function verifyFirebaseAppCheck(req, res, { required = false } = {}) {
   initFirebaseIfPossible();
   if (firebaseInitError) {
@@ -1844,6 +1884,9 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       attachment: firstImage || '',
       additional_attachment: secondImage || '',
       image_urls: workImages,
+      imageUrls: workImages,
+      work_images: workImages,
+      workImages: workImages,
       additional_description: '',
       creation_date: now,
       updated_at: now,
@@ -9026,7 +9069,10 @@ app.post('/api/payment/itn', async (req, res) => {
  * POST /api/token
  * Body: { roomName: string, participantName: string, metadata?: string }
  */
-app.post('/api/token', authMiddleware, async (req, res) => {
+// LK-14: limit to 30 token mints per UID per 5 minutes. Tokens have 15-min TTL
+// so legitimate clients shouldn't need more than ~6/hr. Anything higher likely
+// indicates abuse, a buggy retry loop, or attempted room/identity squatting.
+app.post('/api/token', authMiddleware, rateLimitBy('livekit_token', 30, 5 * 60 * 1000), async (req, res) => {
   try {
     const { roomName, participantName, metadata } = req.body;
 
