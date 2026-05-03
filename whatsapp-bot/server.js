@@ -5904,26 +5904,145 @@ async function executeWaTool(name, args, session) {
     // ═══════════════════════════════════════════
     case 'send_message': {
       if (!firestore) return { error: 'Database unavailable' };
-      const bid = args.bookingId;
-      const msg = args.message;
-      const recipient = args.recipient || 'admin';
+      const bid = String(args.bookingId || '').trim();
+      const msg = String(args.message || '').trim();
+      const recipient = String(args.recipient || 'artisan').trim().toLowerCase();
       if (!bid || !msg) return { error: 'Please provide a booking ID and message.' };
 
+      const senderUserId = session.linkedUserId || '';
+
       try {
-        const msgRef = firestore.collection('messages').doc();
-        await msgRef.set({
-          id: msgRef.id,
-          booking_id: bid,
-          sender_id: session.linkedUserId || session.phone,
-          sender_type: 'client',
-          recipient_type: recipient,
+        // Resolve the booking to find tasksManagement doc + recipient ids.
+        // Customers may pass either a futureBookings id or a tasksManagement id.
+        let tmId = '';
+        let tmData = null;
+        // Try tasksManagement direct first
+        try {
+          const tmSnap = await firestore.collection('tasksManagement').doc(bid).get();
+          if (tmSnap.exists) { tmId = tmSnap.id; tmData = tmSnap.data() || {}; }
+        } catch (_) {}
+        // Fallback: lookup by future_booking_id
+        if (!tmId) {
+          try {
+            const q = await firestore.collection('tasksManagement')
+              .where('future_booking_id', '==', bid).limit(1).get();
+            if (!q.empty) { tmId = q.docs[0].id; tmData = q.docs[0].data() || {}; }
+          } catch (_) {}
+        }
+        // Fallback: futureBookings doc → its tasks_management_id
+        if (!tmId) {
+          try {
+            const fbSnap = await firestore.collection('futureBookings').doc(bid).get();
+            if (fbSnap.exists) {
+              const fbd = fbSnap.data() || {};
+              const linkedTm = String(fbd.tasks_management_id || '').trim();
+              if (linkedTm) {
+                const tmSnap2 = await firestore.collection('tasksManagement').doc(linkedTm).get();
+                if (tmSnap2.exists) { tmId = tmSnap2.id; tmData = tmSnap2.data() || {}; }
+              }
+            }
+          } catch (_) {}
+        }
+
+        if (!tmId || !tmData) {
+          return { error: `Could not find an active booking record for ${bid}. The artisan can only be messaged once a booking is in progress.` };
+        }
+
+        const artisanId = String(tmData.service_provider_id || '').trim();
+        const customerId = String(tmData.user_id || tmData.userId || tmData.uid || '').trim();
+        if (!artisanId || artisanId === 'admin') {
+          return { error: 'No artisan is currently assigned to this booking, so I can\'t pass a message to them yet.' };
+        }
+
+        // Determine actual receiver based on requested recipient.
+        const receiverId = recipient === 'admin' ? 'admin' : artisanId;
+        const senderId = senderUserId || customerId || session.phone || 'whatsapp';
+
+        // 1) Write the message into the chat subcollection that the
+        //    artisan/client apps actually subscribe to.
+        await firestore.collection('tasksManagement').doc(tmId).collection('chat').add({
+          sender_id: senderId,
+          receiver_id: receiverId,
           message: msg,
+          type: 'text',
+          isRead: false,
           source: 'whatsapp',
-          read: false,
-          created_at: admin.firestore.FieldValue.serverTimestamp(),
+          timestamp: admin.firestore.FieldValue.serverTimestamp(),
         });
-        return { success: true, message: `Message sent to ${recipient}.` };
+
+        // 2) FCM push the artisan (or admin) so the message is actually seen.
+        let pushed = false;
+        let pushFailReason = '';
+        if (recipient !== 'admin') {
+          try {
+            const spSnap = await firestore.collection('serviceProvider').doc(artisanId).get();
+            const ad = spSnap.exists ? (spSnap.data() || {}) : {};
+            const tokenCandidates = [
+              ad.deviceToken, ad.device_token, ad.fcm_token, ad.fcmToken,
+              ad.token, ad.push_token, ad.pushToken,
+            ];
+            const seenTokens = new Set();
+            const tokens = [];
+            for (const c of tokenCandidates) {
+              const t = String(c || '').trim();
+              if (t && !seenTokens.has(t)) { seenTokens.add(t); tokens.push(t); }
+            }
+            if (tokens.length === 0) {
+              pushFailReason = 'no_fcm_token_on_artisan_profile';
+            } else {
+              const senderName = (tmData.user_name || tmData.userName || 'Customer').toString();
+              for (const tok of tokens) {
+                try {
+                  await admin.messaging().send({
+                    token: tok,
+                    notification: { title: senderName, body: msg.slice(0, 240) },
+                    data: {
+                      type: 'chat_message',
+                      task_management_id: tmId,
+                      booking_id: tmId,
+                      sender_id: senderId,
+                    },
+                    android: {
+                      priority: 'high',
+                      notification: { channelId: 'order_request_channel', sound: 'sound' },
+                    },
+                  });
+                  pushed = true;
+                } catch (fcmErr) {
+                  pushFailReason = (fcmErr && fcmErr.message) || String(fcmErr);
+                }
+              }
+            }
+          } catch (e) {
+            pushFailReason = (e && e.message) || String(e);
+          }
+        }
+
+        // 3) Honest response back to the customer — don't claim we
+        //    notified the artisan if the push couldn't go through.
+        if (recipient === 'admin') {
+          return { success: true, message: 'Message sent to admin.' };
+        }
+        if (pushed) {
+          return { success: true, message: 'Message delivered to the artisan.' };
+        }
+        // Saved to chat thread but no push got through — be transparent.
+        try {
+          await logErrorToAdmin(
+            'whatsapp_bot_chat_no_push',
+            `WA customer message saved to chat for ${tmId} but artisan did not receive a push (${pushFailReason || 'unknown'}). Backfill artisan FCM token recommended.`,
+            'whatsapp_bot.send_message',
+            `tmId=${tmId} artisan=${artisanId} reason=${pushFailReason}`,
+            tmId,
+            'medium'
+          );
+        } catch (_) {}
+        return {
+          success: true,
+          message: 'I saved the message to the booking chat, but the artisan\'s phone is not reachable for an instant alert right now (no notification token on file). They will see it when they next open the app. I\'ve also flagged the admin to follow up.',
+        };
       } catch (e) {
+        console.warn('[wa-tool] send_message failed:', e && e.message);
         return { error: 'Failed to send message' };
       }
     }
