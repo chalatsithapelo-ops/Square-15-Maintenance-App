@@ -10364,6 +10364,28 @@ if (require.main === module) {
     console.log(`🔑 Token endpoint: http://localhost:${PORT}/api/token`);
     console.log(`🧠 Voice start endpoint: http://localhost:${PORT}/api/voice/start`);
     console.log(`📦 Environment: ${process.env.NODE_ENV}`);
+    // LK-13: hard refusal — if anyone leaves the no-auth voice flag enabled in
+    // production, log loudly to error_logs and ALSO refuse to enable it (the
+    // flag is read again at request time; we set NODE_ENV-dependent override).
+    try {
+      const dangerFlag = String(process.env.ALLOW_VOICE_START_WITHOUT_AUTH || '').toLowerCase();
+      const isProd = String(process.env.NODE_ENV || '').toLowerCase() === 'production';
+      if (isProd && (dangerFlag === '1' || dangerFlag === 'true' || dangerFlag === 'yes' || dangerFlag === 'on')) {
+        console.error('🚨 SECURITY: ALLOW_VOICE_START_WITHOUT_AUTH is enabled in production. This lets anyone start a voice session without Firebase auth. The flag is being IGNORED — set it to false in Render env vars to silence this warning.');
+        // Forcibly clear so downstream isEnvTruthy() reads false
+        process.env.ALLOW_VOICE_START_WITHOUT_AUTH = 'false';
+        try {
+          admin.firestore().collection('error_logs').add({
+            error_type: 'unsafe_config_blocked',
+            severity: 'critical',
+            source: 'livekit_backend',
+            description: 'ALLOW_VOICE_START_WITHOUT_AUTH was true in production at startup. The flag was forcibly disabled. Update Render env vars to remove the warning.',
+            created_at: admin.firestore.FieldValue.serverTimestamp(),
+            read: false,
+          }).catch(() => {});
+        } catch (_) {}
+      }
+    } catch (_) {}
     console.log('✅ Server ready to accept requests\n');
     try { _startAutoResolveSweeper(); console.log('🩹 Auto-heal sweeper started (every 5 min).'); } catch (_) {}
   });
