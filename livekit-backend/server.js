@@ -7816,8 +7816,36 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
 
 // ── Ozow Payout Notification Webhook ──
 // Ozow calls this when a payout status changes (success, failed, etc.)
+//
+// SECURITY (audit Apr-2026): this endpoint reverses balance deductions on
+// "failed" status, so any unauthenticated caller could fabricate a "failed"
+// notice for a real payoutId and credit an artisan's wallet while the EFT
+// already left the system. We require an out-of-band shared token, supplied
+// either as `?token=` query string (recommended for Ozow's NotifyUrl which
+// has no header support) or `x-internal-secret` header (for internal/admin
+// triggers). The token MUST be configured on Ozow's merchant settings as
+// part of the NotifyUrl. If neither token is configured server-side, we
+// refuse all calls so a misconfigured deploy cannot silently accept
+// unsigned webhooks.
 app.post('/api/ozow-payout-notify', async (req, res) => {
   try {
+    const expectedNotify = process.env.OZOW_NOTIFY_TOKEN || '';
+    const expectedInternal = process.env.INTERNAL_API_SECRET || '';
+    if (!expectedNotify && !expectedInternal) {
+      console.error('[ozow-payout-notify] BLOCKED: no OZOW_NOTIFY_TOKEN or INTERNAL_API_SECRET configured');
+      return res.status(503).json({ error: 'Webhook auth not configured' });
+    }
+    const providedNotify = String(req.query.token || req.body.token || '');
+    const providedInternal = String(req.headers['x-internal-secret'] || '');
+    const okNotify = expectedNotify && providedNotify && providedNotify.length === expectedNotify.length
+      && crypto.timingSafeEqual(Buffer.from(providedNotify), Buffer.from(expectedNotify));
+    const okInternal = expectedInternal && providedInternal && providedInternal.length === expectedInternal.length
+      && crypto.timingSafeEqual(Buffer.from(providedInternal), Buffer.from(expectedInternal));
+    if (!okNotify && !okInternal) {
+      console.warn(`[ozow-payout-notify] UNAUTHENTICATED call from ${req.ip} payoutId=${req.body && req.body.payoutId}`);
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
     const { payoutId, status, statusMessage, bankReference } = req.body;
     console.log(`[ozow-payout-notify] payoutId=${payoutId} status=${status} ref=${bankReference}`);
 

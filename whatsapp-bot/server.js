@@ -5334,7 +5334,14 @@ async function executeWaTool(name, args, session) {
         : 'accepted_converted';
       const statusOnAccept = 'rfq_approved_waiting_assignment';
 
-      await firestore.collection('futureBookings').doc(rfqId).update({
+      // CRITICAL (audit Apr-2026): wrap the dual-collection write in a
+      // batch so futureBookings + tasksManagement update atomically.
+      // Previously two sequential awaits could leave the booking in an
+      // inconsistent state if the second write failed (admin sees the
+      // RFQ as "accepted" in one list but downstream wallet/cancel
+      // tools that key off tasksManagement would silently 404).
+      const _acceptBatch = firestore.batch();
+      _acceptBatch.update(firestore.collection('futureBookings').doc(rfqId), {
         rfq_status: rfqStatusOnAccept,
         status: statusOnAccept,
         artisan_confirmed: 'pending',
@@ -5361,7 +5368,7 @@ async function executeWaTool(name, args, session) {
 
       // Mirror accepted RFQ to tasksManagement so all downstream handlers
       // (cancel, reschedule, wallet payment, admin app) can find it
-      await firestore.collection('tasksManagement').doc(rfqId).set({
+      _acceptBatch.set(firestore.collection('tasksManagement').doc(rfqId), {
         id: rfqId,
         order_no: data.order_no || data.rfq_no || rfqId,
         user_id: data.user_id || session.linkedUserId || '',
@@ -5398,6 +5405,7 @@ async function executeWaTool(name, args, session) {
         accepted_at: new Date().toISOString(),
         accepted_via: 'whatsapp',
       }, { merge: true });
+      await _acceptBatch.commit();
 
       // Notify admin to assign an artisan
       await firestore.collection('notifications').add({
