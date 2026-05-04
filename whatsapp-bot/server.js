@@ -7892,6 +7892,32 @@ app.post('/api/job-status-update', requireInternalSecret, async (req, res) => {
 
     await sendWhatsAppMessage(to, msg);
 
+    // ── Safety: when the artisan is on the way, send their profile photo so
+    //    the customer knows who is arriving (parity with the in-app feature). ──
+    if (status === 'progress') {
+      try {
+        // Resolve artisan id from whichever doc we already loaded.
+        let spId = '';
+        try {
+          const tmSnap = await firestore.collection('tasksManagement').doc(mainBookingId).get();
+          if (tmSnap.exists) spId = String((tmSnap.data() || {}).service_provider_id || '').trim();
+        } catch (_) {}
+        if (!spId) {
+          try {
+            const fbSnap2 = await firestore.collection('futureBookings').doc(mainBookingId).get();
+            if (fbSnap2.exists) spId = String((fbSnap2.data() || {}).service_provider_id || '').trim();
+          } catch (_) {}
+        }
+        if (spId) {
+          const prof = await getArtisanProfile(firestore, spId);
+          if (prof.imageUrl) {
+            const who = prof.name || name;
+            await sendWhatsAppImage(to, prof.imageUrl, `👷 ${who} is on the way to booking #${ref}. For your safety, please confirm this is the person who arrives at your door.`);
+          }
+        }
+      } catch (e) { console.warn('[job-status-update] artisan photo send failed:', e.message); }
+    }
+
     // Set the flag IMMEDIATELY after sending so any concurrent listener pass skips.
     // Mirror to BOTH tasksManagement and futureBookings — the futureBookings listener
     // only checks its own doc, so without this mirror it would re-fire and duplicate.
@@ -8200,6 +8226,32 @@ const _quoteRelayInFlight = new Set();
 const _adminAssignRelayInFlight = new Set();
 const _balancePromptInFlight = new Set();
 const _lifecycleInFlight = new Set();
+
+// Look up artisan profile photo URL + display name from serviceProvider/{id}.
+// Used by the 'on the way' (progress) WA so the customer can see who is
+// arriving — a safety feature already present in-app, now mirrored to WhatsApp.
+async function getArtisanProfile(firestore, artisanId) {
+  const out = { imageUrl: '', name: '' };
+  const id = String(artisanId || '').trim();
+  if (!firestore || !id || id === 'admin') return out;
+  try {
+    const snap = await firestore.collection('serviceProvider').doc(id).get();
+    if (!snap.exists) return out;
+    const d = snap.data() || {};
+    const candidates = [d.imageUrl, d.image, d.profile_image, d.profileImage, d.photo_url, d.photoURL, d.profile_picture, d.profilePicture];
+    for (const c of candidates) {
+      const u = String(c || '').trim();
+      if (u && /^https?:\/\//i.test(u) && !u.includes('maintenance-app-d320b.appspot.com')) {
+        out.imageUrl = u;
+        break;
+      }
+    }
+    out.name = String(d.name || d.fullName || d.full_name || '').trim();
+  } catch (e) {
+    console.warn('[getArtisanProfile] failed for', id, ':', e.message);
+  }
+  return out;
+}
 function startQuoteRelayListener() {
   try {
     const firestore = db();
@@ -8852,6 +8904,19 @@ function startJobLifecycleListener() {
             try {
               await sendWhatsAppMessage(to, msg);
               console.log(`[job-lifecycle] sent "${normStatus}" WA to ${to} for ${doc.id}`);
+              // Safety: also send artisan profile photo when they are on the way.
+              if (normStatus === 'progress') {
+                try {
+                  const spId = String(data.service_provider_id || '').trim();
+                  if (spId) {
+                    const prof = await getArtisanProfile(firestore, spId);
+                    if (prof.imageUrl) {
+                      const who = prof.name || artisanName;
+                      await sendWhatsAppImage(to, prof.imageUrl, `👷 ${who} is on the way to booking #${ref}. For your safety, please confirm this is the person who arrives at your door.`);
+                    }
+                  }
+                } catch (e) { console.warn('[job-lifecycle] artisan photo send failed:', e.message); }
+              }
             } catch (e) {
               console.warn(`[job-lifecycle] WA send failed for ${doc.id}:`, e.message);
               continue;
