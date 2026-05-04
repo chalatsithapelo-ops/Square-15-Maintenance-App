@@ -5554,6 +5554,16 @@ async function executeWaTool(name, args, session) {
             const activeField = ad.active;
             if (activeField != null && !isTruthyValue(activeField)) { inactiveRejected += 1; continue; }
             const cats = (ad.categories || ad.category || '').toString().toLowerCase().trim();
+            // CL-MATCH (May 2026 follow-up): the canonical artisan model
+            // (services_provider_model.dart) stores specialty in
+            // `mainCategory` / `subCategory`, NOT in `categories`. So a
+            // plumber registered as mainCategory='Plumbing' but with no
+            // `categories` field was being silently rejected here, leaving
+            // RFQs stuck in admin "Waiting Assignment" with zero artisans
+            // matched. Treat mainCategory/subCategory as additional
+            // sources for the category match.
+            const mainCat = String(ad.mainCategory || ad.main_category || '').toLowerCase().replace(/\s+/g, '_').trim();
+            const subCat = String(ad.subCategory || ad.sub_category || '').toLowerCase().replace(/\s+/g, '_').trim();
             // MED-13: stop letting `general_maintenance` RFQs blast every
             // artisan regardless of specialisation. Require an explicit
             // category match (or that the artisan declares
@@ -5564,13 +5574,17 @@ async function executeWaTool(name, args, session) {
             // cats=='', so a plumber-with-empty-categories matched every job.
             if (cat) {
               const utFallbackMatch = userTasksArtisanIds.has(artDoc.id);
+              const mainSubMatch = (mainCat && (mainCat.includes(cat) || cat.includes(mainCat))) ||
+                (subCat && (subCat.includes(cat) || cat.includes(subCat))) ||
+                mainCat === 'general_maintenance';
               if (!cats) {
                 // CL-MATCH: artisan didn't fill `categories` — accept iff
-                // they registered a userTask under this category.
-                if (!utFallbackMatch) { categoryRejected += 1; continue; }
+                // they registered a userTask under this category OR their
+                // mainCategory/subCategory matches.
+                if (!utFallbackMatch && !mainSubMatch) { categoryRejected += 1; continue; }
               } else {
                 const explicitMatch = cats.includes(cat) || cats.includes('general_maintenance');
-                if (!explicitMatch && !utFallbackMatch) { categoryRejected += 1; continue; }
+                if (!explicitMatch && !utFallbackMatch && !mainSubMatch) { categoryRejected += 1; continue; }
               }
             }
             const aName = ad.name || ad.userName || ad.full_name || artDoc.id;
