@@ -7679,13 +7679,38 @@ app.post('/api/booking-status-update', requireInternalSecret, async (req, res) =
 
     const mainBookingId = bookingId.includes('_') ? bookingId.split('_')[0] : bookingId;
 
-    // ── Dedup guard: skip if same booking+status sent within 60s ──
+    // ── Dedup guard: skip if same booking+status sent within 60s (in-memory) ──
     const dedupKey = `${mainBookingId}:${status}`;
     const lastSent = _recentStatusMessages.get(dedupKey);
     if (lastSent && Date.now() - lastSent < 60000) {
       console.log(`[api/booking-status-update] Dedup: skipping duplicate "${status}" for ${mainBookingId} (sent ${Math.round((Date.now() - lastSent) / 1000)}s ago)`);
       return res.json({ success: true, deduplicated: true, status });
     }
+
+    // ── Persistent cross-path dedup: respect lifecycle flags written by
+    //    /api/job-status-update OR startJobLifecycleListener so the same
+    //    job-complete / progress / cancelled WA isn't sent twice. ──
+    try {
+      const lifecycleStatus = (status === 'in_progress') ? 'progress'
+        : (status === 'done' || status === 'closed') ? 'completed'
+        : (status === 'canceled') ? 'cancelled'
+        : status;
+      if (['progress', 'completed', 'cancelled'].includes(lifecycleStatus)) {
+        const flagKey = `wa_lifecycle_${lifecycleStatus}_sent_at`;
+        const tmCheck = await firestore.collection('tasksManagement').doc(mainBookingId).get();
+        const fbCheck = await firestore.collection('futureBookings').doc(mainBookingId).get();
+        const tmFlag = tmCheck.exists && tmCheck.data() ? tmCheck.data()[flagKey] : null;
+        const fbFlag = fbCheck.exists && fbCheck.data() ? fbCheck.data()[flagKey] : null;
+        if (tmFlag || fbFlag) {
+          console.log(`[api/booking-status-update] Persistent dedup: "${status}" for ${mainBookingId} already sent (flag ${flagKey} present)`);
+          _recentStatusMessages.set(dedupKey, Date.now());
+          return res.json({ success: true, deduplicated: true, status, skipped: 'lifecycle_flag_present' });
+        }
+      }
+    } catch (e) {
+      console.warn('[api/booking-status-update] persistent dedup check failed:', e.message);
+    }
+
     _recentStatusMessages.set(dedupKey, Date.now());
 
     let customerPhone = '';
@@ -7841,19 +7866,24 @@ app.post('/api/job-status-update', requireInternalSecret, async (req, res) => {
     // Idempotency: skip duplicates if the corresponding listener has already sent the message.
     // This prevents the same notification from being delivered twice when both the HTTP push
     // (from the artisan app) and the Firestore listener fire for the same event.
+    // CHECK BOTH tasksManagement AND futureBookings — the listener writes the flag on
+    // futureBookings while this endpoint historically wrote on tasksManagement, which
+    // caused job-complete duplicates in production.
     try {
-      const tmRef = firestore.collection('tasksManagement').doc(mainBookingId);
-      const tmCur = await tmRef.get();
-      const tmData = tmCur.exists ? tmCur.data() : {};
-      let alreadySent = false;
-      let httpFlagKey = '';
-      if (status === 'before_photo' && tmData.wa_artisan_images_1_sent_at) { alreadySent = true; httpFlagKey = 'wa_artisan_images_1_sent_at'; }
-      else if (status === 'after_photo' && tmData.wa_artisan_images_2_sent_at) { alreadySent = true; httpFlagKey = 'wa_artisan_images_2_sent_at'; }
-      else if (status === 'buying_material' && tmData.wa_buying_material_sent_at) { alreadySent = true; httpFlagKey = 'wa_buying_material_sent_at'; }
-      else if (status === 'progress' && tmData.wa_lifecycle_progress_sent_at) { alreadySent = true; httpFlagKey = 'wa_lifecycle_progress_sent_at'; }
-      else if (status === 'completed' && tmData.wa_lifecycle_completed_sent_at) { alreadySent = true; httpFlagKey = 'wa_lifecycle_completed_sent_at'; }
+      const tmCur = await firestore.collection('tasksManagement').doc(mainBookingId).get();
+      const fbCur = await firestore.collection('futureBookings').doc(mainBookingId).get();
+      const tmData = tmCur.exists ? (tmCur.data() || {}) : {};
+      const fbData = fbCur.exists ? (fbCur.data() || {}) : {};
+      const flagFor = (s) => s === 'before_photo' ? 'wa_artisan_images_1_sent_at'
+        : s === 'after_photo' ? 'wa_artisan_images_2_sent_at'
+        : s === 'buying_material' ? 'wa_buying_material_sent_at'
+        : s === 'progress' ? 'wa_lifecycle_progress_sent_at'
+        : s === 'completed' ? 'wa_lifecycle_completed_sent_at'
+        : '';
+      const httpFlagKey = flagFor(status);
+      const alreadySent = httpFlagKey && (tmData[httpFlagKey] || fbData[httpFlagKey]);
       if (alreadySent) {
-        console.log(`[api/job-status-update] Skipping duplicate "${status}" send for ${mainBookingId} (flag ${httpFlagKey} already set)`);
+        console.log(`[api/job-status-update] Skipping duplicate "${status}" send for ${mainBookingId} (flag ${httpFlagKey} already set in ${tmData[httpFlagKey] ? 'tasksManagement' : 'futureBookings'})`);
         return res.json({ success: true, to, status, skipped: 'already_sent' });
       }
     } catch (e) {
@@ -7862,16 +7892,22 @@ app.post('/api/job-status-update', requireInternalSecret, async (req, res) => {
 
     await sendWhatsAppMessage(to, msg);
 
-    // Set the flag IMMEDIATELY after sending so any concurrent listener pass skips
+    // Set the flag IMMEDIATELY after sending so any concurrent listener pass skips.
+    // Mirror to BOTH tasksManagement and futureBookings — the futureBookings listener
+    // only checks its own doc, so without this mirror it would re-fire and duplicate.
     try {
-      const tmRef2 = firestore.collection('tasksManagement').doc(mainBookingId);
       const flagPatch = {};
       if (status === 'before_photo') flagPatch.wa_artisan_images_1_sent_at = new Date().toISOString();
       else if (status === 'after_photo') flagPatch.wa_artisan_images_2_sent_at = new Date().toISOString();
       else if (status === 'buying_material') flagPatch.wa_buying_material_sent_at = new Date().toISOString();
       else if (status === 'progress') flagPatch.wa_lifecycle_progress_sent_at = new Date().toISOString();
       else if (status === 'completed') flagPatch.wa_lifecycle_completed_sent_at = new Date().toISOString();
-      if (Object.keys(flagPatch).length) await tmRef2.set(flagPatch, { merge: true });
+      if (Object.keys(flagPatch).length) {
+        await Promise.all([
+          firestore.collection('tasksManagement').doc(mainBookingId).set(flagPatch, { merge: true }).catch(() => {}),
+          firestore.collection('futureBookings').doc(mainBookingId).set(flagPatch, { merge: true }).catch(() => {}),
+        ]);
+      }
     } catch (_) {}
 
     // Send the before/after photo as an image message if provided
@@ -8766,7 +8802,17 @@ function startJobLifecycleListener() {
           else if (status === 'canceled') normStatus = 'cancelled';
 
           const flagKey = `wa_lifecycle_${normStatus}_sent_at`;
-          if (data[flagKey]) continue; // already sent
+          if (data[flagKey]) continue; // already sent (futureBookings flag)
+          // Cross-check tasksManagement — if the HTTP /api/job-status-update path
+          // already sent this lifecycle WA, the flag lives there, not on the FB doc.
+          try {
+            const tmCheck = await firestore.collection('tasksManagement').doc(doc.id).get();
+            if (tmCheck.exists && tmCheck.data() && tmCheck.data()[flagKey]) {
+              // mirror onto FB so we don't re-check next snapshot pass
+              try { await doc.ref.update({ [flagKey]: tmCheck.data()[flagKey] }); } catch (_) {}
+              continue;
+            }
+          } catch (_) {}
           const phoneRaw = data.user_phone || data.customerPhone || data.contact || data.client_phone || data.phone || '';
           if (!phoneRaw) continue;
           let to = phoneRaw.replace(/[^0-9]/g, '');
@@ -8810,11 +8856,17 @@ function startJobLifecycleListener() {
               console.warn(`[job-lifecycle] WA send failed for ${doc.id}:`, e.message);
               continue;
             }
+            const sentAt = new Date().toISOString();
             try {
-              await doc.ref.update({ [flagKey]: new Date().toISOString() });
+              await doc.ref.update({ [flagKey]: sentAt });
             } catch (e) {
               console.warn(`[job-lifecycle] flag update failed for ${doc.id}:`, e.message);
             }
+            // Mirror flag to tasksManagement so the HTTP /api/job-status-update
+            // and /api/booking-status-update endpoints see it and don't re-send.
+            try {
+              await firestore.collection('tasksManagement').doc(doc.id).set({ [flagKey]: sentAt }, { merge: true });
+            } catch (_) {}
             // Sync tasksManagement so other consumers (admin app, payment processor) see the same status
             try {
               await firestore.collection('tasksManagement').doc(doc.id).set({
