@@ -9957,7 +9957,8 @@ app.post(
       const ext = contentType === 'image/png' ? 'png' : 'jpg';
       const storagePath = `service_providers/${artisanId}.${ext}`;
       const downloadToken = crypto.randomUUID();
-      const bucket = admin.storage().bucket();
+      const bucketName = process.env.FIREBASE_STORAGE_BUCKET || 'promaintapp-b618a.firebasestorage.app';
+      const bucket = admin.storage().bucket(bucketName);
       const file = bucket.file(storagePath);
       await file.save(buf, {
         contentType,
