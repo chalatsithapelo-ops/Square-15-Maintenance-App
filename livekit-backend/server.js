@@ -7814,6 +7814,101 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
   }
 });
 
+// ── Ozow Payout Verification Webhook ──
+// Ozow calls this BEFORE executing a payout to confirm the request is
+// legitimate. We respond 200 with `verified:true` and echo the payoutId
+// only when (a) the 24-char static OZOW_ACCESS_TOKEN matches and (b) we
+// have a matching `payout_records` doc — so a leaked token alone can't
+// approve a fabricated payoutId.
+app.post('/api/ozow-payout-verify', async (req, res) => {
+  try {
+    const expected = process.env.OZOW_ACCESS_TOKEN || '';
+    if (!expected || expected.length !== 24) {
+      console.error('[ozow-payout-verify] BLOCKED: OZOW_ACCESS_TOKEN missing or not 24 chars');
+      return res.status(503).json({ verified: false, error: 'Verification not configured' });
+    }
+    const provided = String(
+      req.headers['x-ozow-access-token'] ||
+      req.headers['access-token'] ||
+      req.body.accessToken ||
+      req.body.AccessToken ||
+      req.query.token ||
+      ''
+    );
+    const ok = provided.length === expected.length &&
+      crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(expected));
+    if (!ok) {
+      console.warn(`[ozow-payout-verify] UNAUTHENTICATED from ${req.ip}`);
+      return res.status(401).json({ verified: false, error: 'Invalid access token' });
+    }
+
+    const payoutId = req.body.payoutId || req.body.PayoutId || req.query.payoutId || null;
+    const bankReference = req.body.bankReference || req.body.BankReference || null;
+
+    const db = admin.firestore();
+    let found = false;
+    if (payoutId) {
+      const s = await db.collection('payout_records').where('ozow_payout_id', '==', payoutId).limit(1).get();
+      if (!s.empty) found = true;
+    }
+    if (!found && bankReference) {
+      const s = await db.collection('payout_records').where('bank_reference', '==', bankReference).limit(1).get();
+      if (!s.empty) found = true;
+    }
+
+    if (!found) {
+      console.warn(`[ozow-payout-verify] payoutId=${payoutId} ref=${bankReference} not found in payout_records`);
+      return res.status(404).json({ verified: false, error: 'Payout not found' });
+    }
+
+    console.log(`[ozow-payout-verify] APPROVED payoutId=${payoutId} ref=${bankReference}`);
+    return res.status(200).json({
+      verified: true,
+      payoutId: payoutId || bankReference,
+      bankReference: bankReference,
+    });
+  } catch (e) {
+    console.error('[ozow-payout-verify] error:', e && e.message);
+    return res.status(500).json({ verified: false, error: 'Internal error' });
+  }
+});
+
+// ── Ozow Low Float Alert Webhook ──
+// Ozow POSTs here when the merchant float runs low. We surface an admin
+// notification. Same OZOW_ACCESS_TOKEN gate as verify.
+app.post('/api/ozow-low-float-alert', async (req, res) => {
+  try {
+    const expected = process.env.OZOW_ACCESS_TOKEN || '';
+    const provided = String(
+      req.headers['x-ozow-access-token'] ||
+      req.headers['access-token'] ||
+      req.body.accessToken ||
+      req.query.token ||
+      ''
+    );
+    if (!expected || expected.length !== 24 ||
+        provided.length !== expected.length ||
+        !crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(expected))) {
+      return res.status(401).json({ ok: false });
+    }
+    const balance = req.body.balance || req.body.Balance || 'unknown';
+    await admin.firestore().collection('notifications').add({
+      title: '⚠️ Ozow Float Low',
+      body: `Ozow has reported a low float balance: ${balance}. Top up to avoid payout failures.`,
+      type: 'ozow_low_float',
+      user_type: 'admin',
+      read: false,
+      payload: req.body || {},
+      created_at: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    console.log(`[ozow-low-float] balance=${balance}`);
+    return res.status(200).json({ ok: true });
+  } catch (e) {
+    console.error('[ozow-low-float] error:', e && e.message);
+    return res.status(500).json({ ok: false });
+  }
+});
+
 // ── Ozow Payout Notification Webhook ──
 // Ozow calls this when a payout status changes (success, failed, etc.)
 //
@@ -7829,13 +7924,13 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
 // unsigned webhooks.
 app.post('/api/ozow-payout-notify', async (req, res) => {
   try {
-    const expectedNotify = process.env.OZOW_NOTIFY_TOKEN || '';
+    const expectedNotify = process.env.OZOW_NOTIFY_TOKEN || process.env.OZOW_ACCESS_TOKEN || '';
     const expectedInternal = process.env.INTERNAL_API_SECRET || '';
     if (!expectedNotify && !expectedInternal) {
-      console.error('[ozow-payout-notify] BLOCKED: no OZOW_NOTIFY_TOKEN or INTERNAL_API_SECRET configured');
+      console.error('[ozow-payout-notify] BLOCKED: no OZOW_NOTIFY_TOKEN/OZOW_ACCESS_TOKEN or INTERNAL_API_SECRET configured');
       return res.status(503).json({ error: 'Webhook auth not configured' });
     }
-    const providedNotify = String(req.query.token || req.body.token || '');
+    const providedNotify = String(req.query.token || req.body.token || req.headers['x-ozow-access-token'] || '');
     const providedInternal = String(req.headers['x-internal-secret'] || '');
     const okNotify = expectedNotify && providedNotify && providedNotify.length === expectedNotify.length
       && crypto.timingSafeEqual(Buffer.from(providedNotify), Buffer.from(expectedNotify));
