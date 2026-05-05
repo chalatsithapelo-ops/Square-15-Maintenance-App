@@ -430,7 +430,7 @@ function createInMemoryRateLimiter({ windowMs, max, keyFn, name }) {
   };
 }
 
-const jsonBodyLimit = env('JSON_BODY_LIMIT') || '1mb';
+const jsonBodyLimit = env('JSON_BODY_LIMIT') || '25mb';
 const corsOriginsRaw = env('ALLOWED_ORIGINS');
 const corsOrigins = corsOriginsRaw
   ? corsOriginsRaw.split(',').map((s) => s.trim()).filter(Boolean)
