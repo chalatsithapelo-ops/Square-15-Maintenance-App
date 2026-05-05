@@ -1,0 +1,141 @@
+rules_version = '2';
+// Square 15 Firestore Security Rules
+// Default-deny baseline. Each collection lists explicit access rules.
+// Backend (livekit-backend, whatsapp-bot, functions) uses Firebase Admin SDK
+// which BYPASSES these rules — these only constrain direct client access from
+// the Flutter apps + web/admin portals.
+//
+// IMPORTANT: This file is the canonical version. Deploy with:
+//   firebase deploy --only firestore:rules
+//
+// Custom claim used: `admin: true` OR `role: 'admin'` (set via
+// /api/admin/self-bootstrap-claims after admin login).
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() { return request.auth != null; }
+    function isOwner(uid) { return isSignedIn() && request.auth.uid == uid; }
+    function isAdmin() {
+      return isSignedIn() && (
+        request.auth.token.admin == true ||
+        request.auth.token.role == 'admin'
+      );
+    }
+
+    // ── User profiles ──────────────────────────────────────────────────────
+    match /users/{userId} {
+      allow read: if isOwner(userId) || isAdmin();
+      allow create: if isOwner(userId);
+      allow update: if isOwner(userId) || isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    // ── Service providers (artisan profiles) ───────────────────────────────
+    // Public-readable (rendered in customer search). Writes admin-only
+    // (anti-fraud — May 2026): artisans cannot edit their own profile picture
+    // or core profile fields. They go through the admin-mediated flow.
+    match /serviceProvider/{spId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+    match /service_providers/{spId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // ── Bookings / Tasks ───────────────────────────────────────────────────
+    match /tasksManagement/{taskId} {
+      allow read: if isSignedIn() && (
+        resource.data.userId == request.auth.uid ||
+        resource.data.artisanId == request.auth.uid ||
+        isAdmin()
+      );
+      allow create: if isSignedIn();
+      allow update: if isSignedIn() && (
+        resource.data.userId == request.auth.uid ||
+        resource.data.artisanId == request.auth.uid ||
+        isAdmin()
+      );
+      allow delete: if isAdmin();
+    }
+
+    // ── Payment cards (subcollection under user) ───────────────────────────
+    match /users/{userId}/cards/{cardId} {
+      allow read, write: if isOwner(userId);
+    }
+
+    // ── Wallet / balance docs ──────────────────────────────────────────────
+    match /walletTransactions/{txId} {
+      allow read: if isSignedIn() && (
+        resource.data.userId == request.auth.uid || isAdmin()
+      );
+      allow write: if false;  // Backend-only via Admin SDK
+    }
+
+    // ── Promo codes ────────────────────────────────────────────────────────
+    match /promo_codes/{id} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+    match /promo_redemptions/{id} {
+      allow read: if isAdmin();
+      allow create: if isSignedIn();
+      allow update, delete: if isAdmin();
+    }
+
+    // ── App configuration (sensitive — admin only) ─────────────────────────
+    match /app_config/{configId} {
+      allow read, write: if isAdmin();
+    }
+
+    // ── Categories / Tasks catalogue (public read) ─────────────────────────
+    match /categories/{id} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+    match /tasks/{id} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // ── RFQs / Future bookings ─────────────────────────────────────────────
+    match /futureBookings/{id} {
+      allow read: if isSignedIn() && (
+        resource.data.userId == request.auth.uid ||
+        resource.data.artisanId == request.auth.uid ||
+        isAdmin()
+      );
+      allow create: if isSignedIn();
+      allow update, delete: if isAdmin();
+    }
+    match /future_bookings/{id} {
+      allow read: if isSignedIn() && (
+        resource.data.userId == request.auth.uid ||
+        resource.data.artisanId == request.auth.uid ||
+        isAdmin()
+      );
+      allow create: if isSignedIn();
+      allow update, delete: if isAdmin();
+    }
+
+    // ── Admin invite codes ─────────────────────────────────────────────────
+    match /admin_invite_codes/{id} {
+      allow read, write: if isAdmin();
+    }
+
+    // ── Fraud alerts ───────────────────────────────────────────────────────
+    match /fraud_alerts/{id} {
+      allow read, write: if isAdmin();
+    }
+
+    // ── Chat ───────────────────────────────────────────────────────────────
+    match /chat/{chatId}/{document=**} {
+      allow read, write: if isSignedIn();  // TODO: tighten to participants only
+    }
+
+    // ── Default deny for unlisted collections ──────────────────────────────
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

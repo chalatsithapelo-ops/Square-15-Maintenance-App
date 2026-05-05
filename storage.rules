@@ -1,0 +1,43 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    // Default-deny wildcard: no blanket reads. Specific paths below grant reads.
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+
+    // Service-provider profile images: public read (rendered in customer app
+    // and WA flow), admin-only writes (anti-fraud — May 2026).
+    match /service_providers/{file=**} {
+      allow read: if true;
+      allow write: if request.auth != null
+                   && (request.auth.token.admin == true
+                       || request.auth.token.role == 'admin')
+                   && request.resource.size < 15 * 1024 * 1024
+                   && request.resource.contentType.matches('image/.*');
+    }
+
+    // User-owned files: only the owner reads/writes their own folder.
+    match /users/{userId}/{allPaths=**} {
+      allow read: if request.auth != null && request.auth.uid == userId;
+      allow write: if request.auth != null
+                   && request.auth.uid == userId
+                   && request.resource.size < 15 * 1024 * 1024;
+    }
+
+    // Booking attachments (photos, etc.) — authenticated users only.
+    match /uploads/{allPaths=**} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null
+                   && request.resource.size < 10 * 1024 * 1024
+                   && request.resource.contentType.matches('image/.*');
+    }
+
+    // Admin custom-claim path (legacy)
+    match /admin/{allPaths=**} {
+      allow read, write: if request.auth != null
+                         && (request.auth.token.admin == true
+                             || request.auth.token.role == 'admin');
+    }
+  }
+}

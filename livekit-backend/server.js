@@ -1,4 +1,4 @@
-﻿const express = require('express');
+const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const { AccessToken, AgentDispatchClient } = require('livekit-server-sdk');
@@ -8,7 +8,7 @@ const fs = require('fs');
 const OpenAI = require('openai');
 require('dotenv').config();
 
-// ─── Prompt sanitization (prevent injection via user-supplied text) ───
+// --- Prompt sanitization (prevent injection via user-supplied text) ---
 function sanitizeForPrompt(text, maxLen = 500) {
   if (!text || typeof text !== 'string') return '';
   return text
@@ -18,7 +18,7 @@ function sanitizeForPrompt(text, maxLen = 500) {
     .trim();
 }
 
-// ─── OpenAI (for AI RFQ quote generation) ───
+// --- OpenAI (for AI RFQ quote generation) ---
 let _openai = null;
 function getOpenAI() {
   if (_openai) return _openai;
@@ -28,7 +28,7 @@ function getOpenAI() {
   return _openai;
 }
 
-// ─── Builders.co.za Real-Time Pricing (ported from Cloud Functions) ───
+// --- Builders.co.za Real-Time Pricing (ported from Cloud Functions) ---
 
 let _buildersBffCache = { fetchedAt: 0, ttlMs: 12 * 60 * 60 * 1000, value: null };
 
@@ -342,7 +342,7 @@ async function getLearningFactor(firestore, categoryId, categoryName) {
   }
 }
 
-// ─── End Builders Pricing ───
+// --- End Builders Pricing ---
 
 function sanitizeEnvValue(value) {
   if (typeof value !== 'string') return value;
@@ -603,7 +603,7 @@ async function verifyFirebaseAuth(req, res) {
   }
 }
 
-// Express middleware wrapper — verifyFirebaseAuth returns a value but never
+// Express middleware wrapper � verifyFirebaseAuth returns a value but never
 // calls next(), so using it directly as middleware hangs the request.
 function authMiddleware(req, res, next) {
   verifyFirebaseAuth(req, res).then(decoded => {
@@ -611,13 +611,13 @@ function authMiddleware(req, res, next) {
     req.user = decoded;
     next();
   }).catch(err => {
-    console.error('❌ Auth middleware error:', err);
+    console.error('? Auth middleware error:', err);
     if (!res.headersSent) res.status(500).json({ error: 'Internal auth error' });
   });
 }
 
 // LK-14: lightweight in-memory rate limiter. Keyed by `${uid||ip}:${bucket}`.
-// Sliding window — drops timestamps older than `windowMs`. Returns true if
+// Sliding window � drops timestamps older than `windowMs`. Returns true if
 // the request should proceed, false if it should be 429'd. No external dep.
 const _rateBuckets = new Map();
 function rateLimit(bucket, key, max, windowMs) {
@@ -728,24 +728,24 @@ async function resolveRole({ firestore, uid, decodedToken }) {
       if (r === 'artisan' || r === 'client') return r;
       // If Firestore says admin, require custom claims confirmation
       if (r === 'admin') {
-        console.warn(`⚠️ User ${uid} has admin role in Firestore but NOT in custom claims — denying admin access`);
+        console.warn(`?? User ${uid} has admin role in Firestore but NOT in custom claims � denying admin access`);
         return 'client';
       }
 
       // Check boolean flag schema (isAdmin, isServiceProvider, isUser)
       // This handles apps that use boolean flags instead of string roles.
       if (data.isAdmin === true) {
-        console.warn(`⚠️ User ${uid} has isAdmin=true in Firestore but NOT in custom claims — denying admin access`);
+        console.warn(`?? User ${uid} has isAdmin=true in Firestore but NOT in custom claims � denying admin access`);
         return 'client';
       }
       if (data.isServiceProvider === true) return 'artisan';
       if (data.isUser === true) return 'client';
     }
   } catch (e) {
-    console.warn(`⚠️ Role lookup (users doc) failed for ${uid}:`, e.message);
+    console.warn(`?? Role lookup (users doc) failed for ${uid}:`, e.message);
   }
 
-  // Fallback: check the serviceProvider collection — artisan profiles live
+  // Fallback: check the serviceProvider collection � artisan profiles live
   // there keyed by UID (or linked via user_id/uid fields), not in 'users'.
   try {
     const spSnap = await firestore.collection('serviceProvider').doc(uid).get();
@@ -756,7 +756,7 @@ async function resolveRole({ firestore, uid, decodedToken }) {
       if (!q.empty) return 'artisan';
     }
   } catch (e) {
-    console.warn(`⚠️ Role lookup (serviceProvider) failed for ${uid}:`, e.message);
+    console.warn(`?? Role lookup (serviceProvider) failed for ${uid}:`, e.message);
   }
 
   return 'client';
@@ -836,7 +836,7 @@ const ACTION_TIERS = Object.freeze({
   submit_complaint: 'B',
   request_payment_link: 'B',
   pay_with_wallet: 'B',
-  // Phase 4: Admin automation tools (Tier B — admin role required)
+  // Phase 4: Admin automation tools (Tier B � admin role required)
   admin_bulk_reassign: 'B',
   admin_close_stale_cases: 'B',
   admin_broadcast_notification: 'B',
@@ -848,7 +848,7 @@ const ACTION_TIERS = Object.freeze({
   get_refund_history: 'A',
   get_payout_status: 'A',
   get_fraud_alerts: 'A',
-  // Phase 5.2: Money-moving (Tier C — requires approval pipeline)
+  // Phase 5.2: Money-moving (Tier C � requires approval pipeline)
   request_refund: 'C',
   request_wallet_adjustment: 'C',
   request_payout: 'C',
@@ -1054,7 +1054,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         }, { merge: true });
       });
     } catch (e) {
-      console.warn(`⚠️ Counter increment failed for ${prefix}/${dateKey}: ${e.message}; using timestamp fallback`);
+      console.warn(`?? Counter increment failed for ${prefix}/${dateKey}: ${e.message}; using timestamp fallback`);
       seq = Date.now() % 1000 + 1;
     }
     return seq;
@@ -1100,7 +1100,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
   }
 
   function isArtisanActive(artisanData) {
-    // ── IMPORTANT ──────────────────────────────────────────────────────
+    // -- IMPORTANT ------------------------------------------------------
     // Only the manual "Status" toggle (the `active` field, stored as
     // 'y'/'n') should gate dispatch.  Presence fields like `is_online`,
     // `online`, `status_online` etc. must NOT be checked here because
@@ -1108,9 +1108,9 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     // backgrounded / closed.  Artisans who simply close the app (without
     // signing out or turning Status off) must still receive requests and
     // push notifications.
-    // ────────────────────────────────────────────────────────────────────
+    // --------------------------------------------------------------------
     const active = artisanData && artisanData.active;
-    if (active == null) return true; // field missing → default to active
+    if (active == null) return true; // field missing ? default to active
     return isTruthyExtended(active);
   }
 
@@ -1838,7 +1838,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
           orderSeq = next;
         });
       } catch (e) {
-        console.warn(`⚠️ Order counter transaction failed: ${e.message}; falling back to date-based order number`);
+        console.warn(`?? Order counter transaction failed: ${e.message}; falling back to date-based order number`);
         orderSeq = null;
       }
     }
@@ -2372,9 +2372,9 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     return await createOrderBookingFromPayload();
   }
 
-  // ═══════════════════════════════════════════════════════════════
+  // ---------------------------------------------------------------
   // Phase 3: Messaging & Case Management (inlined to access scope)
-  // ═══════════════════════════════════════════════════════════════
+  // ---------------------------------------------------------------
 
   if (action === 'get_messages') {
     const msgBookingId = String(payload.booking_id || payload.bookingId || '').trim();
@@ -2688,7 +2688,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     };
   }
 
-  // ── Reply to Case (threaded conversation) ──
+  // -- Reply to Case (threaded conversation) --
   if (action === 'reply_to_case') {
     const rcCaseId = String(payload.case_id || payload.caseId || '').trim();
     const rcMessage = String(payload.message || '').trim();
@@ -2746,7 +2746,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     };
   }
 
-  // ── List My Cases ──
+  // -- List My Cases --
   if (action === 'list_my_cases' || action === 'list_cases') {
     const lcState = String(payload.state || payload.status || '').trim().toLowerCase();
     const lcLimit = Math.min(Math.max(parseInt(payload.limit || '10', 10) || 10, 1), 50);
@@ -2820,7 +2820,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     }
   }
 
-  // ── Auto-Escalation Check ──
+  // -- Auto-Escalation Check --
   if (action === 'check_sla_escalation') {
     // Admin-only: check for overdue cases and escalate their priority
     if (actorRole !== 'admin') return { ok: false, status: 403, error: 'admin_only' };
@@ -2876,7 +2876,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     }
   }
 
-  // ── Service Pricing Lookup ──
+  // -- Service Pricing Lookup --
   if (action === 'lookup_service_pricing' || action === 'list_services') {
     try {
       const categoryName = String(payload.category_name || payload.categoryName || '').trim().toLowerCase();
@@ -3033,7 +3033,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     }
   }
 
-  // ── Booking Analytics (admin only, capped at 500 docs) ──
+  // -- Booking Analytics (admin only, capped at 500 docs) --
   if (action === 'get_booking_analytics') {
     if (actorRole !== 'admin') {
       return { ok: false, success: false, error: 'forbidden', message: 'Booking analytics is restricted to admin users.' };
@@ -3094,7 +3094,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     }
   }
 
-  // ── List My Bookings ──
+  // -- List My Bookings --
   if (action === 'list_my_bookings' || action === 'list_user_bookings') {
     if (!actorUid) return { ok: false, status: 401, error: 'unauthorized' };
 
@@ -3141,7 +3141,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       const qs = await orderedQuery.get();
       bookings = qs.docs.map(_extractBooking);
     } catch (err) {
-      // Composite index missing – fall back to unordered query + JS sort
+      // Composite index missing � fall back to unordered query + JS sort
       if (err.code === 9 || (err.message && err.message.includes('index'))) {
         console.warn('[list_bookings] composite index missing, falling back to JS sort');
         try {
@@ -3160,7 +3160,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     return { ok: true, status: 200, data: { bookings, count: bookings.length } };
   }
 
-  // ── Get Wallet Balance ──
+  // -- Get Wallet Balance --
   if (action === 'get_wallet_balance') {
     if (!actorUid) return { ok: false, status: 401, error: 'unauthorized' };
 
@@ -3182,7 +3182,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     }
   }
 
-  // ── Check Payment Status (can work with booking_id OR tasks_management_id) ──
+  // -- Check Payment Status (can work with booking_id OR tasks_management_id) --
   if (action === 'check_payment' || action === 'get_payment_status') {
     if (!actorUid) return { ok: false, status: 401, error: 'unauthorized' };
 
@@ -3270,7 +3270,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     }
   }
 
-  // ── Request Payment Link — generates PayFast URL + stores in payment_links + sends notification ──
+  // -- Request Payment Link � generates PayFast URL + stores in payment_links + sends notification --
   if (action === 'request_payment_link') {
     try {
       const bid = bookingId || String(payload.tasks_management_id || '').trim();
@@ -3309,7 +3309,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       const paymentType = payload.payment_type || 'full';
       let payAmount;
       if (bData.deposit_paid === true && bData.balance_paid !== true) {
-        // Deposit already paid → pay balance
+        // Deposit already paid ? pay balance
         payAmount = parseFloat(bData.balance_amount || (cost * 0.65));
       } else if (paymentType === 'deposit') {
         payAmount = Math.round(cost * 0.35 * 100) / 100;
@@ -3441,7 +3441,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     }
   }
 
-  // ── Pay with Wallet ──
+  // -- Pay with Wallet --
   if (action === 'pay_with_wallet') {
     try {
       const bid = bookingId || String(payload.tasks_management_id || '').trim();
@@ -3469,7 +3469,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       // has been paid. Without this guard a caller could request
       // payment_type='balance' on a fresh booking and the implicit branch
       // below would silently fall back to charging the full amount or 65%
-      // — confusing the customer and breaking transactionLogs accounting.
+      // � confusing the customer and breaking transactionLogs accounting.
       if (paymentType === 'balance' && bData.deposit_paid !== true) {
         return { ok: false, status: 400, error: 'cannot_pay_balance_before_deposit' };
       }
@@ -3616,7 +3616,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     };
   }
 
-  // ── Explain Quote (RFQ details, scope of work) ──
+  // -- Explain Quote (RFQ details, scope of work) --
   if (action === 'explain_quote' || action === 'explain_rfq_quote') {
     const data = await loadBooking();
     if (!data) {
@@ -3692,7 +3692,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     return { ok: true, status: 200, data: result };
   }
 
-  // ── Generate AI RFQ Quote (with Builders.co.za real-time pricing) ──
+  // -- Generate AI RFQ Quote (with Builders.co.za real-time pricing) --
   if (action === 'generate_rfq_quote') {
     const data = await loadBooking();
     if (!data) return { ok: false, status: 404, error: 'booking_not_found' };
@@ -3844,7 +3844,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         learning_factor: r2(learningFactor),
         pricing_sources: { builders: buildersCount, catalog: catalogCount, ai_estimate: aiCount },
         breakdown: [
-          { description: `Labour (${laborHours}hrs @ R${lrUsed}/hr${learningFactor !== 1 ? ` × ${learningFactor.toFixed(2)} adj` : ''})`, cost: laborCost.toFixed(2) },
+          { description: `Labour (${laborHours}hrs @ R${lrUsed}/hr${learningFactor !== 1 ? ` � ${learningFactor.toFixed(2)} adj` : ''})`, cost: laborCost.toFixed(2) },
           ...(artisanBuys && bom.length > 0 ? [{ description: `Materials & Supplies (${buildersCount} Builders-priced, ${catalogCount} catalog, ${aiCount} estimated)`, cost: matWithMarkup.toFixed(2) }] : []),
           ...(eqCost > 0 ? [{ description: 'Equipment & Tools', cost: eqCost.toFixed(2) }] : []),
           { description: 'Contingency (15%)', cost: contingency.toFixed(2) },
@@ -3872,7 +3872,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     }
   }
 
-  // ── Accept RFQ Quote ──
+  // -- Accept RFQ Quote --
   if (action === 'accept_rfq_quote') {
     const data = await loadBooking();
     if (!data) return { ok: false, status: 404, error: 'booking_not_found' };
@@ -3970,7 +3970,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
             try {
               await admin.messaging().send({
                 token: art.token,
-                notification: { title: '🔔 New RFQ Job Available', body: `RFQ ${data.rfq_no || bookingId} — R${priceNum.toFixed(2)}. Tap to view and accept.` },
+                notification: { title: '?? New RFQ Job Available', body: `RFQ ${data.rfq_no || bookingId} � R${priceNum.toFixed(2)}. Tap to view and accept.` },
                 data: { type: 'rfq_accepted', booking_id: bookingId },
                 android: { notification: { channelId: 'order_request_channel', sound: 'sound' } },
               });
@@ -3984,7 +3984,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
 
     if (!autoDispatched) {
       await writeAdminNotification({
-        title: 'RFQ Quote Accepted — Assign Artisan',
+        title: 'RFQ Quote Accepted � Assign Artisan',
         message: `Customer accepted RFQ ${data.rfq_no || bookingId} (R${priceNum.toFixed(2)}) via voice. Please assign an artisan.`,
         data: { type: 'rfq_accepted', bookingId },
       });
@@ -3993,7 +3993,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     return { ok: true, status: 200, data: { accepted: true, price, rfq_no: String(data.rfq_no || '').trim(), auto_dispatched: autoDispatched } };
   }
 
-  // ── Reject / Negotiate RFQ Quote ──
+  // -- Reject / Negotiate RFQ Quote --
   if (action === 'reject_rfq_quote') {
     const data = await loadBooking();
     if (!data) return { ok: false, status: 404, error: 'booking_not_found' };
@@ -4295,7 +4295,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     };
   }
 
-  // ── New Tier A: get_transaction_history ──────────────────────────
+  // -- New Tier A: get_transaction_history --------------------------
   if (action === 'get_transaction_history') {
     try {
       const limit = Math.min(Math.max(Number(payload.limit) || 20, 1), 50);
@@ -4332,7 +4332,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     }
   }
 
-  // ── New Tier A: get_deposit_requests ────────────────────────────
+  // -- New Tier A: get_deposit_requests ----------------------------
   if (action === 'get_deposit_requests') {
     try {
       const limit = Math.min(Math.max(Number(payload.limit) || 20, 1), 50);
@@ -4356,7 +4356,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     }
   }
 
-  // ── New Tier A: get_service_categories ──────────────────────────
+  // -- New Tier A: get_service_categories --------------------------
   if (action === 'get_service_categories') {
     try {
       const snap = await firestore.collection('tasksCategories').limit(50).get();
@@ -4378,7 +4378,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     }
   }
 
-  // ── New Tier A: get_notifications ──────────────────────────────
+  // -- New Tier A: get_notifications ------------------------------
   if (action === 'get_notifications') {
     try {
       const limit = Math.min(Math.max(Number(payload.limit) || 15, 1), 30);
@@ -4400,12 +4400,12 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       });
       return { ok: true, status: 200, data: { notifications: items, count: items.length } };
     } catch (e) {
-      // Notifications subcollection may not exist — return empty
+      // Notifications subcollection may not exist � return empty
       return { ok: true, status: 200, data: { notifications: [], count: 0 } };
     }
   }
 
-  // ── New Tier A: get_scheduled_bookings ─────────────────────────
+  // -- New Tier A: get_scheduled_bookings -------------------------
   if (action === 'get_scheduled_bookings') {
     try {
       const snap = await firestore.collection('futureBookings')
@@ -4438,7 +4438,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     }
   }
 
-  // ── New Tier A: get_artisan_info ───────────────────────────────
+  // -- New Tier A: get_artisan_info -------------------------------
   if (action === 'get_artisan_info') {
     const artisanIdInput = String(payload.artisan_id || payload.service_provider_id || '').trim();
     if (!artisanIdInput) return { ok: false, status: 400, error: 'artisan_id required' };
@@ -4465,7 +4465,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     }
   }
 
-  // ── New Tier B: submit_rating ──────────────────────────────────
+  // -- New Tier B: submit_rating ----------------------------------
   if (action === 'submit_rating') {
     const targetBookingId = String(payload.booking_id || bookingId || '').trim();
     if (!targetBookingId) return { ok: false, status: 400, error: 'booking_id required' };
@@ -4521,7 +4521,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     }
   }
 
-  // ── New Tier B: submit_complaint ───────────────────────────────
+  // -- New Tier B: submit_complaint -------------------------------
   if (action === 'submit_complaint') {
     const subject = String(payload.subject || payload.title || 'Complaint').trim();
     const description = String(payload.description || payload.message || '').trim();
@@ -4555,9 +4555,9 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     }
   }
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // PHASE 4 — Admin Automation Tools (Tier B, admin-only)
-  // ═══════════════════════════════════════════════════════════════════════════
+  // ---------------------------------------------------------------------------
+  // PHASE 4 � Admin Automation Tools (Tier B, admin-only)
+  // ---------------------------------------------------------------------------
 
   if (action === 'admin_bulk_reassign') {
     if (actorRole !== 'admin') return { ok: false, status: 403, error: 'admin_only' };
@@ -4676,9 +4676,9 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     }
   }
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // PHASE 5.1 — Finance Read-Only Tools (Tier A)
-  // ═══════════════════════════════════════════════════════════════════════════
+  // ---------------------------------------------------------------------------
+  // PHASE 5.1 � Finance Read-Only Tools (Tier A)
+  // ---------------------------------------------------------------------------
 
   if (action === 'get_finance_summary') {
     if (actorRole !== 'admin') return { ok: false, status: 403, error: 'admin_only' };
@@ -4880,7 +4880,7 @@ function validateLiveKitEnv(res) {
   const apiSecret = env('LIVEKIT_API_SECRET');
 
   if (!wsUrl || !apiKey || !apiSecret) {
-    console.error('❌ Livekit credentials not configured');
+    console.error('? Livekit credentials not configured');
     res.status(500).json({
       error: 'Server configuration error',
       message:
@@ -4945,9 +4945,9 @@ app.get('/health', (req, res) => {
   });
 });
 
-// ── Public pricing test endpoint (dev only) ──
+// -- Public pricing test endpoint (dev only) --
 app.get('/api/test-pricing', async (req, res) => {
-  // Public pricing endpoint — used by voice agent for service/pricing lookups.
+  // Public pricing endpoint � used by voice agent for service/pricing lookups.
   try {
     const firestore = (() => { initFirebaseIfPossible(); if (firebaseInitError) return null; return admin.firestore(); })();
     if (!firestore) return res.status(500).json({ error: 'firebase_not_configured' });
@@ -5180,12 +5180,12 @@ app.post('/api/voice/start', assistantLimiter, async (req, res) => {
     }
     const metadata = typeof req.body.metadata === 'string' ? req.body.metadata : '';
 
-    // ── Enrich participant metadata with session credentials ──
+    // -- Enrich participant metadata with session credentials --
     // Use voice_session_id + nonce for agent authentication instead of raw Firebase token.
     let enrichedMetadata = metadata;
     try {
       const parsed = metadata ? JSON.parse(metadata) : {};
-      // Do NOT embed the raw Firebase ID token — it would leak to all room participants.
+      // Do NOT embed the raw Firebase ID token � it would leak to all room participants.
       parsed.voice_session_id = sessionId;
       parsed.voice_session_nonce = sessionNonce;
       enrichedMetadata = JSON.stringify(parsed);
@@ -5221,7 +5221,7 @@ app.post('/api/voice/start', assistantLimiter, async (req, res) => {
       metadata: metadata || undefined,
     });
 
-    console.log(`✅ Session started. room=${roomName} user=${participantName} agent=${agentName}`);
+    console.log(`? Session started. room=${roomName} user=${participantName} agent=${agentName}`);
 
     res.json({
       roomName,
@@ -5236,7 +5236,7 @@ app.post('/api/voice/start', assistantLimiter, async (req, res) => {
       request_id: req.requestId || null,
     });
   } catch (error) {
-    console.error('❌ Error starting voice session:', error);
+    console.error('? Error starting voice session:', error);
     res.status(500).json({
       error: 'Voice session start failed',
       message: error && error.message ? error.message : 'Unknown error',
@@ -6260,8 +6260,8 @@ app.post('/api/admin/fix/service-provider-uid-mapping', async (req, res) => {
   });
 });
 
-// ── Server-side FCM Notification Endpoint ──
-// Replaces client-side admin SDK usage — clients call this instead of loading firebase-adminsdk.json
+// -- Server-side FCM Notification Endpoint --
+// Replaces client-side admin SDK usage � clients call this instead of loading firebase-adminsdk.json
 app.post('/api/notifications/send', authMiddleware, assistantLimiter, async (req, res) => {
   try {
     initFirebaseIfPossible();
@@ -6287,7 +6287,7 @@ app.post('/api/notifications/send', authMiddleware, assistantLimiter, async (req
       ? 'order_request_channel'
       : 'high_importance_channel';
 
-    // Send FCM via Admin SDK (server-side — no private key exposed to clients)
+    // Send FCM via Admin SDK (server-side � no private key exposed to clients)
     const message = {
       token: String(token).trim(),
       notification: { title: String(title), body: String(body) },
@@ -6302,7 +6302,7 @@ app.post('/api/notifications/send', authMiddleware, assistantLimiter, async (req
     };
 
     const result = await admin.messaging().send(message);
-    console.log(`✅ FCM sent via backend: ${result}`);
+    console.log(`? FCM sent via backend: ${result}`);
 
     // Optionally store in-app notification doc
     if (userId) {
@@ -6322,12 +6322,12 @@ app.post('/api/notifications/send', authMiddleware, assistantLimiter, async (req
 
     res.json({ ok: true, success: true, messageId: result });
   } catch (error) {
-    console.error('❌ FCM send error:', error);
+    console.error('? FCM send error:', error);
     res.status(500).json({ error: 'Failed to send notification' });
   }
 });
 
-// ── In-memory payment session store (WhatsApp checkout) ──
+// -- In-memory payment session store (WhatsApp checkout) --
 // PayFast /eng/process only accepts POST, not GET. So we store payment data
 // briefly and serve an auto-submit HTML form page via GET.
 const paymentSessions = new Map();
@@ -6339,7 +6339,7 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
-// ─────────────────────────────────────────────────────────────────────────
+// -------------------------------------------------------------------------
 // LK-3 FIX (May 2026): sign PayFast return-url callbacks to prevent an
 // attacker from spoofing `?status=success&booking_id=X` and causing the
 // server-side fallback to mark someone else's booking as paid. We append
@@ -6349,7 +6349,7 @@ setInterval(() => {
 // Tokens are valid for 90 minutes (covers slow checkouts + clock skew).
 // Fail-closed: an unsigned/invalid callback still renders the status page
 // but does NOT trigger the payment-processing fallback.
-// ─────────────────────────────────────────────────────────────────────────
+// -------------------------------------------------------------------------
 const PAYMENT_CALLBACK_TTL_MS = 90 * 60 * 1000;
 function _paymentCallbackSecret() {
   return env('PAYMENT_CALLBACK_SECRET') || env('PAYFAST_PASSPHRASE') || '';
@@ -6357,7 +6357,7 @@ function _paymentCallbackSecret() {
 function signPaymentCallback(bookingId) {
   const secret = _paymentCallbackSecret();
   if (!secret) {
-    console.warn('[payment-callback] no PAYMENT_CALLBACK_SECRET/PAYFAST_PASSPHRASE — callbacks will be unsigned and rejected');
+    console.warn('[payment-callback] no PAYMENT_CALLBACK_SECRET/PAYFAST_PASSPHRASE � callbacks will be unsigned and rejected');
     return '';
   }
   const exp = Date.now() + PAYMENT_CALLBACK_TTL_MS;
@@ -6386,7 +6386,7 @@ function verifyPaymentCallback(bookingId, t, exp) {
   return { ok: true };
 }
 
-// ── GET checkout page — renders auto-submit POST form to PayFast ──
+// -- GET checkout page � renders auto-submit POST form to PayFast --
 app.get('/api/payment/checkout/:sessionId', (req, res) => {
   const session = paymentSessions.get(req.params.sessionId);
   if (!session) {
@@ -6408,7 +6408,7 @@ app.get('/api/payment/checkout/:sessionId', (req, res) => {
   // Garbage-collect session after 5 minutes
   setTimeout(() => paymentSessions.delete(req.params.sessionId), 5 * 60 * 1000);
 
-  // Build hidden form fields — escape values for HTML safety
+  // Build hidden form fields � escape values for HTML safety
   const esc = (s) => String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   const fields = Object.entries(session.paymentData)
     .map(([k, v]) => `<input type="hidden" name="${esc(k)}" value="${esc(v)}">`)
@@ -6417,7 +6417,7 @@ app.get('/api/payment/checkout/:sessionId', (req, res) => {
   res.send(`
     <html>
     <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-    <title>Square 15 — Redirecting to Payment</title></head>
+    <title>Square 15 � Redirecting to Payment</title></head>
     <body style="font-family:sans-serif;text-align:center;padding:60px">
       <h2>Redirecting to secure payment...</h2>
       <p>Amount: <strong>R${esc(session.paymentData.amount)}</strong></p>
@@ -6431,14 +6431,14 @@ app.get('/api/payment/checkout/:sessionId', (req, res) => {
   `);
 });
 
-// ── WhatsApp Payment Link Generation (internal use only) ──
+// -- WhatsApp Payment Link Generation (internal use only) --
 // Called by WhatsApp bot to generate a payment link for customers who may not have the app.
 app.post('/api/payment/whatsapp-initiate', assistantLimiter, async (req, res) => {
   try {
     // Verify internal shared secret
     const internalSecret = (process.env.INTERNAL_API_SECRET || '').trim();
     if (!internalSecret) {
-      console.error('FATAL: INTERNAL_API_SECRET not set — rejecting request');
+      console.error('FATAL: INTERNAL_API_SECRET not set � rejecting request');
       return res.status(503).json({ error: 'Server misconfigured' });
     }
     const providedSecret = (req.headers['x-internal-secret'] || '').trim();
@@ -6467,7 +6467,7 @@ app.post('/api/payment/whatsapp-initiate', assistantLimiter, async (req, res) =>
     const notifyUrl = `${backendUrl}/api/payment/itn`;
 
     // PayFast requires parameters in a SPECIFIC order for signature verification:
-    // merchant → return/cancel/notify → personal → amount/item → custom → payment_method
+    // merchant ? return/cancel/notify ? personal ? amount/item ? custom ? payment_method
     const paymentData = {};
     paymentData.merchant_id = merchantId;
     paymentData.merchant_key = merchantKey;
@@ -6506,12 +6506,12 @@ app.post('/api/payment/whatsapp-initiate', assistantLimiter, async (req, res) =>
       amount: parseFloat(amount).toFixed(2),
     });
   } catch (error) {
-    console.error('❌ WhatsApp payment link error:', error);
+    console.error('? WhatsApp payment link error:', error);
     res.status(500).json({ error: 'Payment link generation failed' });
   }
 });
 
-// ── Server-side PayFast Payment Initiation ──
+// -- Server-side PayFast Payment Initiation --
 // Replaces client-side hardcoded merchant credentials
 // Supports: payment_method='eft' (default/Ozow), 'cc' (card-only)
 // Supports: subscription_type=2 for ad-hoc tokenization (save card for future use)
@@ -6561,7 +6561,7 @@ app.post('/api/payment/initiate', authMiddleware, assistantLimiter, async (req, 
     const defaultNotify = `${backendUrl}/api/payment/itn`;
 
     // PayFast requires parameters in a SPECIFIC order for signature verification:
-    // merchant → return/cancel/notify → personal → amount/item → custom → payment_method → subscription
+    // merchant ? return/cancel/notify ? personal ? amount/item ? custom ? payment_method ? subscription
     const paymentData = {};
     paymentData.merchant_id = merchantId;
     paymentData.merchant_key = merchantKey;
@@ -6612,13 +6612,13 @@ app.post('/api/payment/initiate', authMiddleware, assistantLimiter, async (req, 
     const signature = crypto.createHash('md5').update(sigInput).digest('hex');
     paymentData.signature = signature;
 
-    // Build full payment URL with query params — use + encoding (matches signature)
+    // Build full payment URL with query params � use + encoding (matches signature)
     const queryString = Object.entries(paymentData)
       .map(([k, v]) => `${encodeURIComponent(k).replace(/%20/g, '+')}=${encodeURIComponent(String(v || '')).replace(/%20/g, '+')}`)
       .join('&');
     const fullPaymentUrl = `${payfastUrl}?${queryString}`;
 
-    // Build auto-submitting HTML form (POST) — most reliable PayFast integration method
+    // Build auto-submitting HTML form (POST) � most reliable PayFast integration method
     const formFields = Object.entries(paymentData)
       .map(([k, v]) => `<input type="hidden" name="${k}" value="${String(v || '').replace(/"/g, '&quot;')}" />`)
       .join('\n      ');
@@ -6644,7 +6644,7 @@ app.post('/api/payment/initiate', authMiddleware, assistantLimiter, async (req, 
       payment_data: paymentData,
     });
   } catch (error) {
-    console.error('❌ Payment initiation error:', error);
+    console.error('? Payment initiation error:', error);
     try {
       await logErrorToAdmin(
         'payment_initiation_error',
@@ -6659,7 +6659,7 @@ app.post('/api/payment/initiate', authMiddleware, assistantLimiter, async (req, 
   }
 });
 
-// ── Charge Saved Card (ad-hoc tokenization) ──
+// -- Charge Saved Card (ad-hoc tokenization) --
 // Uses a previously saved PayFast token to charge a card without redirecting
 app.post('/api/payment/charge-token', authMiddleware, assistantLimiter, async (req, res) => {
   try {
@@ -6741,12 +6741,12 @@ app.post('/api/payment/charge-token', authMiddleware, assistantLimiter, async (r
     try {
       result = await chargeResponse.json();
     } catch (parseErr) {
-      console.error('❌ Failed to parse PayFast response:', parseErr.message);
+      console.error('? Failed to parse PayFast response:', parseErr.message);
       return res.status(502).json({ ok: false, error: 'Payment gateway returned invalid response' });
     }
 
     if (chargeResponse.ok && result.data) {
-      console.log(`💳 Token charge successful: R${amount}, task=${custom_str1 || 'N/A'}`);
+      console.log(`?? Token charge successful: R${amount}, task=${custom_str1 || 'N/A'}`);
 
       // Use shared payment processing for full notification chain
       if (custom_str1) {
@@ -6779,16 +6779,16 @@ app.post('/api/payment/charge-token', authMiddleware, assistantLimiter, async (r
 
       res.json({ ok: true, message: 'Payment charged successfully', data: result.data });
     } else {
-      console.error('❌ Token charge failed:', result);
+      console.error('? Token charge failed:', result);
       res.status(400).json({ ok: false, error: result.message || 'Charge failed' });
     }
   } catch (error) {
-    console.error('❌ Token charge error:', error);
+    console.error('? Token charge error:', error);
     res.status(500).json({ error: 'Card charge failed' });
   }
 });
 
-// ── Saved Cards Management ──
+// -- Saved Cards Management --
 // GET: List user's saved cards (masked)
 app.get('/api/payment/saved-cards', authMiddleware, async (req, res) => {
   try {
@@ -6808,12 +6808,12 @@ app.get('/api/payment/saved-cards', authMiddleware, async (req, res) => {
         created_at: d.created_at,
         last_used_at: d.last_used_at,
       };
-      // Note: token is NEVER sent to the client — stays server-side only
+      // Note: token is NEVER sent to the client � stays server-side only
     });
 
     res.json({ ok: true, cards });
   } catch (error) {
-    console.error('❌ Saved cards fetch error:', error);
+    console.error('? Saved cards fetch error:', error);
     res.status(500).json({ error: 'Failed to fetch saved cards' });
   }
 });
@@ -6834,19 +6834,19 @@ app.delete('/api/payment/saved-cards/:cardId', authMiddleware, async (req, res) 
 
     // Soft-delete: mark as inactive rather than deleting
     await cardRef.update({ is_active: false, deleted_at: new Date().toISOString() });
-    console.log(`🗑️ Deactivated saved card ${cardId} for user ${userId}`);
+    console.log(`??? Deactivated saved card ${cardId} for user ${userId}`);
 
     res.json({ ok: true, message: 'Card removed' });
   } catch (error) {
-    console.error('❌ Card deletion error:', error);
+    console.error('? Card deletion error:', error);
     res.status(500).json({ error: 'Failed to remove card' });
   }
 });
 
-// ── Refund Processing ──
+// -- Refund Processing --
 // Processes refund for a paid booking. Supports two methods:
-//   method='wallet' → immediate wallet credit (no PayFast call)
-//   method='card'   → PayFast refund API call (takes 3-5 business days)
+//   method='wallet' ? immediate wallet credit (no PayFast call)
+//   method='card'   ? PayFast refund API call (takes 3-5 business days)
 // Anti-fraud: rate-limited, cooldown check, max refund limits, idempotent
 app.post('/api/payment/refund', authMiddleware, assistantLimiter, async (req, res) => {
   try {
@@ -6863,7 +6863,7 @@ app.post('/api/payment/refund', authMiddleware, assistantLimiter, async (req, re
     const now = new Date().toISOString();
     const db = admin.firestore();
 
-    // ── Anti-fraud: rate limit – max 3 refunds per user per 24 hours ──
+    // -- Anti-fraud: rate limit � max 3 refunds per user per 24 hours --
     const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
     const recentRefunds = await db.collection('transactionLogs')
       .where('user_id', '==', userId)
@@ -6875,7 +6875,7 @@ app.post('/api/payment/refund', authMiddleware, assistantLimiter, async (req, re
       return res.status(429).json({ error: 'Too many refund requests. Please try again later or contact support.' });
     }
 
-    // ── Look up the booking ──
+    // -- Look up the booking --
     const collectionName = doc_type === 'futureBookings' ? 'futureBookings' : 'tasksManagement';
     const docRef = db.collection(collectionName).doc(booking_id);
     const docSnap = await docRef.get();
@@ -6886,26 +6886,26 @@ app.post('/api/payment/refund', authMiddleware, assistantLimiter, async (req, re
     const data = docSnap.data();
     const docUserId = data.user_id || data.userId || '';
 
-    // ── Security: verify the requesting user owns this booking ──
+    // -- Security: verify the requesting user owns this booking --
     if (docUserId !== userId) {
       console.warn(`[refund] User ${userId} attempted refund on booking owned by ${docUserId}`);
       return res.status(403).json({ error: 'You are not authorized to refund this booking.' });
     }
 
-    // ── Check booking is actually cancelled ──
+    // -- Check booking is actually cancelled --
     const status = (data.status || '').toString().toLowerCase();
     if (status !== 'cancelled') {
       return res.status(400).json({ error: 'Booking must be cancelled before requesting a refund.' });
     }
 
-    // ── Idempotency: check if already refunded ──
+    // -- Idempotency: check if already refunded --
     const refundStatus = (data.refund_status || '').toString().toLowerCase();
     const walletRefunded = (data.wallet_refunded || '').toString().toLowerCase();
     if (refundStatus === 'refunded' || walletRefunded === 'yes') {
       return res.json({ ok: true, already_refunded: true, message: 'This booking has already been refunded.' });
     }
 
-    // ── Anti-fraud: cooldown – booking must be at least 5 minutes old ──
+    // -- Anti-fraud: cooldown � booking must be at least 5 minutes old --
     const createdAt = data.created_at || data.createdAt || data.creation_date || '';
     if (createdAt) {
       const bookingAge = Date.now() - new Date(createdAt).getTime();
@@ -6914,7 +6914,7 @@ app.post('/api/payment/refund', authMiddleware, assistantLimiter, async (req, re
       }
     }
 
-    // ── Determine refund amount ──
+    // -- Determine refund amount --
     let refundAmount = 0;
     // Try original transaction first
     const txSnap = await db.collection('transactionLogs')
@@ -6933,7 +6933,7 @@ app.post('/api/payment/refund', authMiddleware, assistantLimiter, async (req, re
       return res.status(400).json({ error: 'Could not determine refund amount.' });
     }
 
-    // ── Anti-fraud: max single refund cap R50,000 ──
+    // -- Anti-fraud: max single refund cap R50,000 --
     if (refundAmount > 50000) {
       console.warn(`[refund] Suspiciously large refund R${refundAmount} for booking ${booking_id}`);
       return res.status(400).json({ error: 'Refund amount exceeds limit. Please contact support.' });
@@ -6941,9 +6941,9 @@ app.post('/api/payment/refund', authMiddleware, assistantLimiter, async (req, re
 
     const txId = crypto.randomUUID();
 
-    // ═══════════════════════════════════════════════════════════
+    // -----------------------------------------------------------
     // METHOD: WALLET (instant credit)
-    // ═══════════════════════════════════════════════════════════
+    // -----------------------------------------------------------
     if (method === 'wallet') {
       // Atomic wallet refund via Firestore transaction
       await db.runTransaction(async (tx) => {
@@ -6990,7 +6990,7 @@ app.post('/api/payment/refund', authMiddleware, assistantLimiter, async (req, re
         });
       });
 
-      console.log(`💰 Wallet refund R${refundAmount.toFixed(2)} for user ${userId}, booking ${booking_id}`);
+      console.log(`?? Wallet refund R${refundAmount.toFixed(2)} for user ${userId}, booking ${booking_id}`);
       return res.json({
         ok: true,
         method: 'wallet',
@@ -6999,9 +6999,9 @@ app.post('/api/payment/refund', authMiddleware, assistantLimiter, async (req, re
       });
     }
 
-    // ═══════════════════════════════════════════════════════════
+    // -----------------------------------------------------------
     // METHOD: CARD (PayFast refund API)
-    // ═══════════════════════════════════════════════════════════
+    // -----------------------------------------------------------
     if (method === 'card') {
       // Atomically mark as processing to prevent concurrent card refunds
       try {
@@ -7032,7 +7032,7 @@ app.post('/api/payment/refund', authMiddleware, assistantLimiter, async (req, re
       // Find the original PayFast payment ID
       const pfPaymentId = data.payfast_payment_id || '';
       if (!pfPaymentId) {
-        // No PayFast payment ID — fall back to creating a refund request for admin
+        // No PayFast payment ID � fall back to creating a refund request for admin
         await db.collection('refund_requests').doc(txId).set({
           id: txId,
           source_doc_id: booking_id,
@@ -7048,7 +7048,7 @@ app.post('/api/payment/refund', authMiddleware, assistantLimiter, async (req, re
         });
         await docRef.update({ refund_status: 'pending_admin_review', updated_at: now });
 
-        console.log(`📋 Card refund request (no pf_id) created for booking ${booking_id}`);
+        console.log(`?? Card refund request (no pf_id) created for booking ${booking_id}`);
         return res.json({
           ok: true,
           method: 'refund_request',
@@ -7121,7 +7121,7 @@ app.post('/api/payment/refund', authMiddleware, assistantLimiter, async (req, re
             payfast_payment_id: pfPaymentId,
           });
 
-          console.log(`💳 Card refund R${refundAmount.toFixed(2)} processed for booking ${booking_id}`);
+          console.log(`?? Card refund R${refundAmount.toFixed(2)} processed for booking ${booking_id}`);
           return res.json({
             ok: true,
             method: 'card',
@@ -7129,7 +7129,7 @@ app.post('/api/payment/refund', authMiddleware, assistantLimiter, async (req, re
             message: `R${refundAmount.toFixed(2)} card refund initiated. It will reflect in 3-5 business days.`,
           });
         } else {
-          // PayFast refund API failed — fall back to admin review
+          // PayFast refund API failed � fall back to admin review
           console.error(`[refund] PayFast refund API failed:`, refundResult);
           await db.collection('refund_requests').doc(txId).set({
             id: txId,
@@ -7187,12 +7187,12 @@ app.post('/api/payment/refund', authMiddleware, assistantLimiter, async (req, re
     if (error.message === 'ALREADY_REFUNDED') {
       return res.json({ ok: true, already_refunded: true, message: 'This booking has already been refunded.' });
     }
-    console.error('❌ Refund error:', error);
+    console.error('? Refund error:', error);
     res.status(500).json({ error: 'Refund processing failed. Please contact support.' });
   }
 });
 
-// ── Admin Payout (charge admin's saved card, credit recipient) ──
+// -- Admin Payout (charge admin's saved card, credit recipient) --
 // Admin charges their own saved card to fund a refund to a client's wallet
 // or pay an artisan's balance. Requires admin role.
 app.post('/api/admin/payout', authMiddleware, assistantLimiter, async (req, res) => {
@@ -7201,7 +7201,7 @@ app.post('/api/admin/payout', authMiddleware, assistantLimiter, async (req, res)
     const decoded = req.user;
     const adminUid = decoded.uid;
 
-    // ── Verify admin role ──
+    // -- Verify admin role --
     const role = await resolveRole({ firestore: db, uid: adminUid, decodedToken: decoded });
     if (role !== 'admin') {
       console.warn(`[admin/payout] Non-admin user ${adminUid} (role=${role}) attempted payout`);
@@ -7222,7 +7222,7 @@ app.post('/api/admin/payout', authMiddleware, assistantLimiter, async (req, res)
       return res.status(400).json({ error: 'Invalid amount. Must be between R0.01 and R100,000.' });
     }
 
-    // ── Look up admin's saved card ──
+    // -- Look up admin's saved card --
     const cardSnap = await db.collection('users').doc(adminUid).collection('saved_cards').doc(card_id).get();
     if (!cardSnap.exists || !cardSnap.data().is_active) {
       return res.status(404).json({ error: 'Saved card not found or inactive.' });
@@ -7232,7 +7232,7 @@ app.post('/api/admin/payout', authMiddleware, assistantLimiter, async (req, res)
       return res.status(400).json({ error: 'Card has no payment token.' });
     }
 
-    // ── Verify recipient exists ──
+    // -- Verify recipient exists --
     const recipientCollection = recipient_type === 'client' ? 'users' : 'serviceProvider';
     const recipientSnap = await db.collection(recipientCollection).doc(recipient_id).get();
     if (!recipientSnap.exists) {
@@ -7241,7 +7241,7 @@ app.post('/api/admin/payout', authMiddleware, assistantLimiter, async (req, res)
     const recipientData = recipientSnap.data() || {};
     const recipientName = recipientData.name || recipientData.displayName || recipientData.full_name || '';
 
-    // ── Charge admin's card via PayFast ad-hoc tokenization ──
+    // -- Charge admin's card via PayFast ad-hoc tokenization --
     const merchantId = env('PAYFAST_MERCHANT_ID');
     const merchantKey = env('PAYFAST_MERCHANT_KEY');
     const passphrase = env('PAYFAST_PASSPHRASE') || '';
@@ -7295,12 +7295,12 @@ app.post('/api/admin/payout', authMiddleware, assistantLimiter, async (req, res)
       return res.status(400).json({ ok: false, error: chargeResult.message || 'Card charge failed.' });
     }
 
-    console.log(`💳 Admin card charged R${payoutAmount.toFixed(2)} for ${recipient_type} ${recipient_id}`);
+    console.log(`?? Admin card charged R${payoutAmount.toFixed(2)} for ${recipient_type} ${recipient_id}`);
 
     // Update card last_used_at
     await cardSnap.ref.update({ last_used_at: now });
 
-    // ── Credit recipient ──
+    // -- Credit recipient --
     const txId = crypto.randomUUID();
 
     if (recipient_type === 'client') {
@@ -7366,9 +7366,9 @@ app.post('/api/admin/payout', authMiddleware, assistantLimiter, async (req, res)
         }
       }
 
-      console.log(`💰 Admin refund R${payoutAmount.toFixed(2)} credited to client ${recipient_id} wallet`);
+      console.log(`?? Admin refund R${payoutAmount.toFixed(2)} credited to client ${recipient_id} wallet`);
     } else {
-      // Credit artisan balance — wrapped in a transaction so the read+update
+      // Credit artisan balance � wrapped in a transaction so the read+update
       // of `serviceProvider.balance` and the matching transactionLogs entry
       // commit atomically. Previously a concurrent payout could read the
       // same `currentBalance` twice and overwrite each other's update,
@@ -7423,7 +7423,7 @@ app.post('/api/admin/payout', authMiddleware, assistantLimiter, async (req, res)
         }
       }
 
-      console.log(`💰 Admin payout R${payoutAmount.toFixed(2)} credited to artisan ${recipient_id}`);
+      console.log(`?? Admin payout R${payoutAmount.toFixed(2)} credited to artisan ${recipient_id}`);
     }
 
     // Update refund_request status if this is processing a pending refund
@@ -7453,12 +7453,12 @@ app.post('/api/admin/payout', authMiddleware, assistantLimiter, async (req, res)
       message: `R${payoutAmount.toFixed(2)} charged to your card and credited to ${recipient_type === 'client' ? 'client wallet' : 'artisan balance'}.`,
     });
   } catch (error) {
-    console.error('❌ Admin payout error:', error);
+    console.error('? Admin payout error:', error);
     res.status(500).json({ error: 'Payout processing failed.' });
   }
 });
 
-// ── Admin: Ozow Direct EFT Payout to artisan/partner bank account ──
+// -- Admin: Ozow Direct EFT Payout to artisan/partner bank account --
 // Sends money directly to the recipient's bank account via Ozow Payout API.
 app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
   try {
@@ -7486,7 +7486,7 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'Invalid amount. Must be between R0.01 and R5,000,000.' });
     }
 
-    // ── Ozow payout API credentials ──
+    // -- Ozow payout API credentials --
     const ozowApiKey = env('OZOW_PAYOUT_API_KEY') || env('OZOW_API_KEY');
     const ozowSiteCode = env('OZOW_SITE_CODE');
 
@@ -7494,7 +7494,7 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       return res.status(503).json({ error: 'Ozow payout credentials not configured. Set OZOW_PAYOUT_API_KEY and OZOW_SITE_CODE in environment.' });
     }
 
-    // ── Map South African bank names to Ozow bank codes ──
+    // -- Map South African bank names to Ozow bank codes --
     const bankCodeMap = {
       'absa': '632005',
       'african bank': '430000',
@@ -7516,7 +7516,7 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
     const bankKey = bank_name.toLowerCase().trim();
     const ozowBankCode = bankCodeMap[bankKey] || branch_code;
 
-    // ── Map account type ──
+    // -- Map account type --
     const accountTypeMap = {
       'cheque/current': '1',
       'cheque': '1',
@@ -7527,10 +7527,10 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
     const ozowAccountType = accountTypeMap[(account_type || 'cheque').toLowerCase()] || '1';
 
     const now = new Date().toISOString();
-    // Ozow bankReference max 20 chars — use compact format
+    // Ozow bankReference max 20 chars � use compact format
     const payoutRef = `SQ${Date.now().toString(36).toUpperCase()}`;
 
-    // ── Call Ozow Payout API ──
+    // -- Call Ozow Payout API --
     // Ozow Payout API lives on pay.ozow.com (NOT api.ozow.com)
     const ozowPayoutUrl = env('OZOW_IS_TEST') === 'true'
       ? 'https://stagingpay.ozow.com/api/v1/sendpayout'
@@ -7649,7 +7649,7 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
 
     console.log(`[admin/ozow-payout] Ozow response (${ozowResponse.status}):`, JSON.stringify(ozowResult));
 
-    // Ozow may return PascalCase or camelCase — handle both
+    // Ozow may return PascalCase or camelCase � handle both
     const payoutId = ozowResult.payoutId || ozowResult.PayoutId || ozowResult.id || ozowResult.Id;
     const ozowStatus = ozowResult.status || ozowResult.Status;
 
@@ -7680,9 +7680,9 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       });
     }
 
-    console.log(`✅ Ozow payout created: ${payoutId} ref=${payoutRef}`);
+    console.log(`? Ozow payout created: ${payoutId} ref=${payoutRef}`);
 
-    // ── Record payout in Firestore ──
+    // -- Record payout in Firestore --
     const txId = crypto.randomUUID();
     const payoutRecord = {
       id: txId,
@@ -7785,8 +7785,8 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
           });
         });
       } catch (txErr) {
-        console.error('❌ Artisan balance deduction failed:', txErr.message);
-        // The Ozow payout was already initiated — log for manual reconciliation
+        console.error('? Artisan balance deduction failed:', txErr.message);
+        // The Ozow payout was already initiated � log for manual reconciliation
       }
     }
 
@@ -7799,7 +7799,7 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       message: `R${payoutAmount.toFixed(2)} EFT payout initiated to ${recipient_name || recipient_type}. Funds will arrive within minutes (RTC) or next business day.`,
     });
   } catch (error) {
-    console.error('❌ Ozow payout error:', error);
+    console.error('? Ozow payout error:', error);
     try {
       await logErrorToAdmin(
         'ozow_payout_exception',
@@ -7814,11 +7814,11 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
   }
 });
 
-// ── Ozow Payout Verification Webhook ──
+// -- Ozow Payout Verification Webhook --
 // Ozow calls this BEFORE executing a payout to confirm the request is
 // legitimate. We respond 200 with `verified:true` and echo the payoutId
 // only when (a) the 24-char static OZOW_ACCESS_TOKEN matches and (b) we
-// have a matching `payout_records` doc — so a leaked token alone can't
+// have a matching `payout_records` doc � so a leaked token alone can't
 // approve a fabricated payoutId.
 app.post('/api/ozow-payout-verify', async (req, res) => {
   try {
@@ -7873,7 +7873,7 @@ app.post('/api/ozow-payout-verify', async (req, res) => {
   }
 });
 
-// ── Ozow Low Float Alert Webhook ──
+// -- Ozow Low Float Alert Webhook --
 // Ozow POSTs here when the merchant float runs low. We surface an admin
 // notification. Same OZOW_ACCESS_TOKEN gate as verify.
 app.post('/api/ozow-low-float-alert', async (req, res) => {
@@ -7893,7 +7893,7 @@ app.post('/api/ozow-low-float-alert', async (req, res) => {
     }
     const balance = req.body.balance || req.body.Balance || 'unknown';
     await admin.firestore().collection('notifications').add({
-      title: '⚠️ Ozow Float Low',
+      title: '?? Ozow Float Low',
       body: `Ozow has reported a low float balance: ${balance}. Top up to avoid payout failures.`,
       type: 'ozow_low_float',
       user_type: 'admin',
@@ -7909,7 +7909,7 @@ app.post('/api/ozow-low-float-alert', async (req, res) => {
   }
 });
 
-// ── Ozow Payout Notification Webhook ──
+// -- Ozow Payout Notification Webhook --
 // Ozow calls this when a payout status changes (success, failed, etc.)
 //
 // SECURITY (audit Apr-2026): this endpoint reverses balance deductions on
@@ -8009,7 +8009,7 @@ app.post('/api/ozow-payout-notify', async (req, res) => {
             balance: admin.firestore.FieldValue.increment(amount),
             updated_at: now,
           });
-          console.log(`↩️ Reversed R${amount} balance deduction for artisan ${payoutData.recipient_id} (failed payout)`);
+          console.log(`?? Reversed R${amount} balance deduction for artisan ${payoutData.recipient_id} (failed payout)`);
         }
       } else if (payoutData.recipient_type === 'partner') {
         const partnerRef = db.collection('corporate_partners').doc(payoutData.recipient_id);
@@ -8021,20 +8021,20 @@ app.post('/api/ozow-payout-notify', async (req, res) => {
             paid_out: admin.firestore.FieldValue.increment(-amount),
             updated_at: now,
           });
-          console.log(`↩️ Reversed R${amount} partner payout for ${payoutData.recipient_id} (failed payout)`);
+          console.log(`?? Reversed R${amount} partner payout for ${payoutData.recipient_id} (failed payout)`);
         }
       }
     }
 
-    console.log(`✅ Payout ${payoutId} updated to ${finalStatus}`);
+    console.log(`? Payout ${payoutId} updated to ${finalStatus}`);
     res.json({ ok: true, status: finalStatus });
   } catch (error) {
-    console.error('❌ Ozow payout notify error:', error);
+    console.error('? Ozow payout notify error:', error);
     res.status(500).json({ error: 'Notification processing failed' });
   }
 });
 
-// ── Admin: Check Ozow payout status ──
+// -- Admin: Check Ozow payout status --
 app.get('/api/admin/ozow-payout-status/:payoutId', authMiddleware, async (req, res) => {
   try {
     const db = admin.firestore();
@@ -8067,12 +8067,12 @@ app.get('/api/admin/ozow-payout-status/:payoutId', authMiddleware, async (req, r
       created_at: data.created_at,
     });
   } catch (error) {
-    console.error('❌ Payout status error:', error);
+    console.error('? Payout status error:', error);
     res.status(500).json({ error: 'Failed to check payout status' });
   }
 });
 
-// ── Admin: Save card via initial payment ──
+// -- Admin: Save card via initial payment --
 // Creates a payment URL for the admin to save a card via PayFast tokenization.
 // Uses a R1 verification charge that will be refunded.
 app.post('/api/admin/save-card', authMiddleware, async (req, res) => {
@@ -8119,7 +8119,7 @@ app.post('/api/admin/save-card', authMiddleware, async (req, res) => {
     const adminName = adminData.name || decoded.name || 'Admin';
 
     // PayFast requires parameters in a SPECIFIC order for signature verification:
-    // merchant → return/cancel/notify → personal → amount/item → custom → payment_method → subscription
+    // merchant ? return/cancel/notify ? personal ? amount/item ? custom ? payment_method ? subscription
     const paymentData = {};
     paymentData.merchant_id = merchantId;
     paymentData.merchant_key = merchantKey;
@@ -8142,7 +8142,7 @@ app.post('/api/admin/save-card', authMiddleware, async (req, res) => {
     // Only add it if the merchant has explicitly enabled it
     paymentData.subscription_type = '2';
 
-    // Generate PayFast signature — use + for spaces (PayFast standard)
+    // Generate PayFast signature � use + for spaces (PayFast standard)
     const passphrase = env('PAYFAST_PASSPHRASE') || '';
     const pfParamString = Object.entries(paymentData)
       .map(([k, v]) => `${encodeURIComponent(k).replace(/%20/g, '+')}=${encodeURIComponent(String(v || '')).replace(/%20/g, '+')}`)
@@ -8153,7 +8153,7 @@ app.post('/api/admin/save-card', authMiddleware, async (req, res) => {
     }
     paymentData.signature = crypto.createHash('md5').update(sigInput).digest('hex');
 
-    // Build auto-submitting HTML form (POST) — PayFast requires form POST for reliable signature validation
+    // Build auto-submitting HTML form (POST) � PayFast requires form POST for reliable signature validation
     const formFields = Object.entries(paymentData)
       .map(([k, v]) => `<input type="hidden" name="${k}" value="${String(v || '').replace(/"/g, '&quot;')}" />`)
       .join('\n      ');
@@ -8178,12 +8178,12 @@ app.post('/api/admin/save-card', authMiddleware, async (req, res) => {
     console.log(`[admin] Card save initiated for admin ${adminUid}, email=${adminEmail ? 'yes' : 'MISSING'}`);
     res.json({ ok: true, payment_url: fullPaymentUrl, payment_form_html: formHtml });
   } catch (error) {
-    console.error('❌ Admin save-card error:', error);
+    console.error('? Admin save-card error:', error);
     res.status(500).json({ error: 'Failed to initiate card save.' });
   }
 });
 
-// ── Shared payment processing helper (used by both ozow-result and ITN) ──
+// -- Shared payment processing helper (used by both ozow-result and ITN) --
 // Idempotent: checks if already processed before updating.
 async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, itemName, source: calledFrom }) {
   if (!bookingId) return { processed: false, reason: 'no booking ID' };
@@ -8193,8 +8193,8 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
   const taskSnap = await taskRef.get();
 
   if (!taskSnap.exists) {
-    // ── SAFETY NET: If doc doesn't exist, create a minimal one so payment is not lost ──
-    console.warn(`[processPayment] tasksManagement/${bookingId} not found — creating minimal doc to preserve payment`);
+    // -- SAFETY NET: If doc doesn't exist, create a minimal one so payment is not lost --
+    console.warn(`[processPayment] tasksManagement/${bookingId} not found � creating minimal doc to preserve payment`);
     const isWA = bookingId.startsWith('WA-');
     // Pull critical fields from futureBookings so the doc isn't orphaned
     let fbFields = {};
@@ -8238,7 +8238,7 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
     await taskRef.set(minimalDoc);
     console.log(`[processPayment] Created minimal tasksManagement/${bookingId} with ${Object.keys(fbFields).length} fields from futureBookings`);
 
-    // ── Send WA notification + push for auto-created doc (don't return early) ──
+    // -- Send WA notification + push for auto-created doc (don't return early) --
     // Use fbFields as taskData source for phone, source, etc.
     const taskSource = (fbFields.source || (bookingId.startsWith('WA-') ? 'whatsapp' : '')).toString().toLowerCase();
     const phone = (fbFields.phone || fbFields.customer_phone || fbFields.customerPhone || fbFields.contact || fbFields.user_phone || fbFields.client_phone || '').toString().trim();
@@ -8260,16 +8260,16 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
         if (autoIsDeposit && !autoDepositAlreadyPaid) {
           autoDisplayAmt = parseFloat(fbPayData.deposit_amount || '0') || Math.round(autoTotalCost * 0.35 * 100) / 100;
           const autoBalAmt = parseFloat(fbPayData.balance_amount || '0') || Math.round((autoTotalCost - autoDisplayAmt) * 100) / 100;
-          waMessage = `💳 *Deposit received!* R${autoDisplayAmt.toFixed(2)} for booking #${orderLabel}.\n\n✅ Your booking is confirmed. The remaining balance of R${autoBalAmt.toFixed(2)} will be due after job completion.\n\nYour artisan will contact you to arrange the visit. 🙏`;
+          waMessage = `?? *Deposit received!* R${autoDisplayAmt.toFixed(2)} for booking #${orderLabel}.\n\n? Your booking is confirmed. The remaining balance of R${autoBalAmt.toFixed(2)} will be due after job completion.\n\nYour artisan will contact you to arrange the visit. ??`;
           // Update the minimal doc with deposit fields
           await taskRef.update({ payment_type: 'deposit', deposit_paid: true, deposit_paid_at: now, deposit_amount: autoDisplayAmt.toFixed(2), balance_amount: autoBalAmt.toFixed(2), balance_remaining: autoBalAmt.toFixed(2), payment_status: 'deposit_paid', paymentStatus: 'deposit_paid' });
         } else if (autoIsDeposit && autoDepositAlreadyPaid) {
           autoDisplayAmt = parseFloat(fbPayData.balance_remaining || fbPayData.balance_amount || '0') || Math.round(autoTotalCost * 0.65 * 100) / 100;
-          waMessage = `💳 *Balance payment received!* R${autoDisplayAmt.toFixed(2)} for booking #${orderLabel}.\n\n✅ Your booking is now fully paid. You can now rate your artisan.\n\nThank you for choosing Square 15! 🙏`;
+          waMessage = `?? *Balance payment received!* R${autoDisplayAmt.toFixed(2)} for booking #${orderLabel}.\n\n? Your booking is now fully paid. You can now rate your artisan.\n\nThank you for choosing Square 15! ??`;
           await taskRef.update({ balance_paid: true, balance_paid_at: now, payment_status: 'paid', paymentStatus: 'paid' });
         } else {
           autoDisplayAmt = autoTotalCost;
-          waMessage = `💳 *Payment received!* R${autoDisplayAmt > 0 ? autoDisplayAmt.toFixed(2) : '0.00'} for booking #${orderLabel}.\n\n✅ Your booking is confirmed. Your artisan will contact you to arrange the visit.\n\nThank you for choosing Square 15! 🙏`;
+          waMessage = `?? *Payment received!* R${autoDisplayAmt > 0 ? autoDisplayAmt.toFixed(2) : '0.00'} for booking #${orderLabel}.\n\n? Your booking is confirmed. Your artisan will contact you to arrange the visit.\n\nThank you for choosing Square 15! ??`;
         }
         await fetch(`${waBot}/api/booking-status-update`, {
           method: 'POST',
@@ -8277,7 +8277,7 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
           body: JSON.stringify({ bookingId: bookingId, status: 'payment_received', message: waMessage }),
           signal: AbortSignal.timeout(10000),
         });
-        console.log(`✅ [processPayment] WhatsApp notification sent for auto-created ${bookingId}`);
+        console.log(`? [processPayment] WhatsApp notification sent for auto-created ${bookingId}`);
       } catch (waErr) {
         console.warn(`[processPayment] WhatsApp notification failed for auto-created ${bookingId}: ${waErr.message}`);
       }
@@ -8304,7 +8304,7 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
 
   const taskData = taskSnap.data() || {};
 
-  // ── Idempotency: use transaction to prevent race conditions (ozow-result + ITN arriving simultaneously) ──
+  // -- Idempotency: use transaction to prevent race conditions (ozow-result + ITN arriving simultaneously) --
   // For deposit bookings, allow a second payment (balance) after deposit is paid.
   // CRITICAL: require at least 2 minutes since deposit was paid to prevent the ITN callback
   // from the SAME deposit payment being treated as a balance payment.
@@ -8327,7 +8327,7 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
           const fdDepPaidAt = fd.deposit_paid_at ? new Date(fd.deposit_paid_at).getTime() : 0;
           const fdTimeSinceDep = fdDepPaidAt ? (Date.now() - fdDepPaidAt) : Infinity;
           if (fd.payment_type === 'deposit' && fd.deposit_paid === true && fd.balance_paid !== true && fd.payment_status !== 'paid' && fdTimeSinceDep > 120000) {
-            // Balance payment — proceed (genuine second payment, not ITN duplicate)
+            // Balance payment � proceed (genuine second payment, not ITN duplicate)
             return;
           }
           throw new Error('ALREADY_VERIFIED');
@@ -8342,12 +8342,12 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
       console.warn(`[processPayment] Idempotency transaction error: ${txErr.message}`);
     }
   } else {
-    console.log(`[processPayment] Balance payment for deposit booking ${bookingId} (${Math.round(timeSinceDeposit/1000)}s after deposit) — bypassing idempotency`);
+    console.log(`[processPayment] Balance payment for deposit booking ${bookingId} (${Math.round(timeSinceDeposit/1000)}s after deposit) � bypassing idempotency`);
   }
 
-  // ── Read deposit/balance info from futureBookings if missing on tasksManagement ──
+  // -- Read deposit/balance info from futureBookings if missing on tasksManagement --
   // The WA bot writes payment_type/deposit_amount to futureBookings, not always to tasksManagement
-  // ── Merge critical fields from futureBookings (phone, source, service_provider_id, user_id) ──
+  // -- Merge critical fields from futureBookings (phone, source, service_provider_id, user_id) --
   // The artisan-accepted handler may create a minimal tasksManagement doc without these fields.
   // Always read futureBookings to fill gaps so WA notifications and push notifications work.
   {
@@ -8385,7 +8385,7 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
     } catch (_) {}
   }
 
-  // ── Also check bridge docs for service_provider_id if still missing ──
+  // -- Also check bridge docs for service_provider_id if still missing --
   if (!taskData.service_provider_id) {
     try {
       const bridgeLookup = await admin.firestore().collection('tasksManagement')
@@ -8406,19 +8406,19 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
     } catch (_) {}
   }
 
-  // ── Determine payment type ──
+  // -- Determine payment type --
   const isDepositBooking = taskData.payment_type === 'deposit' || taskData.payment_status === 'deposit_pending';
   const depositAlreadyPaid = taskData.deposit_paid === true;
   const balanceAlreadyPaid = taskData.balance_paid === true;
 
-  // ────────────────────────────────────────────────────────────────────
-  // ── PAYMENT AMOUNT VERIFICATION (financial-integrity guard) ──
+  // --------------------------------------------------------------------
+  // -- PAYMENT AMOUNT VERIFICATION (financial-integrity guard) --
   // The amount actually paid via PayFast (amountGross) MUST match the
   // amount we recorded as expected (deposit_amount / balance_remaining / cost)
-  // within a small tolerance. Mismatches must NOT auto-confirm — they
+  // within a small tolerance. Mismatches must NOT auto-confirm � they
   // indicate a tampered/stale link, manual override, or quote change after
   // payment was initiated. Such cases are flagged for admin review.
-  // ────────────────────────────────────────────────────────────────────
+  // --------------------------------------------------------------------
   const paidAmount = parseFloat(amountGross);
   if (!isNaN(paidAmount) && paidAmount > 0) {
     const totalCostNum = parseFloat(taskData.cost || taskData.total_cost || '0') || 0;
@@ -8442,13 +8442,13 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
     }
 
     if (expectedAmount > 0) {
-      // Tolerance: max(R1.00 absolute, 1% relative) — covers gateway rounding
+      // Tolerance: max(R1.00 absolute, 1% relative) � covers gateway rounding
       const diff = Math.abs(paidAmount - expectedAmount);
       const tolerance = Math.max(1.00, expectedAmount * 0.01);
       if (diff > tolerance) {
-        console.error(`🚨 [processPayment] AMOUNT MISMATCH for ${bookingId}: expected ${expectedLabel} R${expectedAmount.toFixed(2)} but PayFast received R${paidAmount.toFixed(2)} (diff R${diff.toFixed(2)}, tolerance R${tolerance.toFixed(2)})`);
+        console.error(`?? [processPayment] AMOUNT MISMATCH for ${bookingId}: expected ${expectedLabel} R${expectedAmount.toFixed(2)} but PayFast received R${paidAmount.toFixed(2)} (diff R${diff.toFixed(2)}, tolerance R${tolerance.toFixed(2)})`);
 
-          // Flag the booking for admin review — DO NOT mark as paid
+          // Flag the booking for admin review � DO NOT mark as paid
           const mismatchFields = {
             payment_amount_mismatch: true,
             payment_amount_mismatch_at: now,
@@ -8505,7 +8505,7 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
               verified_via: calledFrom || 'payment_callback',
               item_name: itemName || taskData.item_name || taskData.service_type || '',
             });
-            console.log(`📝 [processPayment] Mismatch transactionLog created: ${txId}`);
+            console.log(`?? [processPayment] Mismatch transactionLog created: ${txId}`);
           } catch (txErr) {
             console.warn(`[processPayment] Mismatch transactionLog failed: ${txErr.message}`);
           }
@@ -8513,7 +8513,7 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
           // Notify admin (in-app + FCM)
           try {
             await admin.firestore().collection('notifications').add({
-              title: '🚨 Payment amount mismatch — manual review required',
+              title: '?? Payment amount mismatch � manual review required',
               body: `Booking ${taskData.order_no || bookingId}: expected ${expectedLabel} R${expectedAmount.toFixed(2)} but received R${paidAmount.toFixed(2)} (diff R${diff.toFixed(2)}). PayFast ID: ${pfPaymentId || 'unknown'}. Booking is on hold pending admin action.`,
               type: 'payment_mismatch',
               user_type: 'admin',
@@ -8539,7 +8539,7 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
                   body: JSON.stringify({
                     bookingId: taskData.future_booking_id || bookingId,
                     status: 'payment_under_review',
-                    message: `⚠️ *Payment received but on hold*\n\nWe received R${paidAmount.toFixed(2)} for booking #${taskData.order_no || bookingId}, but our records show the expected ${expectedLabel} amount is R${expectedAmount.toFixed(2)}.\n\nOur team has been notified and will review this within 1 business hour. Your funds are safe — no further action is needed from you right now. We'll message you once it's resolved. 🙏`,
+                    message: `?? *Payment received but on hold*\n\nWe received R${paidAmount.toFixed(2)} for booking #${taskData.order_no || bookingId}, but our records show the expected ${expectedLabel} amount is R${expectedAmount.toFixed(2)}.\n\nOur team has been notified and will review this within 1 business hour. Your funds are safe � no further action is needed from you right now. We'll message you once it's resolved. ??`,
                   }),
                   signal: AbortSignal.timeout(10000),
                 });
@@ -8553,10 +8553,10 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
       }
       console.log(`[processPayment] Amount verified for ${bookingId}: ${expectedLabel} expected R${expectedAmount.toFixed(2)}, paid R${paidAmount.toFixed(2)} (within tolerance R${tolerance.toFixed(2)})`);
     } else {
-      console.warn(`[processPayment] Could not determine expected amount for ${bookingId} (${expectedLabel}) — proceeding without verification`);
+      console.warn(`[processPayment] Could not determine expected amount for ${bookingId} (${expectedLabel}) � proceeding without verification`);
     }
   } else {
-    console.warn(`[processPayment] amountGross missing/invalid for ${bookingId}: "${amountGross}" — proceeding without verification`);
+    console.warn(`[processPayment] amountGross missing/invalid for ${bookingId}: "${amountGross}" � proceeding without verification`);
   }
 
   const updateData = {
@@ -8612,9 +8612,9 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
   }
 
   await taskRef.update(updateData);
-  console.log(`✅ [processPayment] Updated tasksManagement/${bookingId}: payment_status=${updateData.payment_status}`);
+  console.log(`? [processPayment] Updated tasksManagement/${bookingId}: payment_status=${updateData.payment_status}`);
 
-  // ── Update futureBookings ──
+  // -- Update futureBookings --
   const futureBookingId = taskData.future_booking_id || '';
   const fbId = futureBookingId || bookingId;
 
@@ -8654,13 +8654,13 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
         fbUpdate.status = 'accepted';
       }
       await fbRef.update(fbUpdate);
-      console.log(`✅ [processPayment] Updated futureBookings/${fbId}: payment_status=${fbUpdate.payment_status}`);
+      console.log(`? [processPayment] Updated futureBookings/${fbId}: payment_status=${fbUpdate.payment_status}`);
     }
   } catch (fbErr) {
     console.warn(`[processPayment] futureBookings update failed: ${fbErr.message}`);
   }
 
-  // ── Propagate payment_status to ALL bridge docs (e.g. {bookingId}_{artisanId}) ──
+  // -- Propagate payment_status to ALL bridge docs (e.g. {bookingId}_{artisanId}) --
   try {
     const bridgeSnap = await admin.firestore().collection('tasksManagement')
       .where('future_booking_id', '==', bookingId).get();
@@ -8681,13 +8681,13 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
         });
       });
       await batch.commit();
-      console.log(`✅ [processPayment] Updated ${bridgeSnap.size} bridge doc(s) for ${bookingId}`);
+      console.log(`? [processPayment] Updated ${bridgeSnap.size} bridge doc(s) for ${bookingId}`);
     }
   } catch (bridgeErr) {
     console.warn(`[processPayment] Bridge doc update failed: ${bridgeErr.message}`);
   }
 
-  // ── Send WhatsApp notification to customer ──
+  // -- Send WhatsApp notification to customer --
   const taskSource = (taskData.source || '').toString().toLowerCase();
   if (taskSource.startsWith('whatsapp') || bookingId.startsWith('WA-')) {
     let phone = (taskData.phone || taskData.customer_phone || taskData.customerPhone || taskData.contact || taskData.user_phone || taskData.client_phone || '').toString().trim();
@@ -8724,12 +8724,12 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
         const displayAmount = rawPayAmt > 0 ? rawPayAmt.toFixed(2) : '0.00';
         let waMessage;
         if (isBalancePayment) {
-          waMessage = `💳 *Balance payment received!* R${displayAmount} for booking #${taskData.order_no || fbId}.\n\n✅ Your booking is now fully paid. You can now rate your artisan.\n\nThank you for choosing Square 15! 🙏`;
+          waMessage = `?? *Balance payment received!* R${displayAmount} for booking #${taskData.order_no || fbId}.\n\n? Your booking is now fully paid. You can now rate your artisan.\n\nThank you for choosing Square 15! ??`;
         } else if (isDepositPayment) {
           const balAmount = parseFloat(taskData.balance_amount || 0).toFixed(2);
-          waMessage = `💳 *Deposit received!* R${displayAmount} for booking #${taskData.order_no || fbId}.\n\n✅ Your booking is confirmed. The remaining balance of R${balAmount} will be due after job completion.\n\nYour artisan will contact you to arrange the visit. 🙏`;
+          waMessage = `?? *Deposit received!* R${displayAmount} for booking #${taskData.order_no || fbId}.\n\n? Your booking is confirmed. The remaining balance of R${balAmount} will be due after job completion.\n\nYour artisan will contact you to arrange the visit. ??`;
         } else {
-          waMessage = `💳 *Payment received!* R${displayAmount} for booking #${taskData.order_no || fbId}.\n\n✅ Your booking is confirmed. Your artisan will contact you to arrange the visit.\n\nThank you for choosing Square 15! 🙏`;
+          waMessage = `?? *Payment received!* R${displayAmount} for booking #${taskData.order_no || fbId}.\n\n? Your booking is confirmed. Your artisan will contact you to arrange the visit.\n\nThank you for choosing Square 15! ??`;
         }
         await fetch(`${waBot}/api/booking-status-update`, {
           method: 'POST',
@@ -8741,7 +8741,7 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
           }),
           signal: AbortSignal.timeout(10000),
         });
-        console.log(`✅ [processPayment] WhatsApp notification sent for ${bookingId}`);
+        console.log(`? [processPayment] WhatsApp notification sent for ${bookingId}`);
       } catch (waErr) {
         console.warn(`[processPayment] WhatsApp notification failed: ${waErr.message}`);
       }
@@ -8750,7 +8750,7 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
     }
   }
 
-  // ── Notify artisan via push notification ──
+  // -- Notify artisan via push notification --
   try {
     const artisanId = (taskData.service_provider_id || '').toString().trim();
     if (artisanId) {
@@ -8770,7 +8770,7 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
         }
         const orderLabel = taskData.order_no || fbId;
         const totalForArtisan = parseFloat(taskData.total_cost) || parseFloat(taskData.cost) || 0;
-        // SAFETY: same priority — prefer recorded expected amount over amountGross
+        // SAFETY: same priority � prefer recorded expected amount over amountGross
         let artisanPayAmt;
         if (isDepositPayment) {
           artisanPayAmt = parseFloat(updateData.deposit_amount) || parseFloat(taskData.deposit_amount)
@@ -8798,7 +8798,7 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
               data: { type: 'payment_received', booking_id: fbId, tasks_management_id: bookingId, user_type: 'artisan' },
               android: { priority: 'high', notification: { channelId: 'order_request_channel', sound: 'sound' } },
             });
-            console.log(`✅ [processPayment] Artisan ${artisanId} notified via token ${tok.substring(0, 15)}...`);
+            console.log(`? [processPayment] Artisan ${artisanId} notified via token ${tok.substring(0, 15)}...`);
             // Send to ALL tokens so multi-device artisans get notified everywhere
           } catch (singleErr) {
             console.warn(`[processPayment] FCM token failed for artisan ${artisanId}: ${singleErr.message}`);
@@ -8825,7 +8825,7 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
     console.warn(`[processPayment] Artisan notification failed: ${artErr.message}`);
   }
 
-  // ── Notify linked customer via push notification (if they have the app) ──
+  // -- Notify linked customer via push notification (if they have the app) --
   try {
     const custUserId = (taskData.user_id || taskData.userId || '').toString().trim();
     if (custUserId && !custUserId.startsWith('wa_')) {
@@ -8854,7 +8854,7 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
                 data: { type: 'payment_confirmed', booking_id: fbId, tasks_management_id: bookingId, user_type: 'customer' },
                 android: { priority: 'high', notification: { channelId: 'order_request_channel', sound: 'sound' } },
               });
-              console.log(`✅ [processPayment] Customer ${custUserId} notified via token ${tok.substring(0, 15)}...`);
+              console.log(`? [processPayment] Customer ${custUserId} notified via token ${tok.substring(0, 15)}...`);
             } catch (custFcmErr) {
               console.warn(`[processPayment] Customer FCM failed: ${custFcmErr.message}`);
             }
@@ -8879,7 +8879,7 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
     console.warn(`[processPayment] Customer notification failed: ${custErr.message}`);
   }
 
-  // ── Create transaction log ──
+  // -- Create transaction log --
   try {
     const txRef = admin.firestore().collection('transactionLogs');
     const txQuery = pfPaymentId
@@ -8907,7 +8907,7 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
         item_name: itemName || taskData.item_name || taskData.service_type || '',
         payment_type: isBalancePayment ? 'balance' : isDepositPayment ? 'deposit' : 'full',
       });
-      console.log(`✅ [processPayment] Created transactionLog: ${txId}`);
+      console.log(`? [processPayment] Created transactionLog: ${txId}`);
     }
   } catch (txErr) {
     console.warn(`[processPayment] Transaction log failed: ${txErr.message}`);
@@ -8916,7 +8916,7 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
   return { processed: true, paymentStatus: updateData.payment_status };
 }
 
-// ── Payment Result Page (return URL after PayFast payment) ──
+// -- Payment Result Page (return URL after PayFast payment) --
 // Shows a success/cancel page AND triggers Firestore + WhatsApp update as fallback.
 // The ITN webhook may not reach Render (free tier sleep), so this is the reliable path.
 app.get('/api/payment/ozow-result', async (req, res) => {
@@ -8925,7 +8925,7 @@ app.get('/api/payment/ozow-result', async (req, res) => {
   // Sanitise user-controlled booking_id to prevent XSS
   const safeBookingId = String(booking_id || '').replace(/[<>"'&]/g, '');
   const title = isSuccess ? 'Payment Successful!' : 'Payment Cancelled';
-  const emoji = isSuccess ? '✅' : '❌';
+  const emoji = isSuccess ? '?' : '?';
   const message = isSuccess
     ? `Your payment for booking ${safeBookingId} has been received. You will receive a confirmation on WhatsApp shortly.`
     : `Your payment was cancelled. You can try again from WhatsApp or the Square 15 app.`;
@@ -8945,18 +8945,18 @@ h1{color:${color};margin:0 0 16px}p{color:#555;line-height:1.6;margin:0}</style>
 <p style="margin-top:20px;color:#999;font-size:14px">You can close this page.</p>
 </div></body></html>`);
 
-  // ── FALLBACK: Process payment directly since ITN may not reach Render (free tier sleep) ──
+  // -- FALLBACK: Process payment directly since ITN may not reach Render (free tier sleep) --
   // processSuccessfulPayment has idempotency (ALREADY_VERIFIED transaction), so calling from
-  // both ozow-result AND ITN is safe — only the first one processes.
+  // both ozow-result AND ITN is safe � only the first one processes.
   //
   // LK-3 (May 2026): we MUST verify the signed callback token before processing
   // payment, otherwise an attacker can hit this URL with any booking_id and
-  // mark it paid. Fail-closed: invalid/missing token → render the page (above)
+  // mark it paid. Fail-closed: invalid/missing token ? render the page (above)
   // but DO NOT call processSuccessfulPayment.
   if (isSuccess && booking_id) {
-    // Skip admin card-save synthetic id (no payment to process — PayFast handles tokenisation server-side)
+    // Skip admin card-save synthetic id (no payment to process � PayFast handles tokenisation server-side)
     if (booking_id === 'admin_card_save') {
-      console.log('[ozow-result] admin_card_save callback — no booking processing needed');
+      console.log('[ozow-result] admin_card_save callback � no booking processing needed');
       return;
     }
     const sigCheck = verifyPaymentCallback(booking_id, t, exp);
@@ -8975,7 +8975,7 @@ h1{color:${color};margin:0 0 16px}p{color:#555;line-height:1.6;margin:0}</style>
           read: false,
         });
       } catch (_) {}
-      return; // page already sent — do NOT process payment
+      return; // page already sent � do NOT process payment
     }
     try {
       const preCheck = await admin.firestore().collection('tasksManagement').doc(booking_id).get();
@@ -8985,8 +8985,8 @@ h1{color:${color};margin:0 0 16px}p{color:#555;line-height:1.6;margin:0}</style>
         console.log(`[ozow-result] Booking ${booking_id} already in state '${preData.payment_status}', skipping`);
         return;
       }
-      console.log(`[ozow-result] Processing payment for ${booking_id} (fallback — ITN may or may not arrive)`);
-      // Resolve amount based on payment_type — DO NOT default to total cost,
+      console.log(`[ozow-result] Processing payment for ${booking_id} (fallback � ITN may or may not arrive)`);
+      // Resolve amount based on payment_type � DO NOT default to total cost,
       // or a deposit payment will be recorded as the full amount (financial bug).
       let fallbackItem = preData.description || preData.item_name || '';
       let preDoc = preData;
@@ -9028,23 +9028,23 @@ h1{color:${color};margin:0 0 16px}p{color:#555;line-height:1.6;margin:0}</style>
   }
 });
 
-// ── PayFast ITN (Instant Transaction Notification) Webhook ──
-// Server-side payment verification — PayFast posts here after payment
+// -- PayFast ITN (Instant Transaction Notification) Webhook --
+// Server-side payment verification � PayFast posts here after payment
 app.post('/api/payment/itn', async (req, res) => {
   try {
     const data = req.body;
-    console.log('📥 PayFast ITN received:', JSON.stringify(data));
+    console.log('?? PayFast ITN received:', JSON.stringify(data));
 
     // 1. Verify signature
     const merchantKey = env('PAYFAST_MERCHANT_KEY');
     if (!merchantKey) {
-      console.error('❌ ITN: PAYFAST_MERCHANT_KEY not configured');
+      console.error('? ITN: PAYFAST_MERCHANT_KEY not configured');
       return res.status(503).send('Server misconfigured');
     }
 
     const receivedSignature = data.signature;
     if (!receivedSignature) {
-      console.error('❌ ITN: No signature in payload');
+      console.error('? ITN: No signature in payload');
       return res.status(400).send('Missing signature');
     }
 
@@ -9065,7 +9065,7 @@ app.post('/api/payment/itn', async (req, res) => {
       .digest('hex');
 
     if (receivedSignature !== expectedSignature) {
-      console.error('❌ ITN: Signature mismatch');
+      console.error('? ITN: Signature mismatch');
       return res.status(403).send('Invalid signature');
     }
 
@@ -9081,7 +9081,7 @@ app.post('/api/payment/itn', async (req, res) => {
     const token = String(data.token || ''); // Card tokenization token (when subscription_type=2)
     const billingDate = String(data.billing_date || '');
 
-    console.log(`✅ ITN verified: status=${paymentStatus}, pfId=${pfPaymentId}, amount=R${amountGross}, taskId=${customStr1}${token ? ', token=***' : ''}`);
+    console.log(`? ITN verified: status=${paymentStatus}, pfId=${pfPaymentId}, amount=R${amountGross}, taskId=${customStr1}${token ? ', token=***' : ''}`);
 
     // 3a. Save card token if tokenization was used (subscription_type=2, ad-hoc)
     if (token && paymentStatus === 'COMPLETE' && customStr1) {
@@ -9116,7 +9116,7 @@ app.post('/api/payment/itn', async (req, res) => {
             payfast_payment_id: pfPaymentId,
             is_active: true,
           });
-          console.log(`💳 Saved card token for user ${userId}, card ${cardId}`);
+          console.log(`?? Saved card token for user ${userId}, card ${cardId}`);
         }
       } catch (tokenErr) {
         console.warn(`[ITN] Card token save failed: ${tokenErr.message}`);
@@ -9148,7 +9148,7 @@ app.post('/api/payment/itn', async (req, res) => {
           });
         } catch (replayErr) {
           if (replayErr && replayErr.message === 'ITN_ALREADY_PROCESSED') {
-            console.warn(`[ITN] replay detected for pf_payment_id=${pfPaymentId} task=${customStr1} — skipping`);
+            console.warn(`[ITN] replay detected for pf_payment_id=${pfPaymentId} task=${customStr1} � skipping`);
             return res.status(200).send('OK');
           }
           throw replayErr;
@@ -9175,14 +9175,14 @@ app.post('/api/payment/itn', async (req, res) => {
           payment_status: paymentStatus === 'CANCELLED' ? 'cancelled' : 'failed',
           updated_at: now,
         });
-        console.log(`📝 ITN: ${paymentStatus} for ${customStr1}`);
+        console.log(`?? ITN: ${paymentStatus} for ${customStr1}`);
       }
     }
 
     // PayFast expects a 200 OK response
     res.status(200).send('OK');
   } catch (error) {
-    console.error('❌ PayFast ITN error:', error);
+    console.error('? PayFast ITN error:', error);
     res.status(200).send('OK'); // Always return 200 so PayFast doesn't retry indefinitely
   }
 });
@@ -9245,7 +9245,7 @@ app.post('/api/token', authMiddleware, rateLimitBy('livekit_token', 30, 5 * 60 *
     // Generate JWT token
     const token = await at.toJwt();
 
-    console.log(`✅ Token generated for ${participantName} in room ${roomName}`);
+    console.log(`? Token generated for ${participantName} in room ${roomName}`);
 
     res.json({
       token: token,
@@ -9255,7 +9255,7 @@ app.post('/api/token', authMiddleware, rateLimitBy('livekit_token', 30, 5 * 60 *
     });
 
   } catch (error) {
-    console.error('❌ Error generating token:', error);
+    console.error('? Error generating token:', error);
     res.status(500).json({
       error: 'Token generation failed',
       message: error.message
@@ -9268,7 +9268,7 @@ app.post('/api/token', authMiddleware, rateLimitBy('livekit_token', 30, 5 * 60 *
  * POST /api/chat-bot
  * Body: { question: string }
  * Auth: Firebase ID token required.
- * Rate limit: 60/uid/5min (interactive chat — generous but not abusable).
+ * Rate limit: 60/uid/5min (interactive chat � generous but not abusable).
  */
 app.post('/api/chat-bot', authMiddleware, rateLimitBy('chat_bot', 60, 5 * 60 * 1000), async (req, res) => {
   try {
@@ -9340,7 +9340,7 @@ app.post('/api/create-room', authMiddleware, async (req, res) => {
     });
 
   } catch (error) {
-    console.error('❌ Error creating room:', error);
+    console.error('? Error creating room:', error);
     res.status(500).json({
       error: 'Room creation failed',
       message: error.message
@@ -9374,7 +9374,7 @@ app.post('/api/dispatch-agent', authMiddleware, async (req, res) => {
       metadata: typeof metadata === 'string' ? metadata : undefined,
     });
 
-    console.log(`✅ Agent dispatched to room: ${roomName} (agent=${agentName})`);
+    console.log(`? Agent dispatched to room: ${roomName} (agent=${agentName})`);
     res.json({
       success: true,
       roomName,
@@ -9384,7 +9384,7 @@ app.post('/api/dispatch-agent', authMiddleware, async (req, res) => {
     });
 
   } catch (error) {
-    console.error('❌ Error dispatching agent:', error);
+    console.error('? Error dispatching agent:', error);
     res.status(500).json({
       error: 'Agent dispatch failed',
       message: error && error.message ? error.message : 'Unknown error',
@@ -9403,7 +9403,7 @@ app.post('/api/dispatch-agent', authMiddleware, async (req, res) => {
   }
 });
 
-// ─── Admin-visible error reporter (writes to Firestore error_logs + notifications) ───
+// --- Admin-visible error reporter (writes to Firestore error_logs + notifications) ---
 // Mirrors the WhatsApp bot's logErrorToAdmin so admin popup service picks it up live.
 async function logErrorToAdmin(errorType, description, source, errorDetails, bookingId, severity) {
   try {
@@ -9412,7 +9412,7 @@ async function logErrorToAdmin(errorType, description, source, errorDetails, boo
     if (!firestore) return null;
     const errorId = firestore.collection('error_logs').doc().id;
     const sev = severity || 'medium';
-    const icons = { critical: '🔴', high: '🟠', medium: '🟡', low: '🔵' };
+    const icons = { critical: '??', high: '??', medium: '??', low: '??' };
     const labels = {
       express_error: 'API Request Failed',
       uncaught_exception: 'Backend Crash (Recovered)',
@@ -9430,7 +9430,7 @@ async function logErrorToAdmin(errorType, description, source, errorDetails, boo
       whatsapp_vision_error: 'WhatsApp Photo Analysis Failed',
     };
     const label = labels[errorType] || `Backend Error: ${errorType}`;
-    const title = `${icons[sev] || '🔵'} ${label}`;
+    const title = `${icons[sev] || '??'} ${label}`;
 
     await firestore.collection('error_logs').doc(errorId).set({
       id: errorId,
@@ -9446,7 +9446,7 @@ async function logErrorToAdmin(errorType, description, source, errorDetails, boo
     });
 
     // Fan out to every admin so in-app popups AND FCM pushes reach all of them.
-    // Admin popup listener filters on (user_type='admin', user_id ∈ [uid,'admin']).
+    // Admin popup listener filters on (user_type='admin', user_id ? [uid,'admin']).
     // We write one doc with user_id='admin' (catches the generic subscription),
     // plus per-admin docs (catches the uid-specific subscription). We also
     // collect tokens and fire real FCM pushes so the tray lights up even when
@@ -9547,7 +9547,7 @@ async function logErrorToAdmin(errorType, description, source, errorDetails, boo
           _cleanStaleFcmTokens(stale).catch(() => {});
         }
       } else {
-        console.warn('[errorReport] No admin FCM tokens found — push not sent (error_log still written).');
+        console.warn('[errorReport] No admin FCM tokens found � push not sent (error_log still written).');
       }
     } catch (fanoutErr) {
       console.warn('[errorReport] admin fanout failed:', fanoutErr && fanoutErr.message);
@@ -9565,7 +9565,7 @@ const _errorDedup = new Map();
 let _errorsThisHour = 0;
 let _errorsHourStartedAt = Date.now();
 
-// ─── AUTO-HEAL: Tier 1 self-healing rules ───────────────────────────────────
+// --- AUTO-HEAL: Tier 1 self-healing rules -----------------------------------
 // Scans users/artisans/serviceProvidersRegistration/admin_users collections
 // and scrubs stale FCM tokens detected in a multicast response.
 async function _cleanStaleFcmTokens(staleTokens) {
@@ -9614,7 +9614,7 @@ async function _cleanStaleFcmTokens(staleTokens) {
         'auto_healed',
         `Auto-cleaned ${cleaned} stale FCM push tokens (user devices reinstalled app or uninstalled).`,
         'livekit_backend',
-        `Affected: ${affectedUsers.slice(0, 10).join(', ')}${affectedUsers.length > 10 ? '…' : ''}`,
+        `Affected: ${affectedUsers.slice(0, 10).join(', ')}${affectedUsers.length > 10 ? '�' : ''}`,
         '',
         'low'
       ).then((id) => {
@@ -9689,7 +9689,7 @@ function _startAutoResolveSweeper() {
     }
   }, INTERVAL_MS).unref?.();
 }
-// ─── END AUTO-HEAL ──────────────────────────────────────────────────────────
+// --- END AUTO-HEAL ----------------------------------------------------------
 
 function _plainEnglishFromError(err) {
   const m = (err && (err.message || err.toString())) || '';
@@ -9716,9 +9716,9 @@ function _plainEnglishFromError(err) {
   if (s.includes('ozow')) return 'Ozow payment gateway call failed.';
   if (s.includes('timeout')) return 'An operation timed out. Backend still running.';
   if (s.includes('cannot read') || s.includes('undefined is not')) {
-    return 'Code error — a variable was missing or wrong shape. Auto-recovered.';
+    return 'Code error � a variable was missing or wrong shape. Auto-recovered.';
   }
-  return 'Unexpected backend error. Auto-recovered — server still running. See stack for details.';
+  return 'Unexpected backend error. Auto-recovered � server still running. See stack for details.';
 }
 
 async function _captureBackendError(kind, err, reqInfo) {
@@ -9776,9 +9776,9 @@ async function _captureBackendError(kind, err, reqInfo) {
   }
 }
 
-// Error handling middleware — also forwards to admin dashboard
+// Error handling middleware � also forwards to admin dashboard
 app.use((err, req, res, next) => {
-  console.error('❌ Server error:', err);
+  console.error('? Server error:', err);
   const reqInfo = `${req.method} ${req.originalUrl}`;
   _captureBackendError('express_error', err, reqInfo);
   if (res.headersSent) return next(err);
@@ -9816,14 +9816,18 @@ app.post('/api/admin/bootstrap-claims', adminLimiter, async (req, res) => {
   if (!uid) {
     return res.status(400).json({ error: 'Missing uid in request body' });
   }
+  // Firebase UIDs are 1-128 chars, alphanumeric. Reject anything else early.
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(uid)) {
+    return res.status(400).json({ error: 'Invalid uid format' });
+  }
 
   try {
     await admin.auth().setCustomUserClaims(uid, { role: 'admin' });
-    console.log(`✅ Admin custom claims set for UID: ${uid}`);
+    console.log(`? Admin custom claims set for UID: ${uid}`);
     return res.json({ success: true, uid, message: 'Admin claims set. User must re-login for claims to take effect.' });
   } catch (e) {
-    console.error('❌ Failed to set admin claims:', e);
-    return res.status(500).json({ error: 'Failed to set claims', message: e.message });
+    console.error('? Failed to set admin claims:', e);
+    return res.status(500).json({ error: 'Failed to set claims' });
   }
 });
 
@@ -9868,15 +9872,15 @@ app.post('/api/admin/self-bootstrap-claims', adminLimiter, async (req, res) => {
     // Preserve any other claims that may already be set.
     const existing = (decoded && decoded.claims) || {};
     await admin.auth().setCustomUserClaims(uid, { ...existing, role: 'admin', admin: true });
-    console.log(`✅ self-bootstrap-claims: granted admin to ${uid} (${u.email || ''})`);
+    console.log(`? self-bootstrap-claims: granted admin to ${uid} (${u.email || ''})`);
     return res.json({
       success: true,
       uid,
       message: 'Admin claims set. Force-refresh your ID token for the change to take effect.',
     });
   } catch (e) {
-    console.error('❌ self-bootstrap-claims error:', e);
-    return res.status(500).json({ error: 'Internal error', message: e.message });
+    console.error('? self-bootstrap-claims error:', e);
+    return res.status(500).json({ error: 'Internal error' });
   }
 });
 
@@ -9891,13 +9895,13 @@ app.post('/api/admin/self-bootstrap-claims', adminLimiter, async (req, res) => {
  * }
  *
  * Anti-fraud (May-2026): the admin's Android Storage SDK has been
- * returning a generic [unknown] error during direct putFile() — likely a
+ * returning a generic [unknown] error during direct putFile() � likely a
  * regional/SDK quirk. We bypass the client SDK entirely: backend uses
  * the Firebase Admin SDK (bypasses Storage rules), uploads to
  * `service_providers/{artisanId}.jpg`, generates a download URL, and
  * mirrors `imageUrl`/`image` onto `serviceProvider/{artisanId}` in
  * Firestore so the artisan app + admin app + WA bot all see the new
- * picture immediately. Artisans cannot call this endpoint — we verify
+ * picture immediately. Artisans cannot call this endpoint � we verify
  * the caller is an admin via Firestore (Admin SDK can read it bypassing
  * rules; we don't rely on custom claims here).
  */
@@ -9936,6 +9940,10 @@ app.post(
       const rawB64 = String(req.body?.imageBase64 || '').trim();
       const contentType = String(req.body?.contentType || 'image/jpeg').trim();
       if (!artisanId) return res.status(400).json({ error: 'Missing artisanId' });
+      // Anti-path-traversal: only allow safe Firestore-style ids.
+      if (!/^[A-Za-z0-9_-]{1,128}$/.test(artisanId)) {
+        return res.status(400).json({ error: 'Invalid artisanId format' });
+      }
       if (!rawB64) return res.status(400).json({ error: 'Missing imageBase64' });
       if (!/^image\/(jpeg|jpg|png)$/i.test(contentType)) {
         return res.status(400).json({ error: 'Unsupported contentType (must be image/jpeg or image/png)' });
@@ -9988,21 +9996,21 @@ app.post(
         { merge: true }
       );
 
-      console.log(`✅ admin upload-artisan-image: ${callerUid} → ${artisanId} (${buf.length} bytes)`);
+      console.log(`? admin upload-artisan-image: ${callerUid} ? ${artisanId} (${buf.length} bytes)`);
       return res.json({ success: true, url: publicUrl, path: storagePath, bytes: buf.length });
     } catch (e) {
-      console.error('❌ upload-artisan-image error:', e);
-      return res.status(500).json({ error: 'Upload failed', message: e.message });
+      console.error('? upload-artisan-image error:', e);
+      return res.status(500).json({ error: 'Upload failed' });
     }
   }
 );
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// PHASE 5.2 — Secure Finance Approval Pipeline (Tier C)
-// Money NEVER moves without: auth → fraud check → request doc → admin approval
-// ═══════════════════════════════════════════════════════════════════════════════
+// -------------------------------------------------------------------------------
+// PHASE 5.2 � Secure Finance Approval Pipeline (Tier C)
+// Money NEVER moves without: auth ? fraud check ? request doc ? admin approval
+// -------------------------------------------------------------------------------
 
-// ── Fraud Detection Engine ──────────────────────────────────────────────────
+// -- Fraud Detection Engine --------------------------------------------------
 async function runFraudChecks({ firestore, type, amount, targetUserId, requestedBy, bookingId }) {
   const alerts = [];
   const amountNum = typeof amount === 'number' ? amount : Number.parseFloat(String(amount).replace(/[^0-9.\-]/g, ''));
@@ -10014,7 +10022,7 @@ async function runFraudChecks({ firestore, type, amount, targetUserId, requested
     alerts.push({ rule: 'amount_exceeds_daily_limit', severity: 'high', detail: `R${amountNum} exceeds R${dailyLimit} limit for ${type}` });
   }
 
-  // Rule 2: Velocity check — max 5 finance requests per user per hour
+  // Rule 2: Velocity check � max 5 finance requests per user per hour
   try {
     const oneHourAgo = new Date(Date.now() - 3600000).toISOString();
     const recentSnap = await firestore.collection('finance_requests')
@@ -10027,12 +10035,12 @@ async function runFraudChecks({ firestore, type, amount, targetUserId, requested
     }
   } catch (e) { console.warn('\u26a0\ufe0f fraud velocity check:', e.message); }
 
-  // Rule 3: Self-dealing — admin requesting funds to themselves
+  // Rule 3: Self-dealing � admin requesting funds to themselves
   if (targetUserId === requestedBy) {
     alerts.push({ rule: 'self_dealing', severity: 'critical', detail: 'Admin requesting financial action to own account' });
   }
 
-  // Rule 4: Duplicate refund — same booking refunded within 24 hours
+  // Rule 4: Duplicate refund � same booking refunded within 24 hours
   if (type === 'refund' && bookingId) {
     try {
       const oneDayAgo = new Date(Date.now() - 86400000).toISOString();
@@ -10074,7 +10082,7 @@ async function runFraudChecks({ firestore, type, amount, targetUserId, requested
   return { alerts, blocked, requiresReview, score: alerts.length };
 }
 
-// ─── Device-sourced error reporter ──────────────────────────────────────────
+// --- Device-sourced error reporter ------------------------------------------
 // POST /api/report-error  (authenticated)
 // Body: { error_type, description, source?, error_details?, booking_id?, severity? }
 // Client/admin Flutter apps POST here when their global crash handler fires.
@@ -10110,10 +10118,10 @@ app.post('/api/report-error', authMiddleware, async (req, res) => {
   }
 });
 
-// ─── Tier-2 admin one-tap remediation actions ───────────────────────────────
+// --- Tier-2 admin one-tap remediation actions -------------------------------
 // POST /api/admin/ops/fix
 // Body: { error_id: string, action: string, target?: string }
-// action ∈ 'clean_fcm_tokens' | 'reset_dispatch_lock' | 'bootstrap_claims'
+// action ? 'clean_fcm_tokens' | 'reset_dispatch_lock' | 'bootstrap_claims'
 //        | 'restart_worker' | 'resolve'
 // Admin-only. Applies the action and marks the error_log as status=resolved.
 app.post('/api/admin/ops/fix', adminLimiter, async (req, res) => {
@@ -10136,7 +10144,7 @@ app.post('/api/admin/ops/fix', adminLimiter, async (req, res) => {
 
   try {
     if (action === 'clean_fcm_tokens') {
-      // target = token string OR user/artisan docId — we scrub by token string;
+      // target = token string OR user/artisan docId � we scrub by token string;
       // if a docId is given, pull tokens off that doc first.
       let tokens = [];
       if (target) {
@@ -10236,9 +10244,9 @@ app.post('/api/admin/ops/fix', adminLimiter, async (req, res) => {
     return res.status(500).json({ ok: false, error: 'fix_failed', message: e && e.message, action });
   }
 });
-// ─── END Tier-2 admin ops ───────────────────────────────────────────────────
+// --- END Tier-2 admin ops ---------------------------------------------------
 
-// ── Create Finance Request (admin-only, creates approval doc) ────────────────
+// -- Create Finance Request (admin-only, creates approval doc) ----------------
 app.post('/api/finance/request', adminLimiter, async (req, res) => {
   const firestore = requireFirebase(res);
   if (!firestore) return;
@@ -10371,7 +10379,7 @@ app.post('/api/finance/request', adminLimiter, async (req, res) => {
   });
 });
 
-// ── Approve Finance Request (admin-only, requires different admin than requester) ──
+// -- Approve Finance Request (admin-only, requires different admin than requester) --
 app.post('/api/finance/approve', adminLimiter, async (req, res) => {
   const firestore = requireFirebase(res);
   if (!firestore) return;
@@ -10398,7 +10406,7 @@ app.post('/api/finance/approve', adminLimiter, async (req, res) => {
     });
   }
 
-  // Check status — only pending or flagged can be approved
+  // Check status � only pending or flagged can be approved
   if (!['pending_approval', 'flagged_for_review'].includes(finReq.status)) {
     return res.status(409).json({
       error: 'invalid_status',
@@ -10426,7 +10434,7 @@ app.post('/api/finance/approve', adminLimiter, async (req, res) => {
     });
   }
 
-  // ── Execute the financial operation ──────────────────────────────────
+  // -- Execute the financial operation ----------------------------------
   const now = nowIso();
   let executionResult = null;
   const amount = Number(finReq.amount) || 0;
@@ -10575,7 +10583,7 @@ app.post('/api/finance/approve', adminLimiter, async (req, res) => {
   }
 });
 
-// ── Reject Finance Request (admin-only) ──────────────────────────────────────
+// -- Reject Finance Request (admin-only) --------------------------------------
 app.post('/api/finance/reject', adminLimiter, async (req, res) => {
   const firestore = requireFirebase(res);
   if (!firestore) return;
@@ -10621,7 +10629,7 @@ app.post('/api/finance/reject', adminLimiter, async (req, res) => {
   return res.json({ success: true, request_id: requestId, status: 'rejected' });
 });
 
-// ── List Finance Requests (admin-only) ───────────────────────────────────────
+// -- List Finance Requests (admin-only) ---------------------------------------
 app.get('/api/finance/requests', adminLimiter, async (req, res) => {
   const firestore = requireFirebase(res);
   if (!firestore) return;
@@ -10661,11 +10669,11 @@ app.get('/api/finance/requests', adminLimiter, async (req, res) => {
     });
     return res.json({ success: true, count: items.length, items });
   } catch (e) {
-    return res.status(500).json({ error: 'internal_error', message: e.message });
+    return res.status(500).json({ error: 'internal_error' });
   }
 });
 
-// ── Fraud Alerts Dashboard (admin-only) ──────────────────────────────────────
+// -- Fraud Alerts Dashboard (admin-only) --------------------------------------
 app.get('/api/finance/fraud-alerts', adminLimiter, async (req, res) => {
   const firestore = requireFirebase(res);
   if (!firestore) return;
@@ -10689,7 +10697,7 @@ app.get('/api/finance/fraud-alerts', adminLimiter, async (req, res) => {
         .limit(limit)
         .get();
     } catch (indexErr) {
-      // Composite index may not exist yet — fall back to status-only query
+      // Composite index may not exist yet � fall back to status-only query
       console.warn('[fraud-alerts] Index query failed, falling back:', indexErr.message);
       snap = await firestore.collection('fraud_alerts')
         .where('status', '==', status)
@@ -10699,11 +10707,11 @@ app.get('/api/finance/fraud-alerts', adminLimiter, async (req, res) => {
     const items = snap.docs.map(d => ({ id: d.id, ...d.data() }));
     return res.json({ success: true, count: items.length, items });
   } catch (e) {
-    return res.status(500).json({ error: 'internal_error', message: e.message });
+    return res.status(500).json({ error: 'internal_error' });
   }
 });
 
-// ── Dismiss Fraud Alert (admin-only) ─────────────────────────────────────────
+// -- Dismiss Fraud Alert (admin-only) -----------------------------------------
 app.post('/api/finance/fraud-alerts/dismiss', adminLimiter, async (req, res) => {
   const firestore = requireFirebase(res);
   if (!firestore) return;
@@ -10728,7 +10736,7 @@ app.post('/api/finance/fraud-alerts/dismiss', adminLimiter, async (req, res) => 
     });
     return res.json({ success: true, alert_id: alertId, status: 'dismissed' });
   } catch (e) {
-    return res.status(500).json({ error: 'internal_error', message: e.message });
+    return res.status(500).json({ error: 'internal_error' });
   }
 });
 
@@ -10749,7 +10757,7 @@ if (require.main === module) {
     console.error('\u274c Unhandled Rejection:', reason);
     const err = reason instanceof Error ? reason : new Error(String(reason));
     _captureBackendError('unhandled_rejection', err);
-    // DO NOT exit — keep serving other requests
+    // DO NOT exit � keep serving other requests
   });
   process.on('uncaughtException', (error) => {
     console.error('\u274c Uncaught Exception:', error);
@@ -10758,20 +10766,20 @@ if (require.main === module) {
   });
 
   app.listen(PORT, () => {
-    console.log('🚀 Square 15 Livekit Backend');
-    console.log(`📡 Server running on port ${PORT}`);
-    console.log(`🌐 Health check: http://localhost:${PORT}/health`);
-    console.log(`🔑 Token endpoint: http://localhost:${PORT}/api/token`);
-    console.log(`🧠 Voice start endpoint: http://localhost:${PORT}/api/voice/start`);
-    console.log(`📦 Environment: ${process.env.NODE_ENV}`);
-    // LK-13: hard refusal — if anyone leaves the no-auth voice flag enabled in
+    console.log('?? Square 15 Livekit Backend');
+    console.log(`?? Server running on port ${PORT}`);
+    console.log(`?? Health check: http://localhost:${PORT}/health`);
+    console.log(`?? Token endpoint: http://localhost:${PORT}/api/token`);
+    console.log(`?? Voice start endpoint: http://localhost:${PORT}/api/voice/start`);
+    console.log(`?? Environment: ${process.env.NODE_ENV}`);
+    // LK-13: hard refusal � if anyone leaves the no-auth voice flag enabled in
     // production, log loudly to error_logs and ALSO refuse to enable it (the
     // flag is read again at request time; we set NODE_ENV-dependent override).
     try {
       const dangerFlag = String(process.env.ALLOW_VOICE_START_WITHOUT_AUTH || '').toLowerCase();
       const isProd = String(process.env.NODE_ENV || '').toLowerCase() === 'production';
       if (isProd && (dangerFlag === '1' || dangerFlag === 'true' || dangerFlag === 'yes' || dangerFlag === 'on')) {
-        console.error('🚨 SECURITY: ALLOW_VOICE_START_WITHOUT_AUTH is enabled in production. This lets anyone start a voice session without Firebase auth. The flag is being IGNORED — set it to false in Render env vars to silence this warning.');
+        console.error('?? SECURITY: ALLOW_VOICE_START_WITHOUT_AUTH is enabled in production. This lets anyone start a voice session without Firebase auth. The flag is being IGNORED � set it to false in Render env vars to silence this warning.');
         // Forcibly clear so downstream isEnvTruthy() reads false
         process.env.ALLOW_VOICE_START_WITHOUT_AUTH = 'false';
         try {
@@ -10786,7 +10794,7 @@ if (require.main === module) {
         } catch (_) {}
       }
     } catch (_) {}
-    console.log('✅ Server ready to accept requests\n');
-    try { _startAutoResolveSweeper(); console.log('🩹 Auto-heal sweeper started (every 5 min).'); } catch (_) {}
+    console.log('? Server ready to accept requests\n');
+    try { _startAutoResolveSweeper(); console.log('?? Auto-heal sweeper started (every 5 min).'); } catch (_) {}
   });
 }

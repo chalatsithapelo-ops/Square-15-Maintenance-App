@@ -43,6 +43,16 @@ app.use(helmet());
 app.use(cors());
 app.use(express.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
 
+// ─── PII helper: mask phone numbers in logs ───
+// Format: keep country code (first 2-3 digits) + last 4, redact middle.
+// Example: '27821234567' -> '27***4567'
+function maskPhone(p) {
+  if (!p) return '';
+  const s = String(p).replace(/\D/g, '');
+  if (s.length <= 6) return s.slice(0, 2) + '***';
+  return s.slice(0, 2) + '***' + s.slice(-4);
+}
+
 // ─── Internal API secret middleware (for Flutter app → WA bot calls) ───
 function requireInternalSecret(req, res, next) {
   const internalSecret = (process.env.INTERNAL_API_SECRET || '').trim();
@@ -1133,7 +1143,7 @@ async function restoreSessionFromFirestore(session) {
     } else if (data.promoCode) {
       console.log(`[session] Promo ${data.promoCode} not restored (age ${Math.round(ageMs/1000)}s > ${PROMO_TTL_MS/1000}s TTL) — customer must re-apply`);
     }
-    console.log(`[session] Restored ${session.phone} from Firestore (${session.messages.length} msgs, ${session.photoUrls.length} photos)`);
+    console.log(`[session] Restored ${maskPhone(session.phone)} from Firestore (${session.messages.length} msgs, ${session.photoUrls.length} photos)`);
   } catch (e) {
     console.warn('[session] Firestore restore failed:', e.message);
   }
@@ -2532,7 +2542,7 @@ async function executeWaTool(name, args, session) {
           addressArg = sessionAddr;
         }
         if (!addressArg) {
-          console.log(`[create_booking] ADDRESS GATE: refusing booking for ${session.phone} — no service address`);
+          console.log(`[create_booking] ADDRESS GATE: refusing booking for ${maskPhone(session.phone)} — no service address`);
           return {
             success: false,
             error: 'address_required',
@@ -2777,7 +2787,7 @@ async function executeWaTool(name, args, session) {
         customerName: args.customerName || '',
         customerPhone: session.phone,
         contact: session.phone,
-        user_id: session.linkedUserId || `wa_${session.phone}`,
+        user_id: session.linkedUserId || `wa_${maskPhone(session.phone)}`,
         source: 'whatsapp',
         status: 'pending',
         accept: '',
@@ -2809,7 +2819,7 @@ async function executeWaTool(name, args, session) {
       const futureBooking = {
         id: bookingId,
         order_no: orderNo,
-        user_id: session.linkedUserId || `wa_${session.phone}`,
+        user_id: session.linkedUserId || `wa_${maskPhone(session.phone)}`,
         user_name: args.customerName || '',
         user_phone: session.phone,
         category_name: args.category || '',
@@ -2848,9 +2858,21 @@ async function executeWaTool(name, args, session) {
       // Clear photo URLs after storing them in the booking
       session.photoUrls = [];
 
-      // Record promo redemption if used
+      // Record promo redemption if used (atomic max_uses enforcement)
       if (promoApplied && session.promoId) {
         try {
+          const promoRef = firestore.collection('promo_codes').doc(session.promoId);
+          await firestore.runTransaction(async (txn) => {
+            const snap = await txn.get(promoRef);
+            if (!snap.exists) return; // promo deleted between apply and use
+            const data = snap.data() || {};
+            const used = Number(data.used_count || 0);
+            const max = data.max_uses ? Number(data.max_uses) : 0;
+            if (max > 0 && used >= max) {
+              throw new Error('PROMO_MAX_USES_EXCEEDED');
+            }
+            txn.update(promoRef, { used_count: admin.firestore.FieldValue.increment(1) });
+          });
           await firestore.collection('promo_redemptions').add({
             promo_id: session.promoId,
             user_id: session.linkedUserId || session.phone,
@@ -2859,9 +2881,6 @@ async function executeWaTool(name, args, session) {
             discount_amount: promoApplied.discount,
             source: 'whatsapp',
             created_at: now,
-          });
-          await firestore.collection('promo_codes').doc(session.promoId).update({
-            used_count: admin.firestore.FieldValue.increment(1),
           });
         } catch (e) { console.warn('[wa-tool] promo usage tracking failed:', e.message); }
         // Clear promo from session after use
@@ -3316,11 +3335,11 @@ async function executeWaTool(name, args, session) {
               return tail(pd) === tail(sessDigits);
             });
             if (!matches) {
-              console.warn(`[request_payment_link] linkedUserId ${session.linkedUserId} phone mismatch with session phone ${session.phone} — clearing`);
+              console.warn(`[request_payment_link] linkedUserId ${session.linkedUserId} phone mismatch with session phone ${maskPhone(session.phone)} — clearing`);
               try {
                 await logErrorToAdmin(
                   'linked_user_phone_mismatch',
-                  `Session linkedUserId ${session.linkedUserId} does not match WA phone ${session.phone}`,
+                  `Session linkedUserId ${session.linkedUserId} does not match WA phone ${maskPhone(session.phone)}`,
                   'whatsapp_bot.request_payment_link',
                   '',
                   bid,
@@ -3721,7 +3740,7 @@ async function executeWaTool(name, args, session) {
       const noPhotoReason = String(args.noPhotoReason || args.no_photo_reason || '').trim();
       if (!hasSessionPhotos && !noPhotoReason && !session.photoGateAcknowledged) {
         session.photoGateAcknowledged = false;
-        console.log(`[submit_rfq] PHOTO GATE: refusing RFQ for ${session.phone} — no photo received yet`);
+        console.log(`[submit_rfq] PHOTO GATE: refusing RFQ for ${maskPhone(session.phone)} — no photo received yet`);
         return {
           success: false,
           error: 'photo_required',
@@ -3746,7 +3765,7 @@ async function executeWaTool(name, args, session) {
           addressArg = sessionAddr;
         }
         if (!addressArg) {
-          console.log(`[submit_rfq] ADDRESS GATE: refusing RFQ for ${session.phone} — no service address`);
+          console.log(`[submit_rfq] ADDRESS GATE: refusing RFQ for ${maskPhone(session.phone)} — no service address`);
           return {
             success: false,
             error: 'address_required',
@@ -3825,7 +3844,7 @@ async function executeWaTool(name, args, session) {
         rfq_no: rfqNo,
         is_rfq: 'yes',
         rfq_status: 'pending_admin_review',
-        user_id: session.linkedUserId || `wa_${session.phone}`,
+        user_id: session.linkedUserId || `wa_${maskPhone(session.phone)}`,
         user_name: args.customerName || '',
         user_phone: session.phone,
         category_name: args.category || '',
@@ -5055,7 +5074,7 @@ async function executeWaTool(name, args, session) {
       }
 
       // Create a new user document (compatible with Flutter app UserModel)
-      const userId = `wa_${session.phone}`;
+      const userId = `wa_${maskPhone(session.phone)}`;
       const now = new Date().toISOString();
       const userData = {
         uid: userId,
@@ -6461,7 +6480,7 @@ async function handleMessage(session, userMessage, imageDataUrl) {
               if (td.rating) continue;
               if (!td.wa_rating_request_sent_at) continue;
               session.pendingRatingBookingId = d.id;
-              console.log(`[rating-intercept] restored pendingRatingBookingId=${d.id} for ${session.phone} from Firestore`);
+              console.log(`[rating-intercept] restored pendingRatingBookingId=${d.id} for ${maskPhone(session.phone)} from Firestore`);
               break;
             }
             // Fallback: also check tail-match in case stored phone differs
@@ -6474,7 +6493,7 @@ async function handleMessage(session, userMessage, imageDataUrl) {
                 const tmPhone = String(td.user_phone || td.customerPhone || td.phone || '').replace(/[^0-9]/g, '');
                 if (tmPhone && tmPhone.endsWith(last9)) {
                   session.pendingRatingBookingId = d.id;
-                  console.log(`[rating-intercept] restored pendingRatingBookingId=${d.id} (tail-match) for ${session.phone}`);
+                  console.log(`[rating-intercept] restored pendingRatingBookingId=${d.id} (tail-match) for ${maskPhone(session.phone)}`);
                   break;
                 }
               }
@@ -6619,12 +6638,12 @@ async function handleMessage(session, userMessage, imageDataUrl) {
         session.lastRfqId &&
         (looksLikeQuoteNow || recoveredFromFirestore);
 
-      console.log(`[quote-intercept] phone=${session.phone} userText="${userTextRaw.slice(0,40)}" affirm=${isAffirmative} reject=${isRejection} lastRfqId=${session.lastRfqId || '(none)'} looksLikeQuote=${looksLikeQuoteNow} recovered=${recoveredFromFirestore} → ${shouldInterceptQuote ? 'INTERCEPT' : 'skip'}`);
+      console.log(`[quote-intercept] phone=${maskPhone(session.phone)} userText="${userTextRaw.slice(0,40)}" affirm=${isAffirmative} reject=${isRejection} lastRfqId=${session.lastRfqId || '(none)'} looksLikeQuote=${looksLikeQuoteNow} recovered=${recoveredFromFirestore} → ${shouldInterceptQuote ? 'INTERCEPT' : 'skip'}`);
 
       if (shouldInterceptQuote) {
         const rfqId = session.lastRfqId;
         if (isAffirmative) {
-          console.log(`[quote-intercept] ${session.phone}: YES on quote → accept_rfq_quote(${rfqId})`);
+          console.log(`[quote-intercept] ${maskPhone(session.phone)}: YES on quote → accept_rfq_quote(${rfqId})`);
           session._lastToolsCalled.push('accept_rfq_quote');
           let reply = '';
           try {
@@ -6645,7 +6664,7 @@ async function handleMessage(session, userMessage, imageDataUrl) {
           return reply;
         }
         if (isRejection) {
-          console.log(`[quote-intercept] ${session.phone}: NO on quote → noting rejection`);
+          console.log(`[quote-intercept] ${maskPhone(session.phone)}: NO on quote → noting rejection`);
           const reply = 'No problem — what would you like to change? You can ask to swap a brand, remove an item, or adjust quantities, and I\'ll log it for our admin to update the quote.';
           session.messages.push({ role: 'assistant', content: reply });
           return reply;
@@ -6677,7 +6696,7 @@ async function handleMessage(session, userMessage, imageDataUrl) {
         const parsed = parseScheduleFromText(userTextRaw);
         if (parsed && parsed.date) {
           const rfqId = session.lastRfqId;
-          console.log(`[schedule-intercept] ${session.phone}: "${userTextRaw}" → ${parsed.date} ${parsed.time || ''} for ${rfqId}`);
+          console.log(`[schedule-intercept] ${maskPhone(session.phone)}: "${userTextRaw}" → ${parsed.date} ${parsed.time || ''} for ${rfqId}`);
           const argsObj = { bookingId: rfqId, preferredDate: parsed.date, preferredTime: parsed.time || '', notes: '' };
           session._lastToolsCalled.push('set_preferred_schedule');
           let reply = '';
@@ -6737,7 +6756,7 @@ async function handleMessage(session, userMessage, imageDataUrl) {
         }
         const shouldIntercept = wantsDeposit || wantsFull || (wantsPayGeneric && (paymentType === 'deposit' || paymentType === 'full'));
         if (shouldIntercept) {
-          console.log(`[payment-intercept] ${session.phone}: "${userTextRaw}" → request_payment_link(${bid}, ${paymentType})`);
+          console.log(`[payment-intercept] ${maskPhone(session.phone)}: "${userTextRaw}" → request_payment_link(${bid}, ${paymentType})`);
           const argsObj = { bookingId: bid, paymentType };
           session._lastToolsCalled.push('request_payment_link');
           let reply = '';
@@ -6950,7 +6969,7 @@ async function handleMessage(session, userMessage, imageDataUrl) {
       }).catch(e => {
         // Surface persist failures so we know when sessions silently die on
         // Render restart (was previously swallowed with `.catch(() => {})`).
-        console.error(`[session-persist] CRITICAL: ${session.phone} persist failed: ${e && e.message}`);
+        console.error(`[session-persist] CRITICAL: ${maskPhone(session.phone)} persist failed: ${e && e.message}`);
       });
     }
 
@@ -7160,7 +7179,7 @@ app.post('/webhook', async (req, res) => {
           const appUser = await findUserByPhone(session.phone);
           if (appUser) {
             session.linkedUserId = appUser.id;
-            console.log(`[auto-link] Matched WhatsApp ${session.phone} to app user ${appUser.id} (${appUser.name || 'unknown'})`);
+            console.log(`[auto-link] Matched WhatsApp ${maskPhone(session.phone)} to app user ${appUser.id} (${appUser.name || 'unknown'})`);
           }
         } catch (e) {
           console.warn('[auto-link] Phone lookup failed:', e.message);
@@ -7345,7 +7364,8 @@ app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-wha
 
 // Diagnostic: run buildersSearchOptions live and report what happens.
 // GET /diag/builders?q=shower+mixer&limit=3
-app.get('/diag/builders', async (req, res) => {
+// Auth: requires x-internal-secret header (admin-only diagnostic).
+app.get('/diag/builders', requireInternalSecret, async (req, res) => {
   const q = String(req.query.q || 'shower mixer').trim();
   const limit = Math.min(5, Math.max(1, Number(req.query.limit) || 3));
   const raw = String(req.query.raw || '') === '1';
@@ -7388,7 +7408,8 @@ app.get('/diag/builders', async (req, res) => {
       })),
     });
   } catch (e) {
-    res.status(500).json({ error: e.message, stack: (e.stack || '').split('\n').slice(0, 5) });
+    console.error('[diag/builders] error:', e);
+    res.status(500).json({ error: 'internal_error' });
   }
 });
 
