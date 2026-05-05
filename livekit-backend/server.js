@@ -9880,6 +9880,122 @@ app.post('/api/admin/self-bootstrap-claims', adminLimiter, async (req, res) => {
   }
 });
 
+/**
+ * Upload an artisan profile image (admin-only).
+ * POST /api/admin/upload-artisan-image
+ * Headers: Authorization: Bearer <Firebase ID token>
+ * Body (JSON, route-local 25 MB limit): {
+ *   "artisanId": "<serviceProvider doc id>",
+ *   "imageBase64": "<base64 jpeg/png, no data: prefix>",
+ *   "contentType": "image/jpeg" | "image/png" (optional, default jpeg)
+ * }
+ *
+ * Anti-fraud (May-2026): the admin's Android Storage SDK has been
+ * returning a generic [unknown] error during direct putFile() — likely a
+ * regional/SDK quirk. We bypass the client SDK entirely: backend uses
+ * the Firebase Admin SDK (bypasses Storage rules), uploads to
+ * `service_providers/{artisanId}.jpg`, generates a download URL, and
+ * mirrors `imageUrl`/`image` onto `serviceProvider/{artisanId}` in
+ * Firestore so the artisan app + admin app + WA bot all see the new
+ * picture immediately. Artisans cannot call this endpoint — we verify
+ * the caller is an admin via Firestore (Admin SDK can read it bypassing
+ * rules; we don't rely on custom claims here).
+ */
+app.post(
+  '/api/admin/upload-artisan-image',
+  express.json({ limit: '25mb' }),
+  adminLimiter,
+  async (req, res) => {
+    const firestore = requireFirebase(res);
+    if (!firestore) return;
+    try {
+      // 1) Verify Firebase ID token
+      const authHeader = String(req.headers.authorization || req.headers.Authorization || '');
+      const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+      if (!idToken) return res.status(401).json({ error: 'Missing Authorization Bearer token' });
+
+      let decoded;
+      try {
+        decoded = await admin.auth().verifyIdToken(idToken);
+      } catch (e) {
+        return res.status(401).json({ error: 'Invalid ID token', detail: e.message });
+      }
+
+      // 2) Verify caller is an admin in Firestore
+      const callerUid = decoded.uid;
+      const userDoc = await firestore.collection('users').doc(callerUid).get();
+      if (!userDoc.exists) return res.status(403).json({ error: 'User not found' });
+      const u = userDoc.data() || {};
+      if (u.isAdmin !== true || u.isVerified !== true) {
+        console.warn(`[upload-artisan-image] DENIED for ${callerUid}: isAdmin=${u.isAdmin} isVerified=${u.isVerified}`);
+        return res.status(403).json({ error: 'Admin privileges required' });
+      }
+
+      // 3) Validate body
+      const artisanId = String(req.body?.artisanId || '').trim();
+      const rawB64 = String(req.body?.imageBase64 || '').trim();
+      const contentType = String(req.body?.contentType || 'image/jpeg').trim();
+      if (!artisanId) return res.status(400).json({ error: 'Missing artisanId' });
+      if (!rawB64) return res.status(400).json({ error: 'Missing imageBase64' });
+      if (!/^image\/(jpeg|jpg|png)$/i.test(contentType)) {
+        return res.status(400).json({ error: 'Unsupported contentType (must be image/jpeg or image/png)' });
+      }
+
+      const cleanB64 = rawB64.replace(/^data:image\/\w+;base64,/, '');
+      let buf;
+      try {
+        buf = Buffer.from(cleanB64, 'base64');
+      } catch (e) {
+        return res.status(400).json({ error: 'Invalid base64' });
+      }
+      if (buf.length === 0) return res.status(400).json({ error: 'Empty image' });
+      if (buf.length > 15 * 1024 * 1024) {
+        return res.status(413).json({ error: 'Image exceeds 15MB' });
+      }
+
+      // 4) Upload to Storage via Admin SDK (bypasses rules)
+      const ext = contentType === 'image/png' ? 'png' : 'jpg';
+      const storagePath = `service_providers/${artisanId}.${ext}`;
+      const downloadToken = crypto.randomUUID();
+      const bucket = admin.storage().bucket();
+      const file = bucket.file(storagePath);
+      await file.save(buf, {
+        contentType,
+        metadata: {
+          cacheControl: 'public, max-age=3600',
+          metadata: {
+            firebaseStorageDownloadTokens: downloadToken,
+            uploaded_by: callerUid,
+            uploaded_at: new Date().toISOString(),
+          },
+        },
+        resumable: false,
+        validation: false,
+      });
+
+      const encodedPath = encodeURIComponent(storagePath);
+      const publicUrl = `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/${encodedPath}?alt=media&token=${downloadToken}`;
+
+      // 5) Mirror onto serviceProvider doc (canonical + legacy fields)
+      await firestore.collection('serviceProvider').doc(artisanId).set(
+        {
+          image: publicUrl,
+          imageUrl: publicUrl,
+          image_updated_at: new Date().toISOString(),
+          image_updated_by: callerUid,
+        },
+        { merge: true }
+      );
+
+      console.log(`✅ admin upload-artisan-image: ${callerUid} → ${artisanId} (${buf.length} bytes)`);
+      return res.json({ success: true, url: publicUrl, path: storagePath, bytes: buf.length });
+    } catch (e) {
+      console.error('❌ upload-artisan-image error:', e);
+      return res.status(500).json({ error: 'Upload failed', message: e.message });
+    }
+  }
+);
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // PHASE 5.2 — Secure Finance Approval Pipeline (Tier C)
 // Money NEVER moves without: auth → fraud check → request doc → admin approval
