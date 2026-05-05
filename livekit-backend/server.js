@@ -9827,6 +9827,59 @@ app.post('/api/admin/bootstrap-claims', adminLimiter, async (req, res) => {
   }
 });
 
+/**
+ * Self-bootstrap admin custom claims.
+ * POST /api/admin/self-bootstrap-claims
+ * Header: Authorization: Bearer <Firebase ID token>
+ *
+ * Anti-fraud (May-2026): the admin app calls this immediately after a
+ * successful Firebase Auth login. The backend verifies the caller's ID
+ * token, then reads `users/{uid}` in Firestore (Admin SDK bypasses
+ * security rules). If both `isAdmin == true` and `isVerified == true`,
+ * it sets the `role: 'admin'` custom claim on the user. The admin app
+ * then force-refreshes its ID token so the new claim is present in
+ * subsequent Firebase Storage uploads (which now require it for
+ * `service_providers/**`).
+ */
+app.post('/api/admin/self-bootstrap-claims', adminLimiter, async (req, res) => {
+  const firestore = requireFirebase(res);
+  if (!firestore) return;
+  try {
+    const authHeader = String(req.headers.authorization || req.headers.Authorization || '');
+    const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+    if (!idToken) return res.status(401).json({ error: 'Missing Authorization Bearer token' });
+
+    let decoded;
+    try {
+      decoded = await admin.auth().verifyIdToken(idToken);
+    } catch (e) {
+      return res.status(401).json({ error: 'Invalid ID token', detail: e.message });
+    }
+
+    const uid = decoded.uid;
+    const userDoc = await firestore.collection('users').doc(uid).get();
+    if (!userDoc.exists) return res.status(403).json({ error: 'User not found in Firestore' });
+    const u = userDoc.data() || {};
+    if (u.isAdmin !== true || u.isVerified !== true) {
+      console.warn(`[self-bootstrap-claims] DENIED for ${uid}: isAdmin=${u.isAdmin} isVerified=${u.isVerified}`);
+      return res.status(403).json({ error: 'Not an admin user' });
+    }
+
+    // Preserve any other claims that may already be set.
+    const existing = (decoded && decoded.claims) || {};
+    await admin.auth().setCustomUserClaims(uid, { ...existing, role: 'admin', admin: true });
+    console.log(`✅ self-bootstrap-claims: granted admin to ${uid} (${u.email || ''})`);
+    return res.json({
+      success: true,
+      uid,
+      message: 'Admin claims set. Force-refresh your ID token for the change to take effect.',
+    });
+  } catch (e) {
+    console.error('❌ self-bootstrap-claims error:', e);
+    return res.status(500).json({ error: 'Internal error', message: e.message });
+  }
+});
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // PHASE 5.2 — Secure Finance Approval Pipeline (Tier C)
 // Money NEVER moves without: auth → fraud check → request doc → admin approval
