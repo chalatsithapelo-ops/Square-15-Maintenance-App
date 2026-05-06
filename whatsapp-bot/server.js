@@ -7752,6 +7752,29 @@ app.post('/api/artisan-accepted', requireInternalSecret, async (req, res) => {
       data: { type: 'artisan_accepted', booking_id: mainBookingId },
     });
 
+    // Update the customer's WA session so the next "pay deposit"/"pay full"
+    // intercept resolves to THIS newly-accepted booking instead of an older
+    // stale lastBookingId from a previous conversation.
+    try {
+      const liveSess = sessions.get(to);
+      if (liveSess) {
+        liveSess.lastBookingId = mainBookingId;
+        liveSess.lastRfqId = mainBookingId;
+        liveSess.paymentStatus = 'pending';
+        console.log(`[api/artisan-accepted] in-memory session updated for ${to} → lastBookingId=${mainBookingId}`);
+      }
+      await firestore.collection('wa_sessions').doc(to).set({
+        phone: to,
+        lastBookingId: mainBookingId,
+        lastRfqId: mainBookingId,
+        lastBookingAt: Date.now(),
+        lastActivity: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+      console.log(`[api/artisan-accepted] wa_sessions doc updated for ${to} → lastBookingId=${mainBookingId}`);
+    } catch (e) {
+      console.warn('[api/artisan-accepted] session update failed:', e && e.message);
+    }
+
     res.json({ success: true, to, bookingId: mainBookingId });
   } catch (err) {
     // MED-17: surface webhook failures to error_logs so admin sees stuck
