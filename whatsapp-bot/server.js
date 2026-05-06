@@ -7642,8 +7642,12 @@ app.post('/api/artisan-accepted', requireInternalSecret, async (req, res) => {
       return res.status(409).json({ error: 'Booking is no longer active', status: mainStatus, rfq_status: mainRfqStatus });
     }
     // (b) Idempotency: webhook delivered twice → don't re-message customer.
-    if (mainAccept === '1' || mainStatus === 'pending_payment' || mainStatus === 'paid' || mainStatus === 'deposit_paid') {
-      console.log(`[api/artisan-accepted] booking ${mainBookingId} already accepted/paid (status=${mainStatus}, accept=${mainAccept}) — skipping duplicate notification`);
+    // Use the SAME flag as the Firestore snapshot listener so the two paths
+    // (HTTP webhook + onSnapshot) can never both send the acceptance message.
+    let acceptanceAlreadySent = false;
+    if (fbDoc.exists && fbDoc.data().wa_artisan_acceptance_sent_at) acceptanceAlreadySent = true;
+    if (acceptanceAlreadySent || mainStatus === 'paid' || mainStatus === 'deposit_paid') {
+      console.log(`[api/artisan-accepted] booking ${mainBookingId} already notified (status=${mainStatus}, sent_at=${fbDoc.exists ? fbDoc.data().wa_artisan_acceptance_sent_at : ''}) — skipping duplicate notification`);
       return res.json({ ok: true, deduped: true, status: mainStatus });
     }
 
@@ -7682,11 +7686,14 @@ app.post('/api/artisan-accepted', requireInternalSecret, async (req, res) => {
       }, { merge: true });
     } catch (e) { console.warn('[api/artisan-accepted] main doc update failed:', e.message); }
 
-    // Also update futureBookings to ensure consistency
+    // Also update futureBookings to ensure consistency.
+    // Stamp the dedup flag BEFORE sending so a racing snapshot listener tick
+    // sees it and bails out instead of sending a second copy.
     try {
       await firestore.collection('futureBookings').doc(mainBookingId).set({
         artisan_confirmed: 'yes',
         status: 'pending_payment',
+        wa_artisan_acceptance_sent_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       }, { merge: true });
     } catch (e) { console.warn('[api/artisan-accepted] futureBookings update failed:', e.message); }
@@ -8716,6 +8723,10 @@ function startArtisanAcceptanceListener() {
   try {
     const firestore = db();
     if (!firestore) return;
+    // In-flight lock to prevent two near-simultaneous snapshot ticks from
+    // both passing the wa_artisan_acceptance_sent_at check before either has
+    // written the flag back.
+    const _acceptInFlight = new Set();
     firestore.collection('futureBookings')
       .where('artisan_confirmed', '==', 'yes')
       .onSnapshot(async (snap) => {
@@ -8727,8 +8738,25 @@ function startArtisanAcceptanceListener() {
           const isWa = src.includes('whatsapp') || String(doc.id).startsWith('RFQ-') || String(doc.id).startsWith('WA-');
           if (!isWa) continue;
           if (data.wa_artisan_acceptance_sent_at) continue;
+          if (_acceptInFlight.has(doc.id)) continue;
+          _acceptInFlight.add(doc.id);
+          // Re-read inside the lock to catch a racing webhook that just wrote the flag.
+          try {
+            const fresh = await doc.ref.get();
+            if (fresh.exists && fresh.data().wa_artisan_acceptance_sent_at) {
+              _acceptInFlight.delete(doc.id);
+              continue;
+            }
+            // Stamp the flag BEFORE sending so a racing /api/artisan-accepted
+            // call sees it and bails.
+            await doc.ref.set({ wa_artisan_acceptance_sent_at: new Date().toISOString() }, { merge: true });
+          } catch (e) {
+            console.warn('[artisan-accept-listener] pre-send flag write failed:', e && e.message);
+            _acceptInFlight.delete(doc.id);
+            continue;
+          }
           const customerPhone = data.user_phone || data.customerPhone || data.contact || data.client_phone || data.phone || '';
-          if (!customerPhone) continue;
+          if (!customerPhone) { _acceptInFlight.delete(doc.id); continue; }
 
           const rfqId = doc.id;
           const orderNo = data.order_no || data.rfq_no || rfqId;
@@ -8771,7 +8799,7 @@ function startArtisanAcceptanceListener() {
                 }
               }
             } catch (e) { console.warn(`[artisan-accept-listener] photo send failed for ${rfqId}:`, e.message); }
-            await doc.ref.update({ wa_artisan_acceptance_sent_at: new Date().toISOString() });
+            // Flag was already stamped above before sending; don't re-write here.
             console.log(`[artisan-accept-listener] sent acceptance WA to ${to} for ${rfqId} (artisan=${artisanName})`);
             try {
               await firestore.collection('tasksManagement').doc(rfqId).set({
@@ -8787,8 +8815,29 @@ function startArtisanAcceptanceListener() {
                 updated_at: new Date().toISOString(),
               }, { merge: true });
             } catch (_) {}
+            // Update the customer's WA session so the next "pay deposit"/
+            // "pay full" intercept resolves to THIS newly-accepted booking.
+            try {
+              const liveSess = sessions.get(to);
+              if (liveSess) {
+                liveSess.lastBookingId = rfqId;
+                liveSess.lastRfqId = rfqId;
+                liveSess.paymentStatus = 'pending';
+              }
+              await firestore.collection('wa_sessions').doc(to).set({
+                phone: to,
+                lastBookingId: rfqId,
+                lastRfqId: rfqId,
+                lastBookingAt: Date.now(),
+                lastActivity: admin.firestore.FieldValue.serverTimestamp(),
+              }, { merge: true });
+            } catch (e) { console.warn('[artisan-accept-listener] session update failed:', e && e.message); }
           } catch (e) {
             console.warn(`[artisan-accept-listener] WA send failed for ${rfqId}:`, e.message);
+            // Roll back the dedup flag so the next snapshot tick can retry.
+            try { await doc.ref.update({ wa_artisan_acceptance_sent_at: admin.firestore.FieldValue.delete() }); } catch (_) {}
+          } finally {
+            _acceptInFlight.delete(doc.id);
           }
         }
       }, (err) => {
