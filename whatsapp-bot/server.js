@@ -7698,6 +7698,7 @@ app.post('/api/artisan-accepted', requireInternalSecret, async (req, res) => {
 
     // ── Send artisan profile photo so customer can recognise who's coming. ──
     try {
+      const ref = orderNo || mainBookingId;
       let spId = artisanId;
       if (!spId) {
         try {
@@ -8310,7 +8311,7 @@ const _lifecycleInFlight = new Set();
 // Used by the 'on the way' (progress) WA so the customer can see who is
 // arriving — a safety feature already present in-app, now mirrored to WhatsApp.
 async function getArtisanProfile(firestore, artisanId) {
-  const out = { imageUrl: '', name: '' };
+  const out = { imageUrl: '', name: '', rating: 0 };
   const id = String(artisanId || '').trim();
   if (!firestore || !id || id === 'admin') return out;
   try {
@@ -8326,6 +8327,8 @@ async function getArtisanProfile(firestore, artisanId) {
       }
     }
     out.name = String(d.name || d.fullName || d.full_name || '').trim();
+    const r = Number(d.rating || d.avgRating || d.average_rating || d.averageRating || 0);
+    out.rating = Number.isFinite(r) && r > 0 ? r : 0;
   } catch (e) {
     console.warn('[getArtisanProfile] failed for', id, ':', e.message);
   }
