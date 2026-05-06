@@ -3068,7 +3068,7 @@ async function executeWaTool(name, args, session) {
         balanceAmount: `R${balanceAmount.toFixed(2)}`,
         promoApplied: promoApplied ? `${promoApplied.code} (-R${promoApplied.discount.toFixed(2)})` : null,
         paymentStatus: 'awaiting_artisan',
-        message: `Booking ${orderNo} created! Estimated cost: R${finalCost.toFixed(2)}.\n\n⏳ *Next step:* An artisan needs to accept your job before payment. We're dispatching the nearest available artisan now — you'll be notified as soon as one accepts.\n\n🔒 *Your money is protected:* When it's time to pay, your payment is held in a secure escrow account. The artisan does NOT receive your money until you confirm you are satisfied with the completed work.\n\n💰 *Payment options (after artisan accepts):*\n• Full amount: R${finalCost.toFixed(2)}\n• Deposit (35%): R${depositAmount.toFixed(2)} now, R${balanceAmount.toFixed(2)} after job completion`,
+        message: `Booking ${orderNo} created! Estimated cost: R${finalCost.toFixed(2)}.\n\n⏳ *Next step:* An artisan needs to accept your job before payment. We're dispatching the nearest available artisan now — you'll be notified as soon as one accepts.\n\n🔒 *Your money is 100% protected (Escrow):* When it's time to pay, your payment is held in a secure escrow account. The artisan does NOT receive your money until you confirm you are satisfied with the completed work.\n\n🛡️ *Your safety matters:* Every Square 15 artisan is registered, ID-verified and rated by past customers. When the artisan is on the way, we'll send you their profile photo so you can confirm it's the same person who arrives at your door. If anything ever feels unsafe, reply *"help"* and we'll alert support immediately.\n\n💸 *Refund policy:* Cancel before the artisan starts work for a *full refund*. If you're not satisfied with the completed work, do *not* release payment — reply *"refund"* or *"complaint"* and our team will investigate before any money leaves escrow. Wallet refunds are instant; card refunds take 3–5 business days.\n\n💰 *Payment options (after artisan accepts):*\n• Full amount: R${finalCost.toFixed(2)}\n• Deposit (35%): R${depositAmount.toFixed(2)} now, R${balanceAmount.toFixed(2)} after job completion`,
       };
     }
 
@@ -6218,6 +6218,20 @@ async function executeWaTool(name, args, session) {
 const SYSTEM_PROMPT = `You are Lizzy, the Square 15 Facility Solutions AI assistant on WhatsApp.
 You are an AI-powered assistant (not a human). When greeting a customer for the first time, introduce yourself clearly:
 "Hi! I'm Lizzy, your AI assistant from Square 15 Facility Solutions. I can help you book maintenance services, get quotes, track jobs, and process payments — all right here on WhatsApp. How can I help you today?"
+
+🛡️ TRUST & SAFETY FACTS (USE THESE EXACT TERMS — NEVER INVENT OR EMBELLISH):
+When the customer asks about safety, refunds, escrow, guarantees, vetting, ratings, or "is this safe?", reply ONLY with the facts below. Do NOT invent warranty periods, money-back-guarantee percentages, insurance terms, certification names, or licence claims that are not in this list.
+- ESCROW: All payments are held in a secure escrow account managed by Square 15. The artisan does NOT receive funds until the customer confirms the work is satisfactory.
+- ARTISAN VETTING: Every active Square 15 artisan is registered with Square 15, has submitted a valid government-issued ID, and is rated by past customers. (Do NOT claim formal background checks, criminal-record clearance, trade-licence verification, or insurance unless the customer's booking record explicitly says so.)
+- IDENTITY CHECK: When the artisan is on the way, the bot sends the artisan's profile photo to the customer's WhatsApp so they can match the face at the door before letting anyone in.
+- REFUND POLICY:
+  • Cancel BEFORE the artisan starts work → full refund.
+  • Cancel AFTER work has started but before completion → refund of unused portion, minus any materials already purchased on the customer's behalf and any call-out time worked.
+  • Work completed but customer not satisfied → do NOT release escrow. Reply "refund" or "complaint" and Square 15 admin will investigate before any money leaves escrow.
+  • Wallet refunds are processed instantly. Card refunds take 3–5 business days to reflect.
+- PERSONAL SAFETY: If the customer ever feels unsafe, tell them to reply "help" or "emergency" — this alerts the Square 15 support team immediately. (For life-threatening emergencies always remind them to call 10111 / 10177 first.)
+- WHAT YOU MUST NOT PROMISE: workmanship warranty length, free reworks, insurance cover, criminal-background-check results, trade-licence numbers, "money-back guarantee" beyond the escrow + refund policy above. If the customer asks about these, say: "Our standard protection is the escrow + refund policy I just described. For anything beyond that, I'll connect you with our admin team — would you like me to do that?" then offer to use send_message_to_admin / report_issue.
+- PROACTIVE REASSURANCE: When you successfully create_booking, accept_rfq_quote, or confirm payment, briefly remind the customer of the escrow protection and the artisan-photo-on-the-way safety check. Keep it short — one or two sentences.
 You help homeowners, tenants and businesses across Southern Africa (South Africa, Lesotho, Botswana, Namibia, Zimbabwe, Eswatini) and beyond — wherever Square 15 has artisans available. Square 15 dispatches the nearest qualified artisan based on the SERVICE address, not the customer's phone country. So treat every booking as potentially cross-border and ALWAYS confirm the full service address (with country if outside South Africa) before submitting an RFQ or creating a booking.
 
 ⛔ ABSOLUTE ADDRESS RULE (NEVER SKIP):
@@ -7674,11 +7688,33 @@ app.post('/api/artisan-accepted', requireInternalSecret, async (req, res) => {
     msg += `1️⃣ *Full amount:* ${costStr}\n`;
     msg += `2️⃣ *Deposit (35%):* R${depositAmt} now (R${balanceAmt} due after job)\n`;
     msg += `\nReply *"pay full"* or *"pay deposit"* to get your secure payment link.\n`;
-    msg += `\n🔒 Your payment is held in escrow until you confirm satisfaction with the completed work.\n`;
+    msg += `\n🔒 *Your money is safe:* Payment is held in escrow — released to the artisan ONLY after you confirm the job is done right.\n`;
+    msg += `🛡️ *Your safety:* ${name} is registered & ID-verified with Square 15. We'll share their photo with you shortly so you can match them at the door.\n`;
+    msg += `💸 *Not happy with the work?* Reply *"refund"* or *"complaint"* — we'll investigate before any money is released.\n`;
     msg += `\nReply anytime if you have questions! 😊`;
 
     await sendWhatsAppMessage(to, msg);
     console.log(`[api/artisan-accepted] Sent acceptance notification to ${to} for booking ${mainBookingId}`);
+
+    // ── Send artisan profile photo so customer can recognise who's coming. ──
+    try {
+      let spId = artisanId;
+      if (!spId) {
+        try {
+          const tmSnap = await firestore.collection('tasksManagement').doc(mainBookingId).get();
+          if (tmSnap.exists) spId = String((tmSnap.data() || {}).service_provider_id || '').trim();
+        } catch (_) {}
+      }
+      if (!spId && fbDoc.exists) spId = String((fbDoc.data() || {}).service_provider_id || '').trim();
+      if (spId) {
+        const prof = await getArtisanProfile(firestore, spId);
+        if (prof && prof.imageUrl) {
+          const who = prof.name || name;
+          const ratingStr = (prof.rating && Number(prof.rating) > 0) ? ` ⭐ ${Number(prof.rating).toFixed(1)}` : '';
+          await sendWhatsAppImage(to, prof.imageUrl, `👷 Meet ${who}${ratingStr} — your assigned Square 15 artisan for booking #${ref}. For your safety, please confirm this is the person who arrives at your door before letting them in.`);
+        }
+      }
+    } catch (e) { console.warn('[api/artisan-accepted] artisan photo send failed:', e.message); }
 
     // Push notification to linked customer app
     await notifyLinkedCustomer(firestore, {
@@ -8664,11 +8700,25 @@ function startArtisanAcceptanceListener() {
             msg += `1️⃣ *Full amount:* ${costStr}\n`;
             msg += `2️⃣ *Deposit (35%):* R${depositAmt} now (R${balanceAmt} due after job)\n`;
             msg += `\nReply *"pay full"* or *"pay deposit"* to get your secure payment link.\n`;
-            msg += `\n🔒 Your payment is held in escrow until you confirm satisfaction with the completed work.`;
+            msg += `\n🔒 *Your money is safe:* Payment is held in escrow — released ONLY after you confirm the work is done right.\n`;
+            msg += `🛡️ *Your safety:* ${artisanName} is registered & ID-verified. We'll share their photo with you shortly.\n`;
+            msg += `💸 *Not happy?* Reply *"refund"* or *"complaint"* — we'll investigate before any money is released.`;
           }
 
           try {
             await sendWhatsAppMessage(to, msg);
+            // ── Send artisan profile photo for safety/recognition. ──
+            try {
+              const spId = String(data.service_provider_id || '').trim();
+              if (spId) {
+                const prof = await getArtisanProfile(firestore, spId);
+                if (prof && prof.imageUrl) {
+                  const who = prof.name || artisanName;
+                  const ratingStr = (prof.rating && Number(prof.rating) > 0) ? ` ⭐ ${Number(prof.rating).toFixed(1)}` : '';
+                  await sendWhatsAppImage(to, prof.imageUrl, `👷 Meet ${who}${ratingStr} — your assigned Square 15 artisan for booking #${orderNo}. For your safety, please confirm this is the person who arrives at your door before letting them in.`);
+                }
+              }
+            } catch (e) { console.warn(`[artisan-accept-listener] photo send failed for ${rfqId}:`, e.message); }
             await doc.ref.update({ wa_artisan_acceptance_sent_at: new Date().toISOString() });
             console.log(`[artisan-accept-listener] sent acceptance WA to ${to} for ${rfqId} (artisan=${artisanName})`);
             try {

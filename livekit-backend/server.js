@@ -603,7 +603,7 @@ async function verifyFirebaseAuth(req, res) {
   }
 }
 
-// Express middleware wrapper — verifyFirebaseAuth returns a value but never
+// Express middleware wrapper ï¿½ verifyFirebaseAuth returns a value but never
 // calls next(), so using it directly as middleware hangs the request.
 function authMiddleware(req, res, next) {
   verifyFirebaseAuth(req, res).then(decoded => {
@@ -617,7 +617,7 @@ function authMiddleware(req, res, next) {
 }
 
 // LK-14: lightweight in-memory rate limiter. Keyed by `${uid||ip}:${bucket}`.
-// Sliding window — drops timestamps older than `windowMs`. Returns true if
+// Sliding window ï¿½ drops timestamps older than `windowMs`. Returns true if
 // the request should proceed, false if it should be 429'd. No external dep.
 const _rateBuckets = new Map();
 function rateLimit(bucket, key, max, windowMs) {
@@ -728,14 +728,14 @@ async function resolveRole({ firestore, uid, decodedToken }) {
       if (r === 'artisan' || r === 'client') return r;
       // If Firestore says admin, require custom claims confirmation
       if (r === 'admin') {
-        console.warn(`?? User ${uid} has admin role in Firestore but NOT in custom claims — denying admin access`);
+        console.warn(`?? User ${uid} has admin role in Firestore but NOT in custom claims ï¿½ denying admin access`);
         return 'client';
       }
 
       // Check boolean flag schema (isAdmin, isServiceProvider, isUser)
       // This handles apps that use boolean flags instead of string roles.
       if (data.isAdmin === true) {
-        console.warn(`?? User ${uid} has isAdmin=true in Firestore but NOT in custom claims — denying admin access`);
+        console.warn(`?? User ${uid} has isAdmin=true in Firestore but NOT in custom claims ï¿½ denying admin access`);
         return 'client';
       }
       if (data.isServiceProvider === true) return 'artisan';
@@ -745,7 +745,7 @@ async function resolveRole({ firestore, uid, decodedToken }) {
     console.warn(`?? Role lookup (users doc) failed for ${uid}:`, e.message);
   }
 
-  // Fallback: check the serviceProvider collection — artisan profiles live
+  // Fallback: check the serviceProvider collection ï¿½ artisan profiles live
   // there keyed by UID (or linked via user_id/uid fields), not in 'users'.
   try {
     const spSnap = await firestore.collection('serviceProvider').doc(uid).get();
@@ -836,7 +836,7 @@ const ACTION_TIERS = Object.freeze({
   submit_complaint: 'B',
   request_payment_link: 'B',
   pay_with_wallet: 'B',
-  // Phase 4: Admin automation tools (Tier B — admin role required)
+  // Phase 4: Admin automation tools (Tier B ï¿½ admin role required)
   admin_bulk_reassign: 'B',
   admin_close_stale_cases: 'B',
   admin_broadcast_notification: 'B',
@@ -848,7 +848,7 @@ const ACTION_TIERS = Object.freeze({
   get_refund_history: 'A',
   get_payout_status: 'A',
   get_fraud_alerts: 'A',
-  // Phase 5.2: Money-moving (Tier C — requires approval pipeline)
+  // Phase 5.2: Money-moving (Tier C ï¿½ requires approval pipeline)
   request_refund: 'C',
   request_wallet_adjustment: 'C',
   request_payout: 'C',
@@ -3141,7 +3141,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       const qs = await orderedQuery.get();
       bookings = qs.docs.map(_extractBooking);
     } catch (err) {
-      // Composite index missing – fall back to unordered query + JS sort
+      // Composite index missing ï¿½ fall back to unordered query + JS sort
       if (err.code === 9 || (err.message && err.message.includes('index'))) {
         console.warn('[list_bookings] composite index missing, falling back to JS sort');
         try {
@@ -3270,7 +3270,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     }
   }
 
-  // -- Request Payment Link — generates PayFast URL + stores in payment_links + sends notification --
+  // -- Request Payment Link ï¿½ generates PayFast URL + stores in payment_links + sends notification --
   if (action === 'request_payment_link') {
     try {
       const bid = bookingId || String(payload.tasks_management_id || '').trim();
@@ -3469,7 +3469,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       // has been paid. Without this guard a caller could request
       // payment_type='balance' on a fresh booking and the implicit branch
       // below would silently fall back to charging the full amount or 65%
-      // — confusing the customer and breaking transactionLogs accounting.
+      // ï¿½ confusing the customer and breaking transactionLogs accounting.
       if (paymentType === 'balance' && bData.deposit_paid !== true) {
         return { ok: false, status: 400, error: 'cannot_pay_balance_before_deposit' };
       }
@@ -3844,7 +3844,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         learning_factor: r2(learningFactor),
         pricing_sources: { builders: buildersCount, catalog: catalogCount, ai_estimate: aiCount },
         breakdown: [
-          { description: `Labour (${laborHours}hrs @ R${lrUsed}/hr${learningFactor !== 1 ? ` × ${learningFactor.toFixed(2)} adj` : ''})`, cost: laborCost.toFixed(2) },
+          { description: `Labour (${laborHours}hrs @ R${lrUsed}/hr${learningFactor !== 1 ? ` ï¿½ ${learningFactor.toFixed(2)} adj` : ''})`, cost: laborCost.toFixed(2) },
           ...(artisanBuys && bom.length > 0 ? [{ description: `Materials & Supplies (${buildersCount} Builders-priced, ${catalogCount} catalog, ${aiCount} estimated)`, cost: matWithMarkup.toFixed(2) }] : []),
           ...(eqCost > 0 ? [{ description: 'Equipment & Tools', cost: eqCost.toFixed(2) }] : []),
           { description: 'Contingency (15%)', cost: contingency.toFixed(2) },
@@ -3970,7 +3970,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
             try {
               await admin.messaging().send({
                 token: art.token,
-                notification: { title: '?? New RFQ Job Available', body: `RFQ ${data.rfq_no || bookingId} — R${priceNum.toFixed(2)}. Tap to view and accept.` },
+                notification: { title: '?? New RFQ Job Available', body: `RFQ ${data.rfq_no || bookingId} ï¿½ R${priceNum.toFixed(2)}. Tap to view and accept.` },
                 data: { type: 'rfq_accepted', booking_id: bookingId },
                 android: { notification: { channelId: 'order_request_channel', sound: 'sound' } },
               });
@@ -3984,7 +3984,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
 
     if (!autoDispatched) {
       await writeAdminNotification({
-        title: 'RFQ Quote Accepted — Assign Artisan',
+        title: 'RFQ Quote Accepted ï¿½ Assign Artisan',
         message: `Customer accepted RFQ ${data.rfq_no || bookingId} (R${priceNum.toFixed(2)}) via voice. Please assign an artisan.`,
         data: { type: 'rfq_accepted', bookingId },
       });
@@ -4400,7 +4400,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       });
       return { ok: true, status: 200, data: { notifications: items, count: items.length } };
     } catch (e) {
-      // Notifications subcollection may not exist — return empty
+      // Notifications subcollection may not exist ï¿½ return empty
       return { ok: true, status: 200, data: { notifications: [], count: 0 } };
     }
   }
@@ -4556,7 +4556,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
   }
 
   // ---------------------------------------------------------------------------
-  // PHASE 4 — Admin Automation Tools (Tier B, admin-only)
+  // PHASE 4 ï¿½ Admin Automation Tools (Tier B, admin-only)
   // ---------------------------------------------------------------------------
 
   if (action === 'admin_bulk_reassign') {
@@ -4677,7 +4677,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
   }
 
   // ---------------------------------------------------------------------------
-  // PHASE 5.1 — Finance Read-Only Tools (Tier A)
+  // PHASE 5.1 ï¿½ Finance Read-Only Tools (Tier A)
   // ---------------------------------------------------------------------------
 
   if (action === 'get_finance_summary') {
@@ -4947,7 +4947,7 @@ app.get('/health', (req, res) => {
 
 // -- Public pricing test endpoint (dev only) --
 app.get('/api/test-pricing', async (req, res) => {
-  // Public pricing endpoint — used by voice agent for service/pricing lookups.
+  // Public pricing endpoint ï¿½ used by voice agent for service/pricing lookups.
   try {
     const firestore = (() => { initFirebaseIfPossible(); if (firebaseInitError) return null; return admin.firestore(); })();
     if (!firestore) return res.status(500).json({ error: 'firebase_not_configured' });
@@ -5185,7 +5185,7 @@ app.post('/api/voice/start', assistantLimiter, async (req, res) => {
     let enrichedMetadata = metadata;
     try {
       const parsed = metadata ? JSON.parse(metadata) : {};
-      // Do NOT embed the raw Firebase ID token — it would leak to all room participants.
+      // Do NOT embed the raw Firebase ID token ï¿½ it would leak to all room participants.
       parsed.voice_session_id = sessionId;
       parsed.voice_session_nonce = sessionNonce;
       enrichedMetadata = JSON.stringify(parsed);
@@ -6261,7 +6261,7 @@ app.post('/api/admin/fix/service-provider-uid-mapping', async (req, res) => {
 });
 
 // -- Server-side FCM Notification Endpoint --
-// Replaces client-side admin SDK usage — clients call this instead of loading firebase-adminsdk.json
+// Replaces client-side admin SDK usage ï¿½ clients call this instead of loading firebase-adminsdk.json
 app.post('/api/notifications/send', authMiddleware, assistantLimiter, async (req, res) => {
   try {
     initFirebaseIfPossible();
@@ -6287,7 +6287,7 @@ app.post('/api/notifications/send', authMiddleware, assistantLimiter, async (req
       ? 'order_request_channel'
       : 'high_importance_channel';
 
-    // Send FCM via Admin SDK (server-side — no private key exposed to clients)
+    // Send FCM via Admin SDK (server-side ï¿½ no private key exposed to clients)
     const message = {
       token: String(token).trim(),
       notification: { title: String(title), body: String(body) },
@@ -6357,7 +6357,7 @@ function _paymentCallbackSecret() {
 function signPaymentCallback(bookingId) {
   const secret = _paymentCallbackSecret();
   if (!secret) {
-    console.warn('[payment-callback] no PAYMENT_CALLBACK_SECRET/PAYFAST_PASSPHRASE — callbacks will be unsigned and rejected');
+    console.warn('[payment-callback] no PAYMENT_CALLBACK_SECRET/PAYFAST_PASSPHRASE ï¿½ callbacks will be unsigned and rejected');
     return '';
   }
   const exp = Date.now() + PAYMENT_CALLBACK_TTL_MS;
@@ -6386,7 +6386,7 @@ function verifyPaymentCallback(bookingId, t, exp) {
   return { ok: true };
 }
 
-// -- GET checkout page — renders auto-submit POST form to PayFast --
+// -- GET checkout page ï¿½ renders auto-submit POST form to PayFast --
 app.get('/api/payment/checkout/:sessionId', (req, res) => {
   const session = paymentSessions.get(req.params.sessionId);
   if (!session) {
@@ -6408,7 +6408,7 @@ app.get('/api/payment/checkout/:sessionId', (req, res) => {
   // Garbage-collect session after 5 minutes
   setTimeout(() => paymentSessions.delete(req.params.sessionId), 5 * 60 * 1000);
 
-  // Build hidden form fields — escape values for HTML safety
+  // Build hidden form fields ï¿½ escape values for HTML safety
   const esc = (s) => String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   const fields = Object.entries(session.paymentData)
     .map(([k, v]) => `<input type="hidden" name="${esc(k)}" value="${esc(v)}">`)
@@ -6417,7 +6417,7 @@ app.get('/api/payment/checkout/:sessionId', (req, res) => {
   res.send(`
     <html>
     <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-    <title>Square 15 — Redirecting to Payment</title></head>
+    <title>Square 15 ï¿½ Redirecting to Payment</title></head>
     <body style="font-family:sans-serif;text-align:center;padding:60px">
       <h2>Redirecting to secure payment...</h2>
       <p>Amount: <strong>R${esc(session.paymentData.amount)}</strong></p>
@@ -6438,7 +6438,7 @@ app.post('/api/payment/whatsapp-initiate', assistantLimiter, async (req, res) =>
     // Verify internal shared secret
     const internalSecret = (process.env.INTERNAL_API_SECRET || '').trim();
     if (!internalSecret) {
-      console.error('FATAL: INTERNAL_API_SECRET not set — rejecting request');
+      console.error('FATAL: INTERNAL_API_SECRET not set ï¿½ rejecting request');
       return res.status(503).json({ error: 'Server misconfigured' });
     }
     const providedSecret = (req.headers['x-internal-secret'] || '').trim();
@@ -6612,13 +6612,13 @@ app.post('/api/payment/initiate', authMiddleware, assistantLimiter, async (req, 
     const signature = crypto.createHash('md5').update(sigInput).digest('hex');
     paymentData.signature = signature;
 
-    // Build full payment URL with query params — use + encoding (matches signature)
+    // Build full payment URL with query params ï¿½ use + encoding (matches signature)
     const queryString = Object.entries(paymentData)
       .map(([k, v]) => `${encodeURIComponent(k).replace(/%20/g, '+')}=${encodeURIComponent(String(v || '')).replace(/%20/g, '+')}`)
       .join('&');
     const fullPaymentUrl = `${payfastUrl}?${queryString}`;
 
-    // Build auto-submitting HTML form (POST) — most reliable PayFast integration method
+    // Build auto-submitting HTML form (POST) ï¿½ most reliable PayFast integration method
     const formFields = Object.entries(paymentData)
       .map(([k, v]) => `<input type="hidden" name="${k}" value="${String(v || '').replace(/"/g, '&quot;')}" />`)
       .join('\n      ');
@@ -6808,7 +6808,7 @@ app.get('/api/payment/saved-cards', authMiddleware, async (req, res) => {
         created_at: d.created_at,
         last_used_at: d.last_used_at,
       };
-      // Note: token is NEVER sent to the client — stays server-side only
+      // Note: token is NEVER sent to the client ï¿½ stays server-side only
     });
 
     res.json({ ok: true, cards });
@@ -6863,7 +6863,7 @@ app.post('/api/payment/refund', authMiddleware, assistantLimiter, async (req, re
     const now = new Date().toISOString();
     const db = admin.firestore();
 
-    // -- Anti-fraud: rate limit – max 3 refunds per user per 24 hours --
+    // -- Anti-fraud: rate limit ï¿½ max 3 refunds per user per 24 hours --
     const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
     const recentRefunds = await db.collection('transactionLogs')
       .where('user_id', '==', userId)
@@ -6905,7 +6905,7 @@ app.post('/api/payment/refund', authMiddleware, assistantLimiter, async (req, re
       return res.json({ ok: true, already_refunded: true, message: 'This booking has already been refunded.' });
     }
 
-    // -- Anti-fraud: cooldown – booking must be at least 5 minutes old --
+    // -- Anti-fraud: cooldown ï¿½ booking must be at least 5 minutes old --
     const createdAt = data.created_at || data.createdAt || data.creation_date || '';
     if (createdAt) {
       const bookingAge = Date.now() - new Date(createdAt).getTime();
@@ -7032,7 +7032,7 @@ app.post('/api/payment/refund', authMiddleware, assistantLimiter, async (req, re
       // Find the original PayFast payment ID
       const pfPaymentId = data.payfast_payment_id || '';
       if (!pfPaymentId) {
-        // No PayFast payment ID — fall back to creating a refund request for admin
+        // No PayFast payment ID ï¿½ fall back to creating a refund request for admin
         await db.collection('refund_requests').doc(txId).set({
           id: txId,
           source_doc_id: booking_id,
@@ -7129,7 +7129,7 @@ app.post('/api/payment/refund', authMiddleware, assistantLimiter, async (req, re
             message: `R${refundAmount.toFixed(2)} card refund initiated. It will reflect in 3-5 business days.`,
           });
         } else {
-          // PayFast refund API failed — fall back to admin review
+          // PayFast refund API failed ï¿½ fall back to admin review
           console.error(`[refund] PayFast refund API failed:`, refundResult);
           await db.collection('refund_requests').doc(txId).set({
             id: txId,
@@ -7368,7 +7368,7 @@ app.post('/api/admin/payout', authMiddleware, assistantLimiter, async (req, res)
 
       console.log(`?? Admin refund R${payoutAmount.toFixed(2)} credited to client ${recipient_id} wallet`);
     } else {
-      // Credit artisan balance — wrapped in a transaction so the read+update
+      // Credit artisan balance ï¿½ wrapped in a transaction so the read+update
       // of `serviceProvider.balance` and the matching transactionLogs entry
       // commit atomically. Previously a concurrent payout could read the
       // same `currentBalance` twice and overwrite each other's update,
@@ -7527,7 +7527,7 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
     const ozowAccountType = accountTypeMap[(account_type || 'cheque').toLowerCase()] || '1';
 
     const now = new Date().toISOString();
-    // Ozow bankReference max 20 chars — use compact format
+    // Ozow bankReference max 20 chars ï¿½ use compact format
     const payoutRef = `SQ${Date.now().toString(36).toUpperCase()}`;
 
     // -- Call Ozow Payout API --
@@ -7649,7 +7649,7 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
 
     console.log(`[admin/ozow-payout] Ozow response (${ozowResponse.status}):`, JSON.stringify(ozowResult));
 
-    // Ozow may return PascalCase or camelCase — handle both
+    // Ozow may return PascalCase or camelCase ï¿½ handle both
     const payoutId = ozowResult.payoutId || ozowResult.PayoutId || ozowResult.id || ozowResult.Id;
     const ozowStatus = ozowResult.status || ozowResult.Status;
 
@@ -7786,7 +7786,7 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
         });
       } catch (txErr) {
         console.error('? Artisan balance deduction failed:', txErr.message);
-        // The Ozow payout was already initiated — log for manual reconciliation
+        // The Ozow payout was already initiated ï¿½ log for manual reconciliation
       }
     }
 
@@ -7818,7 +7818,7 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
 // Ozow calls this BEFORE executing a payout to confirm the request is
 // legitimate. We respond 200 with `verified:true` and echo the payoutId
 // only when (a) the 24-char static OZOW_ACCESS_TOKEN matches and (b) we
-// have a matching `payout_records` doc — so a leaked token alone can't
+// have a matching `payout_records` doc ï¿½ so a leaked token alone can't
 // approve a fabricated payoutId.
 app.post('/api/ozow-payout-verify', async (req, res) => {
   try {
@@ -8142,7 +8142,7 @@ app.post('/api/admin/save-card', authMiddleware, async (req, res) => {
     // Only add it if the merchant has explicitly enabled it
     paymentData.subscription_type = '2';
 
-    // Generate PayFast signature — use + for spaces (PayFast standard)
+    // Generate PayFast signature ï¿½ use + for spaces (PayFast standard)
     const passphrase = env('PAYFAST_PASSPHRASE') || '';
     const pfParamString = Object.entries(paymentData)
       .map(([k, v]) => `${encodeURIComponent(k).replace(/%20/g, '+')}=${encodeURIComponent(String(v || '')).replace(/%20/g, '+')}`)
@@ -8153,7 +8153,7 @@ app.post('/api/admin/save-card', authMiddleware, async (req, res) => {
     }
     paymentData.signature = crypto.createHash('md5').update(sigInput).digest('hex');
 
-    // Build auto-submitting HTML form (POST) — PayFast requires form POST for reliable signature validation
+    // Build auto-submitting HTML form (POST) ï¿½ PayFast requires form POST for reliable signature validation
     const formFields = Object.entries(paymentData)
       .map(([k, v]) => `<input type="hidden" name="${k}" value="${String(v || '').replace(/"/g, '&quot;')}" />`)
       .join('\n      ');
@@ -8194,7 +8194,7 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
 
   if (!taskSnap.exists) {
     // -- SAFETY NET: If doc doesn't exist, create a minimal one so payment is not lost --
-    console.warn(`[processPayment] tasksManagement/${bookingId} not found — creating minimal doc to preserve payment`);
+    console.warn(`[processPayment] tasksManagement/${bookingId} not found ï¿½ creating minimal doc to preserve payment`);
     const isWA = bookingId.startsWith('WA-');
     // Pull critical fields from futureBookings so the doc isn't orphaned
     let fbFields = {};
@@ -8327,7 +8327,7 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
           const fdDepPaidAt = fd.deposit_paid_at ? new Date(fd.deposit_paid_at).getTime() : 0;
           const fdTimeSinceDep = fdDepPaidAt ? (Date.now() - fdDepPaidAt) : Infinity;
           if (fd.payment_type === 'deposit' && fd.deposit_paid === true && fd.balance_paid !== true && fd.payment_status !== 'paid' && fdTimeSinceDep > 120000) {
-            // Balance payment — proceed (genuine second payment, not ITN duplicate)
+            // Balance payment ï¿½ proceed (genuine second payment, not ITN duplicate)
             return;
           }
           throw new Error('ALREADY_VERIFIED');
@@ -8342,7 +8342,7 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
       console.warn(`[processPayment] Idempotency transaction error: ${txErr.message}`);
     }
   } else {
-    console.log(`[processPayment] Balance payment for deposit booking ${bookingId} (${Math.round(timeSinceDeposit/1000)}s after deposit) — bypassing idempotency`);
+    console.log(`[processPayment] Balance payment for deposit booking ${bookingId} (${Math.round(timeSinceDeposit/1000)}s after deposit) ï¿½ bypassing idempotency`);
   }
 
   // -- Read deposit/balance info from futureBookings if missing on tasksManagement --
@@ -8415,7 +8415,7 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
   // -- PAYMENT AMOUNT VERIFICATION (financial-integrity guard) --
   // The amount actually paid via PayFast (amountGross) MUST match the
   // amount we recorded as expected (deposit_amount / balance_remaining / cost)
-  // within a small tolerance. Mismatches must NOT auto-confirm — they
+  // within a small tolerance. Mismatches must NOT auto-confirm ï¿½ they
   // indicate a tampered/stale link, manual override, or quote change after
   // payment was initiated. Such cases are flagged for admin review.
   // --------------------------------------------------------------------
@@ -8442,13 +8442,13 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
     }
 
     if (expectedAmount > 0) {
-      // Tolerance: max(R1.00 absolute, 1% relative) — covers gateway rounding
+      // Tolerance: max(R1.00 absolute, 1% relative) ï¿½ covers gateway rounding
       const diff = Math.abs(paidAmount - expectedAmount);
       const tolerance = Math.max(1.00, expectedAmount * 0.01);
       if (diff > tolerance) {
         console.error(`?? [processPayment] AMOUNT MISMATCH for ${bookingId}: expected ${expectedLabel} R${expectedAmount.toFixed(2)} but PayFast received R${paidAmount.toFixed(2)} (diff R${diff.toFixed(2)}, tolerance R${tolerance.toFixed(2)})`);
 
-          // Flag the booking for admin review — DO NOT mark as paid
+          // Flag the booking for admin review ï¿½ DO NOT mark as paid
           const mismatchFields = {
             payment_amount_mismatch: true,
             payment_amount_mismatch_at: now,
@@ -8513,7 +8513,7 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
           // Notify admin (in-app + FCM)
           try {
             await admin.firestore().collection('notifications').add({
-              title: '?? Payment amount mismatch — manual review required',
+              title: '?? Payment amount mismatch ï¿½ manual review required',
               body: `Booking ${taskData.order_no || bookingId}: expected ${expectedLabel} R${expectedAmount.toFixed(2)} but received R${paidAmount.toFixed(2)} (diff R${diff.toFixed(2)}). PayFast ID: ${pfPaymentId || 'unknown'}. Booking is on hold pending admin action.`,
               type: 'payment_mismatch',
               user_type: 'admin',
@@ -8539,7 +8539,7 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
                   body: JSON.stringify({
                     bookingId: taskData.future_booking_id || bookingId,
                     status: 'payment_under_review',
-                    message: `?? *Payment received but on hold*\n\nWe received R${paidAmount.toFixed(2)} for booking #${taskData.order_no || bookingId}, but our records show the expected ${expectedLabel} amount is R${expectedAmount.toFixed(2)}.\n\nOur team has been notified and will review this within 1 business hour. Your funds are safe — no further action is needed from you right now. We'll message you once it's resolved. ??`,
+                    message: `?? *Payment received but on hold*\n\nWe received R${paidAmount.toFixed(2)} for booking #${taskData.order_no || bookingId}, but our records show the expected ${expectedLabel} amount is R${expectedAmount.toFixed(2)}.\n\nOur team has been notified and will review this within 1 business hour. Your funds are safe ï¿½ no further action is needed from you right now. We'll message you once it's resolved. ??`,
                   }),
                   signal: AbortSignal.timeout(10000),
                 });
@@ -8553,10 +8553,10 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
       }
       console.log(`[processPayment] Amount verified for ${bookingId}: ${expectedLabel} expected R${expectedAmount.toFixed(2)}, paid R${paidAmount.toFixed(2)} (within tolerance R${tolerance.toFixed(2)})`);
     } else {
-      console.warn(`[processPayment] Could not determine expected amount for ${bookingId} (${expectedLabel}) — proceeding without verification`);
+      console.warn(`[processPayment] Could not determine expected amount for ${bookingId} (${expectedLabel}) ï¿½ proceeding without verification`);
     }
   } else {
-    console.warn(`[processPayment] amountGross missing/invalid for ${bookingId}: "${amountGross}" — proceeding without verification`);
+    console.warn(`[processPayment] amountGross missing/invalid for ${bookingId}: "${amountGross}" ï¿½ proceeding without verification`);
   }
 
   const updateData = {
@@ -8770,7 +8770,7 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
         }
         const orderLabel = taskData.order_no || fbId;
         const totalForArtisan = parseFloat(taskData.total_cost) || parseFloat(taskData.cost) || 0;
-        // SAFETY: same priority — prefer recorded expected amount over amountGross
+        // SAFETY: same priority ï¿½ prefer recorded expected amount over amountGross
         let artisanPayAmt;
         if (isDepositPayment) {
           artisanPayAmt = parseFloat(updateData.deposit_amount) || parseFloat(taskData.deposit_amount)
@@ -8947,16 +8947,16 @@ h1{color:${color};margin:0 0 16px}p{color:#555;line-height:1.6;margin:0}</style>
 
   // -- FALLBACK: Process payment directly since ITN may not reach Render (free tier sleep) --
   // processSuccessfulPayment has idempotency (ALREADY_VERIFIED transaction), so calling from
-  // both ozow-result AND ITN is safe — only the first one processes.
+  // both ozow-result AND ITN is safe ï¿½ only the first one processes.
   //
   // LK-3 (May 2026): we MUST verify the signed callback token before processing
   // payment, otherwise an attacker can hit this URL with any booking_id and
   // mark it paid. Fail-closed: invalid/missing token ? render the page (above)
   // but DO NOT call processSuccessfulPayment.
   if (isSuccess && booking_id) {
-    // Skip admin card-save synthetic id (no payment to process — PayFast handles tokenisation server-side)
+    // Skip admin card-save synthetic id (no payment to process ï¿½ PayFast handles tokenisation server-side)
     if (booking_id === 'admin_card_save') {
-      console.log('[ozow-result] admin_card_save callback — no booking processing needed');
+      console.log('[ozow-result] admin_card_save callback ï¿½ no booking processing needed');
       return;
     }
     const sigCheck = verifyPaymentCallback(booking_id, t, exp);
@@ -8975,7 +8975,7 @@ h1{color:${color};margin:0 0 16px}p{color:#555;line-height:1.6;margin:0}</style>
           read: false,
         });
       } catch (_) {}
-      return; // page already sent — do NOT process payment
+      return; // page already sent ï¿½ do NOT process payment
     }
     try {
       const preCheck = await admin.firestore().collection('tasksManagement').doc(booking_id).get();
@@ -8985,8 +8985,8 @@ h1{color:${color};margin:0 0 16px}p{color:#555;line-height:1.6;margin:0}</style>
         console.log(`[ozow-result] Booking ${booking_id} already in state '${preData.payment_status}', skipping`);
         return;
       }
-      console.log(`[ozow-result] Processing payment for ${booking_id} (fallback — ITN may or may not arrive)`);
-      // Resolve amount based on payment_type — DO NOT default to total cost,
+      console.log(`[ozow-result] Processing payment for ${booking_id} (fallback ï¿½ ITN may or may not arrive)`);
+      // Resolve amount based on payment_type ï¿½ DO NOT default to total cost,
       // or a deposit payment will be recorded as the full amount (financial bug).
       let fallbackItem = preData.description || preData.item_name || '';
       let preDoc = preData;
@@ -9029,7 +9029,7 @@ h1{color:${color};margin:0 0 16px}p{color:#555;line-height:1.6;margin:0}</style>
 });
 
 // -- PayFast ITN (Instant Transaction Notification) Webhook --
-// Server-side payment verification — PayFast posts here after payment
+// Server-side payment verification ï¿½ PayFast posts here after payment
 app.post('/api/payment/itn', async (req, res) => {
   try {
     const data = req.body;
@@ -9148,7 +9148,7 @@ app.post('/api/payment/itn', async (req, res) => {
           });
         } catch (replayErr) {
           if (replayErr && replayErr.message === 'ITN_ALREADY_PROCESSED') {
-            console.warn(`[ITN] replay detected for pf_payment_id=${pfPaymentId} task=${customStr1} — skipping`);
+            console.warn(`[ITN] replay detected for pf_payment_id=${pfPaymentId} task=${customStr1} ï¿½ skipping`);
             return res.status(200).send('OK');
           }
           throw replayErr;
@@ -9268,7 +9268,7 @@ app.post('/api/token', authMiddleware, rateLimitBy('livekit_token', 30, 5 * 60 *
  * POST /api/chat-bot
  * Body: { question: string }
  * Auth: Firebase ID token required.
- * Rate limit: 60/uid/5min (interactive chat — generous but not abusable).
+ * Rate limit: 60/uid/5min (interactive chat ï¿½ generous but not abusable).
  */
 app.post('/api/chat-bot', authMiddleware, rateLimitBy('chat_bot', 60, 5 * 60 * 1000), async (req, res) => {
   try {
@@ -9300,7 +9300,14 @@ app.post('/api/chat-bot', authMiddleware, rateLimitBy('chat_bot', 60, 5 * 60 * 1
               'You are Lizzy, the AI assistant for Square 15 Facility Solutions, a property maintenance company in South Africa. ' +
               'You help clients with information about plumbing, electrical, painting, carpentry, roofing, tiling, locksmith, and other maintenance services. ' +
               'Be helpful, friendly, and concise. Amounts are in South African Rand (R). ' +
-              "For booking or account actions, suggest the user use the full AI Chat or the app's booking flow.",
+              "For booking or account actions, suggest the user use the full AI Chat or the app's booking flow. " +
+              '\n\nTRUST & SAFETY FACTS â€” use ONLY these wordings, never invent warranties, insurance, criminal-background checks, or licence claims:\n' +
+              '- ESCROW: every payment is held by Square 15 and only released to the artisan after the customer confirms the work is done right.\n' +
+              '- VETTING: every active artisan is registered with Square 15, has submitted government ID, and is rated by past customers.\n' +
+              '- IDENTITY CHECK: when the artisan is on the way, the customer is sent the artisan\'s profile photo on WhatsApp so they can match the face at the door.\n' +
+              '- REFUND POLICY: full refund if cancelled before work starts; partial refund (less materials already bought + time worked) if cancelled mid-job; if work is finished but the customer is not satisfied, escrow stays locked until admin investigates. Wallet refunds are instant; card refunds 3â€“5 business days.\n' +
+              '- PERSONAL SAFETY: tell the user that if they ever feel unsafe they can reply "help" or "emergency" to alert support; for life-threatening emergencies remind them to call 10111 / 10177 first.\n' +
+              '- DO NOT promise workmanship warranties, free reworks, insurance cover, or licence numbers. If asked, say our standard protection is the escrow + refund policy and offer to connect them with admin.',
           },
           { role: 'user', content: question },
         ],
@@ -9547,7 +9554,7 @@ async function logErrorToAdmin(errorType, description, source, errorDetails, boo
           _cleanStaleFcmTokens(stale).catch(() => {});
         }
       } else {
-        console.warn('[errorReport] No admin FCM tokens found — push not sent (error_log still written).');
+        console.warn('[errorReport] No admin FCM tokens found ï¿½ push not sent (error_log still written).');
       }
     } catch (fanoutErr) {
       console.warn('[errorReport] admin fanout failed:', fanoutErr && fanoutErr.message);
@@ -9614,7 +9621,7 @@ async function _cleanStaleFcmTokens(staleTokens) {
         'auto_healed',
         `Auto-cleaned ${cleaned} stale FCM push tokens (user devices reinstalled app or uninstalled).`,
         'livekit_backend',
-        `Affected: ${affectedUsers.slice(0, 10).join(', ')}${affectedUsers.length > 10 ? '…' : ''}`,
+        `Affected: ${affectedUsers.slice(0, 10).join(', ')}${affectedUsers.length > 10 ? 'ï¿½' : ''}`,
         '',
         'low'
       ).then((id) => {
@@ -9716,9 +9723,9 @@ function _plainEnglishFromError(err) {
   if (s.includes('ozow')) return 'Ozow payment gateway call failed.';
   if (s.includes('timeout')) return 'An operation timed out. Backend still running.';
   if (s.includes('cannot read') || s.includes('undefined is not')) {
-    return 'Code error — a variable was missing or wrong shape. Auto-recovered.';
+    return 'Code error ï¿½ a variable was missing or wrong shape. Auto-recovered.';
   }
-  return 'Unexpected backend error. Auto-recovered — server still running. See stack for details.';
+  return 'Unexpected backend error. Auto-recovered ï¿½ server still running. See stack for details.';
 }
 
 async function _captureBackendError(kind, err, reqInfo) {
@@ -9776,7 +9783,7 @@ async function _captureBackendError(kind, err, reqInfo) {
   }
 }
 
-// Error handling middleware — also forwards to admin dashboard
+// Error handling middleware ï¿½ also forwards to admin dashboard
 app.use((err, req, res, next) => {
   console.error('? Server error:', err);
   const reqInfo = `${req.method} ${req.originalUrl}`;
@@ -9895,13 +9902,13 @@ app.post('/api/admin/self-bootstrap-claims', adminLimiter, async (req, res) => {
  * }
  *
  * Anti-fraud (May-2026): the admin's Android Storage SDK has been
- * returning a generic [unknown] error during direct putFile() — likely a
+ * returning a generic [unknown] error during direct putFile() ï¿½ likely a
  * regional/SDK quirk. We bypass the client SDK entirely: backend uses
  * the Firebase Admin SDK (bypasses Storage rules), uploads to
  * `service_providers/{artisanId}.jpg`, generates a download URL, and
  * mirrors `imageUrl`/`image` onto `serviceProvider/{artisanId}` in
  * Firestore so the artisan app + admin app + WA bot all see the new
- * picture immediately. Artisans cannot call this endpoint — we verify
+ * picture immediately. Artisans cannot call this endpoint ï¿½ we verify
  * the caller is an admin via Firestore (Admin SDK can read it bypassing
  * rules; we don't rely on custom claims here).
  */
@@ -10006,7 +10013,7 @@ app.post(
 );
 
 // -------------------------------------------------------------------------------
-// PHASE 5.2 — Secure Finance Approval Pipeline (Tier C)
+// PHASE 5.2 ï¿½ Secure Finance Approval Pipeline (Tier C)
 // Money NEVER moves without: auth ? fraud check ? request doc ? admin approval
 // -------------------------------------------------------------------------------
 
@@ -10022,7 +10029,7 @@ async function runFraudChecks({ firestore, type, amount, targetUserId, requested
     alerts.push({ rule: 'amount_exceeds_daily_limit', severity: 'high', detail: `R${amountNum} exceeds R${dailyLimit} limit for ${type}` });
   }
 
-  // Rule 2: Velocity check — max 5 finance requests per user per hour
+  // Rule 2: Velocity check ï¿½ max 5 finance requests per user per hour
   try {
     const oneHourAgo = new Date(Date.now() - 3600000).toISOString();
     const recentSnap = await firestore.collection('finance_requests')
@@ -10035,12 +10042,12 @@ async function runFraudChecks({ firestore, type, amount, targetUserId, requested
     }
   } catch (e) { console.warn('\u26a0\ufe0f fraud velocity check:', e.message); }
 
-  // Rule 3: Self-dealing — admin requesting funds to themselves
+  // Rule 3: Self-dealing ï¿½ admin requesting funds to themselves
   if (targetUserId === requestedBy) {
     alerts.push({ rule: 'self_dealing', severity: 'critical', detail: 'Admin requesting financial action to own account' });
   }
 
-  // Rule 4: Duplicate refund — same booking refunded within 24 hours
+  // Rule 4: Duplicate refund ï¿½ same booking refunded within 24 hours
   if (type === 'refund' && bookingId) {
     try {
       const oneDayAgo = new Date(Date.now() - 86400000).toISOString();
@@ -10144,7 +10151,7 @@ app.post('/api/admin/ops/fix', adminLimiter, async (req, res) => {
 
   try {
     if (action === 'clean_fcm_tokens') {
-      // target = token string OR user/artisan docId — we scrub by token string;
+      // target = token string OR user/artisan docId ï¿½ we scrub by token string;
       // if a docId is given, pull tokens off that doc first.
       let tokens = [];
       if (target) {
@@ -10406,7 +10413,7 @@ app.post('/api/finance/approve', adminLimiter, async (req, res) => {
     });
   }
 
-  // Check status — only pending or flagged can be approved
+  // Check status ï¿½ only pending or flagged can be approved
   if (!['pending_approval', 'flagged_for_review'].includes(finReq.status)) {
     return res.status(409).json({
       error: 'invalid_status',
@@ -10697,7 +10704,7 @@ app.get('/api/finance/fraud-alerts', adminLimiter, async (req, res) => {
         .limit(limit)
         .get();
     } catch (indexErr) {
-      // Composite index may not exist yet — fall back to status-only query
+      // Composite index may not exist yet ï¿½ fall back to status-only query
       console.warn('[fraud-alerts] Index query failed, falling back:', indexErr.message);
       snap = await firestore.collection('fraud_alerts')
         .where('status', '==', status)
@@ -10757,7 +10764,7 @@ if (require.main === module) {
     console.error('\u274c Unhandled Rejection:', reason);
     const err = reason instanceof Error ? reason : new Error(String(reason));
     _captureBackendError('unhandled_rejection', err);
-    // DO NOT exit — keep serving other requests
+    // DO NOT exit ï¿½ keep serving other requests
   });
   process.on('uncaughtException', (error) => {
     console.error('\u274c Uncaught Exception:', error);
@@ -10772,14 +10779,14 @@ if (require.main === module) {
     console.log(`?? Token endpoint: http://localhost:${PORT}/api/token`);
     console.log(`?? Voice start endpoint: http://localhost:${PORT}/api/voice/start`);
     console.log(`?? Environment: ${process.env.NODE_ENV}`);
-    // LK-13: hard refusal — if anyone leaves the no-auth voice flag enabled in
+    // LK-13: hard refusal ï¿½ if anyone leaves the no-auth voice flag enabled in
     // production, log loudly to error_logs and ALSO refuse to enable it (the
     // flag is read again at request time; we set NODE_ENV-dependent override).
     try {
       const dangerFlag = String(process.env.ALLOW_VOICE_START_WITHOUT_AUTH || '').toLowerCase();
       const isProd = String(process.env.NODE_ENV || '').toLowerCase() === 'production';
       if (isProd && (dangerFlag === '1' || dangerFlag === 'true' || dangerFlag === 'yes' || dangerFlag === 'on')) {
-        console.error('?? SECURITY: ALLOW_VOICE_START_WITHOUT_AUTH is enabled in production. This lets anyone start a voice session without Firebase auth. The flag is being IGNORED — set it to false in Render env vars to silence this warning.');
+        console.error('?? SECURITY: ALLOW_VOICE_START_WITHOUT_AUTH is enabled in production. This lets anyone start a voice session without Firebase auth. The flag is being IGNORED ï¿½ set it to false in Render env vars to silence this warning.');
         // Forcibly clear so downstream isEnvTruthy() reads false
         process.env.ALLOW_VOICE_START_WITHOUT_AUTH = 'false';
         try {

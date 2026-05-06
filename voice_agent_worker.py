@@ -153,15 +153,6 @@ def _format_currency_for_speech(text: str) -> str:
     return result
 
 
-def _fmt_currency(amount) -> str:
-    """Format a numeric amount as 'R1,234.56' for tool return text."""
-    try:
-        val = float(amount)
-        return f"R{val:,.2f}"
-    except (ValueError, TypeError):
-        return f"R{amount}"
-
-
 # Load environment variables (optional locally; Render uses service env vars)
 # Must never crash if the file is nested differently in a container.
 try:
@@ -260,51 +251,6 @@ class BackendAPIClient:
             ) as resp:
                 return await resp.json()
 
-    async def generate_rfq_quote(self, booking_id: str) -> Dict[str, Any]:
-        """Generate AI quote for an RFQ booking."""
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
-            payload = {
-                'action': 'generate_rfq_quote',
-                'payload': {'booking_id': booking_id},
-                'context': self._get_context(),
-            }
-            async with session.post(
-                f'{self.base_url}/api/action/execute',
-                json=payload,
-                headers=self._get_headers()
-            ) as resp:
-                return await resp.json()
-
-    async def accept_rfq_quote(self, booking_id: str) -> Dict[str, Any]:
-        """Accept an RFQ quote."""
-        async with aiohttp.ClientSession(timeout=self.timeout) as session:
-            payload = {
-                'action': 'accept_rfq_quote',
-                'payload': {'booking_id': booking_id, 'source': 'voice'},
-                'context': self._get_context(),
-            }
-            async with session.post(
-                f'{self.base_url}/api/action/execute',
-                json=payload,
-                headers=self._get_headers()
-            ) as resp:
-                return await resp.json()
-
-    async def reject_rfq_quote(self, booking_id: str, reason: str = '') -> Dict[str, Any]:
-        """Reject/negotiate an RFQ quote."""
-        async with aiohttp.ClientSession(timeout=self.timeout) as session:
-            payload = {
-                'action': 'reject_rfq_quote',
-                'payload': {'booking_id': booking_id, 'reason': reason, 'source': 'voice'},
-                'context': self._get_context(),
-            }
-            async with session.post(
-                f'{self.base_url}/api/action/execute',
-                json=payload,
-                headers=self._get_headers()
-            ) as resp:
-                return await resp.json()
-
     async def get_payment_status(self, booking_id: str) -> Dict[str, Any]:
         """Get payment status."""
         async with aiohttp.ClientSession(timeout=self.timeout) as session:
@@ -381,8 +327,6 @@ async def entrypoint(ctx: JobContext):
 
     # Backend API configuration
     backend_url = os.getenv("BACKEND_API_URL", "https://square15-livekit-backend.onrender.com")
-    if not os.getenv("BACKEND_API_URL"):
-        logger.warning("⚠️ BACKEND_API_URL not set — using hardcoded fallback. Set this env var in production.")
     logger.info(f"📡 Backend API URL: {backend_url}")
 
     # Initialize backend client (will be updated with token/session after voice start)
@@ -492,15 +436,21 @@ async def entrypoint(ctx: JobContext):
 
         base = (
             f"You are Lizzy, the Square 15 Voice AI Assistant, speaking to a {role.upper()} user.\n\n"
+            "TRUST & SAFETY FACTS (use ONLY these — never invent warranties, insurance, criminal-background checks, or licence claims):\n"
+            "- Escrow: every payment is held by Square 15 and only released to the artisan after the customer confirms the job is done right.\n"
+            "- Vetting: every active artisan is registered with Square 15, has submitted government ID, and is rated by past customers.\n"
+            "- Identity check: when the artisan is on the way, the system sends the customer the artisan's profile photo via WhatsApp so they can match the face at the door.\n"
+            "- Refund policy: full refund if cancelled before work starts; partial refund (minus materials already bought and time worked) if cancelled mid-job; if work is completed but the customer is not satisfied, payment stays in escrow until admin investigates. Wallet refunds are instant; card refunds take three to five business days.\n"
+            "- Personal safety: tell the user that if they ever feel unsafe they can say 'help' or 'emergency' and we'll alert support; for life-threatening emergencies remind them to call 10111 or 10177 first.\n"
+            "- Do NOT promise workmanship warranties, free reworks, insurance cover, or licence numbers. If asked, say our standard protection is the escrow plus refund policy, and offer to connect them with admin via send_message_to_admin.\n"
+            "- When confirming a new booking, briefly reassure the user about escrow and the artisan-photo identity check (one short sentence).\n\n"
             "RULES:\n"
             "- Greet once, then just help. Never repeat your introduction.\n"
             "- When user asks to DO something, CALL the right tool immediately. Do NOT describe what you would do — just do it.\n"
             "- NEVER say 'I cannot access', 'I am unable to', 'I don't have access to', or 'I need you to be authenticated'. ALWAYS try calling the relevant tool.\n"
             "- BACKEND tools for data: get_booking_status, list_my_bookings, explain_quote, check_payment, get_wallet_balance, get_messages, get_case_status.\n"
             "- BACKEND tools for ACTIONS: cancel_booking, reschedule_booking, send_message_to_artisan, send_message_to_client, send_message_to_admin, mark_booking_in_progress, artisan_cancel_and_reassign, submit_rating, submit_complaint. These tools EXECUTE real actions on the backend — use them, NOT ui_navigate.\n"
-            "- RFQ QUOTE tools: generate_rfq_quote (trigger AI quote), accept_rfq (accept quote → payment), reject_rfq (negotiate quote). Use when handling RFQ requests.\n"
             "- lookup_service_pricing for pricing: when user asks 'how much is...', 'what's the price for...', call lookup_service_pricing.\n"
-            "- FINANCE tools (admin-only, read-only): get_finance_overview, get_daily_revenue_report, get_failed_payments_report, get_fraud_alerts_report. Use when admin asks 'What's the revenue today?', 'Any failed payments?', 'Show financial summary', 'Any fraud alerts?'. These are READ-ONLY and safe. NEVER process refunds, payouts, or wallet adjustments via voice — those require the admin app approval workflow.\n"
             "- ui_navigate ONLY for opening screens/navigation: open_bookings_tab, open_future_bookings, open_wallet, open_profile, open_settings, open_notifications, open_calendar, open_help, open_support, go_home, go_back, close_window, create_order_booking, call_assigned_artisan.\n"
             "- NEVER use ui_navigate for cancel_booking, reschedule_booking, send_message_to_artisan, send_message_to_client, send_message_to_admin, mark_booking_in_progress, artisan_cancel_and_reassign. Use the dedicated tools instead.\n"
             "- NEVER narrate tool calls. Never say JSON, function names, or metadata.\n"
@@ -579,18 +529,14 @@ async def entrypoint(ctx: JobContext):
             "- Then say: 'I am creating a request for a detailed custom quote. You will receive a breakdown with labour, materials, and estimated costs shortly.'\n"
             "- NEVER say 'admin will review' without first giving a price indication.\n"
             "\n"
-            "RFQ QUOTES & FOLLOW-UP (AI-POWERED QUOTING):\n"
-            "- After an RFQ booking is created, an AI quote is automatically generated with labour, materials BOM, equipment, and 15% contingency.\n"
-            "- The create_booking tool auto-generates the quote when is_rfq='yes'. Read back the breakdown to the user.\n"
-            "- If the auto-quote didn't work, call generate_rfq_quote(booking_id) to trigger it manually.\n"
-            "- When the user asks 'how much will it cost?', 'explain the quote', or 'what is the breakdown?' for an RFQ:\n"
+            "RFQ QUOTES & FOLLOW-UP:\n"
+            "- After an RFQ booking is created, the app automatically generates a detailed AI quote with labour, materials, and contingency breakdown.\n"
+            "- Tell the user: 'A preliminary quote is being generated now. You can ask me to explain the quote breakdown once it is ready.'\n"
+            "- When the user asks 'how much will it cost?', 'explain the quote', or 'what is the breakdown?' for an RFQ booking:\n"
             "  1. Call list_my_bookings() to find the RFQ booking.\n"
-            "  2. Call explain_quote(booking_id) to get the AI-generated breakdown.\n"
+            "  2. Call explain_rfq_quote(booking_id) to get the AI-generated breakdown.\n"
             "  3. Read back: labour cost, materials list, equipment, contingency, and grand total.\n"
-            "- QUOTE ACCEPTANCE: When user says 'accept the quote' or 'go ahead' → call accept_rfq(booking_id)\n"
-            "- QUOTE NEGOTIATION: When user says 'too expensive' or 'can you adjust' → call reject_rfq(booking_id, reason)\n"
-            "- ALWAYS present the quote breakdown verbally: labour hours and rate, materials with markup, contingency, and grand total.\n"
-            "- If the quote is not ready yet, say: 'The quote is still being prepared. Check back in a moment.'\n"
+            "- If the quote is not ready yet, say: 'The quote is still being prepared. Check back in a minute.'\n"
             "\n"
             "BOOKING CREATION (IMPORTANT):\n"
             "- To create a new booking, ALWAYS use ui_navigate with action='create_order_booking'.\n"
@@ -599,14 +545,6 @@ async def entrypoint(ctx: JobContext):
             "- After calling ui_navigate, say 'I am processing your booking now, please keep the app open.' Do NOT say an artisan has been dispatched until confirmed.\n"
             "- NEVER open photo upload, map, or any other screen during booking creation. The app handles everything.\n"
             "- Do NOT use open_map or show_location actions. They do not exist.\n"
-            "\n"
-            "PRICE CONFIRMATION (CRITICAL — NEVER SKIP):\n"
-            "- After calling lookup_service_pricing, you MUST present the price to the customer and WAIT for their explicit confirmation BEFORE calling ui_navigate(action='create_order_booking').\n"
-            "- Say something like: 'The cost for [service] is [amount] rand. Shall I go ahead and create the booking?'\n"
-            "- Do NOT create a booking in the same turn as the pricing lookup. You must STOP and wait for the customer to say yes or confirm.\n"
-            "- Only after the customer confirms (e.g. 'yes', 'ok', 'go ahead', 'book it') should you create the booking.\n"
-            "- If the customer questions the price or wants to negotiate, do NOT create the booking — explain the pricing and wait.\n"
-            "- This applies even if you already have all other details (category, address, description). The price MUST be confirmed first.\n"
             "\n"
             "SCREEN AWARENESS & APP CONTROL (IMPORTANT):\n"
             "- You can see what screen the user is on and what actions are available.\n"
@@ -643,17 +581,12 @@ async def entrypoint(ctx: JobContext):
                 "- Create booking: First run the DIAGNOSIS flow (ask 2-3 questions about scope, urgency, and sub-category). "
                 "Then call ui_navigate(action='create_order_booking') with category_name and the enriched problem_description. "
                 "The app handles pricing, RFQ creation, AI quoting, and artisan dispatch automatically.\n"
-                "- For complex jobs (renovations, full installs, geyser replacement): use create_booking with is_rfq='yes'. "
-                "This creates an RFQ and auto-generates an AI quote with labour, materials, and contingency breakdown.\n"
                 "- If the user explicitly says they want a diagnosis and quote WITHOUT booking, use lookup_service_pricing to give them a price range, "
                 "then ask if they want to proceed with a booking.\n"
                 "- Cancel: cancel_booking(booking_id, reason). Reschedule: reschedule_booking(booking_id, date, time).\n"
                 "- Call artisan → ui_navigate(action='call_assigned_artisan', booking_id)\n"
                 "- Future bookings → ui_navigate(action='open_future_bookings')\n"
-                "- Check RFQ quote → explain_quote(booking_id) — reads back the AI-generated cost breakdown\n"
-                "- Accept RFQ quote → accept_rfq(booking_id) — accepts quote and proceeds to payment\n"
-                "- Negotiate RFQ quote → reject_rfq(booking_id, reason) — sends negotiation to admin\n"
-                "- Generate quote manually → generate_rfq_quote(booking_id) — triggers AI quote if not auto-generated\n"
+                "- Check RFQ quote → explain_rfq_quote(booking_id) — reads back the AI-generated cost breakdown\n"
             )
 
         return base
@@ -1142,123 +1075,6 @@ async def entrypoint(ctx: JobContext):
 
     @llm.function_tool(
         description=(
-            "Generate an AI quote for an RFQ booking. Call this after creating an RFQ booking "
-            "to trigger automatic quote generation with labour, materials, and contingency breakdown. "
-            "Use when user asks 'generate a quote for my RFQ' or after create_booking with is_rfq=yes."
-        )
-    )
-    async def generate_rfq_quote(booking_id: str) -> str:
-        """Generate AI quote for an RFQ via backend."""
-        nonlocal backend_client
-        if not backend_client:
-            if not await _ensure_backend_or_retry():
-                return _CONNECTION_RETRY_MSG
-
-        try:
-            result = await backend_client.generate_rfq_quote(booking_id)
-            if not result.get('ok') and not result.get('success'):
-                error = result.get('error', 'unknown_error')
-                if error == 'not_an_rfq':
-                    return "That booking is not an RFQ request."
-                elif error == 'ai_unavailable':
-                    return "AI quote generation is temporarily unavailable. Admin will review and provide a quote."
-                elif error == 'ai_generation_failed':
-                    return "Quote generation encountered an issue. Admin will review manually."
-                return f"Could not generate quote: {error}"
-
-            data = result.get('data', result.get('result', {}))
-
-            if data.get('already_quoted'):
-                q = data.get('ai_quote', {})
-                return (
-                    f"A quote already exists for this RFQ. "
-                    f"Grand total: {q.get('grand_total', 0)} rand. "
-                    f"Scope: {q.get('scope_of_work', 'see details in app')}."
-                )
-
-            q = data.get('ai_quote', {})
-            gt = q.get('grand_total', 0)
-            labor = q.get('laborCost', 0)
-            materials = q.get('materials_with_markup', 0)
-            contingency = q.get('contingency', 0)
-            scope = q.get('scope_of_work', '')
-            duration = q.get('estimated_duration', '')
-            bom = q.get('materialsBOM', [])
-
-            response = f"I've generated a quote for your RFQ. "
-            if scope:
-                response += f"Scope of work: {scope}. "
-            response += f"Labour cost: {labor} rand. "
-            if materials > 0:
-                response += f"Materials with markup: {materials} rand for {len(bom)} items. "
-            if contingency > 0:
-                response += f"Contingency at 15 percent: {contingency} rand. "
-            response += f"Grand total: {gt} rand. "
-            if duration:
-                response += f"Estimated duration: {duration}. "
-            response += "Would you like to accept this quote, or would you prefer to negotiate?"
-
-            return response.strip()
-        except Exception as e:
-            logger.error(f"generate_rfq_quote error: {e}", exc_info=True)
-            return "Sorry, I had trouble generating the quote. Please try again."
-
-    @llm.function_tool(
-        description=(
-            "Accept an RFQ quote and proceed to payment. "
-            "Use when customer says 'accept the quote', 'I agree with the price', 'go ahead with the quote'."
-        )
-    )
-    async def accept_rfq(booking_id: str) -> str:
-        """Accept RFQ quote via backend."""
-        nonlocal backend_client
-        if not backend_client:
-            if not await _ensure_backend_or_retry():
-                return _CONNECTION_RETRY_MSG
-
-        try:
-            result = await backend_client.accept_rfq_quote(booking_id)
-            if not result.get('ok') and not result.get('success'):
-                error = result.get('error', 'unknown_error')
-                if error == 'no_quote_available':
-                    return "There's no quote available for this RFQ yet. Let me generate one first."
-                return f"Could not accept the quote: {error}"
-
-            data = result.get('data', result.get('result', {}))
-            price = data.get('price', '0')
-            rfq_no = data.get('rfq_no', booking_id)
-            return f"Quote accepted for RFQ {rfq_no}! The total is {price} rand. Your booking is now ready for payment. You can pay via wallet or card in the app."
-        except Exception as e:
-            logger.error(f"accept_rfq error: {e}", exc_info=True)
-            return "Sorry, I had trouble accepting the quote. Please try again."
-
-    @llm.function_tool(
-        description=(
-            "Reject or request changes to an RFQ quote. Puts the RFQ into negotiation with admin. "
-            "Use when customer says 'too expensive', 'can you lower the price', 'I want to negotiate'."
-        )
-    )
-    async def reject_rfq(booking_id: str, reason: str = "") -> str:
-        """Reject/negotiate RFQ quote via backend."""
-        nonlocal backend_client
-        if not backend_client:
-            if not await _ensure_backend_or_retry():
-                return _CONNECTION_RETRY_MSG
-
-        try:
-            result = await backend_client.reject_rfq_quote(booking_id, reason)
-            if not result.get('ok') and not result.get('success'):
-                return f"Could not process negotiation: {result.get('error', 'unknown_error')}"
-
-            data = result.get('data', result.get('result', {}))
-            rfq_no = data.get('rfq_no', booking_id)
-            return f"Your negotiation request for RFQ {rfq_no} has been submitted. Our admin team will review and provide an adjusted quote. You'll be notified when the updated quote is ready."
-        except Exception as e:
-            logger.error(f"reject_rfq error: {e}", exc_info=True)
-            return "Sorry, I had trouble processing your request. Please try again."
-
-    @llm.function_tool(
-        description=(
             "Check the payment status for a booking. "
             "Use this when user asks 'Did I pay?' or 'What's the payment status?'"
         )
@@ -1437,36 +1253,7 @@ async def entrypoint(ctx: JobContext):
             is_rfq_flag = result_data.get('is_rfq') or result_data.get('isRFQ')
 
             if is_rfq_flag:
-                # Auto-generate AI quote for RFQ bookings
-                try:
-                    quote_result = await backend_client.generate_rfq_quote(booking_id)
-                    if quote_result.get('ok') or quote_result.get('success'):
-                        q = quote_result.get('data', {}).get('ai_quote', {})
-                        gt = q.get('grand_total', 0)
-                        scope = q.get('scope_of_work', '')
-                        duration = q.get('estimated_duration', '')
-                        labor = q.get('laborCost', 0)
-                        materials = q.get('materials_with_markup', 0)
-                        contingency = q.get('contingency', 0)
-                        bom_count = len(q.get('materialsBOM', []))
-
-                        response = f"Your RFQ request has been submitted, booking {booking_id}. "
-                        response += f"I've also generated a preliminary quote for you. "
-                        if scope:
-                            response += f"Scope: {scope}. "
-                        response += f"Labour: {labor} rand. "
-                        if materials > 0:
-                            response += f"Materials for {bom_count} items: {materials} rand. "
-                        response += f"Contingency 15 percent: {contingency} rand. "
-                        response += f"Grand total: {gt} rand. "
-                        if duration:
-                            response += f"Estimated duration: {duration}. "
-                        response += "Would you like to accept this quote or negotiate?"
-                        return response.strip()
-                except Exception as qe:
-                    logger.warning(f"Auto-quote generation failed for RFQ {booking_id}: {qe}")
-
-                return f"Your RFQ request has been submitted (booking {booking_id}). A detailed quote is being prepared. Ask me to check the quote status anytime."
+                return f"Your RFQ request has been submitted (booking {booking_id}). Admin will review and provide a quote shortly."
             else:
                 return f"Booking {booking_id} created successfully! Dispatching the nearest available artisan now. You'll be notified once an artisan accepts."
 
@@ -1635,7 +1422,7 @@ async def entrypoint(ctx: JobContext):
             # Format messages for readability
             msg_list = []
             for msg in messages[-5:]:  # Last 5 messages
-                sender = "You" if msg.get('sender_id') == app_context_user_id else "Artisan"
+                sender = "You" if msg.get('sender_id') == backend_client.firebase_token else "Artisan"
                 text = msg.get('message', '')
                 msg_list.append(f"{sender}: {text}")
 
@@ -2312,170 +2099,6 @@ async def entrypoint(ctx: JobContext):
             "Just tell me what you'd like to do and I'll help you."
         )
 
-    # =========================================
-    # Phase 5.1: Finance Read-Only Tools (Admin)
-    # =========================================
-
-    @llm.function_tool(
-        description=(
-            "Get a financial overview/summary for the platform. "
-            "Returns total revenue, expenses, profit, and breakdown by category. "
-            "Accepts optional period: 'today', 'week', 'month' (default: 'month'). "
-            "Use when admin asks 'What's the financial summary?', 'How's revenue?', "
-            "'Show me the money overview', 'What's our profit this month?'"
-        )
-    )
-    async def get_finance_overview(period: str = "month") -> str:
-        """Get platform finance summary (admin-only, read-only)."""
-        nonlocal backend_client
-        if not backend_client:
-            if not await _ensure_backend_or_retry():
-                return _CONNECTION_RETRY_MSG
-        try:
-            result = await backend_client.call_backend_action('get_finance_summary', {'period': period})
-            if not result.get('ok') and not result.get('success'):
-                error = result.get('error', 'unknown_error')
-                if error == 'admin_only':
-                    return "Finance data is only available to admin users."
-                return f"Could not get finance summary: {error}"
-            data = result.get('data', result.get('result', {}))
-            total_in = data.get('total_in', 0)
-            total_out = data.get('total_out', 0)
-            net = data.get('net', 0)
-            period_label = data.get('period', period)
-            breakdown = data.get('breakdown', {})
-            response = f"Finance overview for {period_label}: "
-            response += f"Total revenue {_fmt_currency(total_in)}, "
-            response += f"total expenses {_fmt_currency(total_out)}, "
-            response += f"net profit {_fmt_currency(net)}."
-            if breakdown:
-                parts = []
-                for k, v in list(breakdown.items())[:5]:
-                    parts.append(f"{k.replace('_', ' ')}: {_fmt_currency(v)}")
-                response += f" Breakdown: {', '.join(parts)}."
-            return response
-        except Exception as e:
-            logger.error(f"get_finance_overview error: {e}", exc_info=True)
-            return "Sorry, I couldn't fetch the financial overview right now."
-
-    @llm.function_tool(
-        description=(
-            "Get daily revenue report showing income per day. "
-            "Accepts optional days parameter (default 7, max 30). "
-            "Use when admin asks 'What's the daily revenue?', 'Revenue per day?', "
-            "'Show me earnings this week'"
-        )
-    )
-    async def get_daily_revenue_report(days: int = 7) -> str:
-        """Get daily revenue breakdown (admin-only, read-only)."""
-        nonlocal backend_client
-        if not backend_client:
-            if not await _ensure_backend_or_retry():
-                return _CONNECTION_RETRY_MSG
-        try:
-            result = await backend_client.call_backend_action('get_daily_revenue', {'days': min(days, 30)})
-            if not result.get('ok') and not result.get('success'):
-                error = result.get('error', 'unknown_error')
-                if error == 'admin_only':
-                    return "Revenue data is only available to admin users."
-                return f"Could not get daily revenue: {error}"
-            data = result.get('data', result.get('result', {}))
-            day_entries = data.get('days', [])
-            total = data.get('total', 0)
-            if not day_entries:
-                return "No revenue data found for the requested period."
-            response = f"Revenue for the last {len(day_entries)} days, total {_fmt_currency(total)}: "
-            summaries = []
-            for d in day_entries[:7]:
-                date_str = d.get('date', 'unknown')
-                amount = d.get('amount', 0)
-                summaries.append(f"{date_str}: {_fmt_currency(amount)}")
-            response += "; ".join(summaries) + "."
-            return response
-        except Exception as e:
-            logger.error(f"get_daily_revenue_report error: {e}", exc_info=True)
-            return "Sorry, I couldn't fetch the daily revenue report right now."
-
-    @llm.function_tool(
-        description=(
-            "Get a list of failed payments. Shows transactions that failed, were declined, or timed out. "
-            "Use when admin asks 'Any failed payments?', 'Show payment failures', "
-            "'Are there any declined transactions?'"
-        )
-    )
-    async def get_failed_payments_report() -> str:
-        """Get failed payments list (admin-only, read-only)."""
-        nonlocal backend_client
-        if not backend_client:
-            if not await _ensure_backend_or_retry():
-                return _CONNECTION_RETRY_MSG
-        try:
-            result = await backend_client.call_backend_action('get_failed_payments', {})
-            if not result.get('ok') and not result.get('success'):
-                error = result.get('error', 'unknown_error')
-                if error == 'admin_only':
-                    return "Failed payments data is only available to admin users."
-                return f"Could not get failed payments: {error}"
-            data = result.get('data', result.get('result', {}))
-            failures = data.get('failures', [])
-            count = data.get('count', len(failures))
-            if count == 0:
-                return "Great news — there are no failed payments."
-            response = f"There {'is' if count == 1 else 'are'} {count} failed payment{'s' if count != 1 else ''}. "
-            for f in failures[:5]:
-                amount = f.get('amount', 0)
-                reason = f.get('reason', 'unknown')
-                user = f.get('user_name', 'a user')
-                date = (f.get('created_at', '') or '')[:10]
-                response += f"{_fmt_currency(amount)} from {user} — {reason} ({date}). "
-            return response.strip()
-        except Exception as e:
-            logger.error(f"get_failed_payments_report error: {e}", exc_info=True)
-            return "Sorry, I couldn't fetch the failed payments report right now."
-
-    @llm.function_tool(
-        description=(
-            "Get active fraud alerts and suspicious activity flags. "
-            "Shows flagged transactions, self-dealing attempts, unusual patterns. "
-            "Use when admin asks 'Any fraud alerts?', 'Show suspicious activity', "
-            "'Are there security concerns?', 'Any flags?'"
-        )
-    )
-    async def get_fraud_alerts_report() -> str:
-        """Get fraud alerts (admin-only, read-only)."""
-        nonlocal backend_client
-        if not backend_client:
-            if not await _ensure_backend_or_retry():
-                return _CONNECTION_RETRY_MSG
-        try:
-            result = await backend_client.call_backend_action('get_fraud_alerts', {})
-            if not result.get('ok') and not result.get('success'):
-                error = result.get('error', 'unknown_error')
-                if error == 'admin_only':
-                    return "Fraud alerts are only available to admin users."
-                return f"Could not get fraud alerts: {error}"
-            data = result.get('data', result.get('result', {}))
-            alerts = data.get('alerts', [])
-            count = data.get('count', len(alerts))
-            if count == 0:
-                return "No active fraud alerts. The system is clean."
-            response = f"There {'is' if count == 1 else 'are'} {count} active fraud alert{'s' if count != 1 else ''}. "
-            for a in alerts[:5]:
-                severity = a.get('severity', 'medium')
-                rule = a.get('rule', 'unknown')
-                amount = a.get('amount', 0)
-                actor = a.get('actor_email', 'unknown admin')
-                response += f"{severity.upper()} alert: {rule.replace('_', ' ')} "
-                if amount:
-                    response += f"({_fmt_currency(amount)}) "
-                response += f"by {actor}. "
-            if count > 5:
-                response += f"Plus {count - 5} more alerts. Check the admin app for full details."
-            return response.strip()
-        except Exception as e:
-            logger.error(f"get_fraud_alerts_report error: {e}", exc_info=True)
-            return "Sorry, I couldn't fetch the fraud alerts right now."
-
     agent = voice.Agent(
         vad=vad,
         stt=openai.STT(model="whisper-1", language="en"),
@@ -2510,10 +2133,6 @@ async def entrypoint(ctx: JobContext):
             artisan_cancel_and_reassign,
             submit_rating,
             submit_complaint,
-            # RFQ quote tools
-            generate_rfq_quote,
-            accept_rfq,
-            reject_rfq,
             # Phase 3: Messaging tools
             send_message_to_artisan,
             send_message_to_client,
@@ -2527,11 +2146,6 @@ async def entrypoint(ctx: JobContext):
             get_current_screen,
             analyze_screen,
             list_app_features,
-            # Finance tools (admin-only, read-only)
-            get_finance_overview,
-            get_daily_revenue_report,
-            get_failed_payments_report,
-            get_fraud_alerts_report,
         ],
         # --- Latency optimizations ---
         min_endpointing_delay=0.25,       # default 0.5 — faster turn completion
