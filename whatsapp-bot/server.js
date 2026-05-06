@@ -5615,7 +5615,8 @@ async function executeWaTool(name, args, session) {
               }
             }
             const aName = ad.name || ad.userName || ad.full_name || artDoc.id;
-            const aRecord = { id: artDoc.id, name: aName, token: (ad.fcm_token || ad.deviceToken || '').toString().trim() };
+            const aEmail = (ad.email || '').toString().trim().toLowerCase();
+            const aRecord = { id: artDoc.id, name: aName, email: aEmail, token: (ad.fcm_token || ad.deviceToken || '').toString().trim() };
             // Country fields: country (code or name), countries_served (array or comma string), region, city
             const artCountry = String(ad.country || ad.country_code || '').trim().toUpperCase();
             const served = (function () {
@@ -5671,6 +5672,12 @@ async function executeWaTool(name, args, session) {
             const artisanIds = matchedArtisans.map(a => a.id);
             const artisanNames = {};
             matchedArtisans.forEach(a => { artisanNames[a.id] = a.name; });
+            // Lower-cased email array used by firestore rules' `isRfqCandidate`
+            // helper to authorize the dispatched artisan to read the parent
+            // futureBookings doc (their auth.uid != serviceProvider doc id).
+            const dispatchedEmails = matchedArtisans
+              .map(a => (a.email || '').toString().trim().toLowerCase())
+              .filter(e => e.length > 0);
 
             // MED-14: batch the futureBookings + tasksManagement updates so
             // the dispatch state can never be half-written.
@@ -5685,6 +5692,7 @@ async function executeWaTool(name, args, session) {
                   rfq_submitted_to: 'artisan',
                   rfq_assigned_artisan_ids: artisanIds,
                   rfq_assigned_artisan_names: artisanNames,
+                  dispatched_artisan_emails: dispatchedEmails,
                   rfq_auto_assigned: true,
                   rfq_auto_assign_reason: autoReason,
                   rfq_auto_assigned_at: new Date().toISOString(),
@@ -5699,6 +5707,7 @@ async function executeWaTool(name, args, session) {
                   status: 'pending_artisan_acceptance',
                   rfq_status: 'pending_artisan_acceptance',
                   rfq_assigned_artisan_ids: artisanIds,
+                  dispatched_artisan_emails: dispatchedEmails,
                   rfq_auto_assigned: true,
                   rfq_auto_assign_reason: autoReason,
                 }
