@@ -5721,6 +5721,23 @@ async function executeWaTool(name, args, session) {
 
             if (dispatchBatchOk) {
               for (const art of matchedArtisans) {
+                // Always write a Firestore notification doc so the artisan
+                // app's onSnapshot listener picks up the dispatch even when
+                // the FCM token is missing/stale (a major cause of "the
+                // artisan never got the request" reports — May 2026).
+                try {
+                  await firestore.collection('notifications').add({
+                    title: '🔔 New RFQ Job Available',
+                    body: `RFQ ${data.rfq_no || rfqId} — R${priceNum.toFixed(2)}. Tap to view and accept.`,
+                    type: 'rfq_accepted',
+                    user_type: 'artisan',
+                    user_id: art.id,
+                    booking_id: rfqId,
+                    priority: 'high',
+                    read: false,
+                    created_at: admin.firestore.FieldValue.serverTimestamp(),
+                  });
+                } catch (notifErr) { console.warn(`[wa-tool] artisan notif doc failed for ${art.id}:`, notifErr.message); }
                 if (!art.token) continue;
                 try {
                   await admin.messaging().send({
