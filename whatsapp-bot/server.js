@@ -3350,7 +3350,22 @@ async function executeWaTool(name, args, session) {
             }
           }
         } catch (e) {
-          console.warn('[request_payment_link] linkedUserId validation failed:', e.message);
+          // CRITICAL: do NOT keep an unverified linkedUserId on transient
+          // Firestore errors. Leaving it set could route a payment to the
+          // wrong account if the validation fetch happened to fail. Clear
+          // it and force re-link on the next interaction.
+          console.warn('[request_payment_link] linkedUserId validation failed (clearing):', e.message);
+          session.linkedUserId = null;
+          try {
+            await logErrorToAdmin(
+              'linked_user_validation_error',
+              `linkedUserId validation threw for ${maskPhone(session.phone)}: ${e.message}`,
+              'whatsapp_bot.request_payment_link',
+              e.message,
+              bid || '',
+              'medium'
+            );
+          } catch (_) {}
         }
       }
 
@@ -3441,8 +3456,9 @@ async function executeWaTool(name, args, session) {
         }
       }
 
-      // Generate real payment link via backend
+      // Generate real payment link via backend (with one retry + admin alert on failure).
       let paymentUrl = '';
+      let paymentLinkErr = '';
       try {
         const backendUrl = process.env.LIVEKIT_BACKEND_URL || 'https://square15-livekit-backend.onrender.com';
         // Resolve customer name from canonical fields, then session, then a sensible default.
@@ -3450,24 +3466,70 @@ async function executeWaTool(name, args, session) {
           d.user_name || d.userName || d.customer_name || d.customerName || d.name ||
           session.linkedUserName || session.customerName || ''
         ).toString().trim();
-        const resp = await fetch(`${backendUrl}/api/payment/whatsapp-initiate`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'x-internal-secret': process.env.INTERNAL_API_SECRET || '' },
-          body: JSON.stringify({
-            amount: cost.toFixed(2),
-            booking_id: bid,
-            customer_name: resolvedCustomerName,
-            customer_phone: session.phone,
-            description: d.description || d.subcategory || d.category_name || `Booking ${bid}`,
-          }),
-          signal: AbortSignal.timeout(15000),
+        const reqBody = JSON.stringify({
+          amount: cost.toFixed(2),
+          booking_id: bid,
+          customer_name: resolvedCustomerName,
+          customer_phone: session.phone,
+          description: d.description || d.subcategory || d.category_name || `Booking ${bid}`,
         });
-        const result = await resp.json();
-        if (result.ok && result.payment_url) {
-          paymentUrl = result.payment_url;
+        const reqHeaders = { 'Content-Type': 'application/json', 'x-internal-secret': process.env.INTERNAL_API_SECRET || '' };
+        // Helper: one fetch attempt, returning {ok, paymentUrl, status, errMsg}.
+        async function _attempt(timeoutMs) {
+          try {
+            const resp = await fetch(`${backendUrl}/api/payment/whatsapp-initiate`, {
+              method: 'POST', headers: reqHeaders, body: reqBody,
+              signal: AbortSignal.timeout(timeoutMs),
+            });
+            let json = null;
+            try { json = await resp.json(); } catch (_) {}
+            if (resp.ok && json && json.ok && json.payment_url) {
+              return { ok: true, paymentUrl: json.payment_url };
+            }
+            return { ok: false, status: resp.status, errMsg: (json && (json.error || json.message)) || `HTTP ${resp.status}` };
+          } catch (e) {
+            return { ok: false, errMsg: (e && e.message) || 'fetch failed' };
+          }
+        }
+        let r = await _attempt(15000);
+        if (!r.ok) {
+          // Retry once after 1.5s — covers cold-start / transient blip on Render.
+          await new Promise(s => setTimeout(s, 1500));
+          const r2 = await _attempt(20000);
+          if (r2.ok) r = r2;
+          else r = { ok: false, errMsg: `${r.errMsg}; retry: ${r2.errMsg}` };
+        }
+        if (r.ok) {
+          paymentUrl = r.paymentUrl;
+        } else {
+          paymentLinkErr = r.errMsg || 'unknown';
+          console.warn('[wa-tool] payment link generation failed (after retry):', paymentLinkErr);
+          // Surface to admin so a customer waiting for a link doesn't get
+          // silently stuck on the fallback message.
+          try {
+            await logErrorToAdmin(
+              'payment_link_backend_unavailable',
+              `Payment link generation failed after retry for booking ${bid} (${cost.toFixed(2)}). Error: ${paymentLinkErr}`,
+              'whatsapp_bot.request_payment_link',
+              paymentLinkErr,
+              bid,
+              'high'
+            );
+          } catch (_) {}
         }
       } catch (e) {
-        console.warn('[wa-tool] payment link generation failed:', e.message);
+        paymentLinkErr = e && e.message;
+        console.warn('[wa-tool] payment link generation threw:', paymentLinkErr);
+        try {
+          await logErrorToAdmin(
+            'payment_link_backend_threw',
+            `Payment link generation threw for booking ${bid}: ${paymentLinkErr}`,
+            'whatsapp_bot.request_payment_link',
+            paymentLinkErr,
+            bid,
+            'high'
+          );
+        } catch (_) {}
       }
 
       // ── Persist payment-type choice to Firestore (mirror to both collections) ──
@@ -8427,17 +8489,36 @@ function startQuoteRelayListener() {
           }
           const rfqNo = data.rfq_no || data.order_no || doc.id;
 
-          // ── SEND-FIRST, MARK-AFTER (2026-05-02) ──
-          // Prior code marked `whatsapp_quote_relayed=true` BEFORE sending so
-          // a transient WhatsApp / Cloud API failure caused silent message
-          // loss with no retry. We now send everything first; only mark on
-          // success. To avoid duplicate sends if two onSnapshot deliveries
-          // race, take a soft in-memory lock keyed by doc id.
+          // ── MARK-BEFORE-SEND with rollback (2026-05-07) ──
+          // Race / crash safety: stamp `whatsapp_quote_relayed=true` BEFORE
+          // sending so a process crash between send-success and flag-write
+          // can't cause duplicate delivery on restart. If the WA API send
+          // fails, we roll back the flag in `catch` so the next snapshot
+          // tick retries cleanly. Combined with the in-memory in-flight
+          // lock to suppress simultaneous onSnapshot deliveries.
           if (_quoteRelayInFlight.has(doc.id)) continue;
           _quoteRelayInFlight.add(doc.id);
 
           let relaySucceeded = false;
+          let flagStamped = false;
           try {
+            // Re-read to catch a racing process that beat us to it.
+            try {
+              const fresh = await firestore.collection('futureBookings').doc(doc.id).get();
+              if (fresh.exists && fresh.data().whatsapp_quote_relayed === true) {
+                _quoteRelayInFlight.delete(doc.id);
+                continue;
+              }
+              await firestore.collection('futureBookings').doc(doc.id).update({
+                whatsapp_quote_relayed: true,
+                whatsapp_quote_relayed_at: admin.firestore.FieldValue.serverTimestamp(),
+              });
+              flagStamped = true;
+            } catch (e) {
+              console.warn('[quote-relay] pre-send flag stamp failed for', doc.id, '-', e.message);
+              _quoteRelayInFlight.delete(doc.id);
+              continue;
+            }
             try {
               await sendWhatsAppMessage(phone, `Hi${data.user_name ? ' ' + String(data.user_name).split(' ')[0] : ''}! Your quote for ${rfqNo} is ready. Here are the items our admin has selected:`);
             } catch (_) {}
@@ -8534,20 +8615,21 @@ function startQuoteRelayListener() {
             console.warn('[quote-relay] totals send failed for', doc.id, '-', e.message);
           }
 
-          // Mark relayed only after successful delivery so transient WA-API
-          // failures self-heal on the next snapshot tick.
-          if (relaySucceeded) {
+          // If we stamped the flag pre-send but the send failed, ROLL BACK
+          // so the next snapshot tick retries. If the send succeeded the
+          // flag is already correctly set.
+          if (flagStamped && !relaySucceeded) {
             try {
               await firestore.collection('futureBookings').doc(doc.id).update({
-                whatsapp_quote_relayed: true,
-                whatsapp_quote_relayed_at: admin.firestore.FieldValue.serverTimestamp(),
+                whatsapp_quote_relayed: false,
+                whatsapp_quote_relayed_at: admin.firestore.FieldValue.delete(),
               });
+              console.warn(`[quote-relay] RFQ ${rfqNo} → ${phone}: send FAILED, flag rolled back for retry.`);
             } catch (e) {
-              console.warn('[quote-relay] could not mark relayed flag for', doc.id, '—', e.message);
+              console.warn('[quote-relay] flag rollback failed for', doc.id, '—', e.message);
             }
+          } else if (relaySucceeded) {
             console.log(`[quote-relay] RFQ ${rfqNo} → ${phone}: ${items.length} item(s) delivered.`);
-          } else {
-            console.warn(`[quote-relay] RFQ ${rfqNo} → ${phone}: NOT marked — will retry on next change.`);
           }
           } finally {
             _quoteRelayInFlight.delete(doc.id);
@@ -9498,4 +9580,41 @@ app.listen(PORT, () => {
       }).catch(e => console.warn('[cleanup] pricingGuidance cleanup failed:', e.message));
     }
   } catch (e) { console.warn('[cleanup] error:', e.message); }
+});
+
+// ─── Graceful shutdown ──────────────────────────────────────────────────────
+// Render sends SIGTERM before forcefully killing the process. Capture both
+// SIGTERM and SIGINT, unsubscribe known Firestore listeners (best-effort),
+// and exit cleanly so in-flight writes can flush. Without this, Firebase
+// gRPC connections may take seconds to time out, delaying redeploys and
+// occasionally causing the next instance to overlap.
+let _shuttingDown = false;
+function _gracefulShutdown(signal) {
+  if (_shuttingDown) return;
+  _shuttingDown = true;
+  console.log(`[shutdown] ${signal} received — cleaning up listeners and exiting…`);
+  try { if (typeof _quoteRelayUnsubscribe === 'function') _quoteRelayUnsubscribe(); } catch (_) {}
+  try { if (typeof _adminAssignmentRelayUnsubscribe === 'function') _adminAssignmentRelayUnsubscribe(); } catch (_) {}
+  // Give listeners ~2s to flush, then force-exit. Render's grace is ~30s,
+  // 2s is plenty for typical in-flight writes without delaying redeploys.
+  setTimeout(() => process.exit(0), 2000).unref();
+}
+process.on('SIGTERM', () => _gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => _gracefulShutdown('SIGINT'));
+// Surface uncaught errors to admin so we don't fail silently during ops.
+process.on('uncaughtException', (err) => {
+  console.error('[uncaught] exception:', err && err.stack || err);
+  try {
+    if (typeof logErrorToAdmin === 'function') {
+      logErrorToAdmin('uncaught_exception', String(err && err.message || err), 'whatsapp_bot.process', String(err && err.stack || ''), '', 'critical').catch(() => {});
+    }
+  } catch (_) {}
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[unhandled] promise rejection:', reason);
+  try {
+    if (typeof logErrorToAdmin === 'function') {
+      logErrorToAdmin('unhandled_rejection', String((reason && reason.message) || reason), 'whatsapp_bot.process', String((reason && reason.stack) || ''), '', 'high').catch(() => {});
+    }
+  } catch (_) {}
 });
