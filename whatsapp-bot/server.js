@@ -5627,6 +5627,13 @@ async function executeWaTool(name, args, session) {
           const REJECT_STATUSES = new Set(['pending', 'rejected', 'reject', 'suspended', 'inactive', 'disabled']);
           const sameCountryArtisans = [];
           const otherArtisans = [];
+          // BUG-FIX (May 2026): track artisans that pass status/active/country
+          // but FAIL only the category gate. When the primary match returns
+          // zero (e.g. because no artisan in production has populated
+          // mainCategory/categories/userTasks), we'll fall back to this pool
+          // rather than dead-ending the RFQ in admin "Waiting Assignment".
+          // Without this, every WA RFQ stalls until a human notices.
+          const sameCountryNoCatMatch = [];
           let categoryRejected = 0;
           let countryRejected = 0;
           let suspendedRejected = 0;
@@ -5661,21 +5668,10 @@ async function executeWaTool(name, args, session) {
             // declared a specialty — reject for any specific category job.
             // Previously `if (cats && cat)` skipped the check entirely when
             // cats=='', so a plumber-with-empty-categories matched every job.
-            if (cat) {
-              const utFallbackMatch = userTasksArtisanIds.has(artDoc.id);
-              const mainSubMatch = (mainCat && (mainCat.includes(cat) || cat.includes(mainCat))) ||
-                (subCat && (subCat.includes(cat) || cat.includes(subCat))) ||
-                mainCat === 'general_maintenance';
-              if (!cats) {
-                // CL-MATCH: artisan didn't fill `categories` — accept iff
-                // they registered a userTask under this category OR their
-                // mainCategory/subCategory matches.
-                if (!utFallbackMatch && !mainSubMatch) { categoryRejected += 1; continue; }
-              } else {
-                const explicitMatch = cats.includes(cat) || cats.includes('general_maintenance');
-                if (!explicitMatch && !utFallbackMatch && !mainSubMatch) { categoryRejected += 1; continue; }
-              }
-            }
+            // Compute the artisan record + country eligibility up-front so we
+            // can ALSO record artisans that pass everything except category
+            // — used as a last-resort fallback further down when 0 artisans
+            // match the strict gates.
             const aName = ad.name || ad.userName || ad.full_name || artDoc.id;
             const aEmail = (ad.email || '').toString().trim().toLowerCase();
             const aRecord = { id: artDoc.id, name: aName, email: aEmail, token: (ad.fcm_token || ad.deviceToken || '').toString().trim() };
@@ -5687,12 +5683,8 @@ async function executeWaTool(name, args, session) {
               return String(v).split(/[,;]/).map(s => s.trim().toUpperCase()).filter(Boolean);
             })();
             const COUNTRY_NAME_TO_CODE = { 'SOUTH AFRICA': 'ZA', 'LESOTHO': 'LS', 'BOTSWANA': 'BW', 'NAMIBIA': 'NA', 'ZIMBABWE': 'ZW', 'ESWATINI': 'SZ', 'SWAZILAND': 'SZ' };
-              const artCountryCode = COUNTRY_NAME_TO_CODE[artCountry] || artCountry;
+            const artCountryCode = COUNTRY_NAME_TO_CODE[artCountry] || artCountry;
             const servedCodes = served.map(s => COUNTRY_NAME_TO_CODE[s] || s);
-            // Fallback: artisans without ANY country field default to ZA
-            // (the platform's home market). Without this, every artisan in
-            // production silently fails non-ZA dispatch because no one has
-            // populated `country` yet.
             const artisanHasNoCountry = !artCountryCode && servedCodes.length === 0;
             const effectiveArtCountry = artisanHasNoCountry ? 'ZA' : artCountryCode;
             const effectiveServed = artisanHasNoCountry ? ['ZA'] : servedCodes;
@@ -5700,6 +5692,32 @@ async function executeWaTool(name, args, session) {
             const matchesCustomerCountry = inferredCountry && (
               effectiveArtCountry === inferredCountry || effectiveServed.includes(inferredCountry)
             );
+
+            if (cat) {
+              const utFallbackMatch = userTasksArtisanIds.has(artDoc.id);
+              const mainSubMatch = (mainCat && (mainCat.includes(cat) || cat.includes(mainCat))) ||
+                (subCat && (subCat.includes(cat) || cat.includes(subCat))) ||
+                mainCat === 'general_maintenance';
+              let catOk;
+              if (!cats) {
+                // CL-MATCH: artisan didn't fill `categories` — accept iff
+                // they registered a userTask under this category OR their
+                // mainCategory/subCategory matches.
+                catOk = utFallbackMatch || mainSubMatch;
+              } else {
+                const explicitMatch = cats.includes(cat) || cats.includes('general_maintenance');
+                catOk = explicitMatch || utFallbackMatch || mainSubMatch;
+              }
+              if (!catOk) {
+                categoryRejected += 1;
+                // Record into the no-cat-match pool ONLY if they would have
+                // otherwise been a same-country candidate. This pool is the
+                // last-resort fallback when zero artisans match strictly.
+                if (matchesCustomerCountry) sameCountryNoCatMatch.push(aRecord);
+                continue;
+              }
+            }
+
             if (matchesCustomerCountry) sameCountryArtisans.push(aRecord);
             else { countryRejected += 1; otherArtisans.push(aRecord); }
           }
@@ -5728,8 +5746,35 @@ async function executeWaTool(name, args, session) {
             // ZA or unknown — historical broad dispatch (cap 3)
             matchedArtisans = sameCountryArtisans.concat(otherArtisans).slice(0, 3);
           }
+
+          // BUG-FIX (May 2026): LAST-RESORT FALLBACK. If the strict pipeline
+          // returned zero candidates but we DO have artisans who passed
+          // status/active/country checks (and only failed the category gate
+          // because production artisans haven't populated mainCategory /
+          // categories / userTasks), dispatch to them anyway. Without this,
+          // every WA RFQ silently dead-ends in admin "Waiting Assignment"
+          // and the artisan never sees the request — exactly the bug
+          // reported on 2026-05-08. We log a high-severity admin alert so
+          // ops can backfill artisan profile data.
+          let usedNoCatFallback = false;
+          if (matchedArtisans.length === 0 && sameCountryNoCatMatch.length > 0
+              && (!inferredCountry || inferredCountry === 'ZA')) {
+            matchedArtisans = sameCountryNoCatMatch.slice(0, 3);
+            usedNoCatFallback = true;
+            console.warn(`[wa-tool] RFQ ${rfqId} NO-CAT-FALLBACK: dispatching to ${matchedArtisans.length} artisan(s) ignoring category match (no artisans had mainCategory/categories/userTasks for cat="${cat}")`);
+            try {
+              await logErrorToAdmin(
+                'dispatch_no_category_match',
+                `RFQ ${rfqId} cat="${cat}": 0 artisans had matching category data. Dispatched to ${matchedArtisans.length} active artisan(s) as fallback. Backfill mainCategory/categories on serviceProvider docs to restore strict matching.`,
+                'whatsapp_bot.accept_rfq_quote',
+                '',
+                rfqId,
+                'high'
+              );
+            } catch (_) {}
+          }
           // MED-18: surface dispatch funnel so admin can tune eligibility.
-          console.log(`[wa-tool] auto-dispatch RFQ ${rfqId} cat="${cat}" country="${inferredCountry || 'unknown'}" — scanned=${artisanSnap.size}, in-country=${sameCountryArtisans.length}, other-country=${otherArtisans.length}, dispatched=${matchedArtisans.length}, filtered{cat=${categoryRejected}, suspended=${suspendedRejected}, inactive=${inactiveRejected}, country=${countryRejected}}, za-country-fallback=${zaCountryFallbackUsed}`);
+          console.log(`[wa-tool] auto-dispatch RFQ ${rfqId} cat="${cat}" country="${inferredCountry || 'unknown'}" — scanned=${artisanSnap.size}, in-country=${sameCountryArtisans.length}, other-country=${otherArtisans.length}, no-cat-fallback-pool=${sameCountryNoCatMatch.length}, dispatched=${matchedArtisans.length}${usedNoCatFallback ? ' (no-cat fallback)' : ''}, filtered{cat=${categoryRejected}, suspended=${suspendedRejected}, inactive=${inactiveRejected}, country=${countryRejected}}, za-country-fallback=${zaCountryFallbackUsed}`);
           if (matchedArtisans.length > 0) {
             const artisanIds = matchedArtisans.map(a => a.id);
             const artisanNames = {};
@@ -7377,15 +7422,47 @@ app.post('/webhook', async (req, res) => {
           }
           break;
         }
-        case 'location':
-          userText = `[Customer shared location: ${msg.location.latitude}, ${msg.location.longitude}]`;
-          if (msg.location.address) userText += ` Address: ${msg.location.address}`;
+        case 'location': {
           // Persist GPS coordinates on the session so create_booking can store them
           session.sharedLatitude = msg.location.latitude;
           session.sharedLongitude = msg.location.longitude;
           if (msg.location.address) session.sharedAddress = msg.location.address;
+
+          // BUG-FIX (May 2026): WhatsApp's location-pin payload usually omits
+          // an address string. Without one, downstream auto-dispatch can't
+          // infer the customer's city/country and admin sees only "lat, lng"
+          // in the booking — both lead to artisan-matching failures and a
+          // poor admin UX. Reverse-geocode using OpenStreetMap Nominatim
+          // (free, no API key, 1 req/sec). Best-effort with 5s timeout —
+          // if it fails we keep the raw coords and continue.
+          if (!session.sharedAddress) {
+            try {
+              const r = await fetch(
+                `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${encodeURIComponent(msg.location.latitude)}&lon=${encodeURIComponent(msg.location.longitude)}&zoom=18&addressdetails=1`,
+                {
+                  headers: { 'User-Agent': 'Square15-WA-Bot/1.0 (support@square15.co.za)' },
+                  signal: AbortSignal.timeout(5000),
+                }
+              );
+              if (r && r.ok) {
+                const j = await r.json();
+                const display = String(j.display_name || '').trim();
+                if (display) {
+                  session.sharedAddress = display;
+                  console.log(`[location] reverse-geocoded ${from}: ${display}`);
+                }
+              }
+            } catch (geoErr) {
+              console.warn(`[location] reverse-geocode failed for ${from}: ${geoErr && geoErr.message}`);
+            }
+          }
+
+          // Build the userText AFTER geocoding so the AI sees the resolved address.
+          userText = `[Customer shared location: ${msg.location.latitude}, ${msg.location.longitude}]`;
+          if (session.sharedAddress) userText += ` Address: ${session.sharedAddress}`;
           console.log(`[location] ${from}: saved lat=${session.sharedLatitude} lng=${session.sharedLongitude} addr=${session.sharedAddress || 'none'}`);
           break;
+        }
         case 'sticker': {
           // BHV-9: don't silently drop. Briefly acknowledge so the customer
           // knows the bot is alive and what to send instead.
