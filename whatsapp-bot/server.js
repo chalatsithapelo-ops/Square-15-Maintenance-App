@@ -1163,8 +1163,10 @@ async function findUserByPhone(phone) {
   // Also build numeric (int) variants — Flutter app stores `contact` as int
   const numericVariants = new Set();
   for (const v of variants) {
-    const n = parseInt(v, 10);
-    if (!isNaN(n)) numericVariants.add(n);
+    const digitsOnly = String(v).replace(/\D/g, '');
+    if (!digitsOnly) continue;
+    const n = parseInt(digitsOnly, 10);
+    if (Number.isFinite(n)) numericVariants.add(n);
   }
 
   for (const v of variants) {

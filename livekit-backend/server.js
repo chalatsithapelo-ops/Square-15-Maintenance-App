@@ -7932,10 +7932,12 @@ app.post('/api/ozow-payout-notify', async (req, res) => {
     }
     const providedNotify = String(req.query.token || req.body.token || req.headers['x-ozow-access-token'] || '');
     const providedInternal = String(req.headers['x-internal-secret'] || '');
-    const okNotify = expectedNotify && providedNotify && providedNotify.length === expectedNotify.length
-      && crypto.timingSafeEqual(Buffer.from(providedNotify), Buffer.from(expectedNotify));
-    const okInternal = expectedInternal && providedInternal && providedInternal.length === expectedInternal.length
-      && crypto.timingSafeEqual(Buffer.from(providedInternal), Buffer.from(expectedInternal));
+    // Hash both sides to fixed-size SHA-256 buffers so timingSafeEqual never leaks length.
+    const _sha = (s) => crypto.createHash('sha256').update(String(s || '')).digest();
+    const okNotify = !!expectedNotify && !!providedNotify
+      && crypto.timingSafeEqual(_sha(providedNotify), _sha(expectedNotify));
+    const okInternal = !!expectedInternal && !!providedInternal
+      && crypto.timingSafeEqual(_sha(providedInternal), _sha(expectedInternal));
     if (!okNotify && !okInternal) {
       console.warn(`[ozow-payout-notify] UNAUTHENTICATED call from ${req.ip} payoutId=${req.body && req.body.payoutId}`);
       return res.status(401).json({ error: 'Unauthorized' });
