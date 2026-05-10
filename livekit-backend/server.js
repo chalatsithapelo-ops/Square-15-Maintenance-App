@@ -8262,16 +8262,35 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
         if (autoIsDeposit && !autoDepositAlreadyPaid) {
           autoDisplayAmt = parseFloat(fbPayData.deposit_amount || '0') || Math.round(autoTotalCost * 0.35 * 100) / 100;
           const autoBalAmt = parseFloat(fbPayData.balance_amount || '0') || Math.round((autoTotalCost - autoDisplayAmt) * 100) / 100;
-          waMessage = `?? *Deposit received!* R${autoDisplayAmt.toFixed(2)} for booking #${orderLabel}.\n\n? Your booking is confirmed. The remaining balance of R${autoBalAmt.toFixed(2)} will be due after job completion.\n\nYour artisan will contact you to arrange the visit. ??`;
+          waMessage = `💰 *Deposit received!* R${autoDisplayAmt.toFixed(2)} for booking #${orderLabel}.
+
+✅ Your booking is confirmed. The remaining balance of R${autoBalAmt.toFixed(2)} will be due after job completion.
+
+Your artisan will contact you to arrange the visit. 🛠️
+
+📲 *What's next?*
+• You'll receive your artisan's photo & details for safety verification
+• Reply *"track"* to see when they're on the way
+• Reply *"help"* anytime if you have questions`;
           // Update the minimal doc with deposit fields
           await taskRef.update({ payment_type: 'deposit', deposit_paid: true, deposit_paid_at: now, deposit_amount: autoDisplayAmt.toFixed(2), balance_amount: autoBalAmt.toFixed(2), balance_remaining: autoBalAmt.toFixed(2), payment_status: 'deposit_paid', paymentStatus: 'deposit_paid' });
         } else if (autoIsDeposit && autoDepositAlreadyPaid) {
           autoDisplayAmt = parseFloat(fbPayData.balance_remaining || fbPayData.balance_amount || '0') || Math.round(autoTotalCost * 0.65 * 100) / 100;
-          waMessage = `?? *Balance payment received!* R${autoDisplayAmt.toFixed(2)} for booking #${orderLabel}.\n\n? Your booking is now fully paid. You can now rate your artisan.\n\nThank you for choosing Square 15! ??`;
+          waMessage = `💰 *Balance payment received!* R${autoDisplayAmt.toFixed(2)} for booking #${orderLabel}.
+
+✅ Your booking is now fully paid. You can now rate your artisan.
+
+Thank you for choosing Square 15! ⭐
+
+📝 Reply *"rate"* to leave a review for your artisan.`;
           await taskRef.update({ balance_paid: true, balance_paid_at: now, payment_status: 'paid', paymentStatus: 'paid' });
         } else {
           autoDisplayAmt = autoTotalCost;
-          waMessage = `?? *Payment received!* R${autoDisplayAmt > 0 ? autoDisplayAmt.toFixed(2) : '0.00'} for booking #${orderLabel}.\n\n? Your booking is confirmed. Your artisan will contact you to arrange the visit.\n\nThank you for choosing Square 15! ??`;
+          waMessage = `💰 *Payment received!* R${autoDisplayAmt > 0 ? autoDisplayAmt.toFixed(2) : '0.00'} for booking #${orderLabel}.
+
+✅ Your booking is confirmed. Your artisan will contact you to arrange the visit.
+
+Thank you for choosing Square 15! 🛠️`;
         }
         await fetch(`${waBot}/api/booking-status-update`, {
           method: 'POST',
@@ -8541,7 +8560,7 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
                   body: JSON.stringify({
                     bookingId: taskData.future_booking_id || bookingId,
                     status: 'payment_under_review',
-                    message: `?? *Payment received but on hold*\n\nWe received R${paidAmount.toFixed(2)} for booking #${taskData.order_no || bookingId}, but our records show the expected ${expectedLabel} amount is R${expectedAmount.toFixed(2)}.\n\nOur team has been notified and will review this within 1 business hour. Your funds are safe � no further action is needed from you right now. We'll message you once it's resolved. ??`,
+                    message: `⚠️ *Payment received but on hold*\n\nWe received R${paidAmount.toFixed(2)} for booking #${taskData.order_no || bookingId}, but our records show the expected ${expectedLabel} amount is R${expectedAmount.toFixed(2)}.\n\nOur team has been notified and will review this within 1 business hour. Your funds are safe — no further action is needed from you right now. We'll message you once it's resolved. 🙏`,
                   }),
                   signal: AbortSignal.timeout(10000),
                 });
@@ -8726,12 +8745,31 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
         const displayAmount = rawPayAmt > 0 ? rawPayAmt.toFixed(2) : '0.00';
         let waMessage;
         if (isBalancePayment) {
-          waMessage = `?? *Balance payment received!* R${displayAmount} for booking #${taskData.order_no || fbId}.\n\n? Your booking is now fully paid. You can now rate your artisan.\n\nThank you for choosing Square 15! ??`;
+          waMessage = `💰 *Balance payment received!* R${displayAmount} for booking #${taskData.order_no || fbId}.
+
+✅ Your booking is now fully paid. You can now rate your artisan.
+
+Thank you for choosing Square 15! ⭐
+
+📝 Reply *"rate"* to leave a review for your artisan.`;
         } else if (isDepositPayment) {
           const balAmount = parseFloat(taskData.balance_amount || 0).toFixed(2);
-          waMessage = `?? *Deposit received!* R${displayAmount} for booking #${taskData.order_no || fbId}.\n\n? Your booking is confirmed. The remaining balance of R${balAmount} will be due after job completion.\n\nYour artisan will contact you to arrange the visit. ??`;
+          waMessage = `💰 *Deposit received!* R${displayAmount} for booking #${taskData.order_no || fbId}.
+
+✅ Your booking is confirmed. The remaining balance of R${balAmount} will be due after job completion.
+
+Your artisan will contact you to arrange the visit. 🛠️
+
+📲 *What's next?*
+• You'll receive your artisan's photo & details for safety verification
+• Reply *"track"* to see when they're on the way
+• Reply *"help"* anytime if you have questions`;
         } else {
-          waMessage = `?? *Payment received!* R${displayAmount} for booking #${taskData.order_no || fbId}.\n\n? Your booking is confirmed. Your artisan will contact you to arrange the visit.\n\nThank you for choosing Square 15! ??`;
+          waMessage = `💰 *Payment received!* R${displayAmount} for booking #${taskData.order_no || fbId}.
+
+✅ Your booking is confirmed. Your artisan will contact you to arrange the visit.
+
+Thank you for choosing Square 15! 🛠️`;
         }
         await fetch(`${waBot}/api/booking-status-update`, {
           method: 'POST',

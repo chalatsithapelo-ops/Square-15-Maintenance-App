@@ -8990,6 +8990,23 @@ function startArtisanAcceptanceListener() {
                   const who = prof.name || artisanName;
                   const ratingStr = (prof.rating && Number(prof.rating) > 0) ? ` ⭐ ${Number(prof.rating).toFixed(1)}` : '';
                   await sendWhatsAppImage(to, prof.imageUrl, `👷 Meet ${who}${ratingStr} — your assigned Square 15 artisan for booking #${orderNo}. For your safety, please confirm this is the person who arrives at your door before letting them in.`);
+                  // ── Follow-up CTA so the client always knows the next step. ──
+                  try {
+                    const ctaLines = [
+                      `✅ *What happens next:*`,
+                      `1️⃣ ${who} will call you to confirm the visit time.`,
+                      `2️⃣ When they arrive, check the photo above matches.`,
+                      ``,
+                      `💬 *Quick replies anytime:*`,
+                      `• *"track"* — see when artisan is on the way`,
+                      `• *"reschedule"* — change the appointment time`,
+                      `• *"help"* — talk to Square 15 support`,
+                      `• *"complaint"* — report an issue (funds stay in escrow)`,
+                    ];
+                    await sendWhatsAppMessage(to, ctaLines.join('\n'));
+                  } catch (ctaErr) {
+                    console.warn(`[artisan-accept-listener] CTA send failed for ${rfqId}:`, ctaErr.message);
+                  }
                 }
               }
             } catch (e) { console.warn(`[artisan-accept-listener] photo send failed for ${rfqId}:`, e.message); }
