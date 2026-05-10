@@ -2253,7 +2253,15 @@ async function generateAIQuote(category, description, materialsResponsibility, a
           if (isNaN(contingencyPct) || contingencyPct < 0) contingencyPct = 0.15;
         }
         const mm = parseFloat(gd.material_multiplier || gd.materialMultiplier);
-        if (!isNaN(mm) && mm > 0) materialMultiplierFromGuide = mm;
+        // Sanity floor: a multiplier < 1.0 means we'd CHARGE LESS than cost
+        // (a "discount") — which has caused customer totals to omit markup
+        // entirely (May 2026 incident: pricingGuidance/plumbing had 0.35).
+        // Log + ignore bogus values so we always at least pass cost through.
+        if (!isNaN(mm) && mm >= 1.0) {
+          materialMultiplierFromGuide = mm;
+        } else if (!isNaN(mm) && mm > 0) {
+          console.warn(`[ai-quote] pricingGuidance/${catSlug}.material_multiplier=${mm} is < 1.0 (would discount materials below cost). Ignoring; using default ${materialMultiplierFromGuide}x.`);
+        }
         pricingContext = `Labor rate for ${category}: R${laborRate}/hr. Known service prices: ${JSON.stringify(servicePrices)}. Contingency: ${(contingencyPct * 100).toFixed(0)}%. Material multiplier: ${materialMultiplierFromGuide}x`;
       }
     }
