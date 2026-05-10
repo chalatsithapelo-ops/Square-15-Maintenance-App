@@ -9521,6 +9521,15 @@ function startArtisanPhotoListener() {
             } catch (_) {}
           }
 
+          // Don't notify the customer if we have no actual photo to attach.
+          // Sending "Work completed!" with no image is misleading and breaks
+          // trust. Wait until the artisanTasksImages doc has the URL and
+          // re-fire on the next snapshot pass.
+          if (!imageUrl) {
+            console.warn(`[artisan-photo] skipping ai=${ai} for ${doc.id}: no image URL yet (doc_id=${imageDocId})`);
+            continue;
+          }
+
           const name = artisanName || 'Your artisan';
           const ref = orderNo;
           const msg = ai === '1'
