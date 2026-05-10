@@ -3331,7 +3331,7 @@ async function executeWaTool(name, args, session) {
     // ═══════════════════════════════════════════
     case 'request_payment_link': {
       if (!firestore) return { error: 'Database unavailable' };
-      const bid = args.bookingId || session.lastBookingId;
+      let bid = args.bookingId || session.lastBookingId;
       if (!bid) return { error: 'Please provide a booking ID.' };
 
       // HIGH-3: validate session.linkedUserId before letting it influence
@@ -3391,6 +3391,94 @@ async function executeWaTool(name, args, session) {
       let doc = await firestore.collection('futureBookings').doc(bid).get();
       if (!doc.exists) doc = await firestore.collection('tasksManagement').doc(bid).get();
       if (!doc.exists) return { error: `Booking "${bid}" not found.` };
+
+      // FINANCIAL-SAFETY: If the resolved booking is already paid but the
+      // customer has another booking with an OUTSTANDING balance for the
+      // same phone, switch to that one. Otherwise the bot incorrectly says
+      // "already paid" while a real balance is sitting unpaid — losing
+      // revenue and damaging trust. (May 2026 incident.)
+      const isFullyPaid = (rec) => {
+        if (!rec) return false;
+        const ps = String(rec.payment_status || rec.paymentStatus || '').toLowerCase();
+        if (ps === 'paid' || ps === 'fully_paid') return true;
+        if (ps === 'deposit_paid' && rec.balance_paid === true) return true;
+        return false;
+      };
+      const hasOutstandingBalance = (rec) => {
+        if (!rec) return false;
+        const ps = String(rec.payment_status || rec.paymentStatus || '').toLowerCase();
+        if (ps === 'deposit_paid' && rec.balance_paid !== true) return true;
+        // Unpaid bookings with a confirmed cost
+        const cost = parseFloat(rec.cost || rec.total_cost || '0');
+        if (cost > 0 && (ps === '' || ps === 'pending' || ps === 'pending_payment' || ps === 'unpaid')) return true;
+        return false;
+      };
+      if (isFullyPaid(doc.data())) {
+        try {
+          const sessPhone = String(session.phone || '').replace(/\D/g, '');
+          if (sessPhone) {
+            const phoneVariants = Array.from(new Set([
+              sessPhone,
+              sessPhone.replace(/^27/, '0'),
+              '+' + sessPhone,
+              sessPhone.startsWith('0') ? '27' + sessPhone.slice(1) : sessPhone,
+            ]));
+            const candidates = [];
+            for (const ph of phoneVariants) {
+              for (const col of ['futureBookings', 'tasksManagement']) {
+                for (const field of ['user_phone', 'customerPhone', 'phone', 'contact', 'client_phone']) {
+                  try {
+                    const q = await firestore.collection(col)
+                      .where(field, '==', ph)
+                      .orderBy('updated_at', 'desc')
+                      .limit(10)
+                      .get().catch(() => ({ empty: true, docs: [] }));
+                    for (const d2 of q.docs) {
+                      const data2 = d2.data() || {};
+                      if (hasOutstandingBalance(data2) && !isFullyPaid(data2)) {
+                        candidates.push({ id: d2.id, data: data2, ref: d2.ref });
+                      }
+                    }
+                  } catch (_) {}
+                }
+              }
+            }
+            if (candidates.length > 0) {
+              // Pick most recent by updated_at
+              candidates.sort((a, b) => {
+                const ta = new Date(a.data.updated_at || 0).getTime();
+                const tb = new Date(b.data.updated_at || 0).getTime();
+                return tb - ta;
+              });
+              const pick = candidates[0];
+              console.log(`[request_payment_link] Booking ${bid} is paid; switching to outstanding ${pick.id} for ${maskPhone(session.phone)}`);
+              try {
+                await logErrorToAdmin(
+                  'payment_link_rerouted_to_unpaid',
+                  `Customer ${maskPhone(session.phone)} requested link for paid booking ${bid}; rerouted to outstanding ${pick.id}`,
+                  'whatsapp_bot.request_payment_link',
+                  '',
+                  pick.id,
+                  'medium'
+                );
+              } catch (_) {}
+              bid = pick.id;
+              doc = await pick.ref.get();
+              // Update session so future intercepts use the right id
+              session.lastBookingId = pick.id;
+              try {
+                await firestore.collection('wa_sessions').doc(session.phone).set({
+                  phone: session.phone,
+                  lastBookingId: pick.id,
+                  lastActivity: admin.firestore.FieldValue.serverTimestamp(),
+                }, { merge: true });
+              } catch (_) {}
+            }
+          }
+        } catch (e) {
+          console.warn('[request_payment_link] outstanding-balance recovery failed:', e.message);
+        }
+      }
 
       const d = doc.data();
       const totalCost = parseFloat(d.cost || '0');
@@ -8367,6 +8455,31 @@ app.post('/api/job-status-update', requireInternalSecret, async (req, res) => {
               balanceMsg += `\n\nWould you like to pay the balance now? Reply "pay balance" to get a payment link.`;
             }
             await sendWhatsAppMessage(to, balanceMsg);
+            // FINANCIAL-SAFETY: pin session to the balance-due booking so
+            // a follow-up "send me a new link" doesn't resolve to a stale
+            // fully-paid booking.
+            try {
+              // Prefer the FB id (RFQ-XXXX) over TM uuid for session continuity.
+              let bidForSession = mainBookingId;
+              try {
+                const tmS = await firestore.collection('tasksManagement').doc(mainBookingId).get();
+                if (tmS.exists) {
+                  const linkedFb = String((tmS.data() || {}).future_booking_id || '').trim();
+                  if (linkedFb) bidForSession = linkedFb;
+                }
+              } catch (_) {}
+              const liveSess = sessions.get(to);
+              if (liveSess) {
+                liveSess.lastBookingId = bidForSession;
+                liveSess.paymentStatus = 'balance_due';
+              }
+              await firestore.collection('wa_sessions').doc(to).set({
+                phone: to,
+                lastBookingId: bidForSession,
+                lastBookingAt: Date.now(),
+                lastActivity: admin.firestore.FieldValue.serverTimestamp(),
+              }, { merge: true });
+            } catch (e) { console.warn('[job-status-update] session pin failed:', e && e.message); }
           }
         }
       } catch (e) { console.warn('[job-status-update] balance check failed:', e.message); }
@@ -9266,6 +9379,24 @@ function startBalancePromptListener() {
                 wa_balance_prompt_sent_at: new Date().toISOString(),
               }, { merge: true });
             } catch (_) {}
+            // FINANCIAL-SAFETY: pin the customer's WA session to THIS
+            // balance-due booking so the next "send me a new link" / "pay
+            // balance" resolves to the correct unpaid booking (not a
+            // stale fully-paid lastBookingId).
+            try {
+              const bidForSession = fbLinkId || doc.id;
+              const liveSess = sessions.get(to);
+              if (liveSess) {
+                liveSess.lastBookingId = bidForSession;
+                liveSess.paymentStatus = 'balance_due';
+              }
+              await firestore.collection('wa_sessions').doc(to).set({
+                phone: to,
+                lastBookingId: bidForSession,
+                lastBookingAt: Date.now(),
+                lastActivity: admin.firestore.FieldValue.serverTimestamp(),
+              }, { merge: true });
+            } catch (e) { console.warn('[balance-prompt] session pin failed:', e && e.message); }
             console.log(`[balance-prompt] sent balance prompt for ${doc.id} to ${to} (R${balanceAmt.toFixed(2)})`);
           } catch (e) {
             console.warn(`[balance-prompt] WA send failed for ${doc.id}:`, e.message);
