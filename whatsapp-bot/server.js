@@ -2380,9 +2380,18 @@ CRITICAL — MATERIALS COMPLETENESS:
     const r2 = (v) => Math.round(v * 100) / 100;
     // Admin's Amend Quote dialog reads materialsPriced_reference / materialsUnpriced_reference.
     // Provide them as simple {name, unit, qty, unit_price} rows for direct editing.
+    //
+    // BUG-FIX (May 2026): unit_price written here is the SELL price
+    // (base × materialsMultiplier × learningFactor). The admin amend
+    // dialog computes `total = labour + sum(qty × unit_price)` and the
+    // artisan RFQ review shows the per-unit/line value to the artisan,
+    // so both must reflect what the client actually pays. Writing base
+    // costs here previously caused the customer total to omit the
+    // material markup entirely.
+    const sellMultiplier = materialsMultiplier * learningFactor;
     const materialsPriced_reference = materialsBOM
       .filter(b => Number(b.unit_price) > 0)
-      .map(b => ({ name: b.name, unit: b.unit || 'each', qty: b.qty, unit_price: r2(b.unit_price), product_url: b.builders_url || '' }));
+      .map(b => ({ name: b.name, unit: b.unit || 'each', qty: b.qty, unit_price: r2(b.unit_price * sellMultiplier), unit_cost_base: r2(b.unit_price), product_url: b.builders_url || '' }));
     const materialsUnpriced_reference = materialsBOM
       .filter(b => !(Number(b.unit_price) > 0))
       .map(b => ({ name: b.name, unit: b.unit || 'each', qty: b.qty, unit_price: 0 }));
@@ -5792,8 +5801,15 @@ async function executeWaTool(name, args, session) {
             // the dispatch state can never be half-written.
             let dispatchBatchOk = false;
             try {
+              // BUG-FIX (May 2026): Use set+merge instead of update so the
+              // batch does not abort when the tasksManagement doc has not
+              // been written yet (RFQs created via WA only write to
+              // futureBookings at create-time). Previously the batch failed
+              // atomically, leaving rfq_assigned_artisan_ids unset on BOTH
+              // collections — so the artisan app's stream (which keys off
+              // that array) never showed the dispatched RFQ.
               const dispatchBatch = firestore.batch();
-              dispatchBatch.update(
+              dispatchBatch.set(
                 firestore.collection('futureBookings').doc(rfqId),
                 {
                   rfq_status: 'pending_artisan_acceptance',
@@ -5808,9 +5824,11 @@ async function executeWaTool(name, args, session) {
                   rfq_artisan_rejection_count: 0,
                   rfq_artisan_rejections: [],
                   artisan_name: matchedArtisans[0].name,
-                }
+                  updated_at: new Date().toISOString(),
+                },
+                { merge: true }
               );
-              dispatchBatch.update(
+              dispatchBatch.set(
                 firestore.collection('tasksManagement').doc(rfqId),
                 {
                   status: 'pending_artisan_acceptance',
@@ -5819,7 +5837,14 @@ async function executeWaTool(name, args, session) {
                   dispatched_artisan_emails: dispatchedEmails,
                   rfq_auto_assigned: true,
                   rfq_auto_assign_reason: autoReason,
-                }
+                  // Mirror identity fields so the artisan stream has the
+                  // basics even when the doc is being created here.
+                  is_rfq: 'yes',
+                  booking_id: rfqId,
+                  futureBookingId: rfqId,
+                  updated_at: new Date().toISOString(),
+                },
+                { merge: true }
               );
               await dispatchBatch.commit();
               dispatchBatchOk = true;
