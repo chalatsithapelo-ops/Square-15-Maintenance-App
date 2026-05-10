@@ -3096,7 +3096,7 @@ async function executeWaTool(name, args, session) {
     // ═══════════════════════════════════════════
     case 'check_booking_status': {
       if (!firestore) return { error: 'Database unavailable' };
-      const bid = args.bookingId;
+      const bid = String(args.bookingId || '').trim();
       if (!bid) return { error: 'Please provide a booking ID' };
 
       // Try tasksManagement first, then futureBookings
@@ -3331,7 +3331,7 @@ async function executeWaTool(name, args, session) {
     // ═══════════════════════════════════════════
     case 'request_payment_link': {
       if (!firestore) return { error: 'Database unavailable' };
-      let bid = args.bookingId || session.lastBookingId;
+      let bid = String(args.bookingId || session.lastBookingId || '').trim();
       if (!bid) return { error: 'Please provide a booking ID.' };
 
       // HIGH-3: validate session.linkedUserId before letting it influence
@@ -3753,7 +3753,7 @@ async function executeWaTool(name, args, session) {
         else return { error: 'Your WhatsApp number is not linked to a Square 15 account. Wallet payment requires an app account.' };
       }
 
-      const bid = args.bookingId;
+      const bid = String(args.bookingId || '').trim();
       if (!bid) return { error: 'Please provide a booking ID.' };
 
       // Get booking (check both collections)
@@ -4623,7 +4623,7 @@ async function executeWaTool(name, args, session) {
     // ═══════════════════════════════════════════
     case 'cancel_booking': {
       if (!firestore) return { error: 'Database unavailable' };
-      const bid = args.bookingId;
+      const bid = String(args.bookingId || '').trim();
       if (!bid) return { error: 'Please provide a booking ID.' };
 
       // Search tasksManagement first, then fall back to futureBookings so
@@ -4825,7 +4825,7 @@ async function executeWaTool(name, args, session) {
     // ═══════════════════════════════════════════
     case 'reschedule_booking': {
       if (!firestore) return { error: 'Database unavailable' };
-      const bid = args.bookingId;
+      const bid = String(args.bookingId || '').trim();
       if (!bid || !args.newDate) return { error: 'Please provide booking ID and new date.' };
 
       // Validate date is in the future
@@ -4996,7 +4996,7 @@ async function executeWaTool(name, args, session) {
     // ═══════════════════════════════════════════
     case 'rate_booking': {
       if (!firestore) return { error: 'Database unavailable' };
-      const bid = args.bookingId;
+      const bid = String(args.bookingId || '').trim();
       const rating = Math.max(1, Math.min(5, Math.round(args.rating || 0)));
       if (!bid) return { error: 'Please provide a booking ID.' };
       if (!rating) return { error: 'Please provide a rating between 1 and 5.' };
@@ -5077,6 +5077,17 @@ async function executeWaTool(name, args, session) {
       }
 
       session.pendingRatingBookingId = null; // clear pending rating
+      // Pin session.lastBookingId so subsequent customer messages
+      // ("refund", "send me a link") resolve to the just-rated booking.
+      try {
+        session.lastBookingId = bid;
+        await firestore.collection('wa_sessions').doc(session.phone).set({
+          phone: session.phone,
+          lastBookingId: bid,
+          lastBookingAt: Date.now(),
+          lastActivity: admin.firestore.FieldValue.serverTimestamp(),
+        }, { merge: true });
+      } catch (_) {}
       const stars = '⭐'.repeat(rating);
       return {
         success: true,
@@ -5089,7 +5100,7 @@ async function executeWaTool(name, args, session) {
     // ═══════════════════════════════════════════
     case 'request_refund': {
       if (!firestore) return { error: 'Database unavailable' };
-      const bid = args.bookingId;
+      const bid = String(args.bookingId || '').trim();
       if (!bid) return { error: 'Please provide a booking ID.' };
 
       let doc = await firestore.collection('tasksManagement').doc(bid).get();
@@ -5145,6 +5156,17 @@ async function executeWaTool(name, args, session) {
         created_at: admin.firestore.FieldValue.serverTimestamp(),
       });
 
+      // Pin session.lastBookingId so a follow-up "status"/"link" request
+      // resolves to the same booking the customer just disputed.
+      try {
+        session.lastBookingId = bid;
+        await firestore.collection('wa_sessions').doc(session.phone).set({
+          phone: session.phone,
+          lastBookingId: bid,
+          lastBookingAt: Date.now(),
+          lastActivity: admin.firestore.FieldValue.serverTimestamp(),
+        }, { merge: true });
+      } catch (_) {}
       return {
         success: true,
         message: `Refund request submitted for booking ${bid} (R${cost.toFixed(2)}). Our admin team will review and process it within 3-5 business days.`,
@@ -5312,7 +5334,7 @@ async function executeWaTool(name, args, session) {
     case 'check_rfq_status': {
       if (!firestore) return { error: 'Database unavailable' };
 
-      const rfqId = args.rfqId || args.bookingId || session.lastRfqId;
+      const rfqId = String(args.rfqId || args.bookingId || session.lastRfqId || '').trim();
       if (!rfqId) {
         // List all RFQs for this phone number
         try {
@@ -5404,7 +5426,7 @@ async function executeWaTool(name, args, session) {
     case 'accept_rfq_quote': {
       if (!firestore) return { error: 'Database unavailable' };
 
-      const rfqId = args.rfqId || args.bookingId || session.lastRfqId;
+      const rfqId = String(args.rfqId || args.bookingId || session.lastRfqId || '').trim();
       if (!rfqId) return { error: 'Please provide the RFQ ID.' };
 
       const doc = await firestore.collection('futureBookings').doc(rfqId).get();
@@ -6076,7 +6098,7 @@ async function executeWaTool(name, args, session) {
     case 'reject_rfq_quote': {
       if (!firestore) return { error: 'Database unavailable' };
 
-      const rfqId = args.rfqId || args.bookingId || session.lastRfqId;
+      const rfqId = String(args.rfqId || args.bookingId || session.lastRfqId || '').trim();
       if (!rfqId) return { error: 'Please provide the RFQ ID.' };
 
       const doc = await firestore.collection('futureBookings').doc(rfqId).get();
@@ -6113,7 +6135,7 @@ async function executeWaTool(name, args, session) {
     // ═══════════════════════════════════════════
     case 'explain_quote': {
       if (!firestore) return { error: 'Database unavailable' };
-      const bid = args.bookingId;
+      const bid = String(args.bookingId || '').trim();
       if (!bid) return { error: 'Please provide a booking or RFQ ID.' };
 
       let doc = await firestore.collection('futureBookings').doc(bid).get();
@@ -6140,7 +6162,7 @@ async function executeWaTool(name, args, session) {
     // ═══════════════════════════════════════════
     case 'check_payment': {
       if (!firestore) return { error: 'Database unavailable' };
-      const bid = args.bookingId;
+      const bid = String(args.bookingId || '').trim();
       if (!bid) return { error: 'Please provide a booking ID.' };
 
       let doc = await firestore.collection('tasksManagement').doc(bid).get();
@@ -6172,7 +6194,7 @@ async function executeWaTool(name, args, session) {
     // ═══════════════════════════════════════════
     case 'get_messages': {
       if (!firestore) return { error: 'Database unavailable' };
-      const bid = args.bookingId;
+      const bid = String(args.bookingId || '').trim();
       if (!bid) return { error: 'Please provide a booking ID.' };
 
       try {
@@ -7393,18 +7415,28 @@ function _queuePhoto(from, contactName, photo) {
 
 // Incoming messages
 app.post('/webhook', async (req, res) => {
-  // Verify Meta webhook signature (X-Hub-Signature-256)
+  // Verify Meta webhook signature (X-Hub-Signature-256). In production we
+  // REQUIRE the secret to be configured — silently accepting unsigned
+  // webhooks would let an attacker forge inbound WhatsApp events (CRIT).
   const appSecret = process.env.WHATSAPP_APP_SECRET || process.env.META_APP_SECRET || '';
+  const allowUnsigned = process.env.WHATSAPP_ALLOW_UNSIGNED === '1' || process.env.NODE_ENV !== 'production';
   if (appSecret) {
     const signature = req.headers['x-hub-signature-256'] || '';
     const rawBody = req.rawBody || Buffer.from(JSON.stringify(req.body));
     const expected = 'sha256=' + require('crypto').createHmac('sha256', appSecret).update(rawBody).digest('hex');
-    if (signature !== expected) {
+    // Timing-safe compare
+    const a = Buffer.from(signature);
+    const b = Buffer.from(expected);
+    const ok = a.length === b.length && require('crypto').timingSafeEqual(a, b);
+    if (!ok) {
       console.warn('[webhook] Invalid signature — rejecting');
       return res.sendStatus(403);
     }
+  } else if (!allowUnsigned) {
+    console.error('[webhook] CRITICAL: WHATSAPP_APP_SECRET missing in production — rejecting unsigned webhook');
+    return res.sendStatus(403);
   } else {
-    console.warn('[webhook] No WHATSAPP_APP_SECRET configured — signature verification disabled');
+    console.warn('[webhook] No WHATSAPP_APP_SECRET configured — signature verification disabled (dev/test only)');
   }
 
   // Always respond 200 quickly to Meta
@@ -9314,6 +9346,12 @@ function startBalancePromptListener() {
           if (!['completed', 'done', 'closed'].includes(status)) continue;
           if (data.balance_paid === true) continue;
           if (data.wa_balance_prompt_sent_at) continue;
+          // HIGH: in-flight guard prevents duplicate sends if onSnapshot
+          // fires twice (modified + added) before the Firestore flag
+          // write commits. Pairs with _balancePromptInFlight declared
+          // alongside the other relay locks above.
+          if (_balancePromptInFlight.has(doc.id)) continue;
+          _balancePromptInFlight.add(doc.id);
 
           // Resolve WA source via futureBookings link (TM bridge docs typically have
           // source='future_booking' even for WA-originated bookings)
@@ -9400,6 +9438,8 @@ function startBalancePromptListener() {
             console.log(`[balance-prompt] sent balance prompt for ${doc.id} to ${to} (R${balanceAmt.toFixed(2)})`);
           } catch (e) {
             console.warn(`[balance-prompt] WA send failed for ${doc.id}:`, e.message);
+          } finally {
+            _balancePromptInFlight.delete(doc.id);
           }
         }
       }, (err) => {
