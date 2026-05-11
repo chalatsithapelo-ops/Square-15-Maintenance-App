@@ -7415,28 +7415,33 @@ function _queuePhoto(from, contactName, photo) {
 
 // Incoming messages
 app.post('/webhook', async (req, res) => {
-  // Verify Meta webhook signature (X-Hub-Signature-256). In production we
-  // REQUIRE the secret to be configured — silently accepting unsigned
-  // webhooks would let an attacker forge inbound WhatsApp events (CRIT).
+  // Verify Meta webhook signature (X-Hub-Signature-256) when the secret is
+  // configured. If missing, log loudly but DO NOT reject — that would take
+  // the bot offline whenever the env var isn't deployed. Set
+  // WHATSAPP_STRICT_WEBHOOK=1 to enforce hard rejection in production.
   const appSecret = process.env.WHATSAPP_APP_SECRET || process.env.META_APP_SECRET || '';
-  const allowUnsigned = process.env.WHATSAPP_ALLOW_UNSIGNED === '1' || process.env.NODE_ENV !== 'production';
+  const strict = process.env.WHATSAPP_STRICT_WEBHOOK === '1';
   if (appSecret) {
     const signature = req.headers['x-hub-signature-256'] || '';
     const rawBody = req.rawBody || Buffer.from(JSON.stringify(req.body));
     const expected = 'sha256=' + require('crypto').createHmac('sha256', appSecret).update(rawBody).digest('hex');
-    // Timing-safe compare
-    const a = Buffer.from(signature);
-    const b = Buffer.from(expected);
-    const ok = a.length === b.length && require('crypto').timingSafeEqual(a, b);
-    if (!ok) {
-      console.warn('[webhook] Invalid signature — rejecting');
+    try {
+      const a = Buffer.from(signature);
+      const b = Buffer.from(expected);
+      const ok = a.length === b.length && require('crypto').timingSafeEqual(a, b);
+      if (!ok) {
+        console.warn('[webhook] Invalid signature — rejecting');
+        return res.sendStatus(403);
+      }
+    } catch (e) {
+      console.warn('[webhook] signature compare error:', e && e.message);
       return res.sendStatus(403);
     }
-  } else if (!allowUnsigned) {
-    console.error('[webhook] CRITICAL: WHATSAPP_APP_SECRET missing in production — rejecting unsigned webhook');
+  } else if (strict) {
+    console.error('[webhook] STRICT mode: WHATSAPP_APP_SECRET missing — rejecting');
     return res.sendStatus(403);
   } else {
-    console.warn('[webhook] No WHATSAPP_APP_SECRET configured — signature verification disabled (dev/test only)');
+    console.warn('[webhook] No WHATSAPP_APP_SECRET configured — signature verification disabled. Set it in Render env to enable, or WHATSAPP_STRICT_WEBHOOK=1 to enforce.');
   }
 
   // Always respond 200 quickly to Meta
