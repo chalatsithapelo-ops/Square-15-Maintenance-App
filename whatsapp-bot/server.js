@@ -7308,6 +7308,19 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
+// ─── Webhook idempotency (in-memory dedupe of Meta message ids) ───
+// Meta retries webhook delivery if our HTTP 200 takes too long. The same
+// `msg.id` arriving 2-3 times caused duplicate OpenAI calls and Firestore
+// writes. Keep ids for 10 minutes; that's well beyond Meta's retry window.
+const _seenMessageIds = new Map();
+const MSG_ID_TTL_MS = 10 * 60 * 1000;
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, ts] of _seenMessageIds) {
+    if (now - ts > MSG_ID_TTL_MS) _seenMessageIds.delete(id);
+  }
+}, 5 * 60 * 1000);
+
 // ─── Webhook routes ───
 
 // Meta verification handshake
@@ -7463,6 +7476,16 @@ app.post('/webhook', async (req, res) => {
       if (!msg || typeof msg !== 'object' || typeof msg.from !== 'string' || typeof msg.type !== 'string') {
         console.warn('[webhook] skipping malformed message:', JSON.stringify(msg).slice(0, 200));
         continue;
+      }
+      // Idempotency: Meta retries webhook delivery on 5xx / timeout. Without
+      // dedupe, a single user message can be processed 2-3 times (double
+      // OpenAI calls, duplicate Firestore writes, repeated WA replies).
+      if (msg.id && typeof msg.id === 'string') {
+        if (_seenMessageIds.has(msg.id)) {
+          console.log(`[webhook] duplicate message id ${msg.id} \u2014 skipping`);
+          continue;
+        }
+        _seenMessageIds.set(msg.id, Date.now());
       }
       const from = msg.from; // phone number
       let userText = '';
