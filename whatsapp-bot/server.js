@@ -3542,8 +3542,23 @@ async function executeWaTool(name, args, session) {
       // ── Pre-flight double-submit guards ──
       // HIGH-10: deposit_pending without a TTL leaves the booking stuck if
       // the previous link generation crashed. Allow retry after 5 minutes.
+      // NOTE: deposit_pending_at is normally an ISO string, but legacy docs
+      // or other writers can store it as a Firestore Timestamp object. Wrap
+      // the parse so a NaN result (which is falsy) doesn't silently let
+      // duplicate payment links through.
+      const parsePendingAt = (v) => {
+        if (!v) return 0;
+        if (typeof v === 'string') {
+          const t = Date.parse(v);
+          return Number.isFinite(t) ? t : 0;
+        }
+        if (typeof v.toMillis === 'function') return v.toMillis();
+        if (v instanceof Date) return v.getTime();
+        if (typeof v === 'number') return v;
+        return 0;
+      };
       if (isDeposit && d.payment_status === 'deposit_pending') {
-        const depPendingAt = d.deposit_pending_at ? Date.parse(d.deposit_pending_at) : 0;
+        const depPendingAt = parsePendingAt(d.deposit_pending_at);
         if (depPendingAt && (Date.now() - depPendingAt) < 300000) {
           return {
             message: `A deposit payment is already in progress for this booking. Please complete the existing payment or wait a few minutes before requesting a new one.`,
@@ -3554,7 +3569,7 @@ async function executeWaTool(name, args, session) {
       // Block full-payment retry while one was generated in the last 2 minutes
       // (uses full_pending_at timestamp; if older than 2 min, allow re-issue).
       if (!isDeposit && !isDepositPaid) {
-        const fullPendingAt = d.full_pending_at ? Date.parse(d.full_pending_at) : 0;
+        const fullPendingAt = parsePendingAt(d.full_pending_at);
         if (fullPendingAt && (Date.now() - fullPendingAt) < 120000) {
           return {
             message: `A full payment link was just sent for this booking. Please use the existing link, or wait 2 minutes to request a new one.`,
