@@ -5817,8 +5817,17 @@ async function executeWaTool(name, args, session) {
             // — used as a last-resort fallback further down when 0 artisans
             // match the strict gates.
             const aName = ad.name || ad.userName || ad.full_name || artDoc.id;
-            const aEmail = (ad.email || '').toString().trim().toLowerCase();
-            const aRecord = { id: artDoc.id, name: aName, email: aEmail, token: (ad.fcm_token || ad.deviceToken || '').toString().trim() };
+            const aEmail = (ad.email || ad.userEmail || ad.contact_email || '').toString().trim().toLowerCase();
+            // BUG-FIX (May 12 2026): the artisan's Firebase Auth UID lives
+            // in `ad.uid` (see ServiceProviderModelFields.uid). The SP
+            // *document id* (artDoc.id) is auto-generated and is NOT the
+            // auth UID. Without this we can't address the artisan via
+            // notifications (user_id == auth.uid) or via the rule path
+            // `request.auth.uid in dispatched_artisan_uids`, which is
+            // exactly why repeated WA dispatches "don't reach the
+            // artisan" even though the dispatch loop ran successfully.
+            const aAuthUid = (ad.uid || ad.userId || '').toString().trim();
+            const aRecord = { id: artDoc.id, authUid: aAuthUid, name: aName, email: aEmail, token: (ad.fcm_token || ad.deviceToken || '').toString().trim() };
             // Country fields: country (code or name), countries_served (array or comma string), region, city
             const artCountry = String(ad.country || ad.country_code || '').trim().toUpperCase();
             const served = (function () {
@@ -5929,6 +5938,14 @@ async function executeWaTool(name, args, session) {
             const dispatchedEmails = matchedArtisans
               .map(a => (a.email || '').toString().trim().toLowerCase())
               .filter(e => e.length > 0);
+            // BUG-FIX (May 12 2026): also expose the artisan's Firebase
+            // Auth UID so the rule has a path that doesn't depend on a
+            // correctly-populated email field on the serviceProvider doc.
+            // The artisan dashboard's stream (and the notifications
+            // stream) can then key off this array.
+            const dispatchedAuthUids = matchedArtisans
+              .map(a => (a.authUid || '').toString().trim())
+              .filter(u => u.length > 0);
 
             // MED-14: batch the futureBookings + tasksManagement updates so
             // the dispatch state can never be half-written.
@@ -5951,6 +5968,7 @@ async function executeWaTool(name, args, session) {
                   rfq_assigned_artisan_ids: artisanIds,
                   rfq_assigned_artisan_names: artisanNames,
                   dispatched_artisan_emails: dispatchedEmails,
+                  dispatched_artisan_uids: dispatchedAuthUids,
                   rfq_auto_assigned: true,
                   rfq_auto_assign_reason: autoReason,
                   rfq_auto_assigned_at: new Date().toISOString(),
@@ -5968,6 +5986,7 @@ async function executeWaTool(name, args, session) {
                   rfq_status: 'pending_artisan_acceptance',
                   rfq_assigned_artisan_ids: artisanIds,
                   dispatched_artisan_emails: dispatchedEmails,
+                  dispatched_artisan_uids: dispatchedAuthUids,
                   rfq_auto_assigned: true,
                   rfq_auto_assign_reason: autoReason,
                   // Mirror identity fields so the artisan stream has the
@@ -5997,17 +6016,23 @@ async function executeWaTool(name, args, session) {
 
             if (dispatchBatchOk) {
               for (const art of matchedArtisans) {
-                // Always write a Firestore notification doc so the artisan
-                // app's onSnapshot listener picks up the dispatch even when
-                // the FCM token is missing/stale (a major cause of "the
-                // artisan never got the request" reports — May 2026).
+                // BUG-FIX (May 12 2026): write the notification doc keyed
+                // by the artisan's Firebase Auth UID (`art.authUid`) so
+                // their notifications stream — which queries
+                // `user_id == auth.uid` — actually picks it up. The SP
+                // doc id (`art.id`) is NOT the auth UID. Falling back to
+                // the doc id is a no-op for the artisan (the rules
+                // refuse the read) but keeps the doc around for admin
+                // visibility.
+                const notifUserId = art.authUid || art.id;
                 try {
                   await firestore.collection('notifications').add({
                     title: '🔔 New RFQ Job Available',
                     body: `RFQ ${data.rfq_no || rfqId} — R${priceNum.toFixed(2)}. Tap to view and accept.`,
                     type: 'rfq_accepted',
                     user_type: 'artisan',
-                    user_id: art.id,
+                    user_id: notifUserId,
+                    sp_doc_id: art.id,
                     booking_id: rfqId,
                     priority: 'high',
                     read: false,
@@ -6025,7 +6050,7 @@ async function executeWaTool(name, args, session) {
                 } catch (fcmErr) { console.warn(`[wa-tool] FCM to artisan ${art.id} failed:`, fcmErr.message); }
               }
               autoDispatched = true;
-              console.log(`[wa-tool] Auto-dispatched RFQ ${rfqId} to ${artisanIds.length} artisans (${autoReason})`);
+              console.log(`[wa-tool] Auto-dispatched RFQ ${rfqId} to ${artisanIds.length} artisans (${autoReason}) emails=${dispatchedEmails.length} uids=${dispatchedAuthUids.length}`);
             }
           } else {
             console.log(`[wa-tool] No artisans matched for RFQ ${rfqId} — admin will assign manually`);
