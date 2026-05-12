@@ -1586,7 +1586,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
             }
           }
         });
-        if (stale.length) _cleanStaleFcmTokens(stale).catch(() => {});
+        if (stale.length) _cleanStaleFcmTokens(stale).catch(e => console.warn('[fcm] stale token cleanup failed:', e && e.message));
       } catch (_) {}
 
       return {
@@ -3881,17 +3881,21 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     const price = data.quoted_price || (data.ai_quote ? String(data.ai_quote.grand_total) : '0');
     const priceNum = parseFloat(price) || 0;
 
-    await bookingRef.update({
+    // Atomically update futureBookings + tasksManagement so an RFQ can
+    // never be accepted in only one of the two collections (previously the
+    // tasksManagement mirror was a separate try/catch that swallowed
+    // failures, leaving artisans seeing stale data).
+    const _acceptBatch = firestore.batch();
+    _acceptBatch.update(bookingRef, {
       rfq_status: 'accepted_converted',
       status: 'pending_artisan_acceptance',
       accepted_at: now,
       accepted_via: payload.source || 'voice',
       updated_at: now,
     });
-
-    // Mirror to tasksManagement
-    try {
-      await firestore.collection('tasksManagement').doc(bookingId).set({
+    _acceptBatch.set(
+      firestore.collection('tasksManagement').doc(bookingId),
+      {
         id: bookingId,
         order_no: data.order_no || data.rfq_no || bookingId,
         user_id: data.user_id || '',
@@ -3905,8 +3909,15 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         rfq_status: 'accepted_converted',
         accepted_at: now,
         accepted_via: 'voice',
-      }, { merge: true });
-    } catch (e) { console.warn('[voice] tasksManagement mirror failed:', e.message); }
+      },
+      { merge: true },
+    );
+    try {
+      await _acceptBatch.commit();
+    } catch (e) {
+      console.error('[voice accept_rfq_quote] batch commit failed:', e.message);
+      return { ok: false, status: 500, error: 'accept_failed', detail: e.message };
+    }
 
     // Auto-dispatch: route directly to artisans when conditions met
     const materialsResp = (data.materials_responsibility || '').toString().trim().toLowerCase();
@@ -4083,7 +4094,11 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     const prevTime = String(bookingData.scheduled_time || '').trim();
     const requestedBy = actorRole;
 
-    await bookingRef.set(
+    // Atomic reschedule across both collections so the artisan never sees
+    // a stale scheduled_date while the client sees the new one.
+    const _rescheduleBatch = firestore.batch();
+    _rescheduleBatch.set(
+      bookingRef,
       {
         scheduled_date: date,
         scheduled_time: time,
@@ -4095,15 +4110,16 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         previous_scheduled_time: prevTime,
         updated_at: now,
       },
-      { merge: true }
+      { merge: true },
     );
-
     if (tmId) {
-      await firestore
-        .collection('tasksManagement')
-        .doc(tmId)
-        .set({ scheduled_date: date, scheduled_time: time, updated_at: now }, { merge: true });
+      _rescheduleBatch.set(
+        firestore.collection('tasksManagement').doc(tmId),
+        { scheduled_date: date, scheduled_time: time, updated_at: now },
+        { merge: true },
+      );
     }
+    await _rescheduleBatch.commit();
 
     return { ok: true, status: 200, data: { rescheduled: true } };
   }
@@ -4113,25 +4129,30 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       return { ok: false, status: 403, error: 'forbidden' };
     }
 
-    await bookingRef.set(
+    // Atomic in-progress flip across both collections so the UI and
+    // artisan notifications can't diverge on partial failure.
+    const _progressBatch = firestore.batch();
+    _progressBatch.set(
+      bookingRef,
       {
         status: 'in_progress',
         in_progress_at: now,
         updated_at: now,
       },
-      { merge: true }
+      { merge: true },
     );
-
     if (tmId) {
-      await firestore.collection('tasksManagement').doc(tmId).set(
+      _progressBatch.set(
+        firestore.collection('tasksManagement').doc(tmId),
         {
           status: 'progress',
           accept: '1',
           updated_at: now,
         },
-        { merge: true }
+        { merge: true },
       );
     }
+    await _progressBatch.commit();
 
     return { ok: true, status: 200, data: { in_progress: true } };
   }
