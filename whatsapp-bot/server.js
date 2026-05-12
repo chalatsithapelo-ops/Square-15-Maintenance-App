@@ -8913,7 +8913,7 @@ function startQuoteRelayListener() {
             const productUrl = String(it.product_url || it.sourceKey || '').trim();
             // Note: we intentionally do NOT include the product URL in the
             // caption — the client doesn't need to know the supplier.
-            const caption = `*${i + 1}. ${desc}*\n${qty} ${unit} × R${unitPrice.toFixed(0)} = R${lineTotal.toFixed(2)}`;
+            const caption = `*${i + 1}. ${desc}*\n${qty} ${unit} × R${unitPrice.toFixed(2)} = R${lineTotal.toFixed(2)}`;
 
             let delivered = false;
             if (imageUrl && /^https?:\/\//i.test(imageUrl)) {
