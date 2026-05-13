@@ -8940,10 +8940,10 @@ function startQuoteRelayListener() {
             const lines = [];
             lines.push(`Hi! Your quote request (${rfqNo}) has been reviewed.`);
             lines.push('');
-            lines.push(`📋 *Quote Total*`);
+            lines.push(`📋 *Quote Total (Including Labour)*`);
             if (subtotal > 0)  lines.push(`Subtotal: R${subtotal.toFixed(2)}`);
             if (vatAmount > 0) lines.push(`VAT: R${vatAmount.toFixed(2)}`);
-            lines.push(`*Total: R${total.toFixed(2)}*`);
+            lines.push(`*Total (incl. labour): R${total.toFixed(2)}*`);
             if (notes) {
               lines.push('');
               lines.push(`Note from admin: _${notes}_`);
