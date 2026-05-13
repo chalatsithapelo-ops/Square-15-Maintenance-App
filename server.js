@@ -8173,6 +8173,13 @@ app.post('/api/artisan-accepted', requireInternalSecret, async (req, res) => {
         ...(orderNo && { order_no: orderNo }),
         ...(bookingCost && { cost: bookingCost, total_cost: bookingCost }),
         ...(bookingDescription && { description: bookingDescription }),
+        // BUG-FIX (May 13 2026): clear stale timeout_escalated flag so the
+        // admin dashboard shows the booking as assigned again on late-accept.
+        // Admin can still manually re-assign via the normal admin flows.
+        ...(mainRfqStatus === 'timeout_escalated' && {
+          rfq_status: 'accepted',
+          late_accept_at: new Date().toISOString(),
+        }),
         updated_at: new Date().toISOString(),
       }, { merge: true });
     } catch (e) { console.warn('[api/artisan-accepted] main doc update failed:', e.message); }
@@ -8184,6 +8191,13 @@ app.post('/api/artisan-accepted', requireInternalSecret, async (req, res) => {
       await firestore.collection('futureBookings').doc(mainBookingId).set({
         artisan_confirmed: 'yes',
         status: 'pending_payment',
+        ...(artisanId && { service_provider_id: artisanId }),
+        ...(artisanName && { service_provider_name: artisanName }),
+        // Clear stale timeout flag on late accept.
+        ...(mainRfqStatus === 'timeout_escalated' && {
+          rfq_status: 'accepted',
+          late_accept_at: new Date().toISOString(),
+        }),
         wa_artisan_acceptance_sent_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       }, { merge: true });
