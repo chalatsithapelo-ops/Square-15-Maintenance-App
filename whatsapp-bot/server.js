@@ -4900,8 +4900,8 @@ async function executeWaTool(name, args, session) {
       if (!doc.exists) return { error: `Booking "${bid}" not found.` };
 
       const data = doc.data() || {};
-      const assignedIds = Array.isArray(data.rfq_assigned_artisan_ids) ? data.rfq_assigned_artisan_ids : [];
-      const hasAssignedArtisan = assignedIds.length > 0;
+      let assignedIds = Array.isArray(data.rfq_assigned_artisan_ids) ? data.rfq_assigned_artisan_ids : [];
+      let hasAssignedArtisan = assignedIds.length > 0;
       // Defensive: if accept_rfq_quote left the RFQ in 'accepted_converted'
       // because auto-dispatch matched zero artisans (or its fallback write
       // failed silently), the admin's "Waiting Assignment" filter never
@@ -4909,6 +4909,123 @@ async function executeWaTool(name, args, session) {
       // the right bucket and can assign manually.
       const stuckAcceptedConverted =
         (data.rfq_status || '') === 'accepted_converted' && !hasAssignedArtisan;
+
+      // ── RETRY DISPATCH (May 2026) ──────────────────────────────────────
+      // If accept_rfq_quote couldn't match any artisan (e.g. the artisan
+      // pool had no mainCategory / categories / userTasks populated for
+      // this category, OR the deploy at the time predated the no-cat
+      // fallback), the RFQ is stuck in `rfq_approved_waiting_assignment`
+      // with `rfq_no_artisans_matched=true`. The client just told us when
+      // they want the job done — last chance to actually get an artisan
+      // before they get frustrated. Run a relaxed dispatch now: active
+      // artisans with an FCM token, no category gate.
+      const stuckNoArtisans = !hasAssignedArtisan
+        && (data.rfq_no_artisans_matched === true || data.requires_admin_assignment === true);
+      const retryPrice = Number(data.admin_quote_total || data.rfq_total || data.quoted_price || 0);
+      const retryEligible = stuckNoArtisans && retryPrice > 0 && retryPrice < 12000;
+      let retryDispatchAttempted = false;
+      let retryDispatched = [];
+      if (retryEligible) {
+        retryDispatchAttempted = true;
+        try {
+          const artSnap = await firestore.collection('serviceProvider').limit(200).get();
+          const pool = [];
+          const REJECT = new Set(['pending','rejected','reject','suspended','inactive','disabled']);
+          for (const d of artSnap.docs) {
+            const ad = d.data() || {};
+            if (ad.is_suspended === true) continue;
+            if (ad.active != null && !isTruthyValue(ad.active)) continue;
+            const st = ad.status == null ? '' : String(ad.status).toLowerCase();
+            if (st && REJECT.has(st)) continue;
+            const token = String(ad.fcm_token || ad.deviceToken || '').trim();
+            if (!token) continue;
+            pool.push({
+              id: d.id,
+              name: ad.name || ad.userName || ad.full_name || d.id,
+              email: String(ad.email || ad.userEmail || '').trim().toLowerCase(),
+              authUid: String(ad.uid || ad.userId || '').trim(),
+              token,
+            });
+          }
+          const chosen = pool.slice(0, 3);
+          if (chosen.length > 0) {
+            const artisanIds = chosen.map(a => a.id);
+            const artisanNames = {};
+            chosen.forEach(a => { artisanNames[a.id] = a.name; });
+            const emails = chosen.map(a => a.email).filter(Boolean);
+            const uids = chosen.map(a => a.authUid).filter(Boolean);
+            const reDispatchUpdate = {
+              rfq_status: 'pending_artisan_acceptance',
+              status: 'pending_artisan_acceptance',
+              rfq_submitted_to: 'artisan',
+              rfq_assigned_artisan_ids: artisanIds,
+              rfq_assigned_artisan_names: artisanNames,
+              dispatched_artisan_emails: emails,
+              dispatched_artisan_uids: uids,
+              rfq_auto_assigned: true,
+              rfq_auto_assign_reason: 'set_preferred_schedule_retry',
+              rfq_auto_assigned_at: new Date().toISOString(),
+              rfq_no_artisans_matched: false,
+              requires_admin_assignment: false,
+              rfq_artisan_rejection_count: 0,
+              rfq_artisan_rejections: [],
+              artisan_name: chosen[0].name,
+              updated_at: new Date().toISOString(),
+            };
+            const reBatch = firestore.batch();
+            reBatch.set(firestore.collection('futureBookings').doc(bid), reDispatchUpdate, { merge: true });
+            reBatch.set(firestore.collection('tasksManagement').doc(bid), {
+              ...reDispatchUpdate,
+              is_rfq: 'yes',
+              booking_id: bid,
+              futureBookingId: bid,
+            }, { merge: true });
+            await reBatch.commit();
+            for (const a of chosen) {
+              try {
+                await firestore.collection('notifications').add({
+                  title: '🔔 New RFQ Job Available',
+                  body: `RFQ ${data.rfq_no || bid} — R${retryPrice.toFixed(2)}. Tap to view and accept.`,
+                  type: 'rfq_accepted',
+                  user_type: 'artisan',
+                  user_id: a.authUid || a.id,
+                  sp_doc_id: a.id,
+                  booking_id: bid,
+                  priority: 'high',
+                  read: false,
+                  created_at: admin.firestore.FieldValue.serverTimestamp(),
+                });
+              } catch (_) {}
+              try {
+                await admin.messaging().send({
+                  token: a.token,
+                  notification: { title: '🔔 New RFQ Job Available', body: `RFQ ${data.rfq_no || bid} — R${retryPrice.toFixed(2)}. Tap to view and accept.` },
+                  data: { type: 'rfq_accepted', booking_id: bid },
+                  android: { notification: { channelId: 'order_request_channel', sound: 'sound' } },
+                });
+              } catch (fcmErr) { console.warn(`[wa-tool] retry FCM to ${a.name} failed:`, fcmErr.message); }
+            }
+            assignedIds = artisanIds;
+            hasAssignedArtisan = true;
+            retryDispatched = chosen;
+            console.log(`[wa-tool] set_preferred_schedule retry dispatched RFQ ${bid} to ${chosen.length} artisan(s)`);
+            try {
+              await logErrorToAdmin(
+                'dispatch_retry_succeeded',
+                `RFQ ${bid} stuck in waiting_assignment was re-dispatched on schedule capture to ${chosen.length} active artisan(s). Backfill mainCategory/categories on serviceProvider docs to enable strict matching.`,
+                'whatsapp_bot.set_preferred_schedule',
+                '',
+                bid,
+                'medium'
+              );
+            } catch (_) {}
+          } else {
+            console.log(`[wa-tool] set_preferred_schedule retry: no eligible artisans for ${bid}`);
+          }
+        } catch (e) {
+          console.warn('[wa-tool] set_preferred_schedule retry dispatch failed:', e.message);
+        }
+      }
       const update = {
         scheduled_date: dateStr,
         scheduled_time: timeStr,
