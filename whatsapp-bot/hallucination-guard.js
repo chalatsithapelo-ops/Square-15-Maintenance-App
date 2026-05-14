@@ -18,8 +18,20 @@
 const PRICE_RE_GLOBAL = /R\s*(\d{1,3}(?:[ ,]\d{3})*(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)/gi;
 const PRICE_RE = /\bR\s*\d{1,3}(?:[ ,]\d{3})*(?:\.\d{1,2})?\b/i;
 
-const CANNED_RFQ_PROMPT_PREFIX = "Just to be sure — I don't have a fixed price";
-const CANNED_RFQ_PROMPT = "Just to be sure — I don't have a fixed price for that exact job in our catalog. Let me file a quick RFQ so our admin can put together a proper quote for you. Could you confirm: are you happy for our artisan to source the materials, or would you prefer to buy them yourself?";
+// CANNED replacement: ASK for a photo. The previous version promised
+// "Let me file a quick RFQ" / "Let me get that RFQ filed" without ever
+// invoking submit_rfq — a false claim, and it skipped the photo-ask
+// step that the RFQ flow legitimately needs (audit 2026-05-15 regression
+// report: photo prompt disappeared because guard replaced Lizzy's draft
+// with a fake "RFQ filed" message). Asking for a photo is honest (no
+// promise of action) AND lines up with the server-side PHOTO GATE in
+// submit_rfq, so the rest of the flow works naturally on the next turn.
+const CANNED_RFQ_PROMPT_PREFIX = "I don't have a fixed price for that exact job";
+const CANNED_RFQ_PROMPT = "I don't have a fixed price for that exact job in our catalog yet — our admin will need to put together a proper quote. Could you send me a quick photo of the spot where the work is needed? It helps our team scope and price it accurately.";
+// LOOP_BREAK_ACK kept exported for backwards-compat with tests, but no
+// longer emitted: on loop detection the guard now ALLOWS the original
+// reply through (the loop itself proves the canned prompt was the wrong
+// intervention). Keeping a fabricated ack would compound the lie.
 const LOOP_BREAK_ACK = "Got it — thanks for confirming. Let me get that RFQ filed; our admin will review and send a proper quote here on WhatsApp shortly. 🙏";
 
 // Normalise an R-amount capture so "R12,000" and "R12 000" both → "12000".
@@ -108,7 +120,13 @@ function decideGuardAction({ reply, toolReturnedPrice, sessionMessages, userMess
     return { action: 'allow', safeReply: reply, reason: 'user_echo' };
   }
   if (lastAssistantIsCannedPrompt(sessionMessages)) {
-    return { action: 'break_loop', safeReply: LOOP_BREAK_ACK, reason: 'loop_detected' };
+    // Loop detected: the previous turn already replaced Lizzy's reply
+    // with the photo-ask canned prompt and the model is STILL emitting
+    // an R-price. Sending another canned reply would loop AND a fake
+    // ack ("Let me get that RFQ filed") would lie about an action that
+    // never happened. Let the model's reply through — at this point any
+    // residual hallucinated price is less harmful than a false promise.
+    return { action: 'allow', safeReply: reply, reason: 'loop_detected_passthrough' };
   }
   return { action: 'replace', safeReply: CANNED_RFQ_PROMPT, reason: 'hallucinated_price' };
 }
