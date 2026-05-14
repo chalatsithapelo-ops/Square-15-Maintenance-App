@@ -6924,6 +6924,33 @@ async function handleMessage(session, userMessage, imageDataUrl) {
     // greeting them again. Bypass GPT entirely and submit the rating directly.
     try {
       const rawText = (typeof userMessage === 'string' ? userMessage : '').trim();
+      // Bugfix (live test May 2026): validate session.pendingRatingBookingId
+      // points to a recent rating request before honouring it. Otherwise an
+      // old un-rated booking from weeks ago will hijack every "5" reply.
+      const RATING_TTL_MS = 48 * 60 * 60 * 1000;
+      const _now = Date.now();
+      const _toMs = (ts) => {
+        if (!ts) return 0;
+        if (typeof ts === 'object' && typeof ts.toMillis === 'function') return ts.toMillis();
+        if (typeof ts === 'object' && ts._seconds) return ts._seconds * 1000;
+        if (typeof ts === 'string') return Date.parse(ts) || 0;
+        if (typeof ts === 'number') return ts;
+        return 0;
+      };
+      const _fresh = (ts) => { const ms = _toMs(ts); return ms > 0 && (_now - ms) < RATING_TTL_MS; };
+      if (session.pendingRatingBookingId) {
+        try {
+          const firestore = db();
+          if (firestore) {
+            const tmDoc = await firestore.collection('tasksManagement').doc(session.pendingRatingBookingId).get();
+            const td = tmDoc.exists ? (tmDoc.data() || {}) : null;
+            if (!td || td.rating || !_fresh(td.wa_rating_request_sent_at)) {
+              console.log(`[rating-intercept] clearing stale pendingRatingBookingId=${session.pendingRatingBookingId} (rated=${!!(td && td.rating)}, fresh=${!!(td && _fresh(td.wa_rating_request_sent_at))})`);
+              session.pendingRatingBookingId = null;
+            }
+          }
+        } catch { /* ignore — fall through */ }
+      }
       // Restore pendingRatingBookingId from Firestore if listener seeded it after
       // the in-memory session was last persisted (common after Render cold start).
       if (!session.pendingRatingBookingId) {
@@ -6940,6 +6967,7 @@ async function handleMessage(session, userMessage, imageDataUrl) {
               const td = d.data() || {};
               if (td.rating) continue;
               if (!td.wa_rating_request_sent_at) continue;
+              if (!_fresh(td.wa_rating_request_sent_at)) continue;
               session.pendingRatingBookingId = d.id;
               console.log(`[rating-intercept] restored pendingRatingBookingId=${d.id} for ${maskPhone(session.phone)} from Firestore`);
               break;
@@ -6951,6 +6979,7 @@ async function handleMessage(session, userMessage, imageDataUrl) {
               for (const d of q2.docs) {
                 const td = d.data() || {};
                 if (td.rating) continue;
+                if (!_fresh(td.wa_rating_request_sent_at)) continue;
                 const tmPhone = String(td.user_phone || td.customerPhone || td.phone || '').replace(/[^0-9]/g, '');
                 if (tmPhone && tmPhone.endsWith(last9)) {
                   session.pendingRatingBookingId = d.id;
