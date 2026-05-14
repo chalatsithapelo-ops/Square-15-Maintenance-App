@@ -7932,6 +7932,69 @@ app.post('/webhook', async (req, res) => {
 // Health check
 app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'rfq-spec-capture-v27', commit: process.env.RENDER_GIT_COMMIT || 'unknown', deployedAt: process.env.RENDER_DEPLOY_TIME || new Date().toISOString() }));
 
+// ============================================================================
+// DIAGNOSTIC: /debug/inject-message
+// Posts a message into the bot's normal pipeline AS IF it came from a real
+// WhatsApp webhook for the given phone. The bot processes it (handleMessage)
+// and sends a real WhatsApp reply via Meta API to that phone. Returns the
+// reply text so the caller can log what the user will actually see.
+// Auth: x-internal-secret header. Remove after live testing.
+// Body: { phone: "27821234567", text: "hello", reset?: true, contactName?: "Tester" }
+// ============================================================================
+app.post('/debug/inject-message', requireInternalSecret, async (req, res) => {
+  const { phone, text, reset, contactName } = req.body || {};
+  if (!phone || !text) return res.status(400).json({ error: 'phone and text required' });
+  const from = String(phone).replace(/[^\d]/g, '');
+  if (!from) return res.status(400).json({ error: 'invalid phone' });
+  try {
+    let reply = '';
+    let toolsCalled = [];
+    let sentChunks = 0;
+    await withPhoneLock(from, async () => {
+      if (reset) {
+        try { sessions.delete(from); } catch {}
+      }
+      if (isRateLimited(from)) {
+        reply = '[rate-limited]';
+        return;
+      }
+      const session = getSession(from);
+      await restoreSessionFromFirestore(session);
+      if (!session.linkedUserId) {
+        try {
+          const appUser = await findUserByPhone(session.phone);
+          if (appUser) session.linkedUserId = appUser.id;
+        } catch {}
+      }
+      const userText = String(text);
+      logChatMessage(from, 'incoming', userText, { messageType: 'text', linkedUserId: session.linkedUserId, displayName: contactName || 'LiveTest', source: 'inject' });
+      const r = await handleMessage(session, userText);
+      reply = r || '';
+      toolsCalled = session._lastToolsCalled || [];
+      if (!reply.trim()) {
+        await sendWhatsAppMessage(from, 'I could not generate a reply for that yet. Please rephrase your request, or send Hi to restart.');
+        sentChunks = 1;
+        return;
+      }
+      const now = Date.now();
+      if (session._lastReplyText === reply && (now - (session._lastReplyAt || 0)) < 30000) {
+        // duplicate guard — but for testing we still send so user sees it
+      }
+      session._lastReplyText = reply;
+      session._lastReplyAt = now;
+      logChatMessage(from, 'outgoing', reply, { linkedUserId: session.linkedUserId, displayName: contactName || 'LiveTest', toolsCalled, source: 'inject' });
+      const chunks = reply.match(/.{1,4000}/gs) || [reply];
+      for (const chunk of chunks) {
+        try { await sendWhatsAppMessage(from, chunk); sentChunks++; } catch (e) { console.error('[inject] send failed:', e && e.message); }
+      }
+    });
+    return res.json({ ok: true, reply, toolsCalled, sentChunks, phone: from });
+  } catch (e) {
+    console.error('[inject-message] error:', e && (e.stack || e.message));
+    return res.status(500).json({ error: String(e && e.message || e) });
+  }
+});
+
 // Diagnostic: run buildersSearchOptions live and report what happens.
 // GET /diag/builders?q=shower+mixer&limit=3
 // Auth: requires x-internal-secret header (admin-only diagnostic).
