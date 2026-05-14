@@ -7356,8 +7356,8 @@ async function handleMessage(session, userMessage, imageDataUrl) {
     // ─────────────────────────────────────────────────────────────────────
     let safeReply = reply;
     try {
-      const PRICE_RE = /\bR\s*\d{1,3}(?:[ ,]\d{3})*(?:\.\d{1,2})?\b/i;
-      if (PRICE_RE.test(reply)) {
+      const _hg = require('./hallucination-guard');
+      if (_hg.PRICE_RE.test(reply)) {
         const PRICE_TOOLS = new Set([
           'lookup_pricing','create_booking','submit_rfq','accept_rfq_quote',
           'check_rfq_status','reject_rfq_quote','request_payment_link',
@@ -7375,16 +7375,46 @@ async function handleMessage(session, userMessage, imageDataUrl) {
           if (m.role === 'assistant' && Array.isArray(m.tool_calls)) break; // older round
           if (m.role !== 'tool') continue;
           const txt = typeof m.content === 'string' ? m.content : '';
-          if (PRICE_RE.test(txt)) { toolReturnedPrice = true; break; }
+          if (_hg.PRICE_RE.test(txt)) { toolReturnedPrice = true; break; }
           // Numeric grand_total / fixedPrice fields.
           if (/"(grand_total|fixedPrice|cost|total|quoted_price|amount)"\s*:\s*("?R?\s*\d|[1-9]\d*)/i.test(txt)) {
             toolReturnedPrice = true; break;
           }
         }
-        if (!toolReturnedPrice) {
+
+        const decision = _hg.decideGuardAction({
+          reply,
+          toolReturnedPrice,
+          sessionMessages: session.messages,
+          userMessage,
+        });
+        if (decision.action === 'allow') {
+          // Either tools justified the price, or the user themselves typed
+          // it and Lizzy is just echoing — leave the reply untouched.
+          if (decision.reason === 'user_echo') {
+            console.log(`[hallucination-guard] allow — user-echoed price (tools this turn: ${calledThisTurn.join(',') || 'none'})`);
+          }
+        } else if (decision.action === 'break_loop') {
+          // The previous assistant message was already the canned RFQ
+          // prompt — repeating it would loop. Log + send an ack instead.
+          console.warn(`[hallucination-guard] LOOP DETECTED — canned prompt was already sent last turn. Breaking loop.`);
+          console.warn(`[hallucination-guard] Original draft: ${reply.substring(0,200)}`);
+          try {
+            await logErrorToAdmin(
+              'hallucination_guard_loop_break',
+              `Guard would have repeated canned RFQ prompt; broke loop. user="${(typeof userMessage === 'string' ? userMessage : '').substring(0,200)}"`,
+              'whatsapp_bot.handleMessage.hallucinationGuard',
+              '',
+              session.phone,
+              'medium'
+            );
+          } catch (_) {}
+          safeReply = decision.safeReply;
+        } else {
+          // action === 'replace'
           console.warn(`[hallucination-guard] Stripping R-price from reply (tools this turn: ${calledThisTurn.join(',') || 'none'})`);
           console.warn(`[hallucination-guard] Original reply: ${reply.substring(0,200)}`);
-          safeReply = "Just to be sure — I don't have a fixed price for that exact job in our catalog. Let me file a quick RFQ so our admin can put together a proper quote for you. Could you confirm: are you happy for our artisan to source the materials, or would you prefer to buy them yourself?";
+          safeReply = decision.safeReply;
         }
       }
     } catch (guardErr) {
