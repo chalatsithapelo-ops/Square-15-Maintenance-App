@@ -8211,7 +8211,7 @@ app.post('/debug/artisan-accept', requireInternalSecret, async (req, res) => {
       service_provider_id: artisanId,
       service_provider_name: aName,
       status: 'pending_payment',
-      rfq_status: 'pending_artisan_acceptance',
+      rfq_status: 'accepted',
       artisan_accepted_at: new Date().toISOString(),
     };
     await firestore.collection('futureBookings').doc(main).set(updates, { merge: true });
