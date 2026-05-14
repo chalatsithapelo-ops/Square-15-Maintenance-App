@@ -223,7 +223,7 @@ const WA_API = 'https://graph.facebook.com/v19.0';
 async function sendWhatsAppMessage(to, text) {
   const phoneId = process.env.WHATSAPP_PHONE_NUMBER_ID;
   const token   = process.env.WHATSAPP_ACCESS_TOKEN;
-  if (!phoneId || !token) { console.error('[wa] Missing credentials'); return; }
+  if (!phoneId || !token) { console.error('[wa] Missing credentials'); return { ok: false, error: 'no_credentials' }; }
 
   try {
     const res = await fetch(`${WA_API}/${phoneId}/messages`, {
@@ -240,9 +240,15 @@ async function sendWhatsAppMessage(to, text) {
       }),
       signal: AbortSignal.timeout(15000),
     });
-    if (!res.ok) console.error('[wa] send failed:', await res.text());
+    if (!res.ok) {
+      const errText = await res.text();
+      console.error('[wa] send failed:', errText);
+      return { ok: false, status: res.status, error: errText.slice(0, 500) };
+    }
+    return { ok: true };
   } catch (e) {
     console.error('[wa] sendWhatsAppMessage error:', e.message);
+    return { ok: false, error: String(e.message) };
   }
 }
 
@@ -8823,7 +8829,7 @@ app.post('/api/send-rfq-response', requireInternalSecret, async (req, res) => {
 // ─── App → WhatsApp: Notify client of artisan job lifecycle events ───
 app.post('/api/job-status-update', requireInternalSecret, async (req, res) => {
   try {
-    const { bookingId, status, artisanName, imageUrl } = req.body || {};
+    const { bookingId, status, artisanName, imageUrl, force } = req.body || {};
     if (!bookingId || !status) return res.status(400).json({ error: 'bookingId and status required' });
 
     const firestore = db();
@@ -8912,7 +8918,7 @@ app.post('/api/job-status-update', requireInternalSecret, async (req, res) => {
         : s === 'completed' ? 'wa_lifecycle_completed_sent_at'
         : '';
       const httpFlagKey = flagFor(status);
-      const alreadySent = httpFlagKey && (
+      const alreadySent = httpFlagKey && !force && (
         tmData[httpFlagKey] || fbData[httpFlagKey] ||
         linkedTmData[httpFlagKey] || linkedFbData[httpFlagKey]
       );
@@ -8924,7 +8930,10 @@ app.post('/api/job-status-update', requireInternalSecret, async (req, res) => {
       console.warn('[api/job-status-update] idempotency check failed:', e.message);
     }
 
-    await sendWhatsAppMessage(to, msg);
+    const sendResult = await sendWhatsAppMessage(to, msg);
+    if (sendResult && sendResult.ok === false) {
+      console.error('[api/job-status-update] WA send failed:', sendResult.error);
+    }
 
     // ── Safety: when the artisan is on the way, send their profile photo so
     //    the customer knows who is arriving (parity with the in-app feature). ──
@@ -9108,7 +9117,7 @@ app.post('/api/job-status-update', requireInternalSecret, async (req, res) => {
       data: { type: 'job_status_update', booking_id: mainBookingId, status },
     });
 
-    res.json({ success: true, to, status });
+    res.json({ success: true, to, status, sendResult: sendResult || null });
   } catch (err) {
     console.error('[api/job-status-update] error:', err.message);
     res.status(500).json({ error: err.message });
