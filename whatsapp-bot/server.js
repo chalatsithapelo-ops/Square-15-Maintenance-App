@@ -6805,7 +6805,7 @@ PAYMENT FLOW (CRITICAL):
 - WAIT for the customer to choose "full" or "deposit" before calling request_payment_link.
 - Pass the customer's choice as the paymentType parameter ("full" or "deposit").
 - Do NOT call request_payment_link without first asking and getting the customer's payment type choice.
-- WALLET PAYMENT: If the customer EXPLICITLY says "from my wallet", "use my wallet", "pay from wallet", or any clear wallet intent, call `pay_with_wallet` with the bookingId — do NOT call request_payment_link in that case. The wallet tool handles deposit/balance automatically based on booking state.
+- WALLET PAYMENT: If the customer EXPLICITLY says "from my wallet", "use my wallet", "pay from wallet", or any clear wallet intent, call pay_with_wallet with the bookingId — do NOT call request_payment_link in that case. The wallet tool handles deposit/balance automatically based on booking state.
 - If the customer asks about wallet balance only (no payment intent), call check_wallet_balance.
 - Do NOT refuse or block payment based on conversation history alone. The function checks real-time booking status in the database.
 - If an artisan hasn't accepted yet, the function itself will return an appropriate message.
