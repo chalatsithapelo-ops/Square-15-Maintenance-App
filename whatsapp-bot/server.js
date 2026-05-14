@@ -8291,7 +8291,34 @@ app.get('/debug/inspect-booking', requireInternalSecret, async (req, res) => {
   }
 });
 
-// Diagnostic: run buildersSearchOptions live and report what happens.
+// Diagnostic: send a real FCM ping to an artisan to verify their token is alive.
+// POST /debug/test-fcm-artisan  body: { artisanId, title?, body? }
+app.post('/debug/test-fcm-artisan', requireInternalSecret, async (req, res) => {
+  try {
+    const { artisanId, title, body } = req.body || {};
+    if (!artisanId) return res.status(400).json({ error: 'artisanId required' });
+    const firestore = db();
+    if (!firestore) return res.status(503).json({ error: 'firestore unavailable' });
+    const snap = await firestore.collection('serviceProvider').doc(artisanId).get();
+    if (!snap.exists) return res.status(404).json({ error: 'artisan not found' });
+    const ad = snap.data() || {};
+    const token = String(ad.fcm_token || ad.deviceToken || ad.fcmToken || '').trim();
+    if (!token) return res.json({ ok: false, error: 'no_token_on_doc', tokenFields: { fcm_token: !!ad.fcm_token, deviceToken: !!ad.deviceToken, fcmToken: !!ad.fcmToken } });
+    try {
+      const msgId = await admin.messaging().send({
+        token,
+        notification: { title: title || 'Square 15 test ping', body: body || 'If you see this, FCM is working.' },
+        data: { type: 'debug_test', ts: String(Date.now()) },
+        android: { priority: 'high' },
+      });
+      return res.json({ ok: true, messageId: msgId, artisanId, tokenPrefix: token.slice(0, 16) + '...' });
+    } catch (e) {
+      return res.json({ ok: false, error: e.code || e.message, errorDetail: String(e.message).slice(0, 300), tokenPrefix: token.slice(0, 16) + '...' });
+    }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 // GET /diag/builders?q=shower+mixer&limit=3
 // Auth: requires x-internal-secret header (admin-only diagnostic).
 app.get('/diag/builders', requireInternalSecret, async (req, res) => {
