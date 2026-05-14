@@ -7690,11 +7690,19 @@ app.post('/webhook', async (req, res) => {
       let userText = '';
 
       try {
+      // CRITICAL-1 fix (audit 2026-05-15): serialise per-phone so concurrent
+      // webhook deliveries (Meta retries / rapid bursts) cannot interleave
+      // session mutations (lastBookingId, lastRfqId, photoUrls, promoCode,
+      // messages[]). withPhoneLock chains promises keyed by phone — different
+      // phones still parallelise. `continue` inside this block is replaced
+      // with `return` so the arrow exits the locked critical section and the
+      // outer for-loop iterates to the next message naturally.
+      await withPhoneLock(from, async () => {
 
       // Rate-limit check (prevents abuse / runaway OpenAI costs)
       if (isRateLimited(from)) {
         console.warn(`[webhook] Rate limited: ${from}`);
-        continue;
+        return;
       }
 
       const session = getSession(from);
@@ -7718,7 +7726,7 @@ app.post('/webhook', async (req, res) => {
       switch (msg.type) {
         case 'text':
           userText = (msg.text && typeof msg.text.body === 'string') ? msg.text.body : '';
-          if (!userText) { continue; }
+          if (!userText) { return; }
           break;
         case 'interactive':
           // Button replies and list replies
@@ -7739,7 +7747,7 @@ app.post('/webhook', async (req, res) => {
               from,
               'I could not download your photo. Please send the photo again, or describe the issue in text.'
             );
-            continue;
+            return;
           }
 
           // Upload to Firebase Storage so artisans can see it alongside the job.
@@ -7763,7 +7771,7 @@ app.post('/webhook', async (req, res) => {
             approxBytes,
             supportedVisionMime,
           });
-          continue;
+          return;
         }
         case 'document': {
           // BHV-9: previously the placeholder text was passed to GPT but the
@@ -7775,7 +7783,7 @@ app.post('/webhook', async (req, res) => {
             `Thanks${fname ? ` for "${fname}"` : ''}! I can't read documents (PDFs, Word, etc.) yet. Please describe your issue in a text message, or send a photo of the problem and I'll take it from there.`
           );
           logChatMessage(from, 'incoming', `[document: ${fname || 'unknown'}]`, { messageType: 'document', linkedUserId: session.linkedUserId, displayName: _contactName });
-          continue;
+          return;
         }
         case 'audio': {
           // Transcribe voice note via Whisper
@@ -7800,7 +7808,7 @@ app.post('/webhook', async (req, res) => {
               from,
               'I could not transcribe that voice note. Please try sending it again, or type your request in text.'
             );
-            continue;
+            return;
           }
           break;
         }
@@ -7855,7 +7863,7 @@ app.post('/webhook', async (req, res) => {
             );
             session._stickerNudged = true; // only nudge once per session to avoid spam
           }
-          continue;
+          return;
         }
         default: {
           // BHV-9: previously the placeholder text was passed to GPT but the
@@ -7864,11 +7872,11 @@ app.post('/webhook', async (req, res) => {
             from,
             `I can't process "${msg.type}" messages yet. Please send a text describing your issue or a photo of the problem.`
           );
-          continue;
+          return;
         }
       }
 
-      if (!userText.trim()) continue;
+      if (!userText.trim()) return;
 
       // Truncate excessively long messages to prevent OpenAI token abuse
       if (userText.length > 10000) {
@@ -7887,7 +7895,7 @@ app.post('/webhook', async (req, res) => {
           from,
           'I could not generate a reply for that yet. Please rephrase your request, or send Hi to restart.'
         );
-        continue;
+        return;
       }
 
       // Duplicate-reply guard (30s window) — protects against Meta retry storms
@@ -7896,7 +7904,7 @@ app.post('/webhook', async (req, res) => {
         const now = Date.now();
         if (session._lastReplyText === reply && (now - (session._lastReplyAt || 0)) < 30000) {
           console.log(`[webhook] ${from}: suppressed duplicate reply`);
-          continue;
+          return;
         }
         session._lastReplyText = reply;
         session._lastReplyAt = now;
@@ -7910,6 +7918,7 @@ app.post('/webhook', async (req, res) => {
       for (const chunk of chunks) {
         await sendWhatsAppMessage(from, chunk);
       }
+      }); // end withPhoneLock (CRITICAL-1 fix)
       } catch (msgErr) {
         console.error(`[webhook] Message processing failed for ${from}:`, msgErr);
         await notifyWebhookProcessingFailure(from, msgErr, userText);
@@ -9483,8 +9492,14 @@ function startArtisanAcceptanceListener() {
             } catch (e) { console.warn(`[artisan-accept-listener] photo send failed for ${rfqId}:`, e.message); }
             // Flag was already stamped above before sending; don't re-write here.
             console.log(`[artisan-accept-listener] sent acceptance WA to ${to} for ${rfqId} (artisan=${artisanName})`);
+            // CRITICAL-2 fix (audit 2026-05-15): previously silent catch
+            // left tasksManagement stale (showing pending_artisan_acceptance)
+            // while futureBookings showed pending_payment. Admin dashboards
+            // and payment-status queries that hit TM then saw the wrong
+            // state, causing duplicate dispatches and stuck payments.
+            // Retry once, then surface to admin so ops can reconcile.
             try {
-              await firestore.collection('tasksManagement').doc(rfqId).set({
+              const tmPayload = {
                 accept: '1',
                 artisan_confirmed: 'yes',
                 status: 'pending_payment',
@@ -9495,8 +9510,27 @@ function startArtisanAcceptanceListener() {
                 cost: costNum.toFixed(2), total_cost: costNum.toFixed(2),
                 description: descStr,
                 updated_at: new Date().toISOString(),
-              }, { merge: true });
-            } catch (_) {}
+              };
+              try {
+                await firestore.collection('tasksManagement').doc(rfqId).set(tmPayload, { merge: true });
+              } catch (firstErr) {
+                console.warn(`[artisan-accept-listener] TM update failed (retrying): ${firstErr.message}`);
+                await new Promise(r => setTimeout(r, 500));
+                await firestore.collection('tasksManagement').doc(rfqId).set(tmPayload, { merge: true });
+              }
+            } catch (tmErr) {
+              console.error(`[artisan-accept-listener] TM update FAILED for ${rfqId}: ${tmErr && tmErr.message}`);
+              try {
+                await logErrorToAdmin(
+                  'tm_sync_failure_artisan_accept',
+                  `Booking ${rfqId}: futureBookings updated to pending_payment but tasksManagement update failed after retry. Manual reconciliation needed so admin views + payment listeners see correct state. Error: ${tmErr && tmErr.message}`,
+                  'whatsapp_bot.startArtisanAcceptanceListener',
+                  tmErr && tmErr.message || '',
+                  rfqId,
+                  'critical'
+                );
+              } catch (_) {}
+            }
             // Update the customer's WA session so the next "pay deposit"/
             // "pay full" intercept resolves to THIS newly-accepted booking.
             try {
