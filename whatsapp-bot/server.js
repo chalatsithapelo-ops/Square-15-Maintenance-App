@@ -8253,6 +8253,44 @@ app.post('/debug/set-booking-status', requireInternalSecret, async (req, res) =>
   }
 });
 
+// Diagnostic: inspect a booking — show dispatch + status fields used in the flow.
+app.get('/debug/inspect-booking', requireInternalSecret, async (req, res) => {
+  try {
+    const bid = String(req.query.bookingId || '').trim();
+    if (!bid) return res.status(400).json({ error: 'bookingId required' });
+    const firestore = db();
+    if (!firestore) return res.status(503).json({ error: 'firestore unavailable' });
+    const out = { bookingId: bid, futureBookings: null, tasksManagement: null };
+    const fb = await firestore.collection('futureBookings').doc(bid).get();
+    if (fb.exists) {
+      const d = fb.data();
+      out.futureBookings = {
+        status: d.status, rfq_status: d.rfq_status, category: d.category_name || d.category,
+        service_provider_id: d.service_provider_id, service_provider_name: d.service_provider_name,
+        rfq_assigned_artisan_ids: d.rfq_assigned_artisan_ids || null,
+        cost: d.cost, payment_status: d.payment_status, payment_type: d.payment_type, balance_paid: d.balance_paid,
+        wa_artisan_images_1_sent_at: d.wa_artisan_images_1_sent_at,
+        wa_artisan_images_2_sent_at: d.wa_artisan_images_2_sent_at,
+        wa_lifecycle_progress_sent_at: d.wa_lifecycle_progress_sent_at,
+        wa_lifecycle_completed_sent_at: d.wa_lifecycle_completed_sent_at,
+      };
+    }
+    const tm = await firestore.collection('tasksManagement').doc(bid).get();
+    if (tm.exists) {
+      const d = tm.data();
+      out.tasksManagement = {
+        status: d.status, rfq_status: d.rfq_status, category: d.category_name || d.category,
+        service_provider_id: d.service_provider_id, service_provider_name: d.service_provider_name,
+        rfq_assigned_artisan_ids: d.rfq_assigned_artisan_ids || null,
+        cost: d.cost, payment_status: d.payment_status, payment_type: d.payment_type, balance_paid: d.balance_paid,
+      };
+    }
+    res.json(out);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Diagnostic: run buildersSearchOptions live and report what happens.
 // GET /diag/builders?q=shower+mixer&limit=3
 // Auth: requires x-internal-secret header (admin-only diagnostic).
@@ -8956,31 +8994,9 @@ app.post('/api/job-status-update', requireInternalSecret, async (req, res) => {
       console.error('[api/job-status-update] WA send failed:', sendResult.error);
     }
 
-    // ── Safety: when the artisan is on the way, send their profile photo so
-    //    the customer knows who is arriving (parity with the in-app feature). ──
-    if (status === 'progress') {
-      try {
-        // Resolve artisan id from whichever doc we already loaded.
-        let spId = '';
-        try {
-          const tmSnap = await firestore.collection('tasksManagement').doc(mainBookingId).get();
-          if (tmSnap.exists) spId = String((tmSnap.data() || {}).service_provider_id || '').trim();
-        } catch (_) {}
-        if (!spId) {
-          try {
-            const fbSnap2 = await firestore.collection('futureBookings').doc(mainBookingId).get();
-            if (fbSnap2.exists) spId = String((fbSnap2.data() || {}).service_provider_id || '').trim();
-          } catch (_) {}
-        }
-        if (spId) {
-          const prof = await getArtisanProfile(firestore, spId);
-          if (prof.imageUrl) {
-            const who = prof.name || name;
-            await sendWhatsAppImage(to, prof.imageUrl, `👷 ${who} is on the way to booking #${ref}. For your safety, please confirm this is the person who arrives at your door.`);
-          }
-        }
-      } catch (e) { console.warn('[job-status-update] artisan photo send failed:', e.message); }
-    }
+    // NOTE: artisan profile photo is sent ONCE on artisan-accept (the "Meet
+    // [name]" intro). Do NOT re-send it on status=progress — that produced
+    // duplicate identity messages in production.
 
     // Set the flag IMMEDIATELY after sending so any concurrent listener pass skips.
     // Mirror to BOTH tasksManagement and futureBookings — the futureBookings listener
