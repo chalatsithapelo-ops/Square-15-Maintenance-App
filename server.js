@@ -8130,6 +8130,47 @@ app.get('/debug/find-auth-uid', requireInternalSecret, async (req, res) => {
   }
 });
 
+// 4d) Backfill artisan Firebase Auth UID on every serviceProvider doc that is
+//     missing it. Looks up Auth by email and writes `uid` field. Idempotent.
+//     Required so FCM pushes (keyed by auth.uid) actually reach the artisan.
+//     POST /debug/backfill-artisan-uids?dryRun=1 to preview without writing.
+app.post('/debug/backfill-artisan-uids', requireInternalSecret, async (req, res) => {
+  try {
+    const dryRun = String(req.query.dryRun || req.body?.dryRun || '') === '1';
+    const firestore = db();
+    if (!firestore) return res.status(503).json({ error: 'firestore unavailable' });
+    const snap = await firestore.collection('serviceProvider').limit(2000).get();
+    const results = { scanned: snap.size, alreadyOk: 0, fixed: 0, noEmail: 0, noAuthMatch: 0, errors: 0, fixes: [], skipped: [] };
+    for (const d of snap.docs) {
+      const x = d.data() || {};
+      const existing = String(x.uid || x.userId || '').trim();
+      const email = String(x.email || x.userEmail || x.contact_email || '').trim().toLowerCase();
+      if (existing) { results.alreadyOk += 1; continue; }
+      if (!email) { results.noEmail += 1; results.skipped.push({ id: d.id, reason: 'no_email', name: x.name || x.userName || null }); continue; }
+      try {
+        const u = await admin.auth().getUserByEmail(email);
+        if (!dryRun) {
+          await firestore.collection('serviceProvider').doc(d.id).update({ uid: u.uid, updated_at: new Date().toISOString() });
+        }
+        results.fixed += 1;
+        results.fixes.push({ id: d.id, email, uid: u.uid, name: x.name || x.userName || null });
+      } catch (e) {
+        if (String(e.code || '').includes('user-not-found')) {
+          results.noAuthMatch += 1;
+          results.skipped.push({ id: d.id, email, reason: 'no_auth_user' });
+        } else {
+          results.errors += 1;
+          results.skipped.push({ id: d.id, email, reason: e.code || e.message });
+        }
+      }
+    }
+    results.dryRun = dryRun;
+    res.json(results);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // 4b) Find artisan by email/name (for picking the test artisan).
 app.get('/debug/find-artisan', requireInternalSecret, async (req, res) => {
   try {
