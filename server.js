@@ -8104,8 +8104,30 @@ app.post('/debug/quote-rfq', requireInternalSecret, async (req, res) => {
   }
 });
 
+// 4b) Find artisan by email/name (for picking the test artisan).
+app.get('/debug/find-artisan', requireInternalSecret, async (req, res) => {
+  try {
+    const email = String(req.query.email || '').trim().toLowerCase();
+    const name = String(req.query.name || '').trim().toLowerCase();
+    const firestore = db();
+    if (!firestore) return res.status(503).json({ error: 'firestore unavailable' });
+    const snap = await firestore.collection('service_providers').limit(500).get();
+    const matches = [];
+    for (const d of snap.docs) {
+      const x = d.data() || {};
+      const eml = String(x.email || x.emailAddress || '').toLowerCase();
+      const nm = String(x.name || x.fullName || x.businessName || '').toLowerCase();
+      if ((email && eml === email) || (name && nm.includes(name))) {
+        matches.push({ id: d.id, name: x.name || x.fullName || x.businessName || null, email: x.email || x.emailAddress || null, phone: x.phone || x.contact || null, status: x.status || null });
+      }
+    }
+    res.json({ count: matches.length, matches });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // 5) Simulate artisan acceptance: set accept=1 + artisan_confirmed=yes,
-//    then call the existing /api/artisan-accepted webhook logic.
 //    Body: { bookingId, artisanId, artisanName? }
 app.post('/debug/artisan-accept', requireInternalSecret, async (req, res) => {
   try {
