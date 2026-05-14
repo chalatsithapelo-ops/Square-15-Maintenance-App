@@ -7981,15 +7981,25 @@ app.post('/debug/inject-message', requireInternalSecret, async (req, res) => {
     let sentChunks = 0;
     let lastBookingId = null, lastRfqId = null;
     await withPhoneLock(from, async () => {
-      if (reset) { try { sessions.delete(from); } catch {} }
+      if (reset) {
+        try { sessions.delete(from); } catch {}
+        try { const f = db(); if (f) await f.collection('wa_sessions').doc(from).delete(); } catch {}
+      }
       if (isRateLimited(from)) { reply = '[rate-limited]'; return; }
       const session = getSession(from);
-      await restoreSessionFromFirestore(session);
+      if (!reset) await restoreSessionFromFirestore(session);
       if (!session.linkedUserId) {
         try { const u = await findUserByPhone(session.phone); if (u) session.linkedUserId = u.id; } catch {}
       }
       const userText = String(text || '');
       logChatMessage(from, 'incoming', userText, { messageType: imageDataUrl ? 'image' : 'text', linkedUserId: session.linkedUserId, displayName: contactName || 'E2ETest', source: 'inject' });
+      // Mirror real webhook behaviour: when an image arrives, also persist a
+      // marker URL into session.photoUrls so downstream tools (submit_rfq
+      // photo gate, RFQ work_images) treat the photo as received.
+      if (imageDataUrl) {
+        if (!Array.isArray(session.photoUrls)) session.photoUrls = [];
+        session.photoUrls.push('https://test/e2e-injected-photo.jpg');
+      }
       const r = imageDataUrl ? await handleMessage(session, userText, [imageDataUrl]) : await handleMessage(session, userText);
       reply = r || '';
       toolsCalled = session._lastToolsCalled || [];
@@ -8099,6 +8109,22 @@ app.post('/debug/quote-rfq', requireInternalSecret, async (req, res) => {
     await firestore.collection('futureBookings').doc(rfqId).set(updates, { merge: true });
     try { await firestore.collection('tasksManagement').doc(rfqId).set(updates, { merge: true }); } catch {}
     res.json({ ok: true, rfqId, updates });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 4c) Look up Firebase Auth UID by email (returns null if not in Auth).
+app.get('/debug/find-auth-uid', requireInternalSecret, async (req, res) => {
+  try {
+    const email = String(req.query.email || '').trim().toLowerCase();
+    if (!email) return res.status(400).json({ error: 'email required' });
+    try {
+      const u = await admin.auth().getUserByEmail(email);
+      return res.json({ email, uid: u.uid, displayName: u.displayName || null, phone: u.phoneNumber || null, disabled: u.disabled, providers: (u.providerData || []).map(p => p.providerId) });
+    } catch (e) {
+      return res.json({ email, uid: null, error: e.code || e.message });
+    }
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
