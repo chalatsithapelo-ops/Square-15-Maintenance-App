@@ -8033,7 +8033,7 @@ app.get('/debug/test-info', requireInternalSecret, async (req, res) => {
     // Pick first active artisan with at least basic info
     let artisan = null;
     try {
-      const snap = await firestore.collection('service_providers').limit(20).get();
+      const snap = await firestore.collection('serviceProvider').limit(20).get();
       for (const d of snap.docs) {
         const x = d.data() || {};
         if (x.status && String(x.status).toLowerCase() === 'inactive') continue;
@@ -8111,14 +8111,14 @@ app.get('/debug/find-artisan', requireInternalSecret, async (req, res) => {
     const name = String(req.query.name || '').trim().toLowerCase();
     const firestore = db();
     if (!firestore) return res.status(503).json({ error: 'firestore unavailable' });
-    const snap = await firestore.collection('service_providers').limit(500).get();
+    const snap = await firestore.collection('serviceProvider').limit(500).get();
     const matches = [];
     for (const d of snap.docs) {
       const x = d.data() || {};
-      const eml = String(x.email || x.emailAddress || '').toLowerCase();
-      const nm = String(x.name || x.fullName || x.businessName || '').toLowerCase();
+      const eml = String(x.email || x.userEmail || x.contact_email || '').toLowerCase();
+      const nm = String(x.name || x.userName || x.full_name || x.businessName || '').toLowerCase();
       if ((email && eml === email) || (name && nm.includes(name))) {
-        matches.push({ id: d.id, name: x.name || x.fullName || x.businessName || null, email: x.email || x.emailAddress || null, phone: x.phone || x.contact || null, status: x.status || null });
+        matches.push({ id: d.id, authUid: x.uid || x.userId || null, name: x.name || x.userName || x.full_name || null, email: x.email || x.userEmail || null, mainCategory: x.mainCategory || null, status: x.status || null, active: x.active });
       }
     }
     res.json({ count: matches.length, matches });
