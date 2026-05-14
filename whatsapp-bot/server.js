@@ -4978,7 +4978,14 @@ async function executeWaTool(name, args, session) {
               ...reDispatchUpdate,
               is_rfq: 'yes',
               booking_id: bid,
+              // Both camelCase and snake_case for cross-client compatibility.
+              // The Flutter client reads `future_booking_id` (snake) — without
+              // this the "Review Quote & Earnings" / profit-analysis button
+              // never renders for an RFQ candidate.
               futureBookingId: bid,
+              future_booking_id: bid,
+              source: 'whatsapp_rfq',
+              order_type: 'rfq',
             }, { merge: true });
             await reBatch.commit();
             for (const a of chosen) {
@@ -6110,7 +6117,12 @@ async function executeWaTool(name, args, session) {
                   // basics even when the doc is being created here.
                   is_rfq: 'yes',
                   booking_id: rfqId,
+                  // Both camelCase + snake_case so all clients can resolve
+                  // the linked futureBookings doc (Flutter reads snake_case).
                   futureBookingId: rfqId,
+                  future_booking_id: rfqId,
+                  source: 'whatsapp_rfq',
+                  order_type: 'rfq',
                   updated_at: new Date().toISOString(),
                 },
                 { merge: true }
@@ -8134,6 +8146,19 @@ app.post('/api/artisan-accepted', requireInternalSecret, async (req, res) => {
       return res.status(404).json({ error: 'No customer phone found for booking' });
     }
 
+    // ── Atomic dedup claim (May 14 2026) ──
+    // Belt-and-braces: the early check above catches the obvious case, but
+    // does NOT close the millisecond race against the snapshot listener.
+    // claimArtisanAcceptanceSend() uses a Firestore transaction (atomic
+    // check-and-set of wa_artisan_acceptance_sent_at) plus a shared
+    // in-memory Set, so only one of {HTTP webhook, snapshot listener}
+    // can win the right to send the customer message.
+    const _claim = await claimArtisanAcceptanceSend(firestore, mainBookingId);
+    if (!_claim.claimed) {
+      console.log(`[api/artisan-accepted] booking ${mainBookingId} claim refused (${_claim.reason}) — skipping duplicate notification`);
+      return res.json({ ok: true, deduped: true, reason: _claim.reason });
+    }
+
     // Extract artisan ID from bridge bookingId (e.g. WA-XXX_artisanId → artisanId)
     const artisanId = bookingId.includes('_') ? bookingId.split('_').slice(1).join('_') : '';
 
@@ -8161,18 +8186,31 @@ app.post('/api/artisan-accepted', requireInternalSecret, async (req, res) => {
         ...(orderNo && { order_no: orderNo }),
         ...(bookingCost && { cost: bookingCost, total_cost: bookingCost }),
         ...(bookingDescription && { description: bookingDescription }),
+        // BUG-FIX (May 13 2026): clear stale timeout_escalated flag so the
+        // admin dashboard shows the booking as assigned again on late-accept.
+        // Admin can still manually re-assign via the normal admin flows.
+        ...(mainRfqStatus === 'timeout_escalated' && {
+          rfq_status: 'accepted',
+          late_accept_at: new Date().toISOString(),
+        }),
         updated_at: new Date().toISOString(),
       }, { merge: true });
     } catch (e) { console.warn('[api/artisan-accepted] main doc update failed:', e.message); }
 
-    // Also update futureBookings to ensure consistency.
-    // Stamp the dedup flag BEFORE sending so a racing snapshot listener tick
-    // sees it and bails out instead of sending a second copy.
+    // Also update futureBookings to ensure consistency. The dedup flag
+    // (wa_artisan_acceptance_sent_at) is already written atomically by
+    // claimArtisanAcceptanceSend() above, so we don't re-write it here.
     try {
       await firestore.collection('futureBookings').doc(mainBookingId).set({
         artisan_confirmed: 'yes',
         status: 'pending_payment',
-        wa_artisan_acceptance_sent_at: new Date().toISOString(),
+        ...(artisanId && { service_provider_id: artisanId }),
+        ...(artisanName && { service_provider_name: artisanName }),
+        // Clear stale timeout flag on late accept.
+        ...(mainRfqStatus === 'timeout_escalated' && {
+          rfq_status: 'accepted',
+          late_accept_at: new Date().toISOString(),
+        }),
         updated_at: new Date().toISOString(),
       }, { merge: true });
     } catch (e) { console.warn('[api/artisan-accepted] futureBookings update failed:', e.message); }
@@ -8205,8 +8243,18 @@ app.post('/api/artisan-accepted', requireInternalSecret, async (req, res) => {
     msg += `💸 *Not happy with the work?* Reply *"refund"* or *"complaint"* — we'll investigate before any money is released.\n`;
     msg += `\nReply anytime if you have questions! 😊`;
 
-    await sendWhatsAppMessage(to, msg);
-    console.log(`[api/artisan-accepted] Sent acceptance notification to ${to} for booking ${mainBookingId}`);
+    let _sendFailed = false;
+    try {
+      await sendWhatsAppMessage(to, msg);
+      console.log(`[api/artisan-accepted] Sent acceptance notification to ${to} for booking ${mainBookingId}`);
+    } catch (sendErr) {
+      _sendFailed = true;
+      console.error(`[api/artisan-accepted] sendWhatsAppMessage failed for ${mainBookingId}:`, sendErr.message);
+      // Roll back the dedup flag so a retry can re-send. Release the
+      // in-memory claim too so a follow-up listener tick isn't blocked.
+      await releaseArtisanAcceptanceClaim(firestore, mainBookingId, { rollback: true });
+      return res.status(502).json({ error: 'whatsapp_send_failed', message: sendErr.message });
+    }
 
     // ── Send artisan profile photo so customer can recognise who's coming. ──
     try {
@@ -8261,6 +8309,9 @@ app.post('/api/artisan-accepted', requireInternalSecret, async (req, res) => {
       console.warn('[api/artisan-accepted] session update failed:', e && e.message);
     }
 
+    // Release the in-memory claim (flag stays in Firestore as the durable dedup).
+    await releaseArtisanAcceptanceClaim(firestore, mainBookingId);
+
     res.json({ success: true, to, bookingId: mainBookingId });
   } catch (err) {
     // MED-17: surface webhook failures to error_logs so admin sees stuck
@@ -8269,6 +8320,12 @@ app.post('/api/artisan-accepted', requireInternalSecret, async (req, res) => {
     try {
       const bid = (req.body && req.body.bookingId) || '';
       await logErrorToAdmin('webhook_artisan_accepted_failed', `/api/artisan-accepted threw: ${err.message}`, 'whatsapp_bot./api/artisan-accepted', err.message, bid, 'high');
+    } catch (_) {}
+    // Best-effort: release in-memory claim + rollback flag so a retry/listener tick can recover.
+    try {
+      const bid2 = (req.body && req.body.bookingId) || '';
+      const mainBid = bid2.includes('_') ? bid2.split('_')[0] : bid2;
+      if (mainBid) await releaseArtisanAcceptanceClaim(db(), mainBid, { rollback: true });
     } catch (_) {}
     res.status(500).json({ error: err.message });
   }
@@ -8920,6 +8977,15 @@ const _adminAssignRelayInFlight = new Set();
 const _balancePromptInFlight = new Set();
 const _lifecycleInFlight = new Set();
 
+// ── Cross-path artisan-acceptance dedup (May 14 2026) ──
+// Implementation lives in ./acceptance-dedup.js (kept separate so it can be
+// unit-tested without booting the full server). It uses a Firestore
+// transaction (atomic check-and-set of wa_artisan_acceptance_sent_at) plus
+// a shared in-memory Set, so only one of {HTTP webhook /api/artisan-accepted,
+// snapshot listener startArtisanAcceptanceListener} can win the right to
+// send the customer-facing "Great news!" + artisan photo.
+const { claimArtisanAcceptanceSend, releaseArtisanAcceptanceClaim } = require('./acceptance-dedup');
+
 // Look up artisan profile photo URL + display name from serviceProvider/{id}.
 // Used by the 'on the way' (progress) WA so the customer can see who is
 // arriving — a safety feature already present in-app, now mirrored to WhatsApp.
@@ -9300,10 +9366,9 @@ function startArtisanAcceptanceListener() {
   try {
     const firestore = db();
     if (!firestore) return;
-    // In-flight lock to prevent two near-simultaneous snapshot ticks from
-    // both passing the wa_artisan_acceptance_sent_at check before either has
-    // written the flag back.
-    const _acceptInFlight = new Set();
+    // Atomic check-and-set via claimArtisanAcceptanceSend() now handles the
+    // cross-path (listener vs /api/artisan-accepted) race. We no longer need
+    // a local in-flight Set here.
     firestore.collection('futureBookings')
       .where('artisan_confirmed', '==', 'yes')
       .onSnapshot(async (snap) => {
@@ -9314,26 +9379,19 @@ function startArtisanAcceptanceListener() {
           const src = (data.source || data.accepted_via || '').toString().toLowerCase();
           const isWa = src.includes('whatsapp') || String(doc.id).startsWith('RFQ-') || String(doc.id).startsWith('WA-');
           if (!isWa) continue;
+          // Fast path: skip if flag already set (avoids tx round-trip).
           if (data.wa_artisan_acceptance_sent_at) continue;
-          if (_acceptInFlight.has(doc.id)) continue;
-          _acceptInFlight.add(doc.id);
-          // Re-read inside the lock to catch a racing webhook that just wrote the flag.
-          try {
-            const fresh = await doc.ref.get();
-            if (fresh.exists && fresh.data().wa_artisan_acceptance_sent_at) {
-              _acceptInFlight.delete(doc.id);
-              continue;
-            }
-            // Stamp the flag BEFORE sending so a racing /api/artisan-accepted
-            // call sees it and bails.
-            await doc.ref.set({ wa_artisan_acceptance_sent_at: new Date().toISOString() }, { merge: true });
-          } catch (e) {
-            console.warn('[artisan-accept-listener] pre-send flag write failed:', e && e.message);
-            _acceptInFlight.delete(doc.id);
+          // Atomic claim — only the winner proceeds to send.
+          const claim = await claimArtisanAcceptanceSend(firestore, doc.id);
+          if (!claim.claimed) {
+            // Either an in-flight peer, or another path already stamped the flag.
             continue;
           }
           const customerPhone = data.user_phone || data.customerPhone || data.contact || data.client_phone || data.phone || '';
-          if (!customerPhone) { _acceptInFlight.delete(doc.id); continue; }
+          if (!customerPhone) {
+            await releaseArtisanAcceptanceClaim(firestore, doc.id, { rollback: true });
+            continue;
+          }
 
           const rfqId = doc.id;
           const orderNo = data.order_no || data.rfq_no || rfqId;
@@ -9429,10 +9487,12 @@ function startArtisanAcceptanceListener() {
           } catch (e) {
             console.warn(`[artisan-accept-listener] WA send failed for ${rfqId}:`, e.message);
             // Roll back the dedup flag so the next snapshot tick can retry.
-            try { await doc.ref.update({ wa_artisan_acceptance_sent_at: admin.firestore.FieldValue.delete() }); } catch (_) {}
-          } finally {
-            _acceptInFlight.delete(doc.id);
+            await releaseArtisanAcceptanceClaim(firestore, doc.id, { rollback: true });
+            continue;
           }
+          // Success path: release the in-memory claim (the Firestore flag
+          // stays set as the durable dedup marker).
+          await releaseArtisanAcceptanceClaim(firestore, doc.id);
         }
       }, (err) => {
         console.error('[artisan-accept-listener] listener error:', err && err.message);
