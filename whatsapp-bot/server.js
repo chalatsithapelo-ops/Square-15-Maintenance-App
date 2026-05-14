@@ -7932,6 +7932,50 @@ app.post('/webhook', async (req, res) => {
 // Health check
 app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'rfq-spec-capture-v27', commit: process.env.RENDER_GIT_COMMIT || 'unknown', deployedAt: process.env.RENDER_DEPLOY_TIME || new Date().toISOString() }));
 
+// ─── DIAG: synchronous conversation simulator ──────────────────────────────
+// Runs handleMessage() against a dummy phone and returns the bot's reply
+// without sending anything via Meta/WhatsApp. Used for live end-to-end flow
+// tests against the deployed bot without needing a real WA number.
+// Auth: requires x-internal-secret.
+//
+// POST /debug/simulate-conversation
+// body: { phone: "27990000001", message: "hello", reset?: true, imageDataUrl?: "..." }
+// returns: { reply, toolsCalled, sessionState }
+app.post('/debug/simulate-conversation', requireInternalSecret, async (req, res) => {
+  try {
+    const { phone, message, reset, imageDataUrl } = req.body || {};
+    if (!phone || typeof phone !== 'string') return res.status(400).json({ error: 'phone required' });
+    if (typeof message !== 'string') return res.status(400).json({ error: 'message required (string)' });
+    const phoneNorm = String(phone).replace(/[^0-9]/g, '');
+    if (!phoneNorm) return res.status(400).json({ error: 'phone must contain digits' });
+
+    if (reset) sessions.delete(phoneNorm);
+    const session = getSession(phoneNorm);
+    session._lastToolsCalled = [];
+
+    const reply = await handleMessage(session, message, imageDataUrl || null);
+
+    res.json({
+      reply: typeof reply === 'string' ? reply : String(reply || ''),
+      toolsCalled: Array.isArray(session._lastToolsCalled) ? session._lastToolsCalled : [],
+      sessionState: {
+        phone: phoneNorm,
+        lastRfqId: session.lastRfqId || null,
+        lastBookingId: session.lastBookingId || null,
+        sharedAddress: session.sharedAddress || null,
+        photoCount: Array.isArray(session.photoUrls) ? session.photoUrls.length : 0,
+        photoGateAcknowledged: !!session.photoGateAcknowledged,
+        materialSpecCount: Array.isArray(session.materialSpecs) ? session.materialSpecs.length : 0,
+        pendingRatingBookingId: session.pendingRatingBookingId || null,
+        messagesInContext: Array.isArray(session.messages) ? session.messages.length : 0,
+      },
+    });
+  } catch (e) {
+    console.error('[simulate-conversation] error:', e);
+    res.status(500).json({ error: e.message, stack: e.stack });
+  }
+});
+
 // Diagnostic: run buildersSearchOptions live and report what happens.
 // GET /diag/builders?q=shower+mixer&limit=3
 // Auth: requires x-internal-secret header (admin-only diagnostic).
