@@ -7356,8 +7356,8 @@ async function handleMessage(session, userMessage, imageDataUrl) {
     // ─────────────────────────────────────────────────────────────────────
     let safeReply = reply;
     try {
-      const PRICE_RE = /\bR\s*\d{1,3}(?:[ ,]\d{3})*(?:\.\d{1,2})?\b/i;
-      if (PRICE_RE.test(reply)) {
+      const _hg = require('./hallucination-guard');
+      if (_hg.PRICE_RE.test(reply)) {
         const PRICE_TOOLS = new Set([
           'lookup_pricing','create_booking','submit_rfq','accept_rfq_quote',
           'check_rfq_status','reject_rfq_quote','request_payment_link',
@@ -7375,16 +7375,46 @@ async function handleMessage(session, userMessage, imageDataUrl) {
           if (m.role === 'assistant' && Array.isArray(m.tool_calls)) break; // older round
           if (m.role !== 'tool') continue;
           const txt = typeof m.content === 'string' ? m.content : '';
-          if (PRICE_RE.test(txt)) { toolReturnedPrice = true; break; }
+          if (_hg.PRICE_RE.test(txt)) { toolReturnedPrice = true; break; }
           // Numeric grand_total / fixedPrice fields.
           if (/"(grand_total|fixedPrice|cost|total|quoted_price|amount)"\s*:\s*("?R?\s*\d|[1-9]\d*)/i.test(txt)) {
             toolReturnedPrice = true; break;
           }
         }
-        if (!toolReturnedPrice) {
+
+        const decision = _hg.decideGuardAction({
+          reply,
+          toolReturnedPrice,
+          sessionMessages: session.messages,
+          userMessage,
+        });
+        if (decision.action === 'allow') {
+          // Either tools justified the price, or the user themselves typed
+          // it and Lizzy is just echoing — leave the reply untouched.
+          if (decision.reason === 'user_echo') {
+            console.log(`[hallucination-guard] allow — user-echoed price (tools this turn: ${calledThisTurn.join(',') || 'none'})`);
+          }
+        } else if (decision.action === 'break_loop') {
+          // The previous assistant message was already the canned RFQ
+          // prompt — repeating it would loop. Log + send an ack instead.
+          console.warn(`[hallucination-guard] LOOP DETECTED — canned prompt was already sent last turn. Breaking loop.`);
+          console.warn(`[hallucination-guard] Original draft: ${reply.substring(0,200)}`);
+          try {
+            await logErrorToAdmin(
+              'hallucination_guard_loop_break',
+              `Guard would have repeated canned RFQ prompt; broke loop. user="${(typeof userMessage === 'string' ? userMessage : '').substring(0,200)}"`,
+              'whatsapp_bot.handleMessage.hallucinationGuard',
+              '',
+              session.phone,
+              'medium'
+            );
+          } catch (_) {}
+          safeReply = decision.safeReply;
+        } else {
+          // action === 'replace'
           console.warn(`[hallucination-guard] Stripping R-price from reply (tools this turn: ${calledThisTurn.join(',') || 'none'})`);
           console.warn(`[hallucination-guard] Original reply: ${reply.substring(0,200)}`);
-          safeReply = "Just to be sure — I don't have a fixed price for that exact job in our catalog. Let me file a quick RFQ so our admin can put together a proper quote for you. Could you confirm: are you happy for our artisan to source the materials, or would you prefer to buy them yourself?";
+          safeReply = decision.safeReply;
         }
       }
     } catch (guardErr) {
@@ -7660,11 +7690,19 @@ app.post('/webhook', async (req, res) => {
       let userText = '';
 
       try {
+      // CRITICAL-1 fix (audit 2026-05-15): serialise per-phone so concurrent
+      // webhook deliveries (Meta retries / rapid bursts) cannot interleave
+      // session mutations (lastBookingId, lastRfqId, photoUrls, promoCode,
+      // messages[]). withPhoneLock chains promises keyed by phone — different
+      // phones still parallelise. `continue` inside this block is replaced
+      // with `return` so the arrow exits the locked critical section and the
+      // outer for-loop iterates to the next message naturally.
+      await withPhoneLock(from, async () => {
 
       // Rate-limit check (prevents abuse / runaway OpenAI costs)
       if (isRateLimited(from)) {
         console.warn(`[webhook] Rate limited: ${from}`);
-        continue;
+        return;
       }
 
       const session = getSession(from);
@@ -7688,7 +7726,7 @@ app.post('/webhook', async (req, res) => {
       switch (msg.type) {
         case 'text':
           userText = (msg.text && typeof msg.text.body === 'string') ? msg.text.body : '';
-          if (!userText) { continue; }
+          if (!userText) { return; }
           break;
         case 'interactive':
           // Button replies and list replies
@@ -7709,7 +7747,7 @@ app.post('/webhook', async (req, res) => {
               from,
               'I could not download your photo. Please send the photo again, or describe the issue in text.'
             );
-            continue;
+            return;
           }
 
           // Upload to Firebase Storage so artisans can see it alongside the job.
@@ -7733,7 +7771,7 @@ app.post('/webhook', async (req, res) => {
             approxBytes,
             supportedVisionMime,
           });
-          continue;
+          return;
         }
         case 'document': {
           // BHV-9: previously the placeholder text was passed to GPT but the
@@ -7745,7 +7783,7 @@ app.post('/webhook', async (req, res) => {
             `Thanks${fname ? ` for "${fname}"` : ''}! I can't read documents (PDFs, Word, etc.) yet. Please describe your issue in a text message, or send a photo of the problem and I'll take it from there.`
           );
           logChatMessage(from, 'incoming', `[document: ${fname || 'unknown'}]`, { messageType: 'document', linkedUserId: session.linkedUserId, displayName: _contactName });
-          continue;
+          return;
         }
         case 'audio': {
           // Transcribe voice note via Whisper
@@ -7770,7 +7808,7 @@ app.post('/webhook', async (req, res) => {
               from,
               'I could not transcribe that voice note. Please try sending it again, or type your request in text.'
             );
-            continue;
+            return;
           }
           break;
         }
@@ -7825,7 +7863,7 @@ app.post('/webhook', async (req, res) => {
             );
             session._stickerNudged = true; // only nudge once per session to avoid spam
           }
-          continue;
+          return;
         }
         default: {
           // BHV-9: previously the placeholder text was passed to GPT but the
@@ -7834,11 +7872,11 @@ app.post('/webhook', async (req, res) => {
             from,
             `I can't process "${msg.type}" messages yet. Please send a text describing your issue or a photo of the problem.`
           );
-          continue;
+          return;
         }
       }
 
-      if (!userText.trim()) continue;
+      if (!userText.trim()) return;
 
       // Truncate excessively long messages to prevent OpenAI token abuse
       if (userText.length > 10000) {
@@ -7857,7 +7895,7 @@ app.post('/webhook', async (req, res) => {
           from,
           'I could not generate a reply for that yet. Please rephrase your request, or send Hi to restart.'
         );
-        continue;
+        return;
       }
 
       // Duplicate-reply guard (30s window) — protects against Meta retry storms
@@ -7866,7 +7904,7 @@ app.post('/webhook', async (req, res) => {
         const now = Date.now();
         if (session._lastReplyText === reply && (now - (session._lastReplyAt || 0)) < 30000) {
           console.log(`[webhook] ${from}: suppressed duplicate reply`);
-          continue;
+          return;
         }
         session._lastReplyText = reply;
         session._lastReplyAt = now;
@@ -7880,6 +7918,7 @@ app.post('/webhook', async (req, res) => {
       for (const chunk of chunks) {
         await sendWhatsAppMessage(from, chunk);
       }
+      }); // end withPhoneLock (CRITICAL-1 fix)
       } catch (msgErr) {
         console.error(`[webhook] Message processing failed for ${from}:`, msgErr);
         await notifyWebhookProcessingFailure(from, msgErr, userText);
@@ -7892,6 +7931,50 @@ app.post('/webhook', async (req, res) => {
 
 // Health check
 app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'rfq-spec-capture-v27', commit: process.env.RENDER_GIT_COMMIT || 'unknown', deployedAt: process.env.RENDER_DEPLOY_TIME || new Date().toISOString() }));
+
+// ─── DIAG: synchronous conversation simulator ──────────────────────────────
+// Runs handleMessage() against a dummy phone and returns the bot's reply
+// without sending anything via Meta/WhatsApp. Used for live end-to-end flow
+// tests against the deployed bot without needing a real WA number.
+// Auth: requires x-internal-secret.
+//
+// POST /debug/simulate-conversation
+// body: { phone: "27990000001", message: "hello", reset?: true, imageDataUrl?: "..." }
+// returns: { reply, toolsCalled, sessionState }
+app.post('/debug/simulate-conversation', requireInternalSecret, async (req, res) => {
+  try {
+    const { phone, message, reset, imageDataUrl } = req.body || {};
+    if (!phone || typeof phone !== 'string') return res.status(400).json({ error: 'phone required' });
+    if (typeof message !== 'string') return res.status(400).json({ error: 'message required (string)' });
+    const phoneNorm = String(phone).replace(/[^0-9]/g, '');
+    if (!phoneNorm) return res.status(400).json({ error: 'phone must contain digits' });
+
+    if (reset) sessions.delete(phoneNorm);
+    const session = getSession(phoneNorm);
+    session._lastToolsCalled = [];
+
+    const reply = await handleMessage(session, message, imageDataUrl || null);
+
+    res.json({
+      reply: typeof reply === 'string' ? reply : String(reply || ''),
+      toolsCalled: Array.isArray(session._lastToolsCalled) ? session._lastToolsCalled : [],
+      sessionState: {
+        phone: phoneNorm,
+        lastRfqId: session.lastRfqId || null,
+        lastBookingId: session.lastBookingId || null,
+        sharedAddress: session.sharedAddress || null,
+        photoCount: Array.isArray(session.photoUrls) ? session.photoUrls.length : 0,
+        photoGateAcknowledged: !!session.photoGateAcknowledged,
+        materialSpecCount: Array.isArray(session.materialSpecs) ? session.materialSpecs.length : 0,
+        pendingRatingBookingId: session.pendingRatingBookingId || null,
+        messagesInContext: Array.isArray(session.messages) ? session.messages.length : 0,
+      },
+    });
+  } catch (e) {
+    console.error('[simulate-conversation] error:', e);
+    res.status(500).json({ error: e.message, stack: e.stack });
+  }
+});
 
 // Diagnostic: run buildersSearchOptions live and report what happens.
 // GET /diag/builders?q=shower+mixer&limit=3
@@ -8146,6 +8229,19 @@ app.post('/api/artisan-accepted', requireInternalSecret, async (req, res) => {
       return res.status(404).json({ error: 'No customer phone found for booking' });
     }
 
+    // ── Atomic dedup claim (May 14 2026) ──
+    // Belt-and-braces: the early check above catches the obvious case, but
+    // does NOT close the millisecond race against the snapshot listener.
+    // claimArtisanAcceptanceSend() uses a Firestore transaction (atomic
+    // check-and-set of wa_artisan_acceptance_sent_at) plus a shared
+    // in-memory Set, so only one of {HTTP webhook, snapshot listener}
+    // can win the right to send the customer message.
+    const _claim = await claimArtisanAcceptanceSend(firestore, mainBookingId);
+    if (!_claim.claimed) {
+      console.log(`[api/artisan-accepted] booking ${mainBookingId} claim refused (${_claim.reason}) — skipping duplicate notification`);
+      return res.json({ ok: true, deduped: true, reason: _claim.reason });
+    }
+
     // Extract artisan ID from bridge bookingId (e.g. WA-XXX_artisanId → artisanId)
     const artisanId = bookingId.includes('_') ? bookingId.split('_').slice(1).join('_') : '';
 
@@ -8184,9 +8280,9 @@ app.post('/api/artisan-accepted', requireInternalSecret, async (req, res) => {
       }, { merge: true });
     } catch (e) { console.warn('[api/artisan-accepted] main doc update failed:', e.message); }
 
-    // Also update futureBookings to ensure consistency.
-    // Stamp the dedup flag BEFORE sending so a racing snapshot listener tick
-    // sees it and bails out instead of sending a second copy.
+    // Also update futureBookings to ensure consistency. The dedup flag
+    // (wa_artisan_acceptance_sent_at) is already written atomically by
+    // claimArtisanAcceptanceSend() above, so we don't re-write it here.
     try {
       await firestore.collection('futureBookings').doc(mainBookingId).set({
         artisan_confirmed: 'yes',
@@ -8198,7 +8294,6 @@ app.post('/api/artisan-accepted', requireInternalSecret, async (req, res) => {
           rfq_status: 'accepted',
           late_accept_at: new Date().toISOString(),
         }),
-        wa_artisan_acceptance_sent_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       }, { merge: true });
     } catch (e) { console.warn('[api/artisan-accepted] futureBookings update failed:', e.message); }
@@ -8231,8 +8326,18 @@ app.post('/api/artisan-accepted', requireInternalSecret, async (req, res) => {
     msg += `💸 *Not happy with the work?* Reply *"refund"* or *"complaint"* — we'll investigate before any money is released.\n`;
     msg += `\nReply anytime if you have questions! 😊`;
 
-    await sendWhatsAppMessage(to, msg);
-    console.log(`[api/artisan-accepted] Sent acceptance notification to ${to} for booking ${mainBookingId}`);
+    let _sendFailed = false;
+    try {
+      await sendWhatsAppMessage(to, msg);
+      console.log(`[api/artisan-accepted] Sent acceptance notification to ${to} for booking ${mainBookingId}`);
+    } catch (sendErr) {
+      _sendFailed = true;
+      console.error(`[api/artisan-accepted] sendWhatsAppMessage failed for ${mainBookingId}:`, sendErr.message);
+      // Roll back the dedup flag so a retry can re-send. Release the
+      // in-memory claim too so a follow-up listener tick isn't blocked.
+      await releaseArtisanAcceptanceClaim(firestore, mainBookingId, { rollback: true });
+      return res.status(502).json({ error: 'whatsapp_send_failed', message: sendErr.message });
+    }
 
     // ── Send artisan profile photo so customer can recognise who's coming. ──
     try {
@@ -8287,6 +8392,9 @@ app.post('/api/artisan-accepted', requireInternalSecret, async (req, res) => {
       console.warn('[api/artisan-accepted] session update failed:', e && e.message);
     }
 
+    // Release the in-memory claim (flag stays in Firestore as the durable dedup).
+    await releaseArtisanAcceptanceClaim(firestore, mainBookingId);
+
     res.json({ success: true, to, bookingId: mainBookingId });
   } catch (err) {
     // MED-17: surface webhook failures to error_logs so admin sees stuck
@@ -8295,6 +8403,12 @@ app.post('/api/artisan-accepted', requireInternalSecret, async (req, res) => {
     try {
       const bid = (req.body && req.body.bookingId) || '';
       await logErrorToAdmin('webhook_artisan_accepted_failed', `/api/artisan-accepted threw: ${err.message}`, 'whatsapp_bot./api/artisan-accepted', err.message, bid, 'high');
+    } catch (_) {}
+    // Best-effort: release in-memory claim + rollback flag so a retry/listener tick can recover.
+    try {
+      const bid2 = (req.body && req.body.bookingId) || '';
+      const mainBid = bid2.includes('_') ? bid2.split('_')[0] : bid2;
+      if (mainBid) await releaseArtisanAcceptanceClaim(db(), mainBid, { rollback: true });
     } catch (_) {}
     res.status(500).json({ error: err.message });
   }
@@ -8946,6 +9060,15 @@ const _adminAssignRelayInFlight = new Set();
 const _balancePromptInFlight = new Set();
 const _lifecycleInFlight = new Set();
 
+// ── Cross-path artisan-acceptance dedup (May 14 2026) ──
+// Implementation lives in ./acceptance-dedup.js (kept separate so it can be
+// unit-tested without booting the full server). It uses a Firestore
+// transaction (atomic check-and-set of wa_artisan_acceptance_sent_at) plus
+// a shared in-memory Set, so only one of {HTTP webhook /api/artisan-accepted,
+// snapshot listener startArtisanAcceptanceListener} can win the right to
+// send the customer-facing "Great news!" + artisan photo.
+const { claimArtisanAcceptanceSend, releaseArtisanAcceptanceClaim } = require('./acceptance-dedup');
+
 // Look up artisan profile photo URL + display name from serviceProvider/{id}.
 // Used by the 'on the way' (progress) WA so the customer can see who is
 // arriving — a safety feature already present in-app, now mirrored to WhatsApp.
@@ -9326,10 +9449,9 @@ function startArtisanAcceptanceListener() {
   try {
     const firestore = db();
     if (!firestore) return;
-    // In-flight lock to prevent two near-simultaneous snapshot ticks from
-    // both passing the wa_artisan_acceptance_sent_at check before either has
-    // written the flag back.
-    const _acceptInFlight = new Set();
+    // Atomic check-and-set via claimArtisanAcceptanceSend() now handles the
+    // cross-path (listener vs /api/artisan-accepted) race. We no longer need
+    // a local in-flight Set here.
     firestore.collection('futureBookings')
       .where('artisan_confirmed', '==', 'yes')
       .onSnapshot(async (snap) => {
@@ -9340,26 +9462,19 @@ function startArtisanAcceptanceListener() {
           const src = (data.source || data.accepted_via || '').toString().toLowerCase();
           const isWa = src.includes('whatsapp') || String(doc.id).startsWith('RFQ-') || String(doc.id).startsWith('WA-');
           if (!isWa) continue;
+          // Fast path: skip if flag already set (avoids tx round-trip).
           if (data.wa_artisan_acceptance_sent_at) continue;
-          if (_acceptInFlight.has(doc.id)) continue;
-          _acceptInFlight.add(doc.id);
-          // Re-read inside the lock to catch a racing webhook that just wrote the flag.
-          try {
-            const fresh = await doc.ref.get();
-            if (fresh.exists && fresh.data().wa_artisan_acceptance_sent_at) {
-              _acceptInFlight.delete(doc.id);
-              continue;
-            }
-            // Stamp the flag BEFORE sending so a racing /api/artisan-accepted
-            // call sees it and bails.
-            await doc.ref.set({ wa_artisan_acceptance_sent_at: new Date().toISOString() }, { merge: true });
-          } catch (e) {
-            console.warn('[artisan-accept-listener] pre-send flag write failed:', e && e.message);
-            _acceptInFlight.delete(doc.id);
+          // Atomic claim — only the winner proceeds to send.
+          const claim = await claimArtisanAcceptanceSend(firestore, doc.id);
+          if (!claim.claimed) {
+            // Either an in-flight peer, or another path already stamped the flag.
             continue;
           }
           const customerPhone = data.user_phone || data.customerPhone || data.contact || data.client_phone || data.phone || '';
-          if (!customerPhone) { _acceptInFlight.delete(doc.id); continue; }
+          if (!customerPhone) {
+            await releaseArtisanAcceptanceClaim(firestore, doc.id, { rollback: true });
+            continue;
+          }
 
           const rfqId = doc.id;
           const orderNo = data.order_no || data.rfq_no || rfqId;
@@ -9421,8 +9536,14 @@ function startArtisanAcceptanceListener() {
             } catch (e) { console.warn(`[artisan-accept-listener] photo send failed for ${rfqId}:`, e.message); }
             // Flag was already stamped above before sending; don't re-write here.
             console.log(`[artisan-accept-listener] sent acceptance WA to ${to} for ${rfqId} (artisan=${artisanName})`);
+            // CRITICAL-2 fix (audit 2026-05-15): previously silent catch
+            // left tasksManagement stale (showing pending_artisan_acceptance)
+            // while futureBookings showed pending_payment. Admin dashboards
+            // and payment-status queries that hit TM then saw the wrong
+            // state, causing duplicate dispatches and stuck payments.
+            // Retry once, then surface to admin so ops can reconcile.
             try {
-              await firestore.collection('tasksManagement').doc(rfqId).set({
+              const tmPayload = {
                 accept: '1',
                 artisan_confirmed: 'yes',
                 status: 'pending_payment',
@@ -9433,8 +9554,27 @@ function startArtisanAcceptanceListener() {
                 cost: costNum.toFixed(2), total_cost: costNum.toFixed(2),
                 description: descStr,
                 updated_at: new Date().toISOString(),
-              }, { merge: true });
-            } catch (_) {}
+              };
+              try {
+                await firestore.collection('tasksManagement').doc(rfqId).set(tmPayload, { merge: true });
+              } catch (firstErr) {
+                console.warn(`[artisan-accept-listener] TM update failed (retrying): ${firstErr.message}`);
+                await new Promise(r => setTimeout(r, 500));
+                await firestore.collection('tasksManagement').doc(rfqId).set(tmPayload, { merge: true });
+              }
+            } catch (tmErr) {
+              console.error(`[artisan-accept-listener] TM update FAILED for ${rfqId}: ${tmErr && tmErr.message}`);
+              try {
+                await logErrorToAdmin(
+                  'tm_sync_failure_artisan_accept',
+                  `Booking ${rfqId}: futureBookings updated to pending_payment but tasksManagement update failed after retry. Manual reconciliation needed so admin views + payment listeners see correct state. Error: ${tmErr && tmErr.message}`,
+                  'whatsapp_bot.startArtisanAcceptanceListener',
+                  tmErr && tmErr.message || '',
+                  rfqId,
+                  'critical'
+                );
+              } catch (_) {}
+            }
             // Update the customer's WA session so the next "pay deposit"/
             // "pay full" intercept resolves to THIS newly-accepted booking.
             try {
@@ -9455,10 +9595,12 @@ function startArtisanAcceptanceListener() {
           } catch (e) {
             console.warn(`[artisan-accept-listener] WA send failed for ${rfqId}:`, e.message);
             // Roll back the dedup flag so the next snapshot tick can retry.
-            try { await doc.ref.update({ wa_artisan_acceptance_sent_at: admin.firestore.FieldValue.delete() }); } catch (_) {}
-          } finally {
-            _acceptInFlight.delete(doc.id);
+            await releaseArtisanAcceptanceClaim(firestore, doc.id, { rollback: true });
+            continue;
           }
+          // Success path: release the in-memory claim (the Firestore flag
+          // stays set as the durable dedup marker).
+          await releaseArtisanAcceptanceClaim(firestore, doc.id);
         }
       }, (err) => {
         console.error('[artisan-accept-listener] listener error:', err && err.message);
