@@ -8299,24 +8299,43 @@ app.post('/debug/test-fcm-artisan', requireInternalSecret, async (req, res) => {
     if (!artisanId) return res.status(400).json({ error: 'artisanId required' });
     const firestore = db();
     if (!firestore) return res.status(503).json({ error: 'firestore unavailable' });
-    const snap = await firestore.collection('serviceProvider').doc(artisanId).get();
+    const snap = await firestore.collection('serviceProvider').doc(String(artisanId)).get();
     if (!snap.exists) return res.status(404).json({ error: 'artisan not found' });
     const ad = snap.data() || {};
-    const token = String(ad.fcm_token || ad.deviceToken || ad.fcmToken || '').trim();
-    if (!token) return res.json({ ok: false, error: 'no_token_on_doc', tokenFields: { fcm_token: !!ad.fcm_token, deviceToken: !!ad.deviceToken, fcmToken: !!ad.fcmToken } });
-    try {
-      const msgId = await admin.messaging().send({
-        token,
-        notification: { title: title || 'Square 15 test ping', body: body || 'If you see this, FCM is working.' },
-        data: { type: 'debug_test', ts: String(Date.now()) },
-        android: { priority: 'high' },
-      });
-      return res.json({ ok: true, messageId: msgId, artisanId, tokenPrefix: token.slice(0, 16) + '...' });
-    } catch (e) {
-      return res.json({ ok: false, error: e.code || e.message, errorDetail: String(e.message).slice(0, 300), tokenPrefix: token.slice(0, 16) + '...' });
+    // Collect ALL possible token fields and any token-like values found in nested maps
+    const tokenFieldsPresent = {};
+    const candidateKeys = ['fcm_token','deviceToken','fcmToken','device_token','push_token','pushToken','token'];
+    const tokens = [];
+    for (const k of candidateKeys) {
+      const v = ad[k];
+      tokenFieldsPresent[k] = !!v;
+      if (typeof v === 'string' && v.trim().length > 20) tokens.push({ field: k, value: v.trim() });
     }
+    // Also check arrays
+    for (const k of ['tokens','fcm_tokens','deviceTokens']) {
+      if (Array.isArray(ad[k])) {
+        tokenFieldsPresent[k] = ad[k].length;
+        for (const v of ad[k]) if (typeof v === 'string' && v.trim().length > 20) tokens.push({ field: k, value: v.trim() });
+      }
+    }
+    if (tokens.length === 0) return res.json({ ok: false, error: 'no_token_on_doc', tokenFieldsPresent, docKeys: Object.keys(ad).slice(0, 40) });
+    const results = [];
+    for (const t of tokens) {
+      try {
+        const msgId = await admin.messaging().send({
+          token: t.value,
+          notification: { title: String(title || 'Square 15 test ping'), body: String(body || 'If you see this, FCM is working.') },
+          data: { type: 'debug_test', ts: String(Date.now()) },
+          android: { priority: 'high' },
+        });
+        results.push({ field: t.field, ok: true, messageId: msgId, tokenPrefix: t.value.slice(0, 16) + '...' });
+      } catch (e) {
+        results.push({ field: t.field, ok: false, error: String(e.code || e.message), tokenPrefix: t.value.slice(0, 16) + '...' });
+      }
+    }
+    return res.json({ ok: results.some(r => r.ok), artisanId, tokenCount: tokens.length, tokenFieldsPresent, results });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    return res.status(500).json({ error: String(e && (e.message || e)), stack: String(e && e.stack || '').slice(0, 500) });
   }
 });
 // GET /diag/builders?q=shower+mixer&limit=3
