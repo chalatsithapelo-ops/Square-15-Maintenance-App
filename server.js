@@ -7961,6 +7961,182 @@ app.post('/webhook', async (req, res) => {
 // Health check
 app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'rfq-spec-capture-v27', commit: process.env.RENDER_GIT_COMMIT || 'unknown', deployedAt: process.env.RENDER_DEPLOY_TIME || new Date().toISOString() }));
 
+// ════════════════════════════════════════════════════════════════════════════
+// LIVE E2E TEST DIAGNOSTIC ENDPOINTS (auth: x-internal-secret)
+// Remove after full-flow validation. Used by test-full-flow.js to drive a
+// real customer journey on WhatsApp end-to-end.
+// ════════════════════════════════════════════════════════════════════════════
+
+// 1) Inject a WA message into the bot pipeline as if it came from a webhook.
+//    Bot processes it, sends a real reply via Meta API, returns the reply.
+//    Body: { phone, text, reset?, contactName?, imageDataUrl? }
+app.post('/debug/inject-message', requireInternalSecret, async (req, res) => {
+  const { phone, text, reset, contactName, imageDataUrl } = req.body || {};
+  if (!phone) return res.status(400).json({ error: 'phone required' });
+  const from = String(phone).replace(/[^\d]/g, '');
+  if (!from) return res.status(400).json({ error: 'invalid phone' });
+  try {
+    let reply = '';
+    let toolsCalled = [];
+    let sentChunks = 0;
+    let lastBookingId = null, lastRfqId = null;
+    await withPhoneLock(from, async () => {
+      if (reset) { try { sessions.delete(from); } catch {} }
+      if (isRateLimited(from)) { reply = '[rate-limited]'; return; }
+      const session = getSession(from);
+      await restoreSessionFromFirestore(session);
+      if (!session.linkedUserId) {
+        try { const u = await findUserByPhone(session.phone); if (u) session.linkedUserId = u.id; } catch {}
+      }
+      const userText = String(text || '');
+      logChatMessage(from, 'incoming', userText, { messageType: imageDataUrl ? 'image' : 'text', linkedUserId: session.linkedUserId, displayName: contactName || 'E2ETest', source: 'inject' });
+      const r = imageDataUrl ? await handleMessage(session, userText, [imageDataUrl]) : await handleMessage(session, userText);
+      reply = r || '';
+      toolsCalled = session._lastToolsCalled || [];
+      lastBookingId = session.lastBookingId || null;
+      lastRfqId = session.lastRfqId || null;
+      if (!reply.trim()) {
+        await sendWhatsAppMessage(from, 'I could not generate a reply for that yet. Please rephrase, or send Hi to restart.');
+        sentChunks = 1; return;
+      }
+      session._lastReplyText = reply; session._lastReplyAt = Date.now();
+      logChatMessage(from, 'outgoing', reply, { linkedUserId: session.linkedUserId, displayName: contactName || 'E2ETest', toolsCalled, source: 'inject' });
+      const chunks = reply.match(/.{1,4000}/gs) || [reply];
+      for (const chunk of chunks) {
+        try { await sendWhatsAppMessage(from, chunk); sentChunks++; } catch (e) { console.error('[inject] send failed:', e.message); }
+      }
+    });
+    return res.json({ ok: true, reply, toolsCalled, sentChunks, lastBookingId, lastRfqId, phone: from });
+  } catch (e) {
+    console.error('[inject] error:', e.stack || e.message);
+    return res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+// 2) Look up wallet balance + linked user + an active artisan to use in the test.
+app.get('/debug/test-info', requireInternalSecret, async (req, res) => {
+  try {
+    const phone = String(req.query.phone || '').replace(/[^\d]/g, '');
+    if (!phone) return res.status(400).json({ error: 'phone required' });
+    const firestore = db();
+    if (!firestore) return res.status(503).json({ error: 'firestore unavailable' });
+    const user = await findUserByPhone(phone);
+    let balance = null, userId = null, userName = null;
+    if (user) {
+      userId = user.id;
+      const uDoc = await firestore.collection('users').doc(user.id).get();
+      if (uDoc.exists) {
+        balance = parseFloat(uDoc.data().balance || '0');
+        userName = uDoc.data().name || uDoc.data().fullName || null;
+      }
+    }
+    // Pick first active artisan with at least basic info
+    let artisan = null;
+    try {
+      const snap = await firestore.collection('service_providers').limit(20).get();
+      for (const d of snap.docs) {
+        const x = d.data() || {};
+        if (x.status && String(x.status).toLowerCase() === 'inactive') continue;
+        artisan = { id: d.id, name: x.name || x.fullName || x.businessName || 'Test Artisan', phone: x.phone || x.contact || '' };
+        break;
+      }
+    } catch {}
+    res.json({ phone, userId, userName, walletBalance: balance, artisan });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 3) Top up the customer's wallet (test only).
+app.post('/debug/top-up-wallet', requireInternalSecret, async (req, res) => {
+  try {
+    const { phone, amount } = req.body || {};
+    const amt = Number(amount);
+    if (!phone || !amt || amt <= 0) return res.status(400).json({ error: 'phone and positive amount required' });
+    const firestore = db();
+    if (!firestore) return res.status(503).json({ error: 'firestore unavailable' });
+    const user = await findUserByPhone(String(phone).replace(/[^\d]/g, ''));
+    if (!user) return res.status(404).json({ error: 'user not linked' });
+    const uRef = firestore.collection('users').doc(user.id);
+    let newBalance = 0;
+    await firestore.runTransaction(async (txn) => {
+      const s = await txn.get(uRef);
+      const cur = parseFloat((s.data() && s.data().balance) || '0');
+      newBalance = cur + amt;
+      txn.update(uRef, { balance: newBalance.toFixed(2) });
+    });
+    await firestore.collection('transactionLogs').add({
+      user_id: user.id, type: 'topup', subtype: 'e2e_test_topup', amount: amt,
+      source: 'debug_endpoint', status: 'success',
+      created_at: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    res.json({ ok: true, userId: user.id, newBalance: newBalance.toFixed(2) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 4) Patch the RFQ doc to attach an admin quote so the customer can accept.
+//    Input: { rfqId, totalCost, breakdown? }
+//    Sets cost + admin_quote_total + rfq_status='quoted'. Then the customer
+//    can reply "accept R<amount>" via WA and `accept_rfq_quote` will fire.
+app.post('/debug/quote-rfq', requireInternalSecret, async (req, res) => {
+  try {
+    const { rfqId, totalCost, breakdown } = req.body || {};
+    if (!rfqId || !totalCost) return res.status(400).json({ error: 'rfqId and totalCost required' });
+    const firestore = db();
+    if (!firestore) return res.status(503).json({ error: 'firestore unavailable' });
+    const cost = Number(totalCost);
+    const updates = {
+      cost: cost.toFixed(2),
+      admin_quote_total: cost.toFixed(2),
+      rfq_status: 'quoted',
+      status: 'quoted',
+      quoted_at: new Date().toISOString(),
+      admin_quote_breakdown: breakdown || `Labor + materials: R${cost.toFixed(2)}`,
+    };
+    // Patch both collections (futureBookings is canonical for RFQs)
+    await firestore.collection('futureBookings').doc(rfqId).set(updates, { merge: true });
+    try { await firestore.collection('tasksManagement').doc(rfqId).set(updates, { merge: true }); } catch {}
+    res.json({ ok: true, rfqId, updates });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 5) Simulate artisan acceptance: set accept=1 + artisan_confirmed=yes,
+//    then call the existing /api/artisan-accepted webhook logic.
+//    Body: { bookingId, artisanId, artisanName? }
+app.post('/debug/artisan-accept', requireInternalSecret, async (req, res) => {
+  try {
+    const { bookingId, artisanId, artisanName } = req.body || {};
+    if (!bookingId || !artisanId) return res.status(400).json({ error: 'bookingId and artisanId required' });
+    const firestore = db();
+    if (!firestore) return res.status(503).json({ error: 'firestore unavailable' });
+    const main = bookingId.includes('_') ? bookingId.split('_')[0] : bookingId;
+    const aName = artisanName || 'Test Artisan';
+    // Mark accepted in both collections
+    const updates = {
+      accept: '1',
+      artisan_confirmed: 'yes',
+      service_provider_id: artisanId,
+      service_provider_name: aName,
+      status: 'pending_payment',
+      rfq_status: 'pending_artisan_acceptance',
+      artisan_accepted_at: new Date().toISOString(),
+    };
+    await firestore.collection('futureBookings').doc(main).set(updates, { merge: true });
+    await firestore.collection('tasksManagement').doc(main).set(updates, { merge: true });
+    // Forward to the canonical webhook so the customer WA message gets sent through the same code path
+    const fakeReq = { body: { bookingId: `${main}_${artisanId}`, artisanName: aName } };
+    // Reuse the customer-notify section by calling sendWhatsAppMessage directly here would skip dedup.
+    // Easiest: have the test runner call /api/artisan-accepted itself with that body.
+    res.json({ ok: true, bookingId: main, artisanId, instruct: 'now POST /api/artisan-accepted with bookingId=' + `${main}_${artisanId}` });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Diagnostic: run buildersSearchOptions live and report what happens.
 // GET /diag/builders?q=shower+mixer&limit=3
 // Auth: requires x-internal-secret header (admin-only diagnostic).
