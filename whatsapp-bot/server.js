@@ -8294,15 +8294,20 @@ app.get('/debug/inspect-booking', requireInternalSecret, async (req, res) => {
 // Diagnostic: send a real FCM ping to an artisan to verify their token is alive.
 // POST /debug/test-fcm-artisan  body: { artisanId, title?, body? }
 app.post('/debug/test-fcm-artisan', requireInternalSecret, async (req, res) => {
+  const steps = [];
   try {
+    steps.push('enter');
     const { artisanId, title, body } = req.body || {};
+    steps.push('parsed_body:' + !!artisanId);
     if (!artisanId) return res.status(400).json({ error: 'artisanId required' });
     const firestore = db();
+    steps.push('got_db:' + !!firestore);
     if (!firestore) return res.status(503).json({ error: 'firestore unavailable' });
     const snap = await firestore.collection('serviceProvider').doc(String(artisanId)).get();
-    if (!snap.exists) return res.status(404).json({ error: 'artisan not found' });
+    steps.push('got_snap:' + snap.exists);
+    if (!snap.exists) return res.status(404).json({ error: 'artisan not found', steps });
     const ad = snap.data() || {};
-    // Collect ALL possible token fields and any token-like values found in nested maps
+    steps.push('docKeys=' + Object.keys(ad).length);
     const tokenFieldsPresent = {};
     const candidateKeys = ['fcm_token','deviceToken','fcmToken','device_token','push_token','pushToken','token'];
     const tokens = [];
@@ -8311,14 +8316,14 @@ app.post('/debug/test-fcm-artisan', requireInternalSecret, async (req, res) => {
       tokenFieldsPresent[k] = !!v;
       if (typeof v === 'string' && v.trim().length > 20) tokens.push({ field: k, value: v.trim() });
     }
-    // Also check arrays
     for (const k of ['tokens','fcm_tokens','deviceTokens']) {
       if (Array.isArray(ad[k])) {
         tokenFieldsPresent[k] = ad[k].length;
         for (const v of ad[k]) if (typeof v === 'string' && v.trim().length > 20) tokens.push({ field: k, value: v.trim() });
       }
     }
-    if (tokens.length === 0) return res.json({ ok: false, error: 'no_token_on_doc', tokenFieldsPresent, docKeys: Object.keys(ad).slice(0, 40) });
+    steps.push('tokens_found=' + tokens.length);
+    if (tokens.length === 0) return res.json({ ok: false, error: 'no_token_on_doc', tokenFieldsPresent, docKeys: Object.keys(ad).slice(0, 60), steps });
     const results = [];
     for (const t of tokens) {
       try {
@@ -8333,9 +8338,10 @@ app.post('/debug/test-fcm-artisan', requireInternalSecret, async (req, res) => {
         results.push({ field: t.field, ok: false, error: String(e.code || e.message), tokenPrefix: t.value.slice(0, 16) + '...' });
       }
     }
-    return res.json({ ok: results.some(r => r.ok), artisanId, tokenCount: tokens.length, tokenFieldsPresent, results });
+    return res.json({ ok: results.some(r => r.ok), artisanId, tokenCount: tokens.length, tokenFieldsPresent, results, steps });
   } catch (e) {
-    return res.status(500).json({ error: String(e && (e.message || e)), stack: String(e && e.stack || '').slice(0, 500) });
+    console.error('[test-fcm-artisan] error:', e && e.stack || e);
+    return res.status(500).json({ error: String(e && (e.message || e)), stack: String(e && e.stack || '').slice(0, 800), steps });
   }
 });
 // GET /diag/builders?q=shower+mixer&limit=3
