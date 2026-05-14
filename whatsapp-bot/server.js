@@ -8234,6 +8234,25 @@ app.post('/debug/artisan-accept', requireInternalSecret, async (req, res) => {
   }
 });
 
+// Diagnostic: directly set a booking's status on both tasksManagement and futureBookings.
+// POST /debug/set-booking-status  body: { bookingId, status }
+// Simulates the artisan-app writing a lifecycle status to Firestore.
+app.post('/debug/set-booking-status', requireInternalSecret, async (req, res) => {
+  try {
+    const { bookingId, status } = req.body || {};
+    if (!bookingId || !status) return res.status(400).json({ error: 'bookingId and status required' });
+    const firestore = db();
+    if (!firestore) return res.status(503).json({ error: 'firestore unavailable' });
+    const main = String(bookingId).includes('_') ? String(bookingId).split('_')[0] : String(bookingId);
+    const patch = { status, [`status_${status}_at`]: new Date().toISOString() };
+    await firestore.collection('futureBookings').doc(main).set(patch, { merge: true });
+    await firestore.collection('tasksManagement').doc(main).set(patch, { merge: true });
+    res.json({ ok: true, bookingId: main, status });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Diagnostic: run buildersSearchOptions live and report what happens.
 // GET /diag/builders?q=shower+mixer&limit=3
 // Auth: requires x-internal-secret header (admin-only diagnostic).
