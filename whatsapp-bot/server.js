@@ -8379,7 +8379,36 @@ app.get('/debug/read-trace', requireInternalSecret, async (req, res) => {
     res.status(500).json({ error: String(e && e.message || e) });
   }
 });
-// GET /diag/builders?q=shower+mixer&limit=3
+
+// Diagnostic: dump artisan doc identifier + token fields
+app.get('/debug/dump-artisan', requireInternalSecret, async (req, res) => {
+  try {
+    const id = String(req.query.artisanId || '').trim();
+    if (!id) return res.status(400).json({ error: 'artisanId required' });
+    const f = db();
+    const s = await f.collection('serviceProvider').doc(id).get();
+    if (!s.exists) return res.status(404).json({ error: 'not found' });
+    const d = s.data() || {};
+    const pick = (k) => ({ present: !!d[k], value: typeof d[k] === 'string' ? (d[k].slice(0, 60) + (d[k].length > 60 ? '...' : '')) : d[k] });
+    return res.json({
+      id,
+      name: d.name || d.userName || null,
+      identifiers: {
+        uid: pick('uid'), userId: pick('userId'), authUid: pick('authUid'), auth_uid: pick('auth_uid'),
+      },
+      tokens: {
+        fcm_token: pick('fcm_token'), deviceToken: pick('deviceToken'),
+        fcm_token_updated_at: d.fcm_token_updated_at || null,
+        is_online: d.is_online, last_seen: d.last_seen || null,
+      },
+      allKeys: Object.keys(d),
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e && e.message || e) });
+  }
+});
+
+
 // Auth: requires x-internal-secret header (admin-only diagnostic).
 app.get('/diag/builders', requireInternalSecret, async (req, res) => {
   const q = String(req.query.q || 'shower mixer').trim();
