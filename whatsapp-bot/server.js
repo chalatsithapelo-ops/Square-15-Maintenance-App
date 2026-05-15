@@ -8294,54 +8294,83 @@ app.get('/debug/inspect-booking', requireInternalSecret, async (req, res) => {
 // Diagnostic: send a real FCM ping to an artisan to verify their token is alive.
 // POST /debug/test-fcm-artisan  body: { artisanId, title?, body? }
 app.post('/debug/test-fcm-artisan', requireInternalSecret, async (req, res) => {
-  const steps = ['SENTINEL_v3'];
+  // Write trace to firestore at each step so we can recover diagnostic info even if response fails.
+  const traceId = 'trace_' + Date.now();
+  const trace = ['SENTINEL_v4'];
+  const writeTrace = async (extra) => {
+    try { const f = db(); if (f) await f.collection('_debug_traces').doc(traceId).set({ traceId, trace, extra: extra || null, ts: new Date().toISOString() }); } catch (_) {}
+  };
   try {
-    steps.push('enter');
-    const { artisanId, title, body } = req.body || {};
-    steps.push('parsed_body:' + !!artisanId);
-    if (!artisanId) return res.status(400).json({ error: 'artisanId required' });
+    trace.push('enter');
+    const artisanId = (req.body && req.body.artisanId) ? String(req.body.artisanId) : '';
+    trace.push('artisanId=' + artisanId);
+    await writeTrace();
+    if (!artisanId) return res.status(400).json({ error: 'artisanId required', traceId });
+    trace.push('calling_db');
     const firestore = db();
-    steps.push('got_db:' + !!firestore);
-    if (!firestore) return res.status(503).json({ error: 'firestore unavailable' });
-    const snap = await firestore.collection('serviceProvider').doc(String(artisanId)).get();
-    steps.push('got_snap:' + snap.exists);
-    if (!snap.exists) return res.status(404).json({ error: 'artisan not found', steps });
+    trace.push('db_returned:' + !!firestore);
+    await writeTrace();
+    if (!firestore) return res.status(503).json({ error: 'firestore unavailable', traceId });
+    trace.push('calling_get');
+    const snap = await firestore.collection('serviceProvider').doc(artisanId).get();
+    trace.push('snap_exists=' + snap.exists);
+    await writeTrace();
+    if (!snap.exists) return res.status(404).json({ error: 'artisan not found', traceId, trace });
     const ad = snap.data() || {};
-    steps.push('docKeys=' + Object.keys(ad).length);
-    const tokenFieldsPresent = {};
-    const candidateKeys = ['fcm_token','deviceToken','fcmToken','device_token','push_token','pushToken','token'];
+    trace.push('keys=' + Object.keys(ad).length);
+    await writeTrace({ keys: Object.keys(ad) });
     const tokens = [];
-    for (const k of candidateKeys) {
-      const v = ad[k];
-      tokenFieldsPresent[k] = !!v;
-      if (typeof v === 'string' && v.trim().length > 20) tokens.push({ field: k, value: v.trim() });
+    const present = {};
+    for (const k of ['fcm_token','deviceToken','fcmToken','device_token','push_token','pushToken','token']) {
+      present[k] = !!ad[k];
+      if (typeof ad[k] === 'string' && ad[k].trim().length > 20) tokens.push({ field: k, value: ad[k].trim() });
     }
     for (const k of ['tokens','fcm_tokens','deviceTokens']) {
-      if (Array.isArray(ad[k])) {
-        tokenFieldsPresent[k] = ad[k].length;
-        for (const v of ad[k]) if (typeof v === 'string' && v.trim().length > 20) tokens.push({ field: k, value: v.trim() });
-      }
+      if (Array.isArray(ad[k])) { present[k] = ad[k].length; for (const v of ad[k]) if (typeof v === 'string' && v.trim().length > 20) tokens.push({ field: k, value: v.trim() }); }
     }
-    steps.push('tokens_found=' + tokens.length);
-    if (tokens.length === 0) return res.json({ ok: false, error: 'no_token_on_doc', tokenFieldsPresent, docKeys: Object.keys(ad).slice(0, 60), steps });
+    trace.push('tokens=' + tokens.length);
+    await writeTrace({ present, tokenCount: tokens.length });
+    if (tokens.length === 0) return res.json({ ok: false, error: 'no_token_on_doc', present, docKeys: Object.keys(ad), traceId, trace });
     const results = [];
     for (const t of tokens) {
       try {
         const msgId = await admin.messaging().send({
           token: t.value,
-          notification: { title: String(title || 'Square 15 test ping'), body: String(body || 'If you see this, FCM is working.') },
+          notification: { title: 'Square 15 Diagnostic', body: 'Test FCM at ' + new Date().toISOString() },
           data: { type: 'debug_test', ts: String(Date.now()) },
           android: { priority: 'high' },
         });
-        results.push({ field: t.field, ok: true, messageId: msgId, tokenPrefix: t.value.slice(0, 16) + '...' });
+        results.push({ field: t.field, ok: true, messageId: msgId, prefix: t.value.slice(0, 16) });
       } catch (e) {
-        results.push({ field: t.field, ok: false, error: String(e.code || e.message), tokenPrefix: t.value.slice(0, 16) + '...' });
+        results.push({ field: t.field, ok: false, error: String(e.code || e.message).slice(0,200), prefix: t.value.slice(0, 16) });
       }
     }
-    return res.json({ ok: results.some(r => r.ok), artisanId, tokenCount: tokens.length, tokenFieldsPresent, results, steps });
+    trace.push('done');
+    await writeTrace({ results });
+    return res.json({ ok: results.some(r => r.ok), artisanId, results, present, traceId, trace });
   } catch (e) {
-    console.error('[test-fcm-artisan] error:', e && e.stack || e);
-    return res.status(500).json({ error: String(e && (e.message || e)), stack: String(e && e.stack || '').slice(0, 800), steps });
+    const errStr = String((e && e.stack) || (e && e.message) || e);
+    trace.push('CAUGHT_ERR:' + errStr.slice(0,200));
+    await writeTrace({ caught: errStr });
+    try { return res.status(500).json({ error: errStr.slice(0,500), traceId, trace }); }
+    catch (_) { try { res.status(500).end(); } catch (__){} }
+  }
+});
+
+// Diagnostic: read recent debug traces from firestore
+app.get('/debug/read-trace', requireInternalSecret, async (req, res) => {
+  try {
+    const traceId = String(req.query.traceId || '');
+    const firestore = db();
+    if (!firestore) return res.status(503).json({ error: 'firestore unavailable' });
+    if (traceId) {
+      const s = await firestore.collection('_debug_traces').doc(traceId).get();
+      return res.json({ exists: s.exists, data: s.exists ? s.data() : null });
+    }
+    const snap = await firestore.collection('_debug_traces').orderBy('ts', 'desc').limit(5).get();
+    return res.json({ count: snap.size, recent: snap.docs.map(d => d.data()) });
+  } catch (e) {
+    res.status(500).json({ error: String(e && e.message || e) });
   }
 });
 // GET /diag/builders?q=shower+mixer&limit=3
