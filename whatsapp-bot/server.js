@@ -1814,7 +1814,7 @@ const waTools = [
     type: 'function',
     function: {
       name: 'report_issue',
-      description: 'Report a technical issue the customer is experiencing (payment failure, photo upload problem, app error, etc.). Auto-creates a support case and alerts admin for real-time fixing.',
+      description: 'Report a TECHNICAL bug the customer is experiencing — payment failure, photo upload error, app crash, blank screen, button not working, etc. DO NOT use for service complaints about an artisan or job quality (use create_complaint for those). DO NOT use for the bare word "help" or capability questions (just answer them).',
       parameters: {
         type: 'object',
         properties: {
@@ -1823,6 +1823,36 @@ const waTools = [
           booking_id: { type: 'string', description: 'Related booking ID if applicable' },
         },
         required: ['error_type', 'description'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'create_complaint',
+      description: 'File a SERVICE COMPLAINT about an artisan or job quality. Use this when the customer is unhappy with the work, the artisan was unprofessional, the job needs redoing, damage occurred, or the artisan never arrived. Do NOT use for technical app bugs (use report_issue for those).',
+      parameters: {
+        type: 'object',
+        properties: {
+          bookingId:   { type: 'string', description: 'The booking ID the complaint is about (if known)' },
+          description: { type: 'string', description: 'The customer\'s exact wording of the complaint' },
+          severity:    { type: 'string', enum: ['low','medium','high'], description: 'low=minor gripe, medium=needs attention, high=customer is angry / claims damage / asks for refund / safety concern' },
+        },
+        required: ['description'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'track_artisan',
+      description: 'Get the dispatch status and last known location of the artisan assigned to a booking. Use when the customer asks "where is the artisan", "how far are they", "ETA", or "track my artisan".',
+      parameters: {
+        type: 'object',
+        properties: {
+          bookingId: { type: 'string', description: 'The booking ID to track' },
+        },
+        required: ['bookingId'],
       },
     },
   },
@@ -6539,25 +6569,41 @@ async function executeWaTool(name, args, session) {
     case 'list_cases': {
       if (!firestore) return { error: 'Database unavailable' };
       const userId = session.linkedUserId;
-      if (!userId) return { error: 'Please link your account first to view support cases.' };
+      const phone = session.phone || '';
+      if (!userId && !phone) return { error: 'Please link your account first to view support cases.' };
 
       try {
-        let query = firestore.collection('customer_support_cases').where('user_id', '==', userId);
-        if (args.state) query = query.where('status', '==', args.state);
-        const snap = await query.orderBy('created_at', 'desc').limit(10).get();
-        if (snap.empty) return { cases: [], message: 'No support cases found.' };
-        const cases = snap.docs.map(d => {
-          const c = d.data();
-          return {
-            case_id: d.id,
-            subject: c.subject || '',
-            status: c.status || 'unknown',
-            created: c.created_at?.toDate?.()?.toISOString() || '',
-          };
-        });
+        // Fetch by user_id and phone separately to avoid composite-index
+        // requirements (where + where + orderBy). Sort in JS.
+        const queries = [];
+        if (userId) queries.push(firestore.collection('customer_support_cases').where('user_id', '==', userId).limit(25).get());
+        if (phone) queries.push(firestore.collection('customer_support_cases').where('phone', '==', phone).limit(25).get());
+        const snaps = await Promise.all(queries);
+        const seen = new Set();
+        const merged = [];
+        for (const s of snaps) {
+          for (const d of s.docs) {
+            if (seen.has(d.id)) continue;
+            seen.add(d.id);
+            const c = d.data() || {};
+            if (args.state && String(c.status || '').toLowerCase() !== String(args.state).toLowerCase()) continue;
+            merged.push({
+              case_id: d.id,
+              subject: c.subject || c.title || c.description?.slice(0, 60) || '(no subject)',
+              status: c.status || 'open',
+              booking_id: c.booking_id || c.bookingId || '',
+              created_at: c.created_at?.toDate?.()?.getTime?.() || 0,
+              created: c.created_at?.toDate?.()?.toISOString() || '',
+            });
+          }
+        }
+        merged.sort((a, b) => b.created_at - a.created_at);
+        const cases = merged.slice(0, 10).map(({ created_at, ...rest }) => rest);
+        if (cases.length === 0) return { cases: [], count: 0, message: 'You have no support cases on file.' };
         return { cases, count: cases.length };
       } catch (e) {
-        return { error: 'Failed to fetch cases' };
+        console.error('[wa-tool] list_cases failed:', e.message);
+        return { error: `Failed to fetch cases: ${e.message}` };
       }
     }
 
@@ -6650,6 +6696,138 @@ async function executeWaTool(name, args, session) {
         return { success: true, case_id: caseId, message: `Issue logged (ref: ${caseId}). Our tech team has been notified and will look into it right away.` };
       } catch (e) {
         return { error: 'Failed to report issue' };
+      }
+    }
+
+    // ═══════════════════════════════════════════
+    // CREATE COMPLAINT (service complaint, not tech bug)
+    // ═══════════════════════════════════════════
+    case 'create_complaint': {
+      if (!firestore) return { error: 'Database unavailable' };
+      const bid = String(args.bookingId || session.lastBookingId || session.lastRfqId || '').trim();
+      const desc = String(args.description || '').trim();
+      const severity = ['low','medium','high'].includes(args.severity) ? args.severity : 'medium';
+      if (!desc) return { error: 'Please share what went wrong so I can register the complaint.' };
+
+      try {
+        // Resolve artisan name / id from booking if available
+        let artisanId = '', artisanName = '';
+        if (bid) {
+          try {
+            let bDoc = await firestore.collection('tasksManagement').doc(bid).get();
+            if (!bDoc.exists) bDoc = await firestore.collection('futureBookings').doc(bid).get();
+            if (bDoc.exists) {
+              const bd = bDoc.data() || {};
+              artisanId = String(bd.service_provider_id || '').trim();
+              artisanName = String(bd.service_provider_name || bd.artisanName || '').trim();
+            }
+          } catch (_) {}
+        }
+        const caseId = firestore.collection('customer_support_cases').doc().id;
+        await firestore.collection('customer_support_cases').doc(caseId).set({
+          id: caseId,
+          user_id: session.linkedUserId || '',
+          phone: session.phone || '',
+          subject: 'Service complaint',
+          description: desc,
+          booking_id: bid,
+          artisan_id: artisanId,
+          artisan_name: artisanName,
+          category: 'service_complaint',
+          status: 'open',
+          priority: severity === 'high' ? 'high' : severity === 'low' ? 'low' : 'medium',
+          severity,
+          source: 'whatsapp_bot',
+          auto_generated: false,
+          created_at: admin.firestore.FieldValue.serverTimestamp(),
+        });
+        try {
+          await pushAdminNotification({
+            title: severity === 'high' ? '🚨 High-severity complaint' : '📝 New customer complaint',
+            body: `${desc.slice(0, 180)}${bid ? ` (booking ${bid})` : ''}`,
+            type: 'service_complaint',
+            bookingId: bid,
+            extraData: { case_id: caseId, severity, artisan_id: artisanId },
+          });
+        } catch (_) {}
+        return {
+          success: true,
+          case_id: caseId,
+          severity,
+          message: `Complaint registered. Reference: ${caseId}. Our admin team will follow up with you shortly.`,
+        };
+      } catch (e) {
+        console.error('[wa-tool] create_complaint failed:', e.message);
+        return { error: `Failed to register complaint: ${e.message}` };
+      }
+    }
+
+    // ═══════════════════════════════════════════
+    // TRACK ARTISAN
+    // ═══════════════════════════════════════════
+    case 'track_artisan': {
+      if (!firestore) return { error: 'Database unavailable' };
+      const bid = String(args.bookingId || session.lastBookingId || session.lastRfqId || '').trim();
+      if (!bid) return { error: 'Please share which booking to track.' };
+
+      try {
+        let bDoc = await firestore.collection('tasksManagement').doc(bid).get();
+        if (!bDoc.exists) bDoc = await firestore.collection('futureBookings').doc(bid).get();
+        if (!bDoc.exists) return { error: `Booking ${bid} not found.` };
+        const bd = bDoc.data() || {};
+        const artisanId = String(bd.service_provider_id || '').trim();
+        const artisanName = String(bd.service_provider_name || bd.artisanName || '').trim() || 'the assigned artisan';
+        const status = String(bd.status || '').toLowerCase();
+        const paymentStatus = String(bd.payment_status || '').toLowerCase();
+
+        // Status-aware short-circuits — be honest about where things are.
+        if (!artisanId || artisanId === 'admin') {
+          return { bookingId: bid, dispatched: false, message: `No artisan has been assigned to ${bid} yet. We'll notify you as soon as one accepts.` };
+        }
+        if (paymentStatus === 'unpaid' || paymentStatus === 'pending') {
+          return { bookingId: bid, dispatched: false, artisan: artisanName, message: `${artisanName} has accepted ${bid} but is waiting for the deposit to be paid before being dispatched.` };
+        }
+        if (status === 'completed' || status === 'closed') {
+          return { bookingId: bid, dispatched: false, artisan: artisanName, status, message: `${bid} is already ${status}. ${artisanName} has finished the job.` };
+        }
+
+        let location = null;
+        try {
+          const spSnap = await firestore.collection('serviceProvider').doc(artisanId).get();
+          if (spSnap.exists) {
+            const ad = spSnap.data() || {};
+            const lat = Number(ad.last_lat ?? ad.lat ?? ad.latitude ?? (ad.last_location && ad.last_location.lat));
+            const lng = Number(ad.last_lng ?? ad.lng ?? ad.longitude ?? (ad.last_location && ad.last_location.lng));
+            const ts  = ad.last_location_at || ad.last_seen_at || null;
+            if (Number.isFinite(lat) && Number.isFinite(lng) && lat !== 0 && lng !== 0) {
+              location = { lat, lng, mapsUrl: `https://maps.google.com/?q=${lat},${lng}`, updatedAt: ts?.toDate?.()?.toISOString?.() || (typeof ts === 'string' ? ts : null) };
+            }
+          }
+        } catch (_) {}
+
+        const onTheWay = ['progress','in_progress','on_the_way','dispatched','accepted'].includes(status);
+        if (location) {
+          return {
+            bookingId: bid,
+            dispatched: true,
+            artisan: artisanName,
+            status,
+            location,
+            message: `${artisanName} is on the way${location.updatedAt ? ` (location updated ${location.updatedAt})` : ''}. View live position: ${location.mapsUrl}`,
+          };
+        }
+        return {
+          bookingId: bid,
+          dispatched: onTheWay,
+          artisan: artisanName,
+          status,
+          message: onTheWay
+            ? `${artisanName} is dispatched on ${bid}. Live location isn't being shared right now — I'll let you know when they arrive.`
+            : `${artisanName} is assigned to ${bid} (status: ${status || 'pending'}). They haven't started moving to your address yet.`,
+        };
+      } catch (e) {
+        console.error('[wa-tool] track_artisan failed:', e.message);
+        return { error: `Failed to track artisan: ${e.message}` };
       }
     }
 
@@ -6885,7 +7063,28 @@ GUIDELINES:
 - When a customer reports ANY technical problem (payment failed, photos won't upload, app crashed, booking error, screen not loading, etc.), you MUST call report_issue IMMEDIATELY — do NOT just sympathise or acknowledge
 - error_type values: payment_error, image_upload_error, booking_error, network_error, app_crash, loading_error
 - After calling report_issue, reassure the customer: "I've logged this issue and our tech team has been notified. They'll look into it right away."
-- If the customer describes symptoms that sound like a bug (e.g. "the page is blank", "I keep getting an error", "my photos won't send", "payment keeps failing"), treat it as a technical error and report it`;
+- If the customer describes symptoms that sound like a bug (e.g. "the page is blank", "I keep getting an error", "my photos won't send", "payment keeps failing"), treat it as a technical error and report it
+
+⛔ WHEN **NOT** TO CALL report_issue (CRITICAL — over-triggering creates noise for admin):
+- The word "help" on its own, "what can you do", "how does this work", "menu", "options", "what services" — these are CAPABILITY questions. Respond with a short menu of what you can do. DO NOT call report_issue.
+- A successful tool call. After accept_rfq_quote, create_booking, request_payment_link, pay_with_wallet, send_message, set_preferred_schedule, reschedule_booking, rate_booking succeed, the turn is DONE — never tack on report_issue afterwards. Calling report_issue right after a success tool is a BUG and confuses the customer with a fake ticket reference.
+- A user complaint about ARTISAN BEHAVIOUR or JOB QUALITY (e.g. "the work is poor", "the leak is back", "the artisan was rude", "they refused to come back"). This is a SERVICE complaint, NOT a tech bug. Use create_complaint (preferred) — see "COMPLAINTS" below. Only fall back to report_issue if create_complaint is unavailable.
+- A user explicitly wants a refund. Call request_refund — do NOT also call report_issue in the same turn.
+- A user asks "track my artisan" / "where is the artisan" / "how far". Use track_artisan, NOT report_issue.
+
+🆘 COMPLAINTS (CRITICAL — keep service complaints out of the tech-bug queue):
+- A complaint is when the customer is UNHAPPY WITH THE SERVICE OR ARTISAN — the work was incomplete, the artisan was unprofessional, the job needs to be redone, the artisan damaged something, the artisan never arrived, etc.
+- When you detect a complaint phrase ("complaint", "I want to complain", "the artisan was…", "the work is still…", "they didn't fix it", "this is unacceptable") call create_complaint with: bookingId (if known), description (the customer's exact wording), severity ("low" / "medium" / "high" — "high" if customer is angry, claims damage, or asks for refund).
+- After create_complaint succeeds, ONE warm line: "I've registered your complaint and our admin team is on it. Your case reference is [caseId]. They'll be in touch shortly." THEN if the customer also asked for a refund, call request_refund. Never call report_issue for service complaints.
+- If the customer is in IMMEDIATE PHYSICAL DANGER ("I feel unsafe", "they're threatening me"), use create_complaint with severity="high" AND remind them to call 10111 (SAPS) or 10177 (EMS) right away.
+
+❓ HELP / CAPABILITY QUESTIONS:
+- "help", "help me", "what can you do", "options", "menu", "how does this work" → reply with a short capability menu (Bookings · Quotes · Payments · Reschedule · Track artisan · Message artisan · Complaints · Wallet). Ask which one they want.
+- ONLY call report_issue when the user describes a SPECIFIC TECHNICAL FAULT (error message, blank screen, button not working, app crash, payment failed). The bare word "help" is NEVER a technical fault.
+
+📍 TRACK ARTISAN:
+- When the customer asks "where is the artisan", "track my artisan", "how far is he/she", "ETA", call track_artisan with the bookingId.
+- The tool returns the artisan's last known location + dispatch status. Relay it warmly. If no location is available yet, say so honestly.`;
 
 async function handleMessage(session, userMessage, imageDataUrl) {
   // Track tools called this turn (for chat logging)
