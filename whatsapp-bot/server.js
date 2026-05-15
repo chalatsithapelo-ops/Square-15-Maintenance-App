@@ -8294,6 +8294,12 @@ app.get('/debug/inspect-booking', requireInternalSecret, async (req, res) => {
 // Diagnostic: send a real FCM ping to an artisan to verify their token is alive.
 // POST /debug/test-fcm-artisan  body: { artisanId, title?, body? }
 app.post('/debug/test-fcm-artisan', requireInternalSecret, async (req, res) => {
+  return _runTestFcmArtisan(req.body && req.body.artisanId, res);
+});
+app.get('/debug/test-fcm-artisan', requireInternalSecret, async (req, res) => {
+  return _runTestFcmArtisan(req.query && req.query.artisanId, res);
+});
+async function _runTestFcmArtisan(rawArtisanId, res) {
   // Write trace to firestore at each step so we can recover diagnostic info even if response fails.
   const traceId = 'trace_' + Date.now();
   const trace = ['SENTINEL_v4'];
@@ -8302,7 +8308,7 @@ app.post('/debug/test-fcm-artisan', requireInternalSecret, async (req, res) => {
   };
   try {
     trace.push('enter');
-    const artisanId = (req.body && req.body.artisanId) ? String(req.body.artisanId) : '';
+    const artisanId = rawArtisanId ? String(rawArtisanId) : '';
     trace.push('artisanId=' + artisanId);
     await writeTrace();
     if (!artisanId) return res.status(400).json({ error: 'artisanId required', traceId });
