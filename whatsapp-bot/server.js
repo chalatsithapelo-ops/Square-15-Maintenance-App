@@ -261,36 +261,28 @@ async function sendWhatsAppImage(to, imageUrl, caption) {
     return { ok: false, error: 'invalid_url' };
   }
 
-  // Pre-flight: make sure the URL resolves and returns an image content-type.
-  // LOW-20: retry HEAD once on 5xx so a transient upstream blip doesn't
-  // drop the product image entirely. 4xx is fatal (no retry).
-  let headOkOrFatal = false;
-  let lastHeadErr = '';
-  for (let attempt = 0; attempt < 2 && !headOkOrFatal; attempt++) {
-    try {
-      const head = await fetch(imageUrl, { method: 'HEAD', signal: AbortSignal.timeout(6000), redirect: 'follow' });
-      if (head.ok) {
-        const ct = String(head.headers.get('content-type') || '').toLowerCase();
-        if (!ct.startsWith('image/')) {
-          console.warn('[wa-image] wrong content-type:', ct, imageUrl);
-          return { ok: false, error: `bad_ct_${ct}` };
-        }
-        headOkOrFatal = true;
-        break;
-      }
-      lastHeadErr = `head_${head.status}`;
-      if (head.status < 500) {
-        console.warn('[wa-image] HEAD failed', head.status, imageUrl);
-        return { ok: false, error: lastHeadErr };
-      }
-      console.warn(`[wa-image] HEAD ${head.status} (attempt ${attempt + 1}/2), retrying:`, imageUrl);
-    } catch (e) {
-      lastHeadErr = 'head_error';
-      console.warn(`[wa-image] HEAD error (attempt ${attempt + 1}/2):`, e.message, imageUrl);
+  // Pre-flight: try HEAD to catch obvious problems (404 etc) but DON'T be
+  // strict — many real-world CDNs (picsum, Firebase Storage signed URLs,
+  // Builders Warehouse) return 405 Method Not Allowed on HEAD, or omit a
+  // content-type header. Only treat an explicit 404 as fatal; otherwise
+  // fall through to the actual WA send and let WA Cloud API decide.
+  try {
+    const head = await fetch(imageUrl, { method: 'HEAD', signal: AbortSignal.timeout(6000), redirect: 'follow' });
+    if (head.status === 404 || head.status === 410) {
+      console.warn('[wa-image] HEAD', head.status, '(fatal):', imageUrl);
+      return { ok: false, error: `head_${head.status}` };
     }
-    if (!headOkOrFatal && attempt === 0) await new Promise(r => setTimeout(r, 500));
+    if (head.ok) {
+      const ct = String(head.headers.get('content-type') || '').toLowerCase();
+      if (ct && !ct.startsWith('image/') && !ct.startsWith('application/octet-stream')) {
+        console.warn('[wa-image] non-image content-type (will try anyway):', ct, imageUrl);
+      }
+    } else {
+      console.warn('[wa-image] HEAD non-ok', head.status, '(will try send anyway):', imageUrl);
+    }
+  } catch (e) {
+    console.warn('[wa-image] HEAD error (will try send anyway):', e.message, imageUrl);
   }
-  if (!headOkOrFatal) return { ok: false, error: lastHeadErr || 'head_error' };
 
   try {
     const res = await fetch(`${WA_API}/${phoneId}/messages`, {
@@ -8269,6 +8261,13 @@ app.get('/debug/inspect-booking', requireInternalSecret, async (req, res) => {
         service_provider_id: d.service_provider_id, service_provider_name: d.service_provider_name,
         rfq_assigned_artisan_ids: d.rfq_assigned_artisan_ids || null,
         cost: d.cost, payment_status: d.payment_status, payment_type: d.payment_type, balance_paid: d.balance_paid,
+        ai_quote_grand_total: d.ai_quote && d.ai_quote.grand_total,
+        ai_quote_is_draft: d.ai_quote && d.ai_quote.is_admin_draft,
+        admin_quote_total: d.admin_quote && d.admin_quote.total,
+        admin_quote_total_alt: d.admin_quote_total,
+        quoted_price: d.quoted_price, total: d.total, total_price: d.total_price, rfq_total: d.rfq_total,
+        whatsapp_quote_relayed: d.whatsapp_quote_relayed,
+        whatsapp_quote_relayed_at: d.whatsapp_quote_relayed_at,
         wa_artisan_images_1_sent_at: d.wa_artisan_images_1_sent_at,
         wa_artisan_images_2_sent_at: d.wa_artisan_images_2_sent_at,
         wa_lifecycle_progress_sent_at: d.wa_lifecycle_progress_sent_at,
@@ -8783,10 +8782,14 @@ app.post('/api/artisan-accepted', requireInternalSecret, async (req, res) => {
       if (!spId && fbDoc.exists) spId = String((fbDoc.data() || {}).service_provider_id || '').trim();
       if (spId) {
         const prof = await getArtisanProfile(firestore, spId);
+        const who = (prof && prof.name) ? prof.name : name;
+        const ratingStr = (prof && prof.rating && Number(prof.rating) > 0) ? ` ⭐ ${Number(prof.rating).toFixed(1)}` : '';
         if (prof && prof.imageUrl) {
-          const who = prof.name || name;
-          const ratingStr = (prof.rating && Number(prof.rating) > 0) ? ` ⭐ ${Number(prof.rating).toFixed(1)}` : '';
           await sendWhatsAppImage(to, prof.imageUrl, `👷 Meet ${who}${ratingStr} — your assigned Square 15 artisan for booking #${ref}. For your safety, please confirm this is the person who arrives at your door before letting them in.`);
+        } else {
+          // Text-only fallback when artisan has no profile picture on file —
+          // customer still needs to know who is coming.
+          await sendWhatsAppMessage(to, `👷 *Meet ${who}${ratingStr}* — your assigned Square 15 artisan for booking #${ref}.\n\nFor your safety, please confirm this is the person who arrives at your door before letting them in. ${who} is ID-verified and registered with Square 15.`);
         }
       }
     } catch (e) { console.warn('[api/artisan-accepted] artisan photo send failed:', e.message); }
