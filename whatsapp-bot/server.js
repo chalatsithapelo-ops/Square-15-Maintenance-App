@@ -8361,7 +8361,7 @@ async function _runTestFcmArtisan(rawArtisanId, res) {
     try { return res.status(500).json({ error: errStr.slice(0,500), traceId, trace }); }
     catch (_) { try { res.status(500).end(); } catch (__){} }
   }
-});
+}
 
 // Diagnostic: read recent debug traces from firestore
 app.get('/debug/read-trace', requireInternalSecret, async (req, res) => {
