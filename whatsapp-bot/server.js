@@ -8294,7 +8294,7 @@ app.get('/debug/inspect-booking', requireInternalSecret, async (req, res) => {
 // Diagnostic: send a real FCM ping to an artisan to verify their token is alive.
 // POST /debug/test-fcm-artisan  body: { artisanId, title?, body? }
 app.post('/debug/test-fcm-artisan', requireInternalSecret, async (req, res) => {
-  const steps = [];
+  const steps = ['SENTINEL_v3'];
   try {
     steps.push('enter');
     const { artisanId, title, body } = req.body || {};
