@@ -8097,18 +8097,47 @@ app.post('/debug/quote-rfq', requireInternalSecret, async (req, res) => {
     const firestore = db();
     if (!firestore) return res.status(503).json({ error: 'firestore unavailable' });
     const cost = Number(totalCost);
+    // Read existing doc so we can update ai_quote.grand_total + admin_quote.total
+    // in lock-step with the canonical totals — otherwise downstream readers that
+    // prefer ai_quote.grand_total or admin_quote.total see a stale AI draft
+    // (e.g. R4838.63 instead of the admin's final R250).
+    const ref = firestore.collection('futureBookings').doc(rfqId);
+    const snap = await ref.get();
+    const existing = snap.exists ? (snap.data() || {}) : {};
     const updates = {
+      // Canonical price — written by ALL admin/test re-quote paths.
       cost: cost.toFixed(2),
+      quoted_price: cost.toFixed(2),
+      total: cost.toFixed(2),
+      total_price: cost.toFixed(2),
+      totalPrice: cost.toFixed(2),
+      rfq_total: cost,
       admin_quote_total: cost.toFixed(2),
       rfq_status: 'quoted',
       status: 'quoted',
       quoted_at: new Date().toISOString(),
       admin_quote_breakdown: breakdown || `Labor + materials: R${cost.toFixed(2)}`,
     };
-    // Patch both collections (futureBookings is canonical for RFQs)
-    await firestore.collection('futureBookings').doc(rfqId).set(updates, { merge: true });
+    // Overwrite the AI draft grand_total inside ai_quote so admin app's amend
+    // dialog and any reader keying off ai_quote.grand_total reflect reality.
+    if (existing.ai_quote && typeof existing.ai_quote === 'object') {
+      updates.ai_quote = {
+        ...existing.ai_quote,
+        grand_total: cost,
+        total: cost,
+        estimatedCost: cost,
+        is_admin_draft: false,
+        admin_finalised_at: new Date().toISOString(),
+        source: (existing.ai_quote.source || 'whatsapp_ai_builders').replace('_draft', '') + '_admin_finalised',
+      };
+    }
+    // Mirror onto admin_quote.total if admin_quote exists (production admin app path).
+    if (existing.admin_quote && typeof existing.admin_quote === 'object') {
+      updates.admin_quote = { ...existing.admin_quote, total: cost };
+    }
+    await ref.set(updates, { merge: true });
     try { await firestore.collection('tasksManagement').doc(rfqId).set(updates, { merge: true }); } catch {}
-    res.json({ ok: true, rfqId, updates });
+    res.json({ ok: true, rfqId, updates: { ...updates, ai_quote: updates.ai_quote ? '<patched>' : undefined, admin_quote: updates.admin_quote ? '<patched>' : undefined } });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
