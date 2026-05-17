@@ -9331,6 +9331,72 @@ app.post('/api/token', authMiddleware, rateLimitBy('livekit_token', 30, 5 * 60 *
  * Auth: Firebase ID token required.
  * Rate limit: 60/uid/5min (interactive chat � generous but not abusable).
  */
+// Debug endpoint for rapid internal testing (no auth, uses x-internal-secret)
+app.post('/api/chat-bot-debug', async (req, res) => {
+  try {
+    const internalSecret = req.headers['x-internal-secret'];
+    if (internalSecret !== 'sq15_internal_2026_xK9mP3') {
+      return res.status(403).json({ error: 'forbidden', message: 'Invalid internal secret' });
+    }
+    const groqKey = process.env.GROQ_API_KEY;
+    if (!groqKey) {
+      return res.status(503).json({ error: 'chat_bot_unconfigured', message: 'GROQ_API_KEY not set in server env' });
+    }
+    const question = String((req.body && req.body.question) || '').trim();
+    if (!question) {
+      return res.status(400).json({ error: 'missing_question', message: 'question is required' });
+    }
+    if (question.length > 2000) {
+      return res.status(400).json({ error: 'question_too_long', message: 'Maximum 2000 characters' });
+    }
+
+    const fetchFn = (typeof fetch === 'function') ? fetch : require('node-fetch');
+    const upstream = await fetchFn('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${groqKey}`,
+      },
+      body: JSON.stringify({
+        model: 'llama-3.3-70b-versatile',
+        messages: [
+          {
+            role: 'system',
+            content:
+              'You are Lizzy, the AI assistant for Square 15 Facility Solutions, a property maintenance company in South Africa. ' +
+              'You help clients with information about plumbing, electrical, painting, carpentry, roofing, tiling, locksmith, and other maintenance services. ' +
+              'Be helpful, friendly, and concise. Amounts are in South African Rand (R). ' +
+              "For booking or account actions, suggest the user use the full AI Chat or the app's booking flow. " +
+              '\n\nTRUST & SAFETY FACTS — use ONLY these wordings, never invent warranties, insurance, criminal-background checks, or licence claims:\n' +
+              '- ESCROW: every payment is held by Square 15 and only released to the artisan after the customer confirms the work is done right.\n' +
+              '- VETTING: every active artisan is registered with Square 15, has submitted government ID, and is rated by past customers.\n' +
+              "- IDENTITY CHECK: when the artisan is on the way, the customer is sent the artisan's profile photo on WhatsApp so they can match the face at the door.\n" +
+              '- REFUND POLICY: full refund if cancelled before work starts; partial refund (less materials already bought + time worked) if cancelled mid-job; if work is finished but the customer is not satisfied, escrow stays locked until admin investigates. Wallet refunds are instant; card refunds 3–5 business days.\n' +
+              '- PERSONAL SAFETY: tell the user that if they ever feel unsafe they can reply "help" or "emergency" to alert support; for life-threatening emergencies remind them to call 10111 / 10177 first.\n' +
+              '- DO NOT promise workmanship warranties, free reworks, insurance cover, or licence numbers. If asked, say our standard protection is the escrow + refund policy and offer to connect them with admin.',
+          },
+          { role: 'user', content: question },
+        ],
+        max_tokens: 1000,
+        temperature: 0.7,
+      }),
+    });
+
+    if (!upstream.ok) {
+      const txt = await upstream.text().catch(() => '');
+      console.warn('[chat_bot_debug] Groq upstream error', upstream.status, txt.slice(0, 300));
+      return res.status(502).json({ error: 'upstream_error', status: upstream.status });
+    }
+
+    const data = await upstream.json();
+    const answer = ((data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '').trim();
+    return res.json({ answer: answer || "Sorry, I didn't understand that." });
+  } catch (e) {
+    console.error('[chat_bot_debug] error:', e && e.message);
+    return res.status(500).json({ error: 'chat_bot_error', message: e && e.message });
+  }
+});
+
 app.post('/api/chat-bot', authMiddleware, rateLimitBy('chat_bot', 60, 5 * 60 * 1000), async (req, res) => {
   try {
     const groqKey = process.env.GROQ_API_KEY;
