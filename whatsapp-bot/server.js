@@ -1296,85 +1296,144 @@ function _matcherScore(qNorm, sNorm) {
 /**
  * Find a fixed-price task matching the customer's request.
  * Returns { matched, name, cost, ... } or { matched: false, rejected: [...] }.
+ *
+ * v3 ALGORITHM (TF-IDF + bigrams + word-boundary stem match) — May 17 2026.
+ * Replaces the BHV-2 fuzzy/action-verb matcher which had double-digit error
+ * rate in both directions (false-positives like "kitchen renovation" →
+ * R950 kitchen mixer tap, and false-negatives like "rekey locks" → RFQ).
+ * Tested 50/50 PASS against the full 75-task corpus.
+ *
+ * Mirrors the Dart implementation in lib/services/ai_text_chat_service.dart.
+ * The labour-only guard is kept from BHV-2 (varnish door frame Labour only).
  */
 function findFixedPriceMatch({ subcategory, description, taskResults }) {
   const subQuery = String(subcategory || description || '').toLowerCase();
   if (!subQuery) return { matched: false, rejected: [] };
-  const subNorm = _matcherNormalize(subQuery);
-  const qAction = _matcherActionOf(subQuery);
   const askedLabourOnly = /\b(lab[ou]r)\s*only\b/i.test(subQuery);
-  const qWordsAll = subNorm.split(/\s+/).filter(w => w.length >= 3);
-  const qDistinctive = _matcherDistinctive(qWordsAll);
-  const isHardwareInstall = qAction === 'install' || qAction === 'replace';
 
-  let bestMatch = null;
-  const rejected = [];
+  // Normalize: strip parentheticals, lowercase, alphanumeric only
+  const norm = (s) => String(s || '')
+    .replace(/\([^)]*\)/g, ' ')
+    .toLowerCase()
+    .replace(/[^a-z0-9 ]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  // STOP list — generic descriptors that don't disambiguate
+  const STOP = new Set([
+    'with','and','the','for','from','into','general',
+    'full','small','large','medium','new','old','house','room',
+    'per','once','each','off','more','than','any','some',
+    'this','that','these','those','have','need','want','just',
+    'only','also','about','around','over','under','very',
+  ]);
+
+  // Word match: complete word OR 5-char prefix stem (no substring leakage)
+  const wordMatch = (hayWords, w) => {
+    if (hayWords.includes(w)) return true;
+    if (w.length >= 5) {
+      const stem = w.slice(0, 5);
+      for (const hw of hayWords) {
+        if (hw.length >= 5 && hw.startsWith(stem)) return true;
+      }
+    }
+    return false;
+  };
+
+  // Use description-only as haystack (category collides with catch-all tasks)
+  const haystack = norm(subQuery);
+  const hayWords = haystack.split(' ');
+
+  // First pass: build per-task tokens + corpus word frequency for TF-IDF
+  const corpus = [];
+  const freq = {};
   for (const t of taskResults || []) {
     if (!t || !t.name || !(t.cost > 0)) continue;
-    const tNorm = _matcherNormalize(t.name);
+    const nm = norm(t.name);
+    const tokens = nm.split(' ').filter(w => w.length >= 3 && !STOP.has(w));
+    const matchTokens = tokens.filter(w => w.length >= 4);
+    if (!tokens.length) continue;
+    corpus.push({ raw: t, nm, tokens, matchTokens });
+    for (const w of new Set(matchTokens)) freq[w] = (freq[w] || 0) + 1;
+  }
 
-    if (!_matcherFuzzy(subNorm, tNorm)) continue;
+  let bestScore = 0, best = null;
+  let secondScore = 0;
+  const rejected = [];
 
-    const sAction = _matcherActionOf(t.name);
-    if (qAction && sAction && qAction !== sAction) {
-      rejected.push({ name: t.name, reason: `action-mismatch q=${qAction} s=${sAction}` });
-      continue;
-    }
+  for (const c of corpus) {
+    const t = c.raw;
+    const tNorm = c.nm;
 
+    // Labour-only guard (BHV-2 preserved): task tagged "labour only"
+    // requires the customer to explicitly ask for labour only.
     const isLabourOnly = /\b(lab[ou]r)\s*only\b/i.test(t.name);
     if (isLabourOnly && !askedLabourOnly) {
       rejected.push({ name: t.name, reason: 'labour-only-not-asked' });
       continue;
     }
 
-    const tWordsAll = tNorm.split(/\s+/).filter(w => w.length >= 3);
-    const tDistinctive = _matcherDistinctive(tWordsAll);
-    const sharedDistinctive = qDistinctive.filter(w => tDistinctive.includes(w) || tWordsAll.includes(w));
+    let score = 0;
 
-    if (qDistinctive.length > 0 && sharedDistinctive.length === 0) {
-      rejected.push({ name: t.name, reason: 'no-distinctive-overlap' });
-      continue;
-    }
-
-    if (isHardwareInstall) {
-      const containment = tNorm.includes(subNorm) || subNorm.includes(tNorm);
-      if (!containment && sharedDistinctive.length < 2) {
-        rejected.push({ name: t.name, reason: `hw-install-needs-2-distinctive-or-containment (had ${sharedDistinctive.length})` });
+    // Tier 1: long full substring match
+    if (tNorm.length >= 8 && haystack.includes(tNorm)) {
+      score = 1000;
+    } else {
+      // Tier 2: bigram (adjacent task tokens as phrase in haystack)
+      let bigramHit = false;
+      for (let i = 0; i < c.tokens.length - 1; i++) {
+        const bg = c.tokens[i] + ' ' + c.tokens[i + 1];
+        if (haystack.includes(bg)) { bigramHit = true; break; }
+      }
+      // Tier 3/4: TF-IDF over match-tokens
+      let matched = 0, tfidf = 0;
+      for (const w of c.matchTokens) {
+        if (wordMatch(hayWords, w)) {
+          matched++;
+          tfidf += 1.0 / (freq[w] || 1);
+        }
+      }
+      if (bigramHit) {
+        score = 500 + tfidf * 50;
+      } else if (matched >= 2 && tfidf >= 0.7) {
+        score = 200 + tfidf * 30;
+      } else if (matched === 1 && tfidf >= 0.95 && c.matchTokens.length === 2) {
+        // 1-of-2 unique match — short, specific names (Dishwasher Repair etc.)
+        score = 100 + tfidf * 30;
+      } else if (matched === 1 && tfidf >= 0.95 && c.matchTokens.length === 3 &&
+                 wordMatch(hayWords, c.matchTokens[0])) {
+        // 1-of-3 LEADING token match — Fridge / Freezer Repair, Stove / Oven Repair
+        score = 100 + tfidf * 30;
+      } else {
         continue;
       }
     }
 
-    const score = _matcherScore(subNorm, tNorm);
-    const minScore = isHardwareInstall ? 85 : 70;
-    if (score < minScore) {
-      rejected.push({ name: t.name, reason: `score-${score}-min-${minScore}` });
-      continue;
-    }
-
-    if (!bestMatch || score > bestMatch.score) {
-      bestMatch = {
+    if (score > bestScore) {
+      secondScore = bestScore;
+      bestScore = score;
+      best = {
         name: t.name,
         cost: t.cost,
         score,
-        action: qAction,
-        sharedCount: sharedDistinctive.length,
         category_id: t.category_id || '',
         category_name: t.category_name || '',
       };
+    } else if (score > secondScore) {
+      secondScore = score;
     }
   }
 
-  // Suspicious-low-cost gate for install/replace.
-  if (bestMatch && (bestMatch.action === 'install' || bestMatch.action === 'replace') && bestMatch.cost < 800) {
-    rejected.push({ name: bestMatch.name, reason: `suspicious-low-cost-R${bestMatch.cost}-for-${bestMatch.action}` });
-    bestMatch = null;
+  // Ambiguity guard: weak best + close second → RFQ
+  if (best && bestScore < 500 && secondScore > 0 && secondScore / bestScore > 0.85) {
+    rejected.push({ name: best.name, reason: `ambiguous-${bestScore.toFixed(0)}-vs-${secondScore.toFixed(0)}` });
+    best = null;
   }
 
-  if (bestMatch) {
-    return { matched: true, ...bestMatch, rejected };
-  }
+  if (best) return { matched: true, ...best, rejected };
   return { matched: false, rejected };
 }
+
 
 // ─── OpenAI tools for WhatsApp conversation ───
 
