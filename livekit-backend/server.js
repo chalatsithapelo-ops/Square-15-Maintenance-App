@@ -8311,12 +8311,13 @@ app.post('/api/admin/payout-batches/:batchId/approve', authMiddleware, async (re
               'x-internal-secret': internalSecret,
             },
             body: JSON.stringify({
-              recipient_type: it.recipient_type,
+              recipient_type: it.recipient_type === 'corporate_partner' ? 'partner' : it.recipient_type,
               recipient_id: it.recipient_id,
               recipient_name: it.recipient_name,
               amount: it.amount,
               bank_name: it.bank_name,
               account_number: it.account_number,
+              branch_code: it.branch_code || '',
               account_type: it.account_type || 'cheque',
               source: `batch_${req.params.batchId}`,
             }),
@@ -8355,7 +8356,6 @@ app.post('/api/admin/payout-batches/rebuild-now', authMiddleware, async (req, re
     const db = admin.firestore();
     const role = await resolveRole({ firestore: db, uid: req.user.uid, decodedToken: req.user });
     if (role !== 'admin') return res.status(403).json({ error: 'Admin access required.' });
-    // Delete current week's draft if it exists in pending_approval, then run sweeper logic inline.
     const now = new Date();
     const sast = new Date(now.getTime() + 2 * 60 * 60 * 1000);
     const monDate = new Date(sast); monDate.setUTCDate(sast.getUTCDate() - ((sast.getUTCDay() + 6) % 7));
@@ -8363,9 +8363,12 @@ app.post('/api/admin/payout-batches/rebuild-now', authMiddleware, async (req, re
     const existing = await db.collection('payout_batches').doc(weekKey).get();
     if (existing.exists && existing.data().status === 'pending_approval') {
       await db.collection('payout_batches').doc(weekKey).delete();
+    } else if (existing.exists) {
+      return res.status(409).json({ error: `Batch ${weekKey} is in status "${existing.data().status}" — cannot rebuild.` });
     }
-    // Trigger sweeper-equivalent build by calling its inner logic via flag
-    res.json({ ok: true, message: `Rebuild scheduled for ${weekKey}. Sweeper will pick it up within 1 hour, or restart Render for immediate run.` });
+    const result = await _maybeBuildWeeklyBatch(true);
+    if (result && result.error) return res.status(500).json(result);
+    res.json({ ok: true, ...result });
   } catch (e) {
     res.status(500).json({ error: 'Rebuild failed' });
   }
@@ -10131,109 +10134,109 @@ function _startRefundReconciliationSweeper() {
 // Idempotent — won't create a second draft if one already exists for the week.
 function _startWeeklyPayoutBatchSweep() {
   const CHECK_INTERVAL_MS = 60 * 60 * 1000; // re-check every hour
-  async function _maybeBuildWeeklyBatch() {
-    try {
-      const firestore = admin.apps.length ? admin.firestore() : null;
-      if (!firestore) return;
-      const now = new Date();
-      // SAST is UTC+2 — compute SAST day-of-week + hour.
-      const sastMs = now.getTime() + 2 * 60 * 60 * 1000;
-      const sast = new Date(sastMs);
-      const dow = sast.getUTCDay(); // 0=Sun 1=Mon
-      const hour = sast.getUTCHours();
-      if (dow !== 1 || hour < 9 || hour > 10) return; // Mon 09:00-10:59 SAST window
+  // Run once shortly after boot, then hourly.
+  setTimeout(() => _maybeBuildWeeklyBatch(false), 60 * 1000);
+  setInterval(() => _maybeBuildWeeklyBatch(false), CHECK_INTERVAL_MS).unref?.();
+}
 
-      // ISO week key (Mon-anchored, simple version: year + Mon date)
-      const monDate = new Date(sast); monDate.setUTCDate(sast.getUTCDate() - ((sast.getUTCDay() + 6) % 7));
-      const weekKey = `wk_${monDate.toISOString().slice(0, 10)}`; // wk_YYYY-MM-DD
+// force=true bypasses the Mon 09:00 window check (used by rebuild-now).
+async function _maybeBuildWeeklyBatch(force = false) {
+  try {
+    const firestore = admin.apps.length ? admin.firestore() : null;
+    if (!firestore) return { skipped: 'no_firestore' };
+    const now = new Date();
+    const sastMs = now.getTime() + 2 * 60 * 60 * 1000;
+    const sast = new Date(sastMs);
+    const dow = sast.getUTCDay();
+    const hour = sast.getUTCHours();
+    if (!force && (dow !== 1 || hour < 9 || hour > 10)) return { skipped: 'not_in_window' };
 
-      // Idempotency: already drafted this week?
-      const existing = await firestore.collection('payout_batches').doc(weekKey).get();
-      if (existing.exists) return;
+    const monDate = new Date(sast); monDate.setUTCDate(sast.getUTCDate() - ((sast.getUTCDay() + 6) % 7));
+    const weekKey = `wk_${monDate.toISOString().slice(0, 10)}`;
 
-      // Collect partner items
-      const partnerSnap = await firestore.collection('corporate_partners')
-        .where('pending_payout', '>', 0)
-        .limit(200)
-        .get().catch(() => null);
-      const partnerItems = (partnerSnap ? partnerSnap.docs : []).map(d => {
+    const existing = await firestore.collection('payout_batches').doc(weekKey).get();
+    if (existing.exists && !force) return { skipped: 'already_exists', batch_id: weekKey };
+
+    const partnerSnap = await firestore.collection('corporate_partners')
+      .where('pending_payout', '>', 0)
+      .limit(200)
+      .get().catch(() => null);
+    const partnerItems = (partnerSnap ? partnerSnap.docs : []).map(d => {
+      const x = d.data() || {};
+      return {
+        item_id: `p_${d.id}`,
+        recipient_type: 'corporate_partner',
+        recipient_id: d.id,
+        recipient_name: x.business_name || x.company_name || x.name || d.id,
+        original_amount: Number(x.pending_payout) || 0,
+        amount: Number(x.pending_payout) || 0,
+        bank_name: x.bank_name || '',
+        account_number: x.account_number || '',
+        branch_code: x.branch_code || '',
+        account_type: x.account_type || 'cheque',
+        status: 'pending_approval',
+        skip: false,
+        notes: (x.bank_name && x.account_number) ? '' : 'missing_bank_details',
+      };
+    }).filter(i => i.amount > 0);
+
+    const spSnap = await firestore.collection('serviceProvider')
+      .limit(1000)
+      .get().catch(() => null);
+    const artisanItems = (spSnap ? spSnap.docs : [])
+      .map(d => {
         const x = d.data() || {};
+        const bal = parseFloat(x.balance || x.wallet_balance || '0') || 0;
+        if (bal <= 0) return null;
         return {
-          item_id: `p_${d.id}`,
-          recipient_type: 'corporate_partner',
+          item_id: `a_${d.id}`,
+          recipient_type: 'artisan',
           recipient_id: d.id,
-          recipient_name: x.business_name || x.name || d.id,
-          original_amount: Number(x.pending_payout) || 0,
-          amount: Number(x.pending_payout) || 0,
+          recipient_name: x.name || x.full_name || d.id,
+          original_amount: bal,
+          amount: bal,
           bank_name: x.bank_name || '',
           account_number: x.account_number || '',
+          branch_code: x.branch_code || '',
           account_type: x.account_type || 'cheque',
           status: 'pending_approval',
           skip: false,
-          notes: '',
+          notes: (x.bank_name && x.account_number) ? '' : 'missing_bank_details',
         };
-      }).filter(i => i.amount > 0);
+      })
+      .filter(Boolean);
 
-      // Collect artisan items (users with artisan role + positive balance)
-      const usersSnap = await firestore.collection('users')
-        .where('role', '==', 'service_provider')
-        .limit(500)
-        .get().catch(() => null);
-      const artisanItems = (usersSnap ? usersSnap.docs : [])
-        .map(d => {
-          const x = d.data() || {};
-          const bal = parseFloat(x.balance || x.wallet_balance || '0') || 0;
-          if (bal <= 0) return null;
-          return {
-            item_id: `a_${d.id}`,
-            recipient_type: 'artisan',
-            recipient_id: d.id,
-            recipient_name: x.name || x.full_name || d.id,
-            original_amount: bal,
-            amount: bal,
-            bank_name: x.bank_name || '',
-            account_number: x.account_number || '',
-            account_type: x.account_type || 'cheque',
-            status: 'pending_approval',
-            skip: false,
-            notes: x.bank_name && x.account_number ? '' : 'missing_bank_details',
-          };
-        })
-        .filter(Boolean);
+    const items = [...partnerItems, ...artisanItems];
+    if (items.length === 0) return { skipped: 'no_items', batch_id: weekKey };
 
-      const items = [...partnerItems, ...artisanItems];
-      if (items.length === 0) return;
-
-      const totalAmount = items.reduce((s, i) => s + (i.amount || 0), 0);
-      await firestore.collection('payout_batches').doc(weekKey).set({
-        id: weekKey,
-        week_of: monDate.toISOString().slice(0, 10),
-        created_at: new Date().toISOString(),
-        status: 'pending_approval',
-        item_count: items.length,
-        partner_count: partnerItems.length,
-        artisan_count: artisanItems.length,
-        total_amount: parseFloat(totalAmount.toFixed(2)),
-        items,
-      });
-      try {
-        await logErrorToAdmin(
-          'payout_batch_ready',
-          `Weekly payout batch ${weekKey} ready for review: ${items.length} items, R${totalAmount.toFixed(2)}. Open admin app → Payouts to approve.`,
-          'weekly_payout_sweeper',
-          null,
-          null,
-          'medium'
-        );
-      } catch (_) {}
-      console.log(`[payout-batch] Created draft ${weekKey} with ${items.length} items totaling R${totalAmount.toFixed(2)}`);
-    } catch (e) {
-      console.warn('[payout-batch] sweeper error:', e && e.message);
-    }
+    const totalAmount = items.reduce((s, i) => s + (i.amount || 0), 0);
+    await firestore.collection('payout_batches').doc(weekKey).set({
+      id: weekKey,
+      week_of: monDate.toISOString().slice(0, 10),
+      created_at: new Date().toISOString(),
+      status: 'pending_approval',
+      item_count: items.length,
+      partner_count: partnerItems.length,
+      artisan_count: artisanItems.length,
+      total_amount: parseFloat(totalAmount.toFixed(2)),
+      items,
+    });
+    try {
+      await logErrorToAdmin(
+        'payout_batch_ready',
+        `Weekly payout batch ${weekKey} ready for review: ${items.length} items, R${totalAmount.toFixed(2)}. Open admin app → Payouts to approve.`,
+        'weekly_payout_sweeper',
+        null,
+        null,
+        'medium'
+      );
+    } catch (_) {}
+    console.log(`[payout-batch] Created draft ${weekKey} with ${items.length} items totaling R${totalAmount.toFixed(2)}`);
+    return { ok: true, batch_id: weekKey, item_count: items.length, total_amount: totalAmount };
+  } catch (e) {
+    console.warn('[payout-batch] sweeper error:', e && e.message);
+    return { error: e && e.message };
   }
-  // Run once shortly after boot, then hourly.
-  setTimeout(_maybeBuildWeeklyBatch, 60 * 1000);
-  setInterval(_maybeBuildWeeklyBatch, CHECK_INTERVAL_MS).unref?.();
 }
 
 function _plainEnglishFromError(err) {
