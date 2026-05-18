@@ -8372,11 +8372,11 @@ app.post('/api/admin/payout-batches/rebuild-now', authMiddleware, async (req, re
     const monDate = new Date(sast); monDate.setUTCDate(sast.getUTCDate() - ((sast.getUTCDay() + 6) % 7));
     const weekKey = `wk_${monDate.toISOString().slice(0, 10)}`;
     const existing = await db.collection('payout_batches').doc(weekKey).get();
-    if (existing.exists && existing.data().status === 'pending_approval') {
-      await db.collection('payout_batches').doc(weekKey).delete();
-    } else if (existing.exists) {
+    if (existing.exists && existing.data().status !== 'pending_approval') {
       return res.status(409).json({ error: `Batch ${weekKey} is in status "${existing.data().status}" — cannot rebuild.` });
     }
+    // Don't delete — _maybeBuildWeeklyBatch will overwrite via .set() and
+    // preserve notified_at so we don't re-spam admins on every rebuild.
     const result = await _maybeBuildWeeklyBatch(true);
     if (result && result.error) return res.status(500).json(result);
     res.json({ ok: true, ...result });
