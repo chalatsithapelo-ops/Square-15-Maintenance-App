@@ -7526,33 +7526,51 @@ async function handleMessage(session, userMessage, imageDataUrl) {
     }
 
     let response;
-    try {
-      response = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
-        temperature: 0.4,
-        max_tokens: 500,
-        messages: [
-          ...sysMessages,
-          ...session.messages,
-        ],
-        tools: waTools,
-        tool_choice: 'auto',
-      });
-    } catch (aiErr) {
-      console.error('[handleMessage] initial OpenAI failed, retrying once:', aiErr.message);
-      await new Promise(r => setTimeout(r, 800));
-      response = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
-        temperature: 0.4,
-        max_tokens: 300,
-        messages: [
-          ...sysMessages,
-          ...session.messages,
-        ],
-        tools: waTools,
-        tool_choice: 'auto',
-      });
+    // Wrapper with 429-aware retry. OpenAI returns "Please try again in X.XXXs"
+    // when org TPM is exhausted; we honour that hint, then retry once more.
+    async function _callChatWithRetry(opts) {
+      const maxAttempts = 3;
+      let lastErr;
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+          return await openai.chat.completions.create(opts);
+        } catch (e) {
+          lastErr = e;
+          const status = e && e.status;
+          const msg = (e && e.message) || '';
+          if (status === 429 || /rate limit/i.test(msg)) {
+            // Parse "try again in N.NNNs" from the message; clamp 2-30s.
+            let waitMs = 4000;
+            const m = msg.match(/try again in ([\d.]+)s/i);
+            if (m) waitMs = Math.min(30000, Math.max(2000, Math.ceil(parseFloat(m[1]) * 1000) + 500));
+            console.warn(`[handleMessage] 429 attempt ${attempt}/${maxAttempts}; waiting ${waitMs}ms`);
+            await new Promise(r => setTimeout(r, waitMs));
+            // Shrink token budget on retries to fit under TPM cap.
+            opts = { ...opts, max_tokens: Math.max(150, Math.floor((opts.max_tokens || 500) * 0.6)) };
+            continue;
+          }
+          // Non-429: one transient retry only on first failure.
+          if (attempt === 1) {
+            console.warn('[handleMessage] transient OpenAI error, retrying once:', msg);
+            await new Promise(r => setTimeout(r, 800));
+            continue;
+          }
+          throw e;
+        }
+      }
+      throw lastErr;
     }
+    response = await _callChatWithRetry({
+      model: 'gpt-4o-mini',
+      temperature: 0.4,
+      max_tokens: 500,
+      messages: [
+        ...sysMessages,
+        ...session.messages,
+      ],
+      tools: waTools,
+      tool_choice: 'auto',
+    });
 
     let choice = response.choices[0];
     let assistantMessage = choice.message;
@@ -7764,6 +7782,11 @@ async function handleMessage(session, userMessage, imageDataUrl) {
         'high'
       );
     } catch (_) {}
+    // Friendlier user message when it's clearly a rate-limit / overload case.
+    const m = (err && err.message) || '';
+    if (err && (err.status === 429 || /rate limit/i.test(m))) {
+      return "We're getting a lot of requests right now — please send 'Hi' again in about 30 seconds and I'll continue where we left off.";
+    }
     return "I'm having trouble right now. Please try again in a moment, or send 'Hi' to restart our conversation.";
   }
 }
