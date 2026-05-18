@@ -8268,6 +8268,17 @@ app.post('/api/admin/payout-batches/:batchId/approve', authMiddleware, async (re
       return res.status(409).json({ error: `Batch already ${batch.status}` });
     }
 
+    // Pre-flight: refuse to approve if any non-skipped item is missing bank details.
+    // Admin must edit those items (skip them) before approving the batch.
+    const allItems = Array.isArray(batch.items) ? batch.items : [];
+    const blockers = allItems.filter(i => !i.skip && i.amount > 0 && (!i.bank_name || !i.account_number));
+    if (blockers.length > 0 && !req.body?.allow_partial) {
+      return res.status(400).json({
+        error: 'Cannot approve: some items are missing bank details. Skip them or fill the bank fields, then retry. Pass {"allow_partial": true} to approve anyway (those items will fail).',
+        missing_bank_items: blockers.map(b => ({ item_id: b.item_id, recipient_name: b.recipient_name, recipient_type: b.recipient_type })),
+      });
+    }
+
     // Mark approved before firing (prevents double-approve).
     await batchRef.update({
       status: 'processing',
@@ -8275,7 +8286,7 @@ app.post('/api/admin/payout-batches/:batchId/approve', authMiddleware, async (re
       approved_by: req.user.uid,
     });
 
-    const items = Array.isArray(batch.items) ? batch.items : [];
+    const items = allItems;
     const results = [];
     let okCount = 0, failCount = 0;
 
@@ -10095,14 +10106,27 @@ function _startRefundReconciliationSweeper() {
     try {
       const firestore = admin.apps.length ? admin.firestore() : null;
       if (!firestore) return;
+      // refund_requests may store created_at as a Firestore Timestamp OR an ISO
+      // string depending on writer. Query both and merge.
+      const cutoffTs = admin.firestore.Timestamp.fromMillis(Date.now() - STALE_AFTER_MS);
       const cutoffIso = new Date(Date.now() - STALE_AFTER_MS).toISOString();
-      const snap = await firestore.collection('refund_requests')
-        .where('status', '==', 'pending')
-        .where('created_at', '<', cutoffIso)
-        .limit(50)
-        .get();
-      if (snap.empty) return;
-      for (const d of snap.docs) {
+      const [snapTs, snapIso] = await Promise.all([
+        firestore.collection('refund_requests')
+          .where('status', '==', 'pending')
+          .where('created_at', '<', cutoffTs)
+          .limit(50).get().catch(() => ({ docs: [], empty: true, size: 0 })),
+        firestore.collection('refund_requests')
+          .where('status', '==', 'pending')
+          .where('created_at', '<', cutoffIso)
+          .limit(50).get().catch(() => ({ docs: [], empty: true, size: 0 })),
+      ]);
+      const seen = new Set();
+      const docs = [...(snapTs.docs || []), ...(snapIso.docs || [])].filter(d => {
+        if (seen.has(d.id)) return false;
+        seen.add(d.id); return true;
+      });
+      if (docs.length === 0) return;
+      for (const d of docs) {
         const data = d.data() || {};
         if (data.flagged_stale_at) continue; // already flagged
         await d.ref.update({
@@ -10120,7 +10144,7 @@ function _startRefundReconciliationSweeper() {
           );
         } catch (_) {}
       }
-      console.log(`[refund-reconcile] flagged ${snap.size} stale refund requests`);
+      console.log(`[refund-reconcile] flagged ${docs.length} stale refund requests`);
     } catch (e) {
       console.warn('[refund-reconcile] sweeper error:', e && e.message);
     }
