@@ -7847,6 +7847,49 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       }
     }
 
+    // ── Sync with any pending weekly payout batch ─────────────────────────
+    // If this manual payout covers a recipient that is also in a draft batch,
+    // deduct the manual amount from that batch line item so it doesn't get
+    // double-paid when the admin approves the batch.
+    try {
+      const draftSnap = await db.collection('payout_batches')
+        .where('status', '==', 'pending_approval')
+        .orderBy('created_at', 'desc')
+        .limit(3)
+        .get();
+      for (const batchDoc of draftSnap.docs) {
+        const data = batchDoc.data() || {};
+        const items = Array.isArray(data.items) ? data.items.slice() : [];
+        // Match by recipient_type + recipient_id; "partner" in payout endpoint
+        // maps to "corporate_partner" in batch sweeper.
+        const matchType = recipient_type === 'partner' ? 'corporate_partner' : recipient_type;
+        const idx = items.findIndex(i => i.recipient_type === matchType && i.recipient_id === recipient_id && !i.skip);
+        if (idx === -1) continue;
+        const it = { ...items[idx] };
+        const remaining = Math.max(0, (parseFloat(it.amount) || 0) - payoutAmount);
+        if (remaining <= 0.01) {
+          it.skip = true;
+          it.notes = `Paid manually R${payoutAmount.toFixed(2)} on ${now} (payout ${payoutId})`;
+          it.amount = 0;
+        } else {
+          it.amount = parseFloat(remaining.toFixed(2));
+          it.notes = `Partial manual payout R${payoutAmount.toFixed(2)} on ${now} (payout ${payoutId}). Remainder owed.`;
+        }
+        it.synced_from_manual_at = now;
+        items[idx] = it;
+        const total = items.filter(i => !i.skip).reduce((s, i) => s + (parseFloat(i.amount) || 0), 0);
+        await batchDoc.ref.update({
+          items,
+          total_amount: parseFloat(total.toFixed(2)),
+          updated_at: now,
+        });
+        console.log(`[ozow-payout] Synced manual payout to batch ${batchDoc.id} item ${it.item_id}`);
+        break;
+      }
+    } catch (syncErr) {
+      console.warn('[ozow-payout] batch-sync failed (non-fatal):', syncErr && syncErr.message);
+    }
+
     return res.json({
       ok: true,
       payout_id: payoutId,
