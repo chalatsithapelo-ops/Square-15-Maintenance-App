@@ -10234,6 +10234,8 @@ async function _maybeBuildWeeklyBatch(force = false) {
     if (items.length === 0) return { skipped: 'no_items', batch_id: weekKey };
 
     const totalAmount = items.reduce((s, i) => s + (i.amount || 0), 0);
+    // Preserve notified_at on rebuild so we don't re-notify on every PATCH/rebuild cycle.
+    const prevNotifiedAt = existing.exists ? (existing.data() || {}).notified_at || null : null;
     await firestore.collection('payout_batches').doc(weekKey).set({
       id: weekKey,
       week_of: monDate.toISOString().slice(0, 10),
@@ -10244,17 +10246,31 @@ async function _maybeBuildWeeklyBatch(force = false) {
       artisan_count: artisanItems.length,
       total_amount: parseFloat(totalAmount.toFixed(2)),
       items,
+      notified_at: prevNotifiedAt,
     });
-    try {
-      await logErrorToAdmin(
-        'payout_batch_ready',
-        `Weekly payout batch ${weekKey} ready for review: ${items.length} items, R${totalAmount.toFixed(2)}. Open admin app → Payouts to approve.`,
-        'weekly_payout_sweeper',
-        null,
-        null,
-        'medium'
-      );
-    } catch (_) {}
+    // Send an INFO-level admin notification once per batch. Not an error.
+    if (!prevNotifiedAt) {
+      try {
+        const message = `Weekly payout batch ${weekKey} ready for review: ${items.length} items, R${totalAmount.toFixed(2)}. Open admin app → Payouts to approve.`;
+        await firestore.collection('notifications').add({
+          title: 'Weekly Payout Batch Ready',
+          message,
+          body: message,
+          type: 'payout_batch_ready',
+          severity: 'info',
+          target: 'admin',
+          user_type: 'admin',
+          user_id: 'admin',
+          batch_id: weekKey,
+          read: false,
+          timestamp: admin.firestore.FieldValue.serverTimestamp(),
+          created_at: admin.firestore.FieldValue.serverTimestamp(),
+        });
+        await firestore.collection('payout_batches').doc(weekKey).update({
+          notified_at: new Date().toISOString(),
+        });
+      } catch (_) {}
+    }
     console.log(`[payout-batch] Created draft ${weekKey} with ${items.length} items totaling R${totalAmount.toFixed(2)}`);
     return { ok: true, batch_id: weekKey, item_count: items.length, total_amount: totalAmount };
   } catch (e) {
