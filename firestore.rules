@@ -381,6 +381,15 @@ service cloud.firestore {
       allow create, delete: if false;
     }
 
+    // ── Payout batches (weekly Ozow batch review/edit/approve) ─────────────
+    // Backend sweeper creates drafts via Admin SDK. Admin app reads + updates
+    // via the /api/admin/payout-batches/* endpoints (which also write via
+    // Admin SDK), so direct client writes are blocked.
+    match /payout_batches/{batchId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if false;
+    }
+
     // ── Default deny for unlisted collections ──────────────────────────────
     match /{document=**} {
       allow read, write: if false;
