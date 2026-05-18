@@ -25,6 +25,64 @@ service firebase.storage {
                    && request.resource.size < 15 * 1024 * 1024;
     }
 
+    // Legacy "users/<id>.jpg" profile-image path used by older app versions
+    // (StorageServices.uploadImageToFirebase(path:'users')). Authenticated
+    // users only; image content; size capped.
+    match /users/{file} {
+      allow read: if true;
+      allow write: if request.auth != null
+                   && request.resource.size < 10 * 1024 * 1024
+                   && request.resource.contentType.matches('image/.*');
+    }
+
+    // Artisan before/after work photos — uploaded by the assigned artisan
+    // from the SP panel. Public read so the client app + WA bot can render
+    // the proof images. Authenticated write only.
+    match /artisan_work_images/{file=**} {
+      allow read: if true;
+      allow write: if request.auth != null
+                   && request.resource.size < 15 * 1024 * 1024
+                   && request.resource.contentType.matches('image/.*');
+    }
+
+    // Customer-side job/task attachments uploaded during booking creation.
+    match /task_attachments/{file=**} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null
+                   && request.resource.size < 15 * 1024 * 1024
+                   && request.resource.contentType.matches('image/.*');
+    }
+    match /job_images/{file=**} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null
+                   && request.resource.size < 15 * 1024 * 1024
+                   && request.resource.contentType.matches('image/.*');
+    }
+
+    // Payment proof / deposit slips uploaded by users.
+    match /users_payment_requests/{file=**} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null
+                   && request.resource.size < 10 * 1024 * 1024
+                   && request.resource.contentType.matches('image/.*');
+    }
+
+    // Flag-issue / balance-proof uploads from the SP panel.
+    match /balance_proofs/{file=**} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null
+                   && request.resource.size < 15 * 1024 * 1024
+                   && request.resource.contentType.matches('image/.*');
+    }
+
+    // AI-agent / task chat image attachments — authenticated users only.
+    match /task_images/{file=**} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null
+                   && request.resource.size < 15 * 1024 * 1024
+                   && request.resource.contentType.matches('image/.*');
+    }
+
     // Booking attachments (photos, etc.) — authenticated users only.
     match /uploads/{allPaths=**} {
       allow read: if request.auth != null;

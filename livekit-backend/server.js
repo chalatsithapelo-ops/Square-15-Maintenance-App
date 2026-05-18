@@ -6348,6 +6348,42 @@ app.post('/api/notifications/send', authMiddleware, assistantLimiter, async (req
   }
 });
 
+// -- AI Photo Diagnosis (GPT-4o Vision) --
+// Used by client app + Lizzy Voice photo enrichment.
+app.post('/api/photo/diagnose', assistantLimiter, async (req, res) => {
+  try {
+    const oai = getOpenAI();
+    if (!oai) return res.status(503).json({ error: 'AI service not configured' });
+    const { image_base64, image_url, user_description, location_context } = req.body || {};
+    if (!image_base64 && !image_url) {
+      return res.status(400).json({ error: 'Provide image_base64 or image_url' });
+    }
+    const imageContent = image_base64
+      ? { type: 'image_url', image_url: { url: image_base64.startsWith('data:') ? image_base64 : `data:image/jpeg;base64,${image_base64}`, detail: 'high' } }
+      : { type: 'image_url', image_url: { url: image_url, detail: 'high' } };
+    const userText = user_description
+      ? `The tenant describes the issue as: "${user_description}"${location_context ? `. Location: ${location_context}` : ''}`
+      : `Please analyze this maintenance issue photo.${location_context ? ` Location: ${location_context}` : ''}`;
+    const completion = await oai.chat.completions.create({
+      model: 'gpt-4o',
+      temperature: 0.2,
+      max_tokens: 800,
+      response_format: { type: 'json_object' },
+      messages: [
+        { role: 'system', content: 'You are an expert maintenance diagnostics AI for Square 15 Maintenance (South Africa). Analyze the photo and return JSON with: issue_type, service_category (Plumbing|Electrical|Painting|Carpentry|Roofing|Tiling|Locksmith|Appliance Repair|Landscaping|General Maintenance), severity (low|medium|high|emergency), urgency_flag (bool), description (2-3 sentences), recommended_action, estimated_complexity (1-5), materials_likely_needed (array), safety_warnings (array), confidence (0.0-1.0). If not a maintenance issue, set issue_type="not_maintenance". Return ONLY valid JSON.' },
+        { role: 'user', content: [imageContent, { type: 'text', text: userText }] },
+      ],
+    });
+    const content = completion.choices[0]?.message?.content || '{}';
+    let diagnosis;
+    try { diagnosis = JSON.parse(content); } catch { diagnosis = { raw: content }; }
+    res.json({ ok: true, diagnosis });
+  } catch (error) {
+    console.error('Photo diagnose error:', error && error.message);
+    res.status(500).json({ error: 'Photo diagnosis failed' });
+  }
+});
+
 // -- In-memory payment session store (WhatsApp checkout) --
 // PayFast /eng/process only accepts POST, not GET. So we store payment data
 // briefly and serve an auto-submit HTML form page via GET.
@@ -9806,6 +9842,48 @@ function _startAutoResolveSweeper() {
 }
 // --- END AUTO-HEAL ----------------------------------------------------------
 
+// Background sweeper: every 6 hours, surface refund_requests that have sat
+// in 'pending' status for >7 days as 'stale_refund_request' error_logs so
+// admin sees them on the Live Issues board. Prevents orphan refunds.
+function _startRefundReconciliationSweeper() {
+  const INTERVAL_MS = 6 * 60 * 60 * 1000;
+  const STALE_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
+  setInterval(async () => {
+    try {
+      const firestore = admin.apps.length ? admin.firestore() : null;
+      if (!firestore) return;
+      const cutoffIso = new Date(Date.now() - STALE_AFTER_MS).toISOString();
+      const snap = await firestore.collection('refund_requests')
+        .where('status', '==', 'pending')
+        .where('created_at', '<', cutoffIso)
+        .limit(50)
+        .get();
+      if (snap.empty) return;
+      for (const d of snap.docs) {
+        const data = d.data() || {};
+        if (data.flagged_stale_at) continue; // already flagged
+        await d.ref.update({
+          flagged_stale_at: new Date().toISOString(),
+          stale_reason: 'pending_over_7_days',
+        });
+        try {
+          await logErrorToAdmin(
+            'stale_refund_request',
+            `Refund request ${d.id} pending for >7 days. user=${data.user_id || '?'} amount=R${data.amount || 0} booking=${data.source_doc_id || '?'} method=${data.payment_method || '?'}`,
+            'refund_reconciliation_sweeper',
+            null,
+            data.source_doc_id || null,
+            'high'
+          );
+        } catch (_) {}
+      }
+      console.log(`[refund-reconcile] flagged ${snap.size} stale refund requests`);
+    } catch (e) {
+      console.warn('[refund-reconcile] sweeper error:', e && e.message);
+    }
+  }, INTERVAL_MS).unref?.();
+}
+
 function _plainEnglishFromError(err) {
   const m = (err && (err.message || err.toString())) || '';
   const s = m.toLowerCase();
@@ -9854,9 +9932,15 @@ async function _captureBackendError(kind, err, reqInfo) {
       return;
     }
     _errorDedup.set(key, { firstSeen: now, lastSeen: now, count: 1 });
+    // LRU+TTL cap. First sweep entries >10min old, then if still over cap evict oldest by lastSeen.
     if (_errorDedup.size > 500) {
       for (const [k, v] of _errorDedup.entries()) {
         if (now - v.lastSeen > 10 * 60 * 1000) _errorDedup.delete(k);
+      }
+      if (_errorDedup.size > 500) {
+        const sorted = [..._errorDedup.entries()].sort((a, b) => a[1].lastSeen - b[1].lastSeen);
+        const toDrop = _errorDedup.size - 500;
+        for (let i = 0; i < toDrop; i++) _errorDedup.delete(sorted[i][0]);
       }
     }
     _errorsThisHour += 1;
@@ -10911,5 +10995,6 @@ if (require.main === module) {
     } catch (_) {}
     console.log('? Server ready to accept requests\n');
     try { _startAutoResolveSweeper(); console.log('?? Auto-heal sweeper started (every 5 min).'); } catch (_) {}
+    try { _startRefundReconciliationSweeper(); console.log('?? Refund-reconciliation sweeper started (every 6h).'); } catch (_) {}
   });
 }

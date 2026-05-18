@@ -34,29 +34,142 @@ service cloud.firestore {
     // Public-readable (rendered in customer search). Writes admin-only
     // (anti-fraud — May 2026): artisans cannot edit their own profile picture
     // or core profile fields. They go through the admin-mediated flow.
+    //
+    // EXCEPTION (May 2026): the artisan must be able to keep their FCM /
+    // device token fresh on their OWN serviceProvider doc — otherwise no
+    // RFQ push ever reaches them on a new device. We allow update IFF the
+    // signed-in user's email matches the doc's email AND the only changed
+    // fields are the FCM/device-token allowlist below.
+    function isOwnSpDoc() {
+      return isSignedIn() &&
+             resource.data.email is string &&
+             request.auth.token.email != null &&
+             resource.data.email.lower() == request.auth.token.email.lower();
+    }
+    function spUpdateOnlyTokenFields() {
+      // Artisan can refresh: FCM/device tokens, last-seen timestamps,
+      // their current GPS position (used for dispatch routing), and the
+      // online/offline availability flag (toggle widget). Anti-fraud
+      // fields (name, services, hourlyRate, profile picture, banking)
+      // remain admin-only.
+      return request.resource.data.diff(resource.data).affectedKeys()
+        .hasOnly([
+          'deviceToken', 'fcm_token', 'fcmToken',
+          'last_seen_at', 'lastSeenAt', 'updated_at',
+          'lat', 'lng', 'location',
+          'status', 'availability', 'isOnline', 'is_online'
+        ]);
+    }
     match /serviceProvider/{spId} {
       allow read: if true;
-      allow write: if isAdmin();
+      allow update: if isAdmin() || (isOwnSpDoc() && spUpdateOnlyTokenFields());
+      allow create, delete: if isAdmin();
     }
     match /service_providers/{spId} {
       allow read: if true;
-      allow write: if isAdmin();
+      allow update: if isAdmin() || (isOwnSpDoc() && spUpdateOnlyTokenFields());
+      allow create, delete: if isAdmin();
     }
 
     // ── Bookings / Tasks ───────────────────────────────────────────────────
+    // Field reality (May 2026): codebase uses `user_id` (= Firebase Auth UID)
+    // for the customer and `service_provider_id` for the assigned artisan.
+    // CRITICAL: `service_provider_id` is the serviceProvider Firestore DOC
+    // ID, NOT the Firebase Auth UID — the admin app creates SP docs via
+    // .add() with auto-generated ids. So we cannot match the artisan with
+    // `request.auth.uid`. We resolve the artisan via the email on their
+    // serviceProvider doc using a get() lookup.
+    function isOwnerOfTask(rsrc) {
+      return isSignedIn() && (
+        rsrc.data.user_id == request.auth.uid ||
+        rsrc.data.userId == request.auth.uid
+      );
+    }
+    function spDocIdMatchesAuthEmail(spDocId) {
+      return isSignedIn() && spDocId is string && spDocId.size() > 0 &&
+             request.auth.token.email != null &&
+             exists(/databases/$(database)/documents/serviceProvider/$(spDocId)) &&
+             get(/databases/$(database)/documents/serviceProvider/$(spDocId)).data.email is string &&
+             get(/databases/$(database)/documents/serviceProvider/$(spDocId)).data.email.lower() ==
+               request.auth.token.email.lower();
+    }
+    function isArtisanOfTask(rsrc) {
+      return isSignedIn() && (
+        rsrc.data.service_provider_id == request.auth.uid ||
+        rsrc.data.artisanId == request.auth.uid ||
+        (rsrc.data.service_provider_id is string &&
+         spDocIdMatchesAuthEmail(rsrc.data.service_provider_id))
+      );
+    }
+    // RFQ candidate (in the assigned pool, hasn't claimed yet). We can't
+    // get() every SP doc id in the array, so we authorize via a parallel
+    // email array (`dispatched_artisan_emails`) that admin broadcast / WA
+    // bot auto-dispatch stamp on the futureBookings + tasksManagement docs.
+    // This is the canonical pre-accept access path: artisan's auth email
+    // appears in the lowercase email array on the dispatched doc.
+    function isRfqCandidate(rsrc) {
+      return isSignedIn() &&
+             ((rsrc.data.rfq_assigned_artisan_ids is list &&
+               request.auth.uid in rsrc.data.rfq_assigned_artisan_ids) ||
+              (rsrc.data.dispatched_artisan_uids is list &&
+               request.auth.uid in rsrc.data.dispatched_artisan_uids) ||
+              (rsrc.data.dispatched_artisan_emails is list &&
+               request.auth.token.email != null &&
+               request.auth.token.email.lower() in rsrc.data.dispatched_artisan_emails));
+    }
+    function isTaskTerminal(rsrc) {
+      return rsrc.data.status in ['cancelled', 'canceled', 'completed', 'closed', 'rejected'] ||
+             rsrc.data.rfq_status in ['cancelled', 'canceled', 'completed', 'closed', 'rejected'];
+    }
+    // ── Field-level guard against quote tampering ─────────────────────────
+    // After admin reviews an RFQ (admin_quote_total > 0 OR rfq_status moves
+    // beyond `pending_admin_review`), the customer must NOT be able to edit
+    // financial / pricing / status / authorization fields. They can still
+    // accept the quote, set a schedule, cancel, etc. Admins / backend
+    // (Admin SDK) bypass these checks.
+    function ownerAllowedFieldChange(rsrc) {
+      // Allow if customer hasn't been priced yet (no admin_quote_total).
+      let priced = (rsrc.data.admin_quote_total is number && rsrc.data.admin_quote_total > 0) ||
+                   (rsrc.data.rfq_status in ['pending_artisan_acceptance', 'accepted_converted', 'pending_payment']);
+      // Whitelist of fields a priced-quote owner may touch.
+      let safe = [
+        'preferred_date', 'preferred_time', 'preferred_schedule', 'scheduled_date', 'scheduled_time',
+        'notes', 'customer_notes', 'user_notes',
+        'rfq_quote_accepted', 'rfq_quote_accepted_at',
+        'cancellation_reason', 'cancelled_at',
+        'updated_at', 'last_user_action_at',
+        'wa_session_phone', 'user_confirmed_arrival', 'arrival_confirmed_at',
+        'rating', 'review', 'review_submitted_at',
+        'completion_acknowledged', 'completion_acknowledged_at',
+        'refund_requested', 'refund_reason', 'complaint_reason'
+      ];
+      return !priced ||
+             request.resource.data.diff(rsrc.data).affectedKeys().hasOnly(safe);
+    }
+
     match /tasksManagement/{taskId} {
-      allow read: if isSignedIn() && (
-        resource.data.userId == request.auth.uid ||
-        resource.data.artisanId == request.auth.uid ||
-        isAdmin()
-      );
+      // Split into FLAT allow-read clauses so Firestore's static query
+      // analyzer can match listen queries (where dispatched_artisan_uids
+      // array_contains <uid>, etc.) to a single provable disjunct.
+      // Nested OR inside helper functions was rejecting listens with
+      // PERMISSION_DENIED on Android clients (May 13 2026).
+      allow read: if isAdmin();
+      allow read: if isOwnerOfTask(resource);
+      allow read: if isArtisanOfTask(resource);
+      allow read: if isSignedIn() &&
+        request.auth.uid in resource.data.dispatched_artisan_uids;
+      allow read: if isSignedIn() &&
+        request.auth.uid in resource.data.rfq_assigned_artisan_ids;
+      allow read: if isSignedIn() &&
+        request.auth.token.email != null &&
+        request.auth.token.email.lower() in resource.data.dispatched_artisan_emails;
       allow create: if isSignedIn();
-      allow update: if isSignedIn() && (
-        resource.data.userId == request.auth.uid ||
-        resource.data.artisanId == request.auth.uid ||
-        isAdmin()
-      );
-      allow delete: if isAdmin();
+      allow update: if isAdmin() ||
+        isArtisanOfTask(resource) ||
+        isRfqCandidate(resource) ||
+        (isOwnerOfTask(resource) && ownerAllowedFieldChange(resource));
+      allow delete: if isAdmin() ||
+        ((isOwnerOfTask(resource) || isArtisanOfTask(resource)) && isTaskTerminal(resource));
     }
 
     // ── Payment cards (subcollection under user) ───────────────────────────
@@ -99,23 +212,48 @@ service cloud.firestore {
     }
 
     // ── RFQs / Future bookings ─────────────────────────────────────────────
+    // Same field-name fix as tasksManagement above. Assigned artisans
+    // (single or RFQ-pool candidates) need read+update access so they
+    // can claim the RFQ atomically and confirm/decline jobs. Customers
+    // + assigned artisans may delete only after the booking has reached
+    // a terminal state.
     match /futureBookings/{id} {
-      allow read: if isSignedIn() && (
-        resource.data.userId == request.auth.uid ||
-        resource.data.artisanId == request.auth.uid ||
-        isAdmin()
-      );
+      allow read: if isAdmin();
+      allow read: if isOwnerOfTask(resource);
+      allow read: if isArtisanOfTask(resource);
+      allow read: if isSignedIn() &&
+        request.auth.uid in resource.data.dispatched_artisan_uids;
+      allow read: if isSignedIn() &&
+        request.auth.uid in resource.data.rfq_assigned_artisan_ids;
+      allow read: if isSignedIn() &&
+        request.auth.token.email != null &&
+        request.auth.token.email.lower() in resource.data.dispatched_artisan_emails;
       allow create: if isSignedIn();
-      allow update, delete: if isAdmin();
+      allow update: if isAdmin() ||
+        isArtisanOfTask(resource) ||
+        isRfqCandidate(resource) ||
+        (isOwnerOfTask(resource) && ownerAllowedFieldChange(resource));
+      allow delete: if isAdmin() ||
+        ((isOwnerOfTask(resource) || isArtisanOfTask(resource)) && isTaskTerminal(resource));
     }
     match /future_bookings/{id} {
-      allow read: if isSignedIn() && (
-        resource.data.userId == request.auth.uid ||
-        resource.data.artisanId == request.auth.uid ||
-        isAdmin()
-      );
+      allow read: if isAdmin();
+      allow read: if isOwnerOfTask(resource);
+      allow read: if isArtisanOfTask(resource);
+      allow read: if isSignedIn() &&
+        request.auth.uid in resource.data.dispatched_artisan_uids;
+      allow read: if isSignedIn() &&
+        request.auth.uid in resource.data.rfq_assigned_artisan_ids;
+      allow read: if isSignedIn() &&
+        request.auth.token.email != null &&
+        request.auth.token.email.lower() in resource.data.dispatched_artisan_emails;
       allow create: if isSignedIn();
-      allow update, delete: if isAdmin();
+      allow update: if isAdmin() ||
+        isArtisanOfTask(resource) ||
+        isRfqCandidate(resource) ||
+        (isOwnerOfTask(resource) && ownerAllowedFieldChange(resource));
+      allow delete: if isAdmin() ||
+        ((isOwnerOfTask(resource) || isArtisanOfTask(resource)) && isTaskTerminal(resource));
     }
 
     // ── Admin invite codes ─────────────────────────────────────────────────
@@ -128,9 +266,104 @@ service cloud.firestore {
       allow read, write: if isAdmin();
     }
 
+    // ── Notifications (admin inbox + per-user notifications) ───────────────
+    // Backend (Admin SDK) writes here freely. Clients read their own:
+    //  - admins read any doc with user_type == 'admin' OR user_id == 'admin'
+    //  - regular users read docs where user_id == their auth uid
+    // Updates limited to "mark as read" style flag toggles; deletes admin-only.
+    function isOwnNotification(rsrc) {
+      return isSignedIn() && (
+        rsrc.data.user_id == request.auth.uid ||
+        rsrc.data.userId == request.auth.uid
+      );
+    }
+    match /notifications/{id} {
+      allow read: if isAdmin() || isOwnNotification(resource);
+      allow create: if isAdmin();
+      allow update: if isAdmin() || isOwnNotification(resource);
+      allow delete: if isAdmin();
+    }
+
+    // ── WhatsApp bot monitor (admin-only) ─────────────────────────────────
+    // The WA bot (Admin SDK) writes here. The admin app reads from the
+    // monitor screen. Subcollection `messages` mirrors the threaded chat.
+    match /wa_chat_logs/{phone} {
+      allow read: if isAdmin();
+      allow write: if isAdmin();
+      match /messages/{msgId} {
+        allow read: if isAdmin();
+        allow write: if isAdmin();
+      }
+    }
+    // WA sessions doc (per-phone state). Admin-readable for debugging.
+    match /wa_sessions/{phone} {
+      allow read: if isAdmin();
+      allow write: if isAdmin();
+    }
+
     // ── Chat ───────────────────────────────────────────────────────────────
+    // Real chat lives at /tasksManagement/{taskId}/chat/{msgId}. Only the
+    // task's owner (customer) or assigned artisan may read/write the
+    // subcollection. The chat ActiveUsers presence subcollection follows
+    // the same access rules.
+    function canAccessTaskChat(taskId) {
+      return isSignedIn() && (
+        isAdmin() ||
+        (exists(/databases/$(database)/documents/tasksManagement/$(taskId)) && (
+          isOwnerOfTask(get(/databases/$(database)/documents/tasksManagement/$(taskId))) ||
+          isArtisanOfTask(get(/databases/$(database)/documents/tasksManagement/$(taskId)))
+        ))
+      );
+    }
+    match /tasksManagement/{taskId}/chat/{msgId} {
+      allow read, create, update: if canAccessTaskChat(taskId);
+      allow delete: if isAdmin();
+    }
+    match /tasksManagement/{taskId}/chatActiveUsers/{userId} {
+      allow read: if canAccessTaskChat(taskId);
+      allow write: if isSignedIn() && request.auth.uid == userId && canAccessTaskChat(taskId);
+    }
+    // Legacy top-level /chat path — restrict to participants if used.
     match /chat/{chatId}/{document=**} {
-      allow read, write: if isSignedIn();  // TODO: tighten to participants only
+      allow read, write: if isSignedIn() && (
+        isAdmin() ||
+        (resource != null && (
+          (resource.data.participants is list && request.auth.uid in resource.data.participants) ||
+          resource.data.sender_id == request.auth.uid ||
+          resource.data.receiver_id == request.auth.uid
+        ))
+      );
+    }
+
+    // ── Artisan before/after work image records ────────────────────────────
+    // Documents in /artisanTasksImages link to /tasksManagement via the
+    // `task_management_id` field. The doc id is supplied by the client (uuid).
+    // Access is gated by the linked tasksManagement doc: the owner (customer)
+    // and assigned artisan can read; only the assigned artisan can write.
+    match /artisanTasksImages/{imgId} {
+      allow read: if isSignedIn() && (
+        isAdmin() ||
+        (resource != null && exists(/databases/$(database)/documents/tasksManagement/$(resource.data.task_management_id)) && (
+          isOwnerOfTask(get(/databases/$(database)/documents/tasksManagement/$(resource.data.task_management_id))) ||
+          isArtisanOfTask(get(/databases/$(database)/documents/tasksManagement/$(resource.data.task_management_id)))
+        ))
+      );
+      allow create, update: if isSignedIn() && (
+        isAdmin() ||
+        (request.resource.data.task_management_id is string &&
+         exists(/databases/$(database)/documents/tasksManagement/$(request.resource.data.task_management_id)) &&
+         isArtisanOfTask(get(/databases/$(database)/documents/tasksManagement/$(request.resource.data.task_management_id))))
+      );
+      allow delete: if isAdmin();
+    }
+
+    // ── Pricing Guidance (admin pricing guide; admin-only read/write) ──────
+    // Used by:
+    //   - admin app "Pricing Guide Management" screen (direct stream)
+    //   - whatsapp-bot / livekit-backend (Admin SDK — bypasses rules)
+    // Material multipliers, labour rates, contingency % per category.
+    match /pricingGuidance/{categoryId} {
+      allow read, write: if isAdmin();
     }
 
     // ── Default deny for unlisted collections ──────────────────────────────
