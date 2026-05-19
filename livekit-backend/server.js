@@ -7624,9 +7624,19 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
     console.log(`[admin/ozow-payout] URL: ${ozowPayoutUrl}`);
     console.log(`[admin/ozow-payout] Payload:`, JSON.stringify(payoutPayload));
 
+    // Some Ozow merchants need IsRealTimeClearing=false (RTC requires separate enablement).
+    const payoutPayloadNoRTC = { ...payoutPayload, IsRealTimeClearing: false };
+    const payoutPayloadFallbackNoRTC = { ...payoutPayloadFallback, isRealTimeClearing: false };
+
+    // Alternate URL variants we'll fall through on empty-body 500s.
+    const altUrl = env('OZOW_IS_TEST') === 'true'
+      ? 'https://stagingapi.ozow.com/v1/payouts'
+      : 'https://api.ozow.com/v1/payouts';
+
     const ozowAttempts = [
       {
-        name: 'primary_pascal_apiKey',
+        name: 'A_pay_pascal_RTC',
+        url: ozowPayoutUrl,
         headers: {
           'Content-Type': 'application/json',
           'ApiKey': ozowApiKey,
@@ -7635,7 +7645,18 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
         payload: payoutPayload,
       },
       {
-        name: 'fallback_camel_bearer',
+        name: 'B_pay_pascal_noRTC',
+        url: ozowPayoutUrl,
+        headers: {
+          'Content-Type': 'application/json',
+          'ApiKey': ozowApiKey,
+          'Accept': 'application/json',
+        },
+        payload: payoutPayloadNoRTC,
+      },
+      {
+        name: 'C_pay_camel_bearer',
+        url: ozowPayoutUrl,
         headers: {
           'Content-Type': 'application/json',
           'ApiKey': ozowApiKey,
@@ -7645,15 +7666,29 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
         },
         payload: payoutPayloadFallback,
       },
+      {
+        name: 'D_apiv1_pascal_noRTC',
+        url: altUrl,
+        headers: {
+          'Content-Type': 'application/json',
+          'ApiKey': ozowApiKey,
+          'Accept': 'application/json',
+        },
+        payload: payoutPayloadNoRTC,
+      },
     ];
 
     let ozowResponse = null;
     let ozowResult = null;
     let ozowRawText = '';
+    let ozowRespHeaders = {};
+    let ozowAttemptName = '';
+    const attemptHistory = [];
 
     for (const attempt of ozowAttempts) {
       try {
-        const response = await fetch(ozowPayoutUrl, {
+        console.log(`[admin/ozow-payout] -> trying ${attempt.name} ${attempt.url}`);
+        const response = await fetch(attempt.url, {
           method: 'POST',
           headers: attempt.headers,
           body: JSON.stringify(attempt.payload),
@@ -7667,23 +7702,29 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
         } catch (_) {
           parsed = null;
         }
+        const headersObj = {};
+        try { response.headers.forEach((v,k)=>{ headersObj[k]=v; }); } catch(_) {}
 
         const parsedPayoutId = parsed && (parsed.payoutId || parsed.PayoutId || parsed.id || parsed.Id);
         ozowResponse = response;
         ozowResult = parsed;
         ozowRawText = rawText;
+        ozowRespHeaders = headersObj;
+        ozowAttemptName = attempt.name;
+        attemptHistory.push(`${attempt.name}=HTTP${response.status}(${(rawText||'').length}b)`);
 
         if (response.ok && parsedPayoutId) {
           console.log(`[admin/ozow-payout] Ozow success via ${attempt.name}`);
           break;
         }
 
-        console.warn(`[admin/ozow-payout] Attempt ${attempt.name} failed (HTTP ${response.status})`);
-        if (response.status < 500) {
+        console.warn(`[admin/ozow-payout] Attempt ${attempt.name} failed (HTTP ${response.status}) headers=${JSON.stringify(headersObj).slice(0,400)} body=${(rawText||'').slice(0,300)}`);
+        if (response.status >= 400 && response.status < 500) {
           // 4xx is usually a real validation/auth error; don't keep retrying variants.
           break;
         }
       } catch (attemptErr) {
+        attemptHistory.push(`${attempt.name}=THROW(${attemptErr.message})`);
         console.warn(`[admin/ozow-payout] Attempt ${attempt.name} threw: ${attemptErr.message}`);
       }
     }
@@ -7723,7 +7764,7 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
           'ozow_payout_error',
           `Ozow rejected a R${payoutAmount.toFixed(2)} EFT payout to ${recipient_name || recipient_type} (${bank_name} ****${account_number.slice(-4)}). HTTP ${ozowResponse.status}. ${ozowResponse.status === 500 ? 'Usually means: (1) Ozow payout feature not yet activated on your merchant account, (2) wrong OZOW_PAYOUT_API_KEY / OZOW_SITE_CODE in Render env, or (3) server IP not whitelisted in Ozow payout portal.' : 'See ozow_raw detail for the actual rejection reason.'}`,
           'backend',
-          `status=${ozowResponse.status} raw=${ozowRawText || '(empty)'} parsed=${JSON.stringify(ozowResult).slice(0, 500)} bank_code=${ozowBankCode} account_type=${ozowAccountType} site_code=${ozowSiteCode ? 'set' : 'MISSING'} api_key=${ozowApiKey ? 'set' : 'MISSING'} test_mode=${env('OZOW_IS_TEST') === 'true'}`,
+          `status=${ozowResponse.status} attempt=${ozowAttemptName} history=${attemptHistory.join(',')} resp_headers=${JSON.stringify(ozowRespHeaders).slice(0,400)} raw=${ozowRawText || '(empty)'} parsed=${JSON.stringify(ozowResult).slice(0, 500)} bank_code=${ozowBankCode} account_type=${ozowAccountType} site_code=${ozowSiteCode ? 'set' : 'MISSING'} api_key=${ozowApiKey ? 'set' : 'MISSING'} test_mode=${env('OZOW_IS_TEST') === 'true'}`,
           booking_id || null,
           'high'
         );
