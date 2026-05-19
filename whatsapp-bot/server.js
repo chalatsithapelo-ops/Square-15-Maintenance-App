@@ -9765,6 +9765,15 @@ process.on('uncaughtException', (err) => {
 
 // Express error middleware — catches sync/async errors inside request handlers
 app.use((err, req, res, next) => {
+  // Body-parser JSON syntax errors from buggy webhook senders happen often
+  // and pollute error_logs. Return 400 silently — not an internal failure.
+  if (err && err.type === 'entity.parse.failed') {
+    console.warn('[express] bad JSON body on', req.method, req.originalUrl);
+    if (!res.headersSent) {
+      try { res.status(400).json({ ok: false, error: 'invalid_json' }); } catch (_) {}
+    }
+    return;
+  }
   console.error('[express] handler error on', req.method, req.originalUrl, ':', err && (err.stack || err.message));
   _captureProcessError('express_error', err);
   if (res.headersSent) return next(err);
