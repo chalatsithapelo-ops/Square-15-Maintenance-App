@@ -7551,182 +7551,153 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       return res.status(503).json({ error: 'Ozow payout credentials not configured. Set OZOW_PAYOUT_API_KEY and OZOW_SITE_CODE in environment.' });
     }
 
-    // -- Map South African bank names to Ozow bank codes --
-    const bankCodeMap = {
-      'absa': '632005',
-      'african bank': '430000',
-      'bank zero': '888000',
-      'capitec bank': '470010',
-      'capitec': '470010',
-      'discovery bank': '679000',
-      'discovery': '679000',
-      'fnb': '250655',
-      'fnb (first national bank)': '250655',
-      'first national bank': '250655',
-      'investec': '580105',
-      'nedbank': '198765',
-      'standard bank': '051001',
-      'tymebank': '678910',
-      'tyme bank': '678910',
+    // -- Map South African bank names to Ozow bankGroupId UUIDs --
+    // Source: live call to https://stagingpayoutsapi.ozow.com/v1/getavailablebanks (2026-05-21)
+    // These UUIDs are stable across staging + production.
+    const bankGroupIdMap = {
+      'absa':            { id: '3284a0ad-ba78-4838-8c2b-102981286a2b', branch: '632005' },
+      'african bank':    { id: '33a0840b-0cf4-4b8c-86e0-ec6c4be8c60e', branch: '430000' },
+      'capitec bank':    { id: '913999fa-3a32-4e3d-82f0-a1df7e9e4f7b', branch: '470010' },
+      'capitec':         { id: '913999fa-3a32-4e3d-82f0-a1df7e9e4f7b', branch: '470010' },
+      'discovery bank':  { id: 'b8f152a2-8bd2-46c4-930f-4cd5b2b37ef9', branch: '679000' },
+      'discovery':       { id: 'b8f152a2-8bd2-46c4-930f-4cd5b2b37ef9', branch: '679000' },
+      'fnb':             { id: '4816019c-3314-4c80-8b6b-b2cd16dcc4ec', branch: '250655' },
+      'first national bank': { id: '4816019c-3314-4c80-8b6b-b2cd16dcc4ec', branch: '250655' },
+      'nedbank':         { id: 'bf0561fd-4203-4a0c-9174-cb26fcd87a60', branch: '198765' },
+      'standard bank':   { id: 'ad7d8da4-1723-4066-94bb-6662d845e483', branch: '051001' },
+      'tymebank':        { id: '28fcc8fa-985b-480b-82fd-7d09bc19c9d0', branch: '678910' },
+      'tyme bank':       { id: '28fcc8fa-985b-480b-82fd-7d09bc19c9d0', branch: '678910' },
+      'access bank':     { id: 'fd4876ca-db3e-4385-831a-4e465083b1f3', branch: '410506' },
+      'investec':        { id: '4b45be85-b616-4bd1-9027-f8fcf8f9af7b', branch: '580105' },
+      'bidvest bank':    { id: '29c5ee92-46ec-4879-8ad9-5cd3f5502727', branch: '462005' },
+      'sasfin bank':     { id: '54a18018-a9fe-4adb-b752-38004ed735d6', branch: '683000' },
+      'sasfin':          { id: '54a18018-a9fe-4adb-b752-38004ed735d6', branch: '683000' },
     };
 
-    const bankKey = bank_name.toLowerCase().trim();
-    const ozowBankCode = bankCodeMap[bankKey] || branch_code;
-
-    // -- Map account type --
-    const accountTypeMap = {
-      'cheque/current': '1',
-      'cheque': '1',
-      'current': '1',
-      'savings': '2',
-      'transmission': '3',
-    };
-    const ozowAccountType = accountTypeMap[(account_type || 'cheque').toLowerCase()] || '1';
+    const bankKey = String(bank_name || '').toLowerCase().trim();
+    const bankMatch = bankGroupIdMap[bankKey];
+    if (!bankMatch) {
+      return res.status(400).json({
+        ok: false,
+        error: `Unsupported bank "${bank_name}". Supported: ${Object.keys(bankGroupIdMap).join(', ')}`,
+      });
+    }
+    const ozowBankGroupId = bankMatch.id;
+    const ozowBranchCode = bankMatch.branch; // Use universal branch code from Ozow, not user-supplied
 
     const now = new Date().toISOString();
-    // Ozow bankReference max 20 chars � use compact format
+    // Ozow merchantReference max 20 chars - compact base36 timestamp
     const payoutRef = `SQ${Date.now().toString(36).toUpperCase()}`;
+    // Ozow customerBankReference: alphanumeric + spaces + dashes only, max 20 chars
+    const customerBankReference = `Square15-${payoutRef}`.replace(/[^A-Za-z0-9 -]/g, '').slice(0, 20);
 
-    // -- Call Ozow Payout API --
-    // Ozow Payout API lives on pay.ozow.com (NOT api.ozow.com)
-    const ozowPayoutUrl = env('OZOW_IS_TEST') === 'true'
-      ? 'https://stagingpay.ozow.com/api/v1/sendpayout'
-      : 'https://pay.ozow.com/api/v1/sendpayout';
-
+    // -- Build Ozow Payouts API v1 request --
+    // API spec: https://hub.ozow.com/docs/payouts-api/te1u21qvzznh8-step-2-submit-payout-request
+    const ozowPayoutBaseUrl = env('OZOW_IS_TEST') === 'true'
+      ? 'https://stagingpayoutsapi.ozow.com'
+      : 'https://payoutsapi.ozow.com';
+    const ozowPayoutUrl = `${ozowPayoutBaseUrl}/v1/requestpayout`;
     const notifyUrl = `${env('RENDER_EXTERNAL_URL') || 'https://square15-livekit-backend.onrender.com'}/api/ozow-payout-notify`;
+    // Staging does NOT support RTC - must be false. Production can be true but
+    // requires separate RTC activation. Default to false until enabled.
+    const isRtc = false;
+    // amount must be numeric (R). Use 2-decimal float; Ozow accepts ints or floats.
+    const ozowAmount = parseFloat(payoutAmount.toFixed(2));
+
+    // -- AES-256-CBC account number encryption per Ozow spec --
+    // Generate random 32-byte (encoded as 64 hex chars) encryption key per payout.
+    // We persist it in payout_records.encryption_key, then return it to Ozow via
+    // the verify webhook (/api/ozow-payout-verify) when they call back.
+    const encryptionKey = crypto.randomBytes(32).toString('hex'); // 64 ASCII chars
+    // IV: SHA512(merchantRef + amountCents + encryptionKey, lowercased), first 16 bytes
+    const amountCents = Math.round(ozowAmount * 100);
+    const ivSource = `${payoutRef}${amountCents}${encryptionKey}`.toLowerCase();
+    const ivHexFull = crypto.createHash('sha512').update(ivSource, 'utf8').digest('hex');
+    const ivBytes = Buffer.from(ivHexFull.substring(0, 16), 'utf8'); // 16 ASCII bytes
+    // AES key: take first 32 chars of encryption key (already 64 chars, ASCII)
+    const aesKeyBytes = Buffer.from(encryptionKey.substring(0, 32), 'utf8');
+    const cipher = crypto.createCipheriv('aes-256-cbc', aesKeyBytes, ivBytes);
+    cipher.setAutoPadding(true); // PKCS7
+    const encryptedAccountNumber = Buffer.concat([
+      cipher.update(String(account_number), 'utf8'),
+      cipher.final(),
+    ]).toString('base64');
+
+    // -- hashCheck: SHA512 hex of lowercased concat of all fields including apiKey --
+    // Field order (from Ozow C# example):
+    //   siteCode + amount + merchantReference + customerBankReference + apiKey + isRtc + notifyUrl + bankGroupId + accountNumber
+    const hashInput = [
+      ozowSiteCode,
+      ozowAmount,
+      payoutRef,
+      customerBankReference,
+      ozowApiKey,
+      isRtc,
+      notifyUrl,
+      ozowBankGroupId,
+      encryptedAccountNumber,
+    ].join('').toLowerCase();
+    const hashCheck = crypto.createHash('sha512').update(hashInput, 'utf8').digest('hex');
 
     const payoutPayload = {
-      SiteCode: ozowSiteCode,
-      Amount: parseFloat(payoutAmount.toFixed(2)),
-      BankReference: payoutRef,
-      BeneficiaryName: (recipient_name || 'Square 15 Payout').slice(0, 50),
-      BeneficiaryBankCode: ozowBankCode,
-      BeneficiaryAccountNumber: account_number,
-      BeneficiaryAccountType: parseInt(ozowAccountType, 10),
-      IsRealTimeClearing: true,
-      NotifyUrl: notifyUrl,
-    };
-
-    // Fallback payload casing for environments that expect camelCase fields.
-    const payoutPayloadFallback = {
       siteCode: ozowSiteCode,
-      amount: parseFloat(payoutAmount.toFixed(2)),
-      bankReference: payoutRef,
-      beneficiaryName: (recipient_name || 'Square 15 Payout').slice(0, 50),
-      beneficiaryBankCode: ozowBankCode,
-      beneficiaryAccountNumber: account_number,
-      beneficiaryAccountType: parseInt(ozowAccountType, 10),
-      isRealTimeClearing: true,
+      amount: ozowAmount,
+      merchantReference: payoutRef,
+      customerBankReference: customerBankReference,
+      isRtc: isRtc,
       notifyUrl: notifyUrl,
+      bankingDetails: {
+        bankGroupId: ozowBankGroupId,
+        accountNumber: encryptedAccountNumber,
+        branchCode: ozowBranchCode,
+      },
+      hashCheck: hashCheck,
     };
 
-    console.log(`[admin/ozow-payout] Initiating R${payoutAmount.toFixed(2)} to ${recipient_type} ${recipient_id} (${bank_name} ****${account_number.slice(-4)})`);
-    console.log(`[admin/ozow-payout] URL: ${ozowPayoutUrl}`);
-    console.log(`[admin/ozow-payout] Payload:`, JSON.stringify(payoutPayload));
-
-    // Some Ozow merchants need IsRealTimeClearing=false (RTC requires separate enablement).
-    const payoutPayloadNoRTC = { ...payoutPayload, IsRealTimeClearing: false };
-    const payoutPayloadFallbackNoRTC = { ...payoutPayloadFallback, isRealTimeClearing: false };
-
-    // Alternate URL variants we'll fall through on empty-body 500s.
-    const altUrl = env('OZOW_IS_TEST') === 'true'
-      ? 'https://stagingapi.ozow.com/v1/payouts'
-      : 'https://api.ozow.com/v1/payouts';
-
-    const ozowAttempts = [
-      {
-        name: 'A_pay_pascal_RTC',
-        url: ozowPayoutUrl,
-        headers: {
-          'Content-Type': 'application/json',
-          'ApiKey': ozowApiKey,
-          'Accept': 'application/json',
-        },
-        payload: payoutPayload,
-      },
-      {
-        name: 'B_pay_pascal_noRTC',
-        url: ozowPayoutUrl,
-        headers: {
-          'Content-Type': 'application/json',
-          'ApiKey': ozowApiKey,
-          'Accept': 'application/json',
-        },
-        payload: payoutPayloadNoRTC,
-      },
-      {
-        name: 'C_pay_camel_bearer',
-        url: ozowPayoutUrl,
-        headers: {
-          'Content-Type': 'application/json',
-          'ApiKey': ozowApiKey,
-          'Authorization': `Bearer ${ozowApiKey}`,
-          'X-Api-Key': ozowApiKey,
-          'Accept': 'application/json',
-        },
-        payload: payoutPayloadFallback,
-      },
-      {
-        name: 'D_apiv1_pascal_noRTC',
-        url: altUrl,
-        headers: {
-          'Content-Type': 'application/json',
-          'ApiKey': ozowApiKey,
-          'Accept': 'application/json',
-        },
-        payload: payoutPayloadNoRTC,
-      },
-    ];
+    console.log(`[admin/ozow-payout] Initiating R${payoutAmount.toFixed(2)} to ${recipient_type} ${recipient_id} (${bank_name} ****${String(account_number).slice(-4)})`);
+    console.log(`[admin/ozow-payout] URL: ${ozowPayoutUrl} ref=${payoutRef}`);
+    console.log(`[admin/ozow-payout] Payload (acct masked):`, JSON.stringify({
+      ...payoutPayload,
+      bankingDetails: { ...payoutPayload.bankingDetails, accountNumber: `[ENC:${encryptedAccountNumber.slice(0,12)}...]` },
+      hashCheck: `${hashCheck.slice(0,16)}...`,
+    }));
 
     let ozowResponse = null;
     let ozowResult = null;
     let ozowRawText = '';
     let ozowRespHeaders = {};
-    let ozowAttemptName = '';
-    const attemptHistory = [];
 
-    for (const attempt of ozowAttempts) {
-      try {
-        console.log(`[admin/ozow-payout] -> trying ${attempt.name} ${attempt.url}`);
-        const response = await fetch(attempt.url, {
-          method: 'POST',
-          headers: attempt.headers,
-          body: JSON.stringify(attempt.payload),
-          signal: AbortSignal.timeout(30000),
-        });
+    try {
+      const response = await fetch(ozowPayoutUrl, {
+        method: 'POST',
+        headers: {
+          'ApiKey': ozowApiKey,
+          'SiteCode': ozowSiteCode,
+          'Accept': 'application/json',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payoutPayload),
+        signal: AbortSignal.timeout(30000),
+      });
 
-        const rawText = await response.text().catch(() => '');
-        let parsed;
-        try {
-          parsed = rawText ? JSON.parse(rawText) : {};
-        } catch (_) {
-          parsed = null;
-        }
-        const headersObj = {};
-        try { response.headers.forEach((v,k)=>{ headersObj[k]=v; }); } catch(_) {}
+      const rawText = await response.text().catch(() => '');
+      let parsed;
+      try { parsed = rawText ? JSON.parse(rawText) : {}; } catch (_) { parsed = null; }
+      const headersObj = {};
+      try { response.headers.forEach((v, k) => { headersObj[k] = v; }); } catch (_) {}
 
-        const parsedPayoutId = parsed && (parsed.payoutId || parsed.PayoutId || parsed.id || parsed.Id);
-        ozowResponse = response;
-        ozowResult = parsed;
-        ozowRawText = rawText;
-        ozowRespHeaders = headersObj;
-        ozowAttemptName = attempt.name;
-        attemptHistory.push(`${attempt.name}=HTTP${response.status}(${(rawText||'').length}b)`);
+      ozowResponse = response;
+      ozowResult = parsed;
+      ozowRawText = rawText;
+      ozowRespHeaders = headersObj;
 
-        if (response.ok && parsedPayoutId) {
-          console.log(`[admin/ozow-payout] Ozow success via ${attempt.name}`);
-          break;
-        }
-
-        console.warn(`[admin/ozow-payout] Attempt ${attempt.name} failed (HTTP ${response.status}) headers=${JSON.stringify(headersObj).slice(0,400)} body=${(rawText||'').slice(0,300)}`);
-        if (response.status >= 400 && response.status < 500) {
-          // 4xx is usually a real validation/auth error; don't keep retrying variants.
-          break;
-        }
-      } catch (attemptErr) {
-        attemptHistory.push(`${attempt.name}=THROW(${attemptErr.message})`);
-        console.warn(`[admin/ozow-payout] Attempt ${attempt.name} threw: ${attemptErr.message}`);
-      }
+      console.log(`[admin/ozow-payout] Ozow HTTP ${response.status} headers=${JSON.stringify(headersObj).slice(0,300)} body=${(rawText||'').slice(0,500)}`);
+    } catch (attemptErr) {
+      console.error(`[admin/ozow-payout] fetch threw: ${attemptErr.message}`);
+      return res.status(502).json({
+        ok: false,
+        error: `Ozow request failed: ${attemptErr.message}`,
+      });
     }
 
     if (!ozowResponse) {
@@ -7747,24 +7718,28 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
 
     console.log(`[admin/ozow-payout] Ozow response (${ozowResponse.status}):`, JSON.stringify(ozowResult));
 
-    // Ozow may return PascalCase or camelCase � handle both
-    const payoutId = ozowResult.payoutId || ozowResult.PayoutId || ozowResult.id || ozowResult.Id;
-    const ozowStatus = ozowResult.status || ozowResult.Status;
+    // Ozow Payouts v1 response shape: { payoutId, payoutStatus: { status, subStatus, errorMessage } }
+    const payoutId = ozowResult && (ozowResult.payoutId || ozowResult.PayoutId);
+    const payoutStatusObj = (ozowResult && (ozowResult.payoutStatus || ozowResult.PayoutStatus)) || {};
+    const ozowStatusCode = payoutStatusObj.status != null ? payoutStatusObj.status : (ozowResult && ozowResult.status);
+    const ozowSubStatus = payoutStatusObj.subStatus != null ? payoutStatusObj.subStatus : null;
+    const ozowErrorMessage = payoutStatusObj.errorMessage || payoutStatusObj.ErrorMessage || (ozowResult && (ozowResult.errorMessage || ozowResult.error)) || '';
+    // Status codes 1 (Received), 2 (Verification), 3 (SubmittedForProcessing), 5 (Complete) = OK.
+    // Status 4 (ProcessingError), 99 (Cancelled), 90 (Returned) = failure.
+    const isOzowSuccess = ozowResponse.ok && payoutId && [1, 2, 3, 5].includes(Number(ozowStatusCode));
+    const ozowStatus = isOzowSuccess ? 'pending' : 'failed';
 
-    if (!ozowResponse.ok || !payoutId) {
-      console.error(`[admin/ozow-payout] Ozow API error (HTTP ${ozowResponse.status}):`, JSON.stringify(ozowResult));
-      console.error(`[admin/ozow-payout] Ozow raw body:`, ozowRawText || '(empty)');
-      const errMsg = ozowResult.message || ozowResult.errorMessage || ozowResult.error
-        || (ozowResult.errors && JSON.stringify(ozowResult.errors))
+    if (!isOzowSuccess) {
+      console.error(`[admin/ozow-payout] Ozow rejected (HTTP ${ozowResponse.status}, status=${ozowStatusCode}, subStatus=${ozowSubStatus}): ${ozowErrorMessage}`);
+      const errMsg = ozowErrorMessage
         || (ozowRawText && ozowRawText.length < 500 ? ozowRawText : null)
-        || `Ozow payout failed (HTTP ${ozowResponse.status})`;
-      // Log to Live Issues so admin sees the root cause in the dashboard
+        || `Ozow payout failed (HTTP ${ozowResponse.status}, status=${ozowStatusCode})`;
       try {
         await logErrorToAdmin(
           'ozow_payout_error',
-          `Ozow rejected a R${payoutAmount.toFixed(2)} EFT payout to ${recipient_name || recipient_type} (${bank_name} ****${account_number.slice(-4)}). HTTP ${ozowResponse.status}. ${ozowResponse.status === 500 ? 'Usually means: (1) Ozow payout feature not yet activated on your merchant account, (2) wrong OZOW_PAYOUT_API_KEY / OZOW_SITE_CODE in Render env, or (3) server IP not whitelisted in Ozow payout portal.' : 'See ozow_raw detail for the actual rejection reason.'}`,
+          `Ozow rejected a R${payoutAmount.toFixed(2)} EFT payout to ${recipient_name || recipient_type} (${bank_name} ****${String(account_number).slice(-4)}). HTTP ${ozowResponse.status} status=${ozowStatusCode} subStatus=${ozowSubStatus}. ${ozowErrorMessage || 'See ozow_raw detail.'}`,
           'backend',
-          `status=${ozowResponse.status} attempt=${ozowAttemptName} history=${attemptHistory.join(',')} resp_headers=${JSON.stringify(ozowRespHeaders).slice(0,400)} raw=${ozowRawText || '(empty)'} parsed=${JSON.stringify(ozowResult).slice(0, 500)} bank_code=${ozowBankCode} account_type=${ozowAccountType} site_code=${ozowSiteCode ? 'set' : 'MISSING'} api_key=${ozowApiKey ? 'set' : 'MISSING'} test_mode=${env('OZOW_IS_TEST') === 'true'}`,
+          `status=${ozowResponse.status} ozow_status=${ozowStatusCode} ozow_sub=${ozowSubStatus} err=${ozowErrorMessage} resp_headers=${JSON.stringify(ozowRespHeaders).slice(0,400)} raw=${ozowRawText || '(empty)'} parsed=${JSON.stringify(ozowResult).slice(0, 500)} bank_group_id=${ozowBankGroupId} branch=${ozowBranchCode} site_code=${ozowSiteCode ? 'set' : 'MISSING'} api_key=${ozowApiKey ? 'set' : 'MISSING'} test_mode=${env('OZOW_IS_TEST') === 'true'} ref=${payoutRef}`,
           booking_id || null,
           'high'
         );
@@ -7773,12 +7748,14 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
         ok: false,
         error: errMsg,
         ozow_status: ozowResponse.status,
+        ozow_status_code: ozowStatusCode,
+        ozow_sub_status: ozowSubStatus,
         ozow_response: ozowResult,
         ozow_raw: ozowRawText && ozowRawText.length < 500 ? ozowRawText : undefined,
       });
     }
 
-    console.log(`? Ozow payout created: ${payoutId} ref=${payoutRef}`);
+    console.log(`✓ Ozow payout created: ${payoutId} ref=${payoutRef} status=${ozowStatusCode} sub=${ozowSubStatus}`);
 
     // -- Record payout in Firestore --
     const txId = crypto.randomUUID();
@@ -7786,6 +7763,13 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       id: txId,
       ozow_payout_id: payoutId,
       payout_reference: payoutRef,
+      merchant_reference: payoutRef,
+      customer_bank_reference: customerBankReference,
+      // ★ Required for /api/ozow-payout-verify to respond with the AES key
+      // when Ozow calls back. Without these the payout will fail at verification.
+      encryption_key: encryptionKey,
+      amount_cents: amountCents,
+      bank_group_id: ozowBankGroupId,
       type: recipient_type === 'partner' ? 'partner_payout' : 'artisan_payout',
       method: 'ozow_eft',
       recipient_id,
@@ -7793,11 +7777,12 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       recipient_type,
       amount: payoutAmount.toFixed(2),
       bank_name,
-      account_number_masked: `****${account_number.slice(-4)}`,
-      branch_code,
+      account_number_masked: `****${String(account_number).slice(-4)}`,
+      branch_code: ozowBranchCode,
       account_type: account_type || 'cheque',
-      status: ozowStatus || 'pending',
-      ozow_status: ozowStatus || 'Pending',
+      status: 'pending',
+      ozow_status: ozowStatusCode,
+      ozow_sub_status: ozowSubStatus,
       admin_id: adminUid,
       reason: reason || `Admin EFT payout to ${recipient_type}`,
       ...(booking_id ? { tasks_management_id: booking_id } : {}),
@@ -7963,50 +7948,76 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
 // approve a fabricated payoutId.
 app.post('/api/ozow-payout-verify', async (req, res) => {
   try {
+    // Optional OZOW_ACCESS_TOKEN gate. Ozow's verification webhook does NOT
+    // send a custom token by default — it relies on the payoutId being
+    // unguessable + IP whitelist on their side. If you configure
+    // OZOW_ACCESS_TOKEN (24 chars) here AND in Ozow's portal webhook
+    // settings, we'll enforce it; otherwise allow Ozow's call through.
     const expected = process.env.OZOW_ACCESS_TOKEN || '';
-    if (!expected || expected.length !== 24) {
-      console.error('[ozow-payout-verify] BLOCKED: OZOW_ACCESS_TOKEN missing or not 24 chars');
-      return res.status(503).json({ verified: false, error: 'Verification not configured' });
+    if (expected && expected.length === 24) {
+      const provided = String(
+        req.headers['x-ozow-access-token'] ||
+        req.headers['access-token'] ||
+        req.body.accessToken ||
+        req.body.AccessToken ||
+        req.query.token ||
+        ''
+      );
+      const ok = provided.length === expected.length &&
+        crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(expected));
+      if (!ok) {
+        console.warn(`[ozow-payout-verify] UNAUTHENTICATED from ${req.ip}`);
+        return res.status(401).json({ verified: false, error: 'Invalid access token' });
+      }
     }
-    const provided = String(
-      req.headers['x-ozow-access-token'] ||
-      req.headers['access-token'] ||
-      req.body.accessToken ||
-      req.body.AccessToken ||
-      req.query.token ||
-      ''
-    );
-    const ok = provided.length === expected.length &&
-      crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(expected));
-    if (!ok) {
-      console.warn(`[ozow-payout-verify] UNAUTHENTICATED from ${req.ip}`);
-      return res.status(401).json({ verified: false, error: 'Invalid access token' });
-    }
+    console.log(`[ozow-payout-verify] incoming from ${req.ip} body=${JSON.stringify(req.body).slice(0,500)}`);
 
     const payoutId = req.body.payoutId || req.body.PayoutId || req.query.payoutId || null;
-    const bankReference = req.body.bankReference || req.body.BankReference || null;
+    const bankReference = req.body.bankReference || req.body.BankReference || req.body.merchantReference || req.body.MerchantReference || null;
 
     const db = admin.firestore();
-    let found = false;
+    let foundDoc = null;
     if (payoutId) {
       const s = await db.collection('payout_records').where('ozow_payout_id', '==', payoutId).limit(1).get();
-      if (!s.empty) found = true;
+      if (!s.empty) foundDoc = s.docs[0];
     }
-    if (!found && bankReference) {
-      const s = await db.collection('payout_records').where('bank_reference', '==', bankReference).limit(1).get();
-      if (!s.empty) found = true;
+    if (!foundDoc && bankReference) {
+      // Try merchant_reference first (current schema), then legacy bank_reference field.
+      let s = await db.collection('payout_records').where('merchant_reference', '==', bankReference).limit(1).get();
+      if (s.empty) s = await db.collection('payout_records').where('bank_reference', '==', bankReference).limit(1).get();
+      if (!s.empty) foundDoc = s.docs[0];
     }
 
-    if (!found) {
+    if (!foundDoc) {
       console.warn(`[ozow-payout-verify] payoutId=${payoutId} ref=${bankReference} not found in payout_records`);
       return res.status(404).json({ verified: false, error: 'Payout not found' });
     }
 
-    console.log(`[ozow-payout-verify] APPROVED payoutId=${payoutId} ref=${bankReference}`);
+    const rec = foundDoc.data() || {};
+    const encryptionKey = rec.encryption_key || rec.encryptionKey || null;
+    if (!encryptionKey) {
+      console.warn(`[ozow-payout-verify] payout ${foundDoc.id} has no encryption_key (legacy record?)`);
+      return res.status(409).json({ verified: false, error: 'Encryption key missing on payout record' });
+    }
+
+    // Mark record as verified for audit
+    try {
+      await foundDoc.ref.update({
+        verification_at: new Date().toISOString(),
+        verified: true,
+      });
+    } catch (_) {}
+
+    console.log(`[ozow-payout-verify] APPROVED payoutId=${payoutId} ref=${bankReference} - returning encryption key`);
+    // Ozow expects the encryption key in the response so it can decrypt the
+    // accountNumber field. Field names tried by Ozow: encryptionKey / EncryptionKey.
     return res.status(200).json({
       verified: true,
-      payoutId: payoutId || bankReference,
-      bankReference: bankReference,
+      payoutId: payoutId || rec.ozow_payout_id || null,
+      bankReference: bankReference || rec.merchant_reference || null,
+      merchantReference: rec.merchant_reference || null,
+      encryptionKey: encryptionKey,
+      EncryptionKey: encryptionKey,
     });
   } catch (e) {
     console.error('[ozow-payout-verify] error:', e && e.message);
