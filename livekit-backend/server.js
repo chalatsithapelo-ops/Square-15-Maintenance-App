@@ -7631,16 +7631,19 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
     // exhaust the list.
     const amtRaw = String(ozowAmount);           // e.g. "5"
     const amt2dp = ozowAmount.toFixed(2);        // e.g. "5.00"
+    const plainAcct = String(account_number);
     const sha512 = (s) => crypto.createHash('sha512').update(s, 'utf8').digest('hex');
     const hashVariants = [
       { name: 'V1_5_apikeyMid',         input: [ozowSiteCode, amtRaw, payoutRef, customerBankReference, ozowApiKey, isRtc, notifyUrl, ozowBankGroupId, encryptedAccountNumber].join('').toLowerCase() },
-      { name: 'V2_500_apikeyMid',       input: [ozowSiteCode, amt2dp, payoutRef, customerBankReference, ozowApiKey, isRtc, notifyUrl, ozowBankGroupId, encryptedAccountNumber].join('').toLowerCase() },
-      { name: 'V3_5_apikeyEnd',         input: [ozowSiteCode, amtRaw, payoutRef, customerBankReference, isRtc, notifyUrl, ozowBankGroupId, encryptedAccountNumber, ozowApiKey].join('').toLowerCase() },
-      { name: 'V4_5_noApiKey',          input: [ozowSiteCode, amtRaw, payoutRef, customerBankReference, isRtc, notifyUrl, ozowBankGroupId, encryptedAccountNumber].join('').toLowerCase() },
-      { name: 'V5_5_withBranch',        input: [ozowSiteCode, amtRaw, payoutRef, customerBankReference, ozowApiKey, isRtc, notifyUrl, ozowBankGroupId, encryptedAccountNumber, ozowBranchCode].join('').toLowerCase() },
-      { name: 'V6_5_branchBeforeAcct',  input: [ozowSiteCode, amtRaw, payoutRef, customerBankReference, ozowApiKey, isRtc, notifyUrl, ozowBankGroupId, ozowBranchCode, encryptedAccountNumber].join('').toLowerCase() },
-      { name: 'V7_500_branchBeforeAcct',input: [ozowSiteCode, amt2dp, payoutRef, customerBankReference, ozowApiKey, isRtc, notifyUrl, ozowBankGroupId, ozowBranchCode, encryptedAccountNumber].join('').toLowerCase() },
-      { name: 'V8_IsRtc_capitalised',   input: [ozowSiteCode, amtRaw, payoutRef, customerBankReference, ozowApiKey, isRtc ? 'True' : 'False', notifyUrl, ozowBankGroupId, encryptedAccountNumber].join('').toLowerCase() },
+      { name: 'V2_plainAcct',           input: [ozowSiteCode, amtRaw, payoutRef, customerBankReference, ozowApiKey, isRtc, notifyUrl, ozowBankGroupId, plainAcct].join('').toLowerCase() },
+      { name: 'V3_plainAcct_2dp',       input: [ozowSiteCode, amt2dp, payoutRef, customerBankReference, ozowApiKey, isRtc, notifyUrl, ozowBankGroupId, plainAcct].join('').toLowerCase() },
+      { name: 'V4_plainAcct_noLower',   input: [ozowSiteCode, amtRaw, payoutRef, customerBankReference, ozowApiKey, isRtc, notifyUrl, ozowBankGroupId, plainAcct].join('') },
+      { name: 'V5_encAcct_noLower',     input: [ozowSiteCode, amtRaw, payoutRef, customerBankReference, ozowApiKey, isRtc, notifyUrl, ozowBankGroupId, encryptedAccountNumber].join('') },
+      { name: 'V6_plain_branch',        input: [ozowSiteCode, amtRaw, payoutRef, customerBankReference, ozowApiKey, isRtc, notifyUrl, ozowBankGroupId, ozowBranchCode, plainAcct].join('').toLowerCase() },
+      { name: 'V7_plain_apikeyEnd',     input: [ozowSiteCode, amtRaw, payoutRef, customerBankReference, isRtc, notifyUrl, ozowBankGroupId, plainAcct, ozowApiKey].join('').toLowerCase() },
+      { name: 'V8_isRtcCap_noLower',    input: [ozowSiteCode, amtRaw, payoutRef, customerBankReference, ozowApiKey, isRtc ? 'True' : 'False', notifyUrl, ozowBankGroupId, encryptedAccountNumber].join('') },
+      { name: 'V9_amount2dp_noLower',   input: [ozowSiteCode, amt2dp, payoutRef, customerBankReference, ozowApiKey, isRtc ? 'True' : 'False', notifyUrl, ozowBankGroupId, encryptedAccountNumber].join('') },
+      { name: 'V10_500_apikeyMid',      input: [ozowSiteCode, amt2dp, payoutRef, customerBankReference, ozowApiKey, isRtc, notifyUrl, ozowBankGroupId, encryptedAccountNumber].join('').toLowerCase() },
     ];
     console.log(`[admin/ozow-payout] Will try ${hashVariants.length} hash variants. ref=${payoutRef}`);
     // First variant by default; the loop below will override hashCheck if needed.
@@ -7761,7 +7764,7 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
           'ozow_payout_error',
           `Ozow rejected a R${payoutAmount.toFixed(2)} EFT payout to ${recipient_name || recipient_type} (${bank_name} ****${String(account_number).slice(-4)}). HTTP ${ozowResponse.status} status=${ozowStatusCode} subStatus=${ozowSubStatus}. ${ozowErrorMessage || 'See ozow_raw detail.'}`,
           'backend',
-          `status=${ozowResponse.status} ozow_status=${ozowStatusCode} ozow_sub=${ozowSubStatus} err=${ozowErrorMessage} resp_headers=${JSON.stringify(ozowRespHeaders).slice(0,400)} raw=${ozowRawText || '(empty)'} parsed=${JSON.stringify(ozowResult).slice(0, 500)} bank_group_id=${ozowBankGroupId} branch=${ozowBranchCode} site_code=${ozowSiteCode ? 'set' : 'MISSING'} api_key=${ozowApiKey ? 'set' : 'MISSING'} test_mode=${env('OZOW_IS_TEST') === 'true'} ref=${payoutRef}`,
+          `status=${ozowResponse.status} ozow_status=${ozowStatusCode} ozow_sub=${ozowSubStatus} err=${ozowErrorMessage} variant=${ozowHashVariantUsed} history=${hashAttemptHistory.join(' | ')} resp_headers=${JSON.stringify(ozowRespHeaders).slice(0,400)} raw=${ozowRawText || '(empty)'} parsed=${JSON.stringify(ozowResult).slice(0, 500)} bank_group_id=${ozowBankGroupId} branch=${ozowBranchCode} site_code=${ozowSiteCode ? 'set' : 'MISSING'} api_key=${ozowApiKey ? 'set' : 'MISSING'} test_mode=${env('OZOW_IS_TEST') === 'true'} ref=${payoutRef}`,
           booking_id || null,
           'high'
         );
