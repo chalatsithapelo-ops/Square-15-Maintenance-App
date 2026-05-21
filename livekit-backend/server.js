@@ -7626,9 +7626,12 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
     // -- hashCheck: SHA512 hex of lowercased concat of all fields including apiKey --
     // Field order (from Ozow C# example):
     //   siteCode + amount + merchantReference + customerBankReference + apiKey + isRtc + notifyUrl + bankGroupId + accountNumber
+    // CRITICAL: Ozow server formats amount as "5.00" (decimal.ToString with 2 dp),
+    // NOT "5", so we must do the same in our hash computation.
+    const amountForHash = ozowAmount.toFixed(2);
     const hashInput = [
       ozowSiteCode,
-      ozowAmount,
+      amountForHash,
       payoutRef,
       customerBankReference,
       ozowApiKey,
