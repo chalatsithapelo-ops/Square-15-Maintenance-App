@@ -7631,19 +7631,20 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
     // exhaust the list.
     const amtRaw = String(ozowAmount);           // e.g. "5"
     const amt2dp = ozowAmount.toFixed(2);        // e.g. "5.00"
+    const amtCents = String(amountCents);        // e.g. "500"
     const plainAcct = String(account_number);
     const sha512 = (s) => crypto.createHash('sha512').update(s, 'utf8').digest('hex');
     const hashVariants = [
-      { name: 'V1_5_apikeyMid',         input: [ozowSiteCode, amtRaw, payoutRef, customerBankReference, ozowApiKey, isRtc, notifyUrl, ozowBankGroupId, encryptedAccountNumber].join('').toLowerCase() },
-      { name: 'V2_plainAcct',           input: [ozowSiteCode, amtRaw, payoutRef, customerBankReference, ozowApiKey, isRtc, notifyUrl, ozowBankGroupId, plainAcct].join('').toLowerCase() },
-      { name: 'V3_plainAcct_2dp',       input: [ozowSiteCode, amt2dp, payoutRef, customerBankReference, ozowApiKey, isRtc, notifyUrl, ozowBankGroupId, plainAcct].join('').toLowerCase() },
-      { name: 'V4_plainAcct_noLower',   input: [ozowSiteCode, amtRaw, payoutRef, customerBankReference, ozowApiKey, isRtc, notifyUrl, ozowBankGroupId, plainAcct].join('') },
-      { name: 'V5_encAcct_noLower',     input: [ozowSiteCode, amtRaw, payoutRef, customerBankReference, ozowApiKey, isRtc, notifyUrl, ozowBankGroupId, encryptedAccountNumber].join('') },
-      { name: 'V6_plain_branch',        input: [ozowSiteCode, amtRaw, payoutRef, customerBankReference, ozowApiKey, isRtc, notifyUrl, ozowBankGroupId, ozowBranchCode, plainAcct].join('').toLowerCase() },
-      { name: 'V7_plain_apikeyEnd',     input: [ozowSiteCode, amtRaw, payoutRef, customerBankReference, isRtc, notifyUrl, ozowBankGroupId, plainAcct, ozowApiKey].join('').toLowerCase() },
-      { name: 'V8_isRtcCap_noLower',    input: [ozowSiteCode, amtRaw, payoutRef, customerBankReference, ozowApiKey, isRtc ? 'True' : 'False', notifyUrl, ozowBankGroupId, encryptedAccountNumber].join('') },
-      { name: 'V9_amount2dp_noLower',   input: [ozowSiteCode, amt2dp, payoutRef, customerBankReference, ozowApiKey, isRtc ? 'True' : 'False', notifyUrl, ozowBankGroupId, encryptedAccountNumber].join('') },
-      { name: 'V10_500_apikeyMid',      input: [ozowSiteCode, amt2dp, payoutRef, customerBankReference, ozowApiKey, isRtc, notifyUrl, ozowBankGroupId, encryptedAccountNumber].join('').toLowerCase() },
+      { name: 'V1_amtCents_enc',        input: [ozowSiteCode, amtCents, payoutRef, customerBankReference, ozowApiKey, isRtc, notifyUrl, ozowBankGroupId, encryptedAccountNumber].join('').toLowerCase() },
+      { name: 'V2_amtCents_plain',      input: [ozowSiteCode, amtCents, payoutRef, customerBankReference, ozowApiKey, isRtc, notifyUrl, ozowBankGroupId, plainAcct].join('').toLowerCase() },
+      { name: 'V3_amt5_enc',            input: [ozowSiteCode, amtRaw, payoutRef, customerBankReference, ozowApiKey, isRtc, notifyUrl, ozowBankGroupId, encryptedAccountNumber].join('').toLowerCase() },
+      { name: 'V4_amt500_enc',          input: [ozowSiteCode, amt2dp, payoutRef, customerBankReference, ozowApiKey, isRtc, notifyUrl, ozowBankGroupId, encryptedAccountNumber].join('').toLowerCase() },
+      { name: 'V5_amtCents_branch',     input: [ozowSiteCode, amtCents, payoutRef, customerBankReference, ozowApiKey, isRtc, notifyUrl, ozowBankGroupId, encryptedAccountNumber, ozowBranchCode].join('').toLowerCase() },
+      { name: 'V6_amt5_branch_after',   input: [ozowSiteCode, amtRaw, payoutRef, customerBankReference, ozowApiKey, isRtc, notifyUrl, ozowBankGroupId, encryptedAccountNumber, ozowBranchCode].join('').toLowerCase() },
+      { name: 'V7_amtCents_branch_before',input: [ozowSiteCode, amtCents, payoutRef, customerBankReference, ozowApiKey, isRtc, notifyUrl, ozowBankGroupId, ozowBranchCode, encryptedAccountNumber].join('').toLowerCase() },
+      { name: 'V8_amt5_keyEnd',         input: [ozowSiteCode, amtRaw, payoutRef, customerBankReference, isRtc, notifyUrl, ozowBankGroupId, encryptedAccountNumber, ozowApiKey].join('').toLowerCase() },
+      { name: 'V9_amtCents_noLower',    input: [ozowSiteCode, amtCents, payoutRef, customerBankReference, ozowApiKey, isRtc, notifyUrl, ozowBankGroupId, encryptedAccountNumber].join('') },
+      { name: 'V10_amt5_decimalDot',    input: [ozowSiteCode, ozowAmount.toFixed(1), payoutRef, customerBankReference, ozowApiKey, isRtc, notifyUrl, ozowBankGroupId, encryptedAccountNumber].join('').toLowerCase() },
     ];
     console.log(`[admin/ozow-payout] Will try ${hashVariants.length} hash variants. ref=${payoutRef}`);
     // First variant by default; the loop below will override hashCheck if needed.
