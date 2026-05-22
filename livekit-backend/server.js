@@ -7788,6 +7788,30 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
         ozow_sub_status: ozowSubStatus,
         ozow_response: ozowResult,
         ozow_raw: ozowRawText && ozowRawText.length < 500 ? ozowRawText : undefined,
+        // Sandbox-only diagnostic fields so the test client can see the exact
+        // pre-hash string and outbound body. apiKey redacted from input string.
+        sandbox_echo: isOzowSandbox ? {
+          pre_hash_input: (() => {
+            const k = ozowApiKey.toLowerCase();
+            return hashInput.endsWith(k)
+              ? hashInput.slice(0, -k.length) + `<apiKey:${k.length}chars>`
+              : hashInput;
+          })(),
+          hash_check: hashCheck,
+          outbound_body: payoutPayload,
+          fields: {
+            siteCode: ozowSiteCode,
+            amountCents,
+            merchantReference: payoutRef,
+            customerBankReference,
+            isRtc: isRtc ? 'True' : 'False',
+            notifyUrl,
+            bankGroupId: ozowBankGroupId,
+            encryptedAccountNumber,
+            branchCode: ozowBranchCode,
+            apiKeyChars: ozowApiKey.length,
+          },
+        } : undefined,
       });
     }
 
