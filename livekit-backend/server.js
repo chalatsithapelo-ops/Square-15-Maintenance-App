@@ -7538,8 +7538,8 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
     if (!amount || !recipient_id || !recipient_type || !account_number || !branch_code || !bank_name) {
       return res.status(400).json({ error: 'Missing required fields: amount, recipient_id, recipient_type, bank_name, account_number, branch_code' });
     }
-    if (recipient_type !== 'artisan' && recipient_type !== 'partner') {
-      return res.status(400).json({ error: 'recipient_type must be "artisan" or "partner"' });
+    if (recipient_type !== 'artisan' && recipient_type !== 'partner' && recipient_type !== 'client') {
+      return res.status(400).json({ error: 'recipient_type must be "artisan", "partner", or "client"' });
     }
 
     const payoutAmount = parseFloat(amount);
@@ -7830,7 +7830,7 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       encryption_key: encryptionKey,
       amount_cents: amountCents,
       bank_group_id: ozowBankGroupId,
-      type: recipient_type === 'partner' ? 'partner_payout' : 'artisan_payout',
+      type: recipient_type === 'partner' ? 'partner_payout' : (recipient_type === 'client' ? 'client_refund' : 'artisan_payout'),
       method: 'ozow_eft',
       recipient_id,
       recipient_name: recipient_name || '',
@@ -7858,7 +7858,7 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       amount: payoutAmount.toFixed(2),
       transaction_at: now,
       status: 'pending',
-      type: recipient_type === 'partner' ? 'partner_eft_payout' : 'artisan_eft_payout',
+      type: recipient_type === 'partner' ? 'partner_eft_payout' : (recipient_type === 'client' ? 'client_refund_eft' : 'artisan_eft_payout'),
       subtype: `${recipient_type}_payout`,
       direction: 'out',
       cash_movement: true,
@@ -7930,6 +7930,28 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       } catch (txErr) {
         console.error('? Artisan balance deduction failed:', txErr.message);
         // The Ozow payout was already initiated � log for manual reconciliation
+      }
+    }
+
+    // Update client refund_request if applicable (booking_id may carry refund_request id)
+    if (recipient_type === 'client' && booking_id) {
+      try {
+        const refundRef = db.collection('refund_requests').doc(booking_id);
+        const refundSnap = await refundRef.get();
+        if (refundSnap.exists) {
+          await refundRef.update({
+            status: 'processed',
+            refund_method: 'ozow_eft',
+            payout_id: txId,
+            ozow_payout_id: payoutId,
+            payout_reference: payoutRef,
+            processed_at: now,
+            processed_by: adminUid,
+            updated_at: now,
+          });
+        }
+      } catch (refundErr) {
+        console.error('? Client refund_request update failed:', refundErr.message);
       }
     }
 
