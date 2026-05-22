@@ -6631,9 +6631,13 @@ app.post('/api/payment/initiate', authMiddleware, assistantLimiter, async (req, 
     paymentData.item_name = String(item_name);
     if (custom_str1) paymentData.custom_str1 = custom_str1;
 
-    // Force card-only checkout when payment_method is 'cc'
-    if (payment_method === 'cc') {
-      paymentData.payment_method = 'cc';
+    // Force a specific PayFast payment method when requested.
+    // Accepted codes: 'cc' (card), 'eft' (instant EFT), 'mc' (Mobicred),
+    // 'mt' (MoreTyme), 'rc' (RCS Store Card), 'sc' (SnapScan), 'zp' (Zapper),
+    // 'mp' (Masterpass), 'ap' (ApplePay), 'sp' (SamsungPay).
+    const allowedMethods = new Set(['cc', 'eft', 'mc', 'mt', 'rc', 'sc', 'zp', 'mp', 'ap', 'sp']);
+    if (payment_method && allowedMethods.has(String(payment_method))) {
+      paymentData.payment_method = String(payment_method);
     }
 
     // Enable ad-hoc tokenization (save card) only when explicitly enabled in env.
@@ -11413,12 +11417,187 @@ app.post('/api/finance/fraud-alerts/dismiss', adminLimiter, async (req, res) => 
 });
 
 // 404 handler
-app.use((req, res) => {
-  res.status(404).json({
-    error: 'Not found',
-    message: 'The requested endpoint does not exist'
-  });
+// ─────────────────────────────────────────────────────────────────────────────
+// PayJustNow direct integration (scaffolding — keys arrive later).
+//
+// Flow when live:
+//   1. Client POSTs /api/bnpl/payjustnow/create-order with { amount, taskId, ... }
+//   2. Backend reads app_config/bnpl_payJustNow → api_key, sandbox/prod flag.
+//   3. Backend POSTs to PayJustNow /order endpoint, receives token + redirectUrl.
+//   4. Backend stores bnpl_orders/{orderId} with status='pending'.
+//   5. Returns { redirect_url, token, order_id } to client.
+//   6. Client opens WebView → on confirm redirect, client posts /api/bnpl/payjustnow/capture.
+//   7. Backend posts to PayJustNow /order/{token}/capture, marks bnpl_orders captured.
+//   8. PayJustNow webhook → /api/bnpl/payjustnow/webhook (signed; we verify).
+//
+// Right now every endpoint returns 503 because we have no API key.
+// When PayJustNow sends us their keys, fill PAYJUSTNOW_* config values and
+// flip the COMING_SOON guard at the top — no client changes needed.
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function getPayJustNowConfig() {
+  try {
+    const snap = await admin.firestore()
+      .collection('app_config').doc('bnpl_payJustNow').get();
+    if (!snap.exists) return null;
+    const d = snap.data() || {};
+    if (d.enabled !== true) return null;
+    const apiKey = (d.api_key || '').toString();
+    if (!apiKey) return null;
+    return {
+      apiKey,
+      useSandbox: d.use_sandbox !== false,
+      confirmUrl: d.confirm_url || 'https://square15.co.za/bnpl/payJustNow/confirm',
+      cancelUrl:  d.cancel_url  || 'https://square15.co.za/bnpl/payJustNow/cancel',
+      // Real base URLs will be confirmed by PayJustNow during onboarding.
+      // Until then they live in env so we don't have to redeploy to fix them.
+      sandboxBase: env('PAYJUSTNOW_SANDBOX_BASE') || '',
+      productionBase: env('PAYJUSTNOW_PRODUCTION_BASE') || '',
+      webhookSecret: env('PAYJUSTNOW_WEBHOOK_SECRET') || '',
+    };
+  } catch (e) {
+    console.error('[payjustnow] config load error:', e.message);
+    return null;
+  }
+}
+
+app.post('/api/bnpl/payjustnow/create-order', authMiddleware, assistantLimiter, async (req, res) => {
+  const cfg = await getPayJustNowConfig();
+  if (!cfg) {
+    return res.status(503).json({
+      ok: false,
+      error: 'payjustnow_not_configured',
+      message: 'PayJustNow integration is pending merchant approval. Please use another payment method.',
+    });
+  }
+  const base = cfg.useSandbox ? cfg.sandboxBase : cfg.productionBase;
+  if (!base) {
+    return res.status(503).json({
+      ok: false,
+      error: 'payjustnow_base_url_missing',
+      message: 'PayJustNow base URL not configured. Set PAYJUSTNOW_SANDBOX_BASE / PAYJUSTNOW_PRODUCTION_BASE on Render.',
+    });
+  }
+
+  const { amount, taskId, consumer } = req.body || {};
+  if (!amount || isNaN(parseFloat(amount))) {
+    return res.status(400).json({ ok: false, error: 'invalid_amount' });
+  }
+  const orderId = `SQ15-PJN-${Date.now()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+  const body = {
+    amount: parseFloat(amount).toFixed(2),
+    merchantReference: orderId,
+    merchant: {
+      redirectConfirmUrl: cfg.confirmUrl,
+      redirectCancelUrl: cfg.cancelUrl,
+    },
+    consumer: consumer || {},
+    description: `Square 15 Maintenance - Job ${taskId || ''}`,
+    taxAmount: '0.00',
+    shippingAmount: '0.00',
+  };
+
+  try {
+    const fetch = (await import('node-fetch')).default;
+    const resp = await fetch(`${base}/order`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${cfg.apiKey}`,
+      },
+      body: JSON.stringify(body),
+    });
+    const text = await resp.text();
+    let data = {};
+    try { data = JSON.parse(text); } catch (_) {}
+    if (!resp.ok) {
+      console.warn(`[payjustnow] create-order ${resp.status}: ${text.slice(0, 300)}`);
+      return res.status(502).json({ ok: false, error: 'provider_error', status: resp.status });
+    }
+    const token = data.token || data.id || '';
+    const redirectUrl = data.redirectCheckoutUrl || data.redirect_url || data.checkoutUrl || '';
+    if (!token || !redirectUrl) {
+      return res.status(502).json({ ok: false, error: 'provider_response_missing_fields' });
+    }
+    await admin.firestore().collection('bnpl_orders').doc(orderId).set({
+      order_id: orderId,
+      provider: 'payJustNow',
+      provider_name: 'PayJustNow',
+      token,
+      amount: parseFloat(amount).toFixed(2),
+      task_id: taskId || null,
+      uid: req.user && req.user.uid || null,
+      status: 'pending',
+      sandbox: cfg.useSandbox,
+      created_at: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+    return res.json({ ok: true, order_id: orderId, token, redirect_url: redirectUrl });
+  } catch (e) {
+    console.error('[payjustnow] create-order error:', e.message);
+    return res.status(502).json({ ok: false, error: 'network_error', message: e.message });
+  }
 });
+
+app.post('/api/bnpl/payjustnow/capture', authMiddleware, async (req, res) => {
+  const cfg = await getPayJustNowConfig();
+  if (!cfg) return res.status(503).json({ ok: false, error: 'payjustnow_not_configured' });
+  const base = cfg.useSandbox ? cfg.sandboxBase : cfg.productionBase;
+  const { token, orderId } = req.body || {};
+  if (!token) return res.status(400).json({ ok: false, error: 'missing_token' });
+
+  try {
+    const fetch = (await import('node-fetch')).default;
+    const resp = await fetch(`${base}/order/${encodeURIComponent(token)}/capture`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${cfg.apiKey}` },
+    });
+    const ok = resp.ok;
+    if (orderId) {
+      await admin.firestore().collection('bnpl_orders').doc(orderId).set({
+        status: ok ? 'captured' : 'capture_failed',
+        captured_at: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+    }
+    return res.json({ ok, status: resp.status });
+  } catch (e) {
+    console.error('[payjustnow] capture error:', e.message);
+    return res.status(502).json({ ok: false, error: 'network_error' });
+  }
+});
+
+// PayJustNow webhook (signature verification — exact header name TBD by PJN docs).
+app.post('/api/bnpl/payjustnow/webhook', express.raw({ type: '*/*' }), async (req, res) => {
+  const cfg = await getPayJustNowConfig();
+  if (!cfg) return res.status(503).send('not_configured');
+  const rawBody = req.body && req.body.length ? req.body.toString('utf8') : '';
+  const signature = req.header('x-payjustnow-signature') || req.header('x-signature') || '';
+  if (cfg.webhookSecret) {
+    const expected = crypto.createHmac('sha256', cfg.webhookSecret)
+      .update(rawBody).digest('hex');
+    if (signature && signature.toLowerCase() !== expected.toLowerCase()) {
+      console.warn('[payjustnow] webhook signature mismatch');
+      return res.status(401).send('invalid_signature');
+    }
+  }
+  let payload = {};
+  try { payload = JSON.parse(rawBody); } catch (_) {}
+  const orderId = payload.merchantReference || payload.order_id || '';
+  const status = (payload.orderStatus || payload.status || '').toString().toLowerCase();
+  if (orderId) {
+    try {
+      await admin.firestore().collection('bnpl_orders').doc(orderId).set({
+        webhook_status: status,
+        webhook_received_at: admin.firestore.FieldValue.serverTimestamp(),
+        webhook_payload: payload,
+      }, { merge: true });
+    } catch (e) {
+      console.error('[payjustnow] webhook persist error:', e.message);
+    }
+  }
+  res.json({ ok: true });
+});
+
+
 
 // Export app for serverless/tests
 module.exports = app;
