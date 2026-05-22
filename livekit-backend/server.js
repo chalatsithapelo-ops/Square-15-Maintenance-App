@@ -7627,32 +7627,33 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       cipher.final(),
     ]).toString('base64');
 
-    // -- hashCheck: SHA512 hex of lowercased concat of all fields including apiKey --
-    // DIAGNOSTIC MODE: try multiple field orderings to discover which Ozow's
-    // server expects. The Ozow docs are inconsistent about whether branchCode
-    // is included, where apiKey sits, and how amount is formatted.
-    // Each variant computes hashCheck differently; we retry until success or
-    // exhaust the list.
-    const amtRaw = String(ozowAmount);           // e.g. "5"
-    const amt2dp = ozowAmount.toFixed(2);        // e.g. "5.00"
-    const amtCents = String(amountCents);        // e.g. "500"
-    const plainAcct = String(account_number);
+    // -- hashCheck: SHA512 hex of lowercased concat per Ozow's C# reference
+    // (received from Itumeleng @ Ozow, 22 May 2026). Field order:
+    //   siteCode + Convert.ToInt32(amount*100) + merchantReference
+    //   + customerBankReference + isRtc("False"/"True") + notifyUrl
+    //   + bankGroupId + encryptedAccountNumber + branchCode + apiKey
+    // Then .ToLower() → SHA512 → hex (lowercase).
+    // Notes:
+    //   • Amount is integer cents with NO decimal/padding (R5.00 → "500").
+    //   • IsRtc is a C# bool → "False"/"True" then lowercased to "false"/"true".
+    //     JS String(false) === "false" lowercases to "false", same result.
+    //   • accountNumber field in the hash is the ENCRYPTED (AES) value.
+    //   • apiKey is the LAST field, NOT after customerBankReference.
     const sha512 = (s) => crypto.createHash('sha512').update(s, 'utf8').digest('hex');
-    const hashVariants = [
-      { name: 'V1_amtCents_enc',        input: [ozowSiteCode, amtCents, payoutRef, customerBankReference, ozowApiKey, isRtc, notifyUrl, ozowBankGroupId, encryptedAccountNumber].join('').toLowerCase() },
-      { name: 'V2_amtCents_plain',      input: [ozowSiteCode, amtCents, payoutRef, customerBankReference, ozowApiKey, isRtc, notifyUrl, ozowBankGroupId, plainAcct].join('').toLowerCase() },
-      { name: 'V3_amt5_enc',            input: [ozowSiteCode, amtRaw, payoutRef, customerBankReference, ozowApiKey, isRtc, notifyUrl, ozowBankGroupId, encryptedAccountNumber].join('').toLowerCase() },
-      { name: 'V4_amt500_enc',          input: [ozowSiteCode, amt2dp, payoutRef, customerBankReference, ozowApiKey, isRtc, notifyUrl, ozowBankGroupId, encryptedAccountNumber].join('').toLowerCase() },
-      { name: 'V5_amtCents_branch',     input: [ozowSiteCode, amtCents, payoutRef, customerBankReference, ozowApiKey, isRtc, notifyUrl, ozowBankGroupId, encryptedAccountNumber, ozowBranchCode].join('').toLowerCase() },
-      { name: 'V6_amt5_branch_after',   input: [ozowSiteCode, amtRaw, payoutRef, customerBankReference, ozowApiKey, isRtc, notifyUrl, ozowBankGroupId, encryptedAccountNumber, ozowBranchCode].join('').toLowerCase() },
-      { name: 'V7_amtCents_branch_before',input: [ozowSiteCode, amtCents, payoutRef, customerBankReference, ozowApiKey, isRtc, notifyUrl, ozowBankGroupId, ozowBranchCode, encryptedAccountNumber].join('').toLowerCase() },
-      { name: 'V8_amt5_keyEnd',         input: [ozowSiteCode, amtRaw, payoutRef, customerBankReference, isRtc, notifyUrl, ozowBankGroupId, encryptedAccountNumber, ozowApiKey].join('').toLowerCase() },
-      { name: 'V9_amtCents_noLower',    input: [ozowSiteCode, amtCents, payoutRef, customerBankReference, ozowApiKey, isRtc, notifyUrl, ozowBankGroupId, encryptedAccountNumber].join('') },
-      { name: 'V10_amt5_decimalDot',    input: [ozowSiteCode, ozowAmount.toFixed(1), payoutRef, customerBankReference, ozowApiKey, isRtc, notifyUrl, ozowBankGroupId, encryptedAccountNumber].join('').toLowerCase() },
-    ];
-    console.log(`[admin/ozow-payout] Will try ${hashVariants.length} hash variants. ref=${payoutRef}`);
-    // First variant by default; the loop below will override hashCheck if needed.
-    let hashCheck = sha512(hashVariants[0].input);
+    const hashInput = [
+      ozowSiteCode,
+      amountCents,              // integer cents, no decimal
+      payoutRef,                // merchantReference
+      customerBankReference,
+      isRtc ? 'True' : 'False', // matches C# bool.ToString()
+      notifyUrl,
+      ozowBankGroupId,
+      encryptedAccountNumber,   // AES-256-CBC base64
+      ozowBranchCode,
+      ozowApiKey,               // ★ LAST per Ozow C# reference
+    ].join('').toLowerCase();
+    let hashCheck = sha512(hashInput);
+    console.log(`[admin/ozow-payout] hashInput len=${hashInput.length} ref=${payoutRef} amtCents=${amountCents}`);
 
     const payoutPayload = {
       siteCode: ozowSiteCode,
@@ -7676,59 +7677,28 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
     let ozowResult = null;
     let ozowRawText = '';
     let ozowRespHeaders = {};
-    let ozowHashVariantUsed = '';
-    const hashAttemptHistory = [];
 
-    for (const variant of hashVariants) {
-      const candidateHash = sha512(variant.input);
-      payoutPayload.hashCheck = candidateHash;
-      try {
-        const response = await fetch(ozowPayoutUrl, {
-          method: 'POST',
-          headers: {
-            'ApiKey': ozowApiKey,
-            'SiteCode': ozowSiteCode,
-            'Accept': 'application/json',
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify(payoutPayload),
-          signal: AbortSignal.timeout(30000),
-        });
-        const rawText = await response.text().catch(() => '');
-        let parsed;
-        try { parsed = rawText ? JSON.parse(rawText) : {}; } catch (_) { parsed = null; }
-        const headersObj = {};
-        try { response.headers.forEach((v, k) => { headersObj[k] = v; }); } catch (_) {}
-
-        const errMsg = (parsed && parsed.payoutStatus && parsed.payoutStatus.errorMessage) || '';
-        const isHashError = /hash/i.test(errMsg);
-
-        ozowResponse = response;
-        ozowResult = parsed;
-        ozowRawText = rawText;
-        ozowRespHeaders = headersObj;
-        ozowHashVariantUsed = variant.name;
-        hashAttemptHistory.push(`${variant.name}=${errMsg ? errMsg.slice(0,40) : 'OK'}`);
-
-        console.log(`[admin/ozow-payout] ${variant.name} → HTTP ${response.status} msg="${errMsg.slice(0,60)}"`);
-
-        if (!isHashError) {
-          // We got a real response (success OR a non-hash error like min/max).
-          // Stop trying more hash variants.
-          hashCheck = candidateHash;
-          break;
-        }
-        // Hash error → try next variant
-      } catch (attemptErr) {
-        hashAttemptHistory.push(`${variant.name}=THROW(${attemptErr.message})`);
-        console.warn(`[admin/ozow-payout] ${variant.name} threw: ${attemptErr.message}`);
-      }
+    try {
+      const response = await fetch(ozowPayoutUrl, {
+        method: 'POST',
+        headers: {
+          'ApiKey': ozowApiKey,
+          'SiteCode': ozowSiteCode,
+          'Accept': 'application/json',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payoutPayload),
+        signal: AbortSignal.timeout(30000),
+      });
+      ozowRawText = await response.text().catch(() => '');
+      try { ozowResult = ozowRawText ? JSON.parse(ozowRawText) : {}; } catch (_) { ozowResult = null; }
+      try { response.headers.forEach((v, k) => { ozowRespHeaders[k] = v; }); } catch (_) {}
+      ozowResponse = response;
+      const errMsg = (ozowResult && ozowResult.payoutStatus && ozowResult.payoutStatus.errorMessage) || '';
+      console.log(`[admin/ozow-payout] HTTP ${response.status} msg="${errMsg.slice(0,80)}" ref=${payoutRef}`);
+    } catch (attemptErr) {
+      console.error(`[admin/ozow-payout] Ozow request threw: ${attemptErr.message}`);
     }
-
-    if (!ozowResponse) {
-      return res.status(502).json({ ok: false, error: 'All Ozow hash variants failed to even connect' });
-    }
-    console.log(`[admin/ozow-payout] Final variant used: ${ozowHashVariantUsed} history=${hashAttemptHistory.join(' | ')}`);
 
     if (!ozowResponse) {
       return res.status(502).json({
@@ -7769,7 +7739,7 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
           'ozow_payout_error',
           `Ozow rejected a R${payoutAmount.toFixed(2)} EFT payout to ${recipient_name || recipient_type} (${bank_name} ****${String(account_number).slice(-4)}). HTTP ${ozowResponse.status} status=${ozowStatusCode} subStatus=${ozowSubStatus}. ${ozowErrorMessage || 'See ozow_raw detail.'}`,
           'backend',
-          `status=${ozowResponse.status} ozow_status=${ozowStatusCode} ozow_sub=${ozowSubStatus} err=${ozowErrorMessage} variant=${ozowHashVariantUsed} history=${hashAttemptHistory.join(' | ')} resp_headers=${JSON.stringify(ozowRespHeaders).slice(0,400)} raw=${ozowRawText || '(empty)'} parsed=${JSON.stringify(ozowResult).slice(0, 500)} bank_group_id=${ozowBankGroupId} branch=${ozowBranchCode} site_code=${ozowSiteCode ? 'set' : 'MISSING'} api_key=${ozowApiKey ? 'set' : 'MISSING'} test_mode=${env('OZOW_IS_TEST') === 'true'} ref=${payoutRef}`,
+          `status=${ozowResponse.status} ozow_status=${ozowStatusCode} ozow_sub=${ozowSubStatus} err=${ozowErrorMessage} resp_headers=${JSON.stringify(ozowRespHeaders).slice(0,400)} raw=${ozowRawText || '(empty)'} parsed=${JSON.stringify(ozowResult).slice(0, 500)} bank_group_id=${ozowBankGroupId} branch=${ozowBranchCode} site_code=${ozowSiteCode ? 'set' : 'MISSING'} api_key=${ozowApiKey ? 'set' : 'MISSING'} test_mode=${env('OZOW_IS_TEST') === 'true'} ref=${payoutRef}`,
           booking_id || null,
           'high'
         );
