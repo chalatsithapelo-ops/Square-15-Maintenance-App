@@ -7852,7 +7852,12 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
 
     await db.collection('payout_records').doc(txId).set(payoutRecord);
 
-    // Also log to transactionLogs
+    // Also log to transactionLogs — include queryable id fields so the record
+    // appears on the relevant admin detail screen for that recipient.
+    //   - client refunds: user_id (admin user_detail queries on user_id)
+    //   - artisan payouts: service_provider_id + artisan_id
+    //   - partner payouts: partner_id + corporate_partner_id
+    // `transaction_by` is the canonical "who is this transaction for" field.
     await db.collection('transactionLogs').doc(txId).set({
       id: txId,
       amount: payoutAmount.toFixed(2),
@@ -7868,6 +7873,11 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       ozow_payout_id: payoutId,
       recipient_id,
       recipient_name: recipient_name || '',
+      recipient_type,
+      transaction_by: recipient_id,
+      ...(recipient_type === 'client' ? { user_id: recipient_id } : {}),
+      ...(recipient_type === 'artisan' ? { service_provider_id: recipient_id, artisan_id: recipient_id } : {}),
+      ...(recipient_type === 'partner' ? { partner_id: recipient_id, corporate_partner_id: recipient_id } : {}),
       admin_id: adminUid,
       reason: reason || `Admin EFT payout`,
       ...(booking_id ? { tasks_management_id: booking_id } : {}),
@@ -7996,6 +8006,194 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       }
     } catch (syncErr) {
       console.warn('[ozow-payout] batch-sync failed (non-fatal):', syncErr && syncErr.message);
+    }
+
+    // ── Notifications ─────────────────────────────────────────────────────
+    // Every successful payout (any amount, any recipient type) must notify:
+    //   (a) all admins with an FCM push + a notifications doc, and
+    //   (b) the recipient (artisan or client) with a push + notifications doc.
+    // Partners have no app — partner notification = admin-only.
+    // Helpers are declared inline because the global notification helpers
+    // (writeAdminNotification / writePersonalNotification) are nested inside
+    // executeBookingAction's closure and not accessible from this route.
+    try {
+      const nowIsoStr = new Date().toISOString();
+      const recipientLabel = recipient_name || recipient_type;
+      const amountStr = `R${payoutAmount.toFixed(2)}`;
+      const acctMasked = `****${String(account_number).slice(-4)}`;
+      const typeLabel = recipient_type === 'partner'
+        ? 'Partner payout'
+        : (recipient_type === 'client' ? 'Client refund' : 'Artisan payout');
+
+      const _collectTokens = (docData) => {
+        const d = docData && typeof docData === 'object' ? docData : {};
+        const out = [];
+        const seen = new Set();
+        const push = (v) => {
+          const t = String(v || '').trim();
+          if (t && !seen.has(t)) { seen.add(t); out.push(t); }
+        };
+        push(d.deviceToken); push(d.device_token); push(d.fcm_token);
+        push(d.fcmToken); push(d.token); push(d.push_token); push(d.pushToken);
+        for (const list of [d.tokens, d.fcm_tokens, d.deviceTokens]) {
+          if (Array.isArray(list)) for (const item of list) push(item);
+        }
+        return out;
+      };
+
+      const _toStringMap = (v) => {
+        const obj = v && typeof v === 'object' ? v : {};
+        const out = {};
+        for (const [k, val] of Object.entries(obj)) {
+          if (val == null) continue;
+          out[String(k)] = String(val);
+        }
+        return out;
+      };
+
+      const _sendPush = async ({ tokens, title, body, data }) => {
+        if (!tokens || tokens.length === 0) return { attempted: 0, success: 0, failure: 0 };
+        try {
+          const resp = await admin.messaging().sendEachForMulticast({
+            tokens,
+            notification: {
+              title: String(title || '').trim() || undefined,
+              body: String(body || '').trim() || undefined,
+            },
+            data: _toStringMap(data),
+            android: { priority: 'high', notification: { channelId: 'high_importance_channel' } },
+          });
+          return { attempted: tokens.length, success: resp.successCount || 0, failure: resp.failureCount || 0 };
+        } catch (e) {
+          console.warn('[ozow-payout] FCM send failed:', e && e.message);
+          return { attempted: tokens.length, success: 0, failure: tokens.length };
+        }
+      };
+
+      const _writeNotifDoc = async ({ userId, userType, title, message, data }) => {
+        const ref = db.collection('notifications').doc();
+        await ref.set({
+          id: ref.id,
+          user_id: String(userId || ''),
+          user_type: String(userType || '').toLowerCase(),
+          title: String(title || ''),
+          message: String(message || ''),
+          type: String((data && data.type) || ''),
+          read: false,
+          view: false,
+          time: nowIsoStr,
+          created_at: nowIsoStr,
+          recipient_uid: String(userId || ''),
+          data: data || {},
+        });
+        return ref.id;
+      };
+
+      // (a) ADMIN notifications — every admin user, no amount threshold.
+      try {
+        const adminPayload = {
+          type: 'admin_payout_initiated',
+          recipient_type,
+          recipient_id: String(recipient_id || ''),
+          recipient_name: String(recipient_name || ''),
+          amount: payoutAmount.toFixed(2),
+          payout_id: String(payoutId || ''),
+          payout_reference: payoutRef,
+          payment_method: 'ozow_eft',
+          ...(booking_id ? { booking_id: String(booking_id) } : {}),
+        };
+        const adminTitle = `${typeLabel} initiated: ${amountStr}`;
+        const adminBody = `${amountStr} EFT to ${recipientLabel} (${bank_name} ${acctMasked}) ref ${payoutRef}.`;
+
+        const adminTokens = [];
+        const seenAdminTokens = new Set();
+        let adminSnap;
+        try {
+          adminSnap = await db.collection('users').where('isAdmin', '==', true).get();
+        } catch (qe) {
+          console.warn('[ozow-payout] admin lookup failed:', qe && qe.message);
+          adminSnap = { docs: [] };
+        }
+        for (const adminDoc of (adminSnap.docs || [])) {
+          const adminUidLocal = adminDoc.id;
+          // Write per-admin notification doc.
+          try {
+            await _writeNotifDoc({
+              userId: adminUidLocal,
+              userType: 'admin',
+              title: adminTitle,
+              message: adminBody,
+              data: adminPayload,
+            });
+          } catch (we) { console.warn('[ozow-payout] admin notif doc failed:', we && we.message); }
+          // Collect tokens.
+          for (const t of _collectTokens(adminDoc.data() || {})) {
+            if (!seenAdminTokens.has(t)) { seenAdminTokens.add(t); adminTokens.push(t); }
+          }
+        }
+        if (adminTokens.length > 0) {
+          await _sendPush({ tokens: adminTokens, title: adminTitle, body: adminBody, data: adminPayload });
+        }
+      } catch (anErr) {
+        console.warn('[ozow-payout] admin notification block failed (non-fatal):', anErr && anErr.message);
+      }
+
+      // (b) RECIPIENT notification — artisan / client only (partners have no app).
+      if (recipient_type === 'artisan' || recipient_type === 'client') {
+        try {
+          const recipientUType = recipient_type === 'client' ? 'user' : 'artisan';
+          const recipientTitle = recipient_type === 'client'
+            ? `Refund sent: ${amountStr}`
+            : `Payout sent: ${amountStr}`;
+          const recipientMsg = recipient_type === 'client'
+            ? `Your ${amountStr} refund has been sent to ${bank_name} ${acctMasked}. Funds arrive within minutes (RTC) or next business day. Ref ${payoutRef}.`
+            : `Your ${amountStr} payout has been sent to ${bank_name} ${acctMasked}. Funds arrive within minutes (RTC) or next business day. Ref ${payoutRef}.`;
+          const recipientPayload = {
+            type: recipient_type === 'client' ? 'refund_sent' : 'payout_sent',
+            amount: payoutAmount.toFixed(2),
+            payout_id: String(payoutId || ''),
+            payout_reference: payoutRef,
+            payment_method: 'ozow_eft',
+            bank_name: String(bank_name || ''),
+            account_masked: acctMasked,
+            ...(booking_id ? { booking_id: String(booking_id) } : {}),
+          };
+
+          await _writeNotifDoc({
+            userId: recipient_id,
+            userType: recipientUType,
+            title: recipientTitle,
+            message: recipientMsg,
+            data: recipientPayload,
+          });
+
+          // Collect tokens (users + serviceProvider for artisans).
+          const recipTokens = [];
+          const seenRecipTokens = new Set();
+          const addTokens = (arr) => {
+            for (const t of arr) {
+              if (!seenRecipTokens.has(t)) { seenRecipTokens.add(t); recipTokens.push(t); }
+            }
+          };
+          try {
+            const userDoc = await db.collection('users').doc(recipient_id).get();
+            if (userDoc.exists) addTokens(_collectTokens(userDoc.data() || {}));
+          } catch (_) {}
+          if (recipientUType === 'artisan') {
+            try {
+              const spDoc = await db.collection('serviceProvider').doc(recipient_id).get();
+              if (spDoc.exists) addTokens(_collectTokens(spDoc.data() || {}));
+            } catch (_) {}
+          }
+          if (recipTokens.length > 0) {
+            await _sendPush({ tokens: recipTokens, title: recipientTitle, body: recipientMsg, data: recipientPayload });
+          }
+        } catch (pnErr) {
+          console.warn('[ozow-payout] recipient notification failed (non-fatal):', pnErr && pnErr.message);
+        }
+      }
+    } catch (notifyErr) {
+      console.warn('[ozow-payout] notification block failed (non-fatal):', notifyErr && notifyErr.message);
     }
 
     return res.json({
