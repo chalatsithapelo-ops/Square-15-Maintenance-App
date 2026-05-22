@@ -7655,6 +7655,33 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
     let hashCheck = sha512(hashInput);
     console.log(`[admin/ozow-payout] hashInput len=${hashInput.length} ref=${payoutRef} amtCents=${amountCents}`);
 
+    // Sandbox echo: in staging/test mode print the EXACT pre-hash string and
+    // computed hash so we can diff against Ozow's "Before Hashcheck" debug line
+    // from their C# reference. Never enabled in production (test_mode guard).
+    const isOzowSandbox = env('OZOW_IS_TEST') === 'true';
+    if (isOzowSandbox) {
+      // Redact apiKey from echoed string (last token) to keep secrets out of logs.
+      const apiKeyLc = ozowApiKey.toLowerCase();
+      const redactedInput = hashInput.endsWith(apiKeyLc)
+        ? hashInput.slice(0, -apiKeyLc.length) + `<apiKey:${apiKeyLc.length}chars>`
+        : hashInput;
+      console.log('[admin/ozow-payout][SANDBOX-ECHO] === PRE-HASH STRING ===');
+      console.log('[admin/ozow-payout][SANDBOX-ECHO] input :', redactedInput);
+      console.log('[admin/ozow-payout][SANDBOX-ECHO] hash  :', hashCheck);
+      console.log('[admin/ozow-payout][SANDBOX-ECHO] fields:', JSON.stringify({
+        siteCode: ozowSiteCode,
+        amountCents,
+        merchantReference: payoutRef,
+        customerBankReference,
+        isRtc: isRtc ? 'True' : 'False',
+        notifyUrl,
+        bankGroupId: ozowBankGroupId,
+        encryptedAccountNumber,
+        branchCode: ozowBranchCode,
+        apiKeyChars: ozowApiKey.length,
+      }));
+    }
+
     const payoutPayload = {
       siteCode: ozowSiteCode,
       amount: ozowAmount,
@@ -7672,6 +7699,10 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
 
     console.log(`[admin/ozow-payout] Initiating R${payoutAmount.toFixed(2)} to ${recipient_type} ${recipient_id} (${bank_name} ****${String(account_number).slice(-4)})`);
     console.log(`[admin/ozow-payout] URL: ${ozowPayoutUrl} ref=${payoutRef}`);
+    if (isOzowSandbox) {
+      console.log('[admin/ozow-payout][SANDBOX-ECHO] === OUTBOUND REQUEST ===');
+      console.log('[admin/ozow-payout][SANDBOX-ECHO] body  :', JSON.stringify(payoutPayload));
+    }
 
     let ozowResponse = null;
     let ozowResult = null;
@@ -7696,6 +7727,11 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       ozowResponse = response;
       const errMsg = (ozowResult && ozowResult.payoutStatus && ozowResult.payoutStatus.errorMessage) || '';
       console.log(`[admin/ozow-payout] HTTP ${response.status} msg="${errMsg.slice(0,80)}" ref=${payoutRef}`);
+      if (isOzowSandbox) {
+        console.log('[admin/ozow-payout][SANDBOX-ECHO] === INBOUND RESPONSE ===');
+        console.log('[admin/ozow-payout][SANDBOX-ECHO] status:', response.status);
+        console.log('[admin/ozow-payout][SANDBOX-ECHO] raw   :', ozowRawText || '(empty)');
+      }
     } catch (attemptErr) {
       console.error(`[admin/ozow-payout] Ozow request threw: ${attemptErr.message}`);
     }
