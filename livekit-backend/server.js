@@ -365,6 +365,40 @@ function isEnvTruthy(name) {
   return s === '1' || s === 'true' || s === 'yes' || s === 'y' || s === 'on';
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// Cyber-security gap #14: Ozow production credential safety assertion.
+// Detect env-var desync (test key + prod URL, or live key + sandbox URL) that
+// could route real money to sandbox or sandbox calls to production. Returns
+// an array of human-readable errors; empty array means safe.
+// Heuristic only — Ozow does not publish a deterministic key-format spec, so
+// we rely on patterns observed in the credential pair they provided. The
+// helper is called at startup AND inline at the payout route for live mode.
+// ──────────────────────────────────────────────────────────────────────────────
+function assertOzowProdSafety() {
+  const errs = [];
+  const isTest = env('OZOW_IS_TEST') === 'true';
+  const apiKey = env('OZOW_PAYOUT_API_KEY') || env('OZOW_API_KEY') || '';
+  const siteCode = env('OZOW_SITE_CODE') || '';
+  // Only enforce when explicitly running in live mode. Sandbox is permissive.
+  if (isTest) return errs;
+  // Live mode: hard requirements.
+  if (!apiKey) errs.push('OZOW_PAYOUT_API_KEY missing in live mode');
+  if (!siteCode) errs.push('OZOW_SITE_CODE missing in live mode');
+  // Sandbox site codes Ozow has issued historically start with "TSTSTE" or
+  // include the literal "TEST". If those appear while OZOW_IS_TEST=false the
+  // env vars are mismatched.
+  const sc = String(siteCode).toUpperCase();
+  if (/^(TST|TEST|TSTSTE)/.test(sc) || sc.includes('TEST')) {
+    errs.push(`OZOW_SITE_CODE looks like a sandbox code ("${siteCode}") but OZOW_IS_TEST=false`);
+  }
+  // Sandbox API keys Ozow issues frequently include the word "TEST" or
+  // "STAGING" in the prefix/suffix. Treat that as a desync signal.
+  if (/TEST|STAGING|SANDBOX/i.test(apiKey)) {
+    errs.push('OZOW_PAYOUT_API_KEY appears to be a sandbox key but OZOW_IS_TEST=false');
+  }
+  return errs;
+}
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -7555,6 +7589,149 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       return res.status(503).json({ error: 'Ozow payout credentials not configured. Set OZOW_PAYOUT_API_KEY and OZOW_SITE_CODE in environment.' });
     }
 
+    const now = new Date().toISOString();
+
+    // ─── Gap #14: Ozow prod credential safety assertion ───
+    // If we're in live mode but env vars look like a sandbox setup, refuse
+    // to send money. This protects against desync after a partial cutover.
+    const ozowSafetyErrs = assertOzowProdSafety();
+    if (ozowSafetyErrs.length > 0) {
+      console.error('🚨 OZOW PROD SAFETY BLOCK:', ozowSafetyErrs);
+      try {
+        await db.collection('error_logs').add({
+          error_type: 'ozow_prod_safety_block',
+          severity: 'critical',
+          source: 'ozow_payout_route',
+          errors: ozowSafetyErrs,
+          admin_id: adminUid,
+          attempted_amount: payoutAmount,
+          created_at: now,
+        });
+      } catch (_) {}
+      return res.status(503).json({
+        error: 'Ozow credential safety check failed. Cannot process payouts.',
+        details: ozowSafetyErrs,
+      });
+    }
+
+    // ─── Gap #4: Daily payout hard block (per-admin) ───
+    // Owner role may exceed daily limit; everyone else is hard-capped.
+    // The R50k DAILY_LIMITS.payout was previously *alerted* in fraud rules but
+    // not actually blocking — convert to a hard block here. Any payout pushing
+    // the admin's running total past their cap is refused before Ozow is hit.
+    const DAILY_PAYOUT_CAP_DEFAULT = 50000;
+    const DAILY_PAYOUT_CAP_OWNER = 500000; // R500k for owner role
+    const adminClaimRole = (decoded.role || '').toString().toLowerCase();
+    const isOwner = adminClaimRole === 'owner' || decoded.owner === true;
+    const adminDailyCap = isOwner ? DAILY_PAYOUT_CAP_OWNER : DAILY_PAYOUT_CAP_DEFAULT;
+    try {
+      const dayStart = new Date();
+      dayStart.setHours(0, 0, 0, 0);
+      const dayStartIso = dayStart.toISOString();
+      const todaySnap = await db.collection('payout_records')
+        .where('admin_id', '==', adminUid)
+        .where('created_at', '>=', dayStartIso)
+        .limit(500)
+        .get();
+      let todayTotal = 0;
+      todaySnap.docs.forEach(d => {
+        const data = d.data() || {};
+        // Only count successful/pending — failed/rejected don't move money.
+        const st = String(data.status || '').toLowerCase();
+        if (st === 'failed' || st === 'rejected' || st === 'cancelled') return;
+        const amt = parseFloat(data.amount || 0);
+        if (!isNaN(amt)) todayTotal += amt;
+      });
+      const projected = todayTotal + payoutAmount;
+      if (projected > adminDailyCap) {
+        await db.collection('fraud_alerts').add({
+          rule: 'daily_payout_cap_block',
+          severity: 'high',
+          admin_id: adminUid,
+          today_total: todayTotal,
+          attempted_amount: payoutAmount,
+          cap: adminDailyCap,
+          recipient_id, recipient_type,
+          created_at: now,
+        });
+        return res.status(403).json({
+          error: 'Daily payout cap exceeded for your role',
+          details: `Today total R${todayTotal.toFixed(2)} + R${payoutAmount.toFixed(2)} = R${projected.toFixed(2)} > R${adminDailyCap} cap`,
+          role: isOwner ? 'owner' : 'admin',
+        });
+      }
+    } catch (e) {
+      console.warn('[ozow-payout] daily cap check failed (fail-closed):', e.message);
+      return res.status(503).json({ error: 'Internal control check failed. Try again shortly.' });
+    }
+
+    // ─── Gap #15: Bank-account-change cool-down (24h) ───
+    // Detect when the recipient's payout-bound bank account has changed
+    // recently. If the {recipient_id × account_number} pair is new (or the
+    // recipient's account was modified within the last 24h), block payout
+    // and raise a fraud alert. Owner can override by setting a fresh flag
+    // doc — kept as backlog work for the role-tier system.
+    try {
+      const masked = `****${String(account_number).slice(-4)}`;
+      // 1. Most recent successful payout to this recipient
+      const recentSnap = await db.collection('payout_records')
+        .where('recipient_id', '==', recipient_id)
+        .where('status', 'in', ['success', 'pending'])
+        .orderBy('created_at', 'desc')
+        .limit(5)
+        .get()
+        .catch(() => null);
+
+      let recipientHasHistory = recentSnap && !recentSnap.empty;
+      let lastMasked = '';
+      if (recipientHasHistory) {
+        const lastDoc = recentSnap.docs[0].data() || {};
+        lastMasked = (lastDoc.account_number_masked || '').toString();
+      }
+
+      // 2. Check recipient profile doc for recent bank-account changes
+      const profileCol = recipient_type === 'artisan'
+        ? 'serviceProvider'
+        : recipient_type === 'partner' ? 'corporate_partners' : 'users';
+      let profileBankUpdatedAt = null;
+      try {
+        const profSnap = await db.collection(profileCol).doc(recipient_id).get();
+        if (profSnap.exists) {
+          const pd = profSnap.data() || {};
+          const candidate = pd.bank_account_updated_at || pd.bank_details_updated_at || pd.bankAccountUpdatedAt;
+          if (candidate) profileBankUpdatedAt = new Date(String(candidate));
+        }
+      } catch (_) {}
+
+      const isAccountChanged = recipientHasHistory && lastMasked && lastMasked !== masked;
+      const isProfileRecentlyChanged = profileBankUpdatedAt &&
+        (Date.now() - profileBankUpdatedAt.getTime()) < (24 * 60 * 60 * 1000);
+
+      if (isAccountChanged || isProfileRecentlyChanged) {
+        await db.collection('fraud_alerts').add({
+          rule: 'bank_account_change_cooldown',
+          severity: 'critical',
+          admin_id: adminUid,
+          recipient_id, recipient_type,
+          new_account_masked: masked,
+          previous_account_masked: lastMasked || null,
+          profile_bank_updated_at: profileBankUpdatedAt ? profileBankUpdatedAt.toISOString() : null,
+          attempted_amount: payoutAmount,
+          created_at: now,
+        });
+        return res.status(403).json({
+          error: 'Bank account change cool-down active',
+          details: isAccountChanged
+            ? `Recipient's last successful payout used ${lastMasked}, now ${masked}. 24-hour cool-down active.`
+            : `Recipient's stored bank details changed within 24h. Cool-down active.`,
+          retry_after: '24h',
+        });
+      }
+    } catch (e) {
+      console.warn('[ozow-payout] bank-change cooldown check failed (fail-closed):', e.message);
+      return res.status(503).json({ error: 'Internal control check failed. Try again shortly.' });
+    }
+
     // -- Map South African bank names to Ozow bankGroupId UUIDs --
     // Source: live call to https://stagingpayoutsapi.ozow.com/v1/getavailablebanks (2026-05-21)
     // These UUIDs are stable across staging + production.
@@ -7589,7 +7766,6 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
     const ozowBankGroupId = bankMatch.id;
     const ozowBranchCode = bankMatch.branch; // Use universal branch code from Ozow, not user-supplied
 
-    const now = new Date().toISOString();
     // Ozow merchantReference max 20 chars - compact base36 timestamp
     const payoutRef = `SQ${Date.now().toString(36).toUpperCase()}`;
     // Ozow customerBankReference: alphanumeric + spaces + dashes only, max 20 chars
@@ -11873,6 +12049,26 @@ if (require.main === module) {
     console.log(`?? Token endpoint: http://localhost:${PORT}/api/token`);
     console.log(`?? Voice start endpoint: http://localhost:${PORT}/api/voice/start`);
     console.log(`?? Environment: ${process.env.NODE_ENV}`);
+    // ─── Gap #14: Ozow prod safety at startup ───
+    try {
+      const ozowErrs = assertOzowProdSafety();
+      if (ozowErrs.length > 0) {
+        console.error('🚨 OZOW PROD SAFETY WARNING AT STARTUP:', ozowErrs);
+        try {
+          admin.firestore().collection('error_logs').add({
+            error_type: 'ozow_prod_safety_warning_startup',
+            severity: 'critical',
+            source: 'livekit_backend',
+            errors: ozowErrs,
+            created_at: new Date().toISOString(),
+          });
+        } catch (_) {}
+      } else if (env('OZOW_IS_TEST') === 'true') {
+        console.log('✅ Ozow: SANDBOX mode (no money will move).');
+      } else {
+        console.log('✅ Ozow: LIVE mode — credentials passed safety check.');
+      }
+    } catch (e) { console.warn('Ozow safety assertion threw:', e.message); }
     // LK-13: hard refusal � if anyone leaves the no-auth voice flag enabled in
     // production, log loudly to error_logs and ALSO refuse to enable it (the
     // flag is read again at request time; we set NODE_ENV-dependent override).
