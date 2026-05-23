@@ -7630,7 +7630,6 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       const dayStartIso = dayStart.toISOString();
       const todaySnap = await db.collection('payout_records')
         .where('admin_id', '==', adminUid)
-        .where('created_at', '>=', dayStartIso)
         .limit(500)
         .get()
         .catch((err) => {
@@ -7640,6 +7639,9 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       let todayTotal = 0;
       todaySnap.docs.forEach(d => {
         const data = d.data() || {};
+        // Filter by date in-process to avoid needing a composite index.
+        const created = String(data.created_at || '');
+        if (created < dayStartIso) return;
         // Only count successful/pending — failed/rejected don't move money.
         const st = String(data.status || '').toLowerCase();
         if (st === 'failed' || st === 'rejected' || st === 'cancelled') return;
@@ -7678,12 +7680,10 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
     try {
       const masked = `****${String(account_number).slice(-4)}`;
       // 1. Most recent successful/pending payout to this recipient.
-      // No `status in` here — that would require a composite index. We
-      // filter in-process below.
+      // Use single-field query then sort in-process to avoid composite index.
       const recentSnap = await db.collection('payout_records')
         .where('recipient_id', '==', recipient_id)
-        .orderBy('created_at', 'desc')
-        .limit(10)
+        .limit(50)
         .get()
         .catch((err) => {
           console.warn('[ozow-payout] recent payouts query failed:', err.message);
@@ -7693,8 +7693,10 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       let recipientHasHistory = false;
       let lastMasked = '';
       if (recentSnap && !recentSnap.empty) {
-        for (const doc of recentSnap.docs) {
-          const dd = doc.data() || {};
+        const docs = recentSnap.docs
+          .map(d => d.data() || {})
+          .sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')));
+        for (const dd of docs) {
           const st = String(dd.status || '').toLowerCase();
           if (st === 'failed' || st === 'rejected' || st === 'cancelled') continue;
           const m = (dd.account_number_masked || '').toString();
