@@ -12412,6 +12412,11 @@ if (require.main === module) {
     // If OWNER_UID is set in env, ensure that uid has the `owner` custom
     // claim. Idempotent and safe to run on every startup.
     try {
+      initFirebaseIfPossible();
+      if (firebaseInitError) {
+        console.warn('Owner bootstrap skipped (Firebase not configured):', firebaseInitError.message);
+        throw firebaseInitError;
+      }
       const ownerUid = env('OWNER_UID');
       if (ownerUid) {
         const user = await admin.auth().getUser(ownerUid).catch(() => null);
