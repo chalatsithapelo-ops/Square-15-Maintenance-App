@@ -7745,7 +7745,6 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
         });
       }
     } catch (e) {
-    } catch (e) {
       console.warn('[ozow-payout] bank-change cooldown check failed (fail-closed):', e.code || '', e.message);
       return res.status(503).json({ error: 'Internal control check failed. Try again shortly.', stage: 'bank_change', detail: e.message });
     }
