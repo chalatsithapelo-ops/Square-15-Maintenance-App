@@ -796,6 +796,90 @@ async function resolveRole({ firestore, uid, decodedToken }) {
   return 'client';
 }
 
+// ─── Multi-Admin Governance (May 23 2026) ─────────────────────────────────
+// Five admin tiers, distinguished by Firebase custom claim `role`:
+//   owner    — full power, can grant/revoke other admins' roles, R500k/day cap
+//   finance  — can disburse money (payouts, refunds), R50k/day cap
+//   ops      — bookings, dispatch, RFQs (no money movement)
+//   support  — view-only user data + send messages
+//   auditor  — view-only on transactions + audit logs
+// Legacy `admin` claim is treated as `finance` until explicitly migrated.
+const ADMIN_TIERS = ['owner', 'finance', 'ops', 'support', 'auditor'];
+
+function resolveAdminTier(decoded) {
+  if (!decoded) return null;
+  const raw = String(decoded.role || decoded.user_role || '').trim().toLowerCase();
+  if (ADMIN_TIERS.includes(raw)) return raw;
+  // Legacy single-tier admins → finance.
+  if (raw === 'admin' || decoded.admin === true) return 'finance';
+  return null;
+}
+
+function requireAdminTier(allowed) {
+  const allow = new Set(allowed);
+  return function (req, res, next) {
+    const tier = resolveAdminTier(req.user);
+    if (!tier || !allow.has(tier)) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: `This action requires one of: ${[...allow].join(', ')}. Your tier: ${tier || 'none'}.`,
+      });
+    }
+    req.adminTier = tier;
+    next();
+  };
+}
+
+// ─── TOTP (RFC 6238) — minimal pure-Node implementation ──────────────────
+// Avoids adding `speakeasy` to dependencies (smaller surface, no install risk
+// on Render). 30-second window, 6-digit codes, SHA-1, base32 secrets.
+const _b32alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+function base32Encode(buf) {
+  let bits = '';
+  for (const b of buf) bits += b.toString(2).padStart(8, '0');
+  let out = '';
+  for (let i = 0; i + 5 <= bits.length; i += 5) {
+    out += _b32alphabet[parseInt(bits.substr(i, 5), 2)];
+  }
+  return out;
+}
+function base32Decode(str) {
+  let bits = '';
+  for (const c of String(str || '').toUpperCase().replace(/=+$/, '')) {
+    const v = _b32alphabet.indexOf(c);
+    if (v < 0) continue;
+    bits += v.toString(2).padStart(5, '0');
+  }
+  const bytes = [];
+  for (let i = 0; i + 8 <= bits.length; i += 8) bytes.push(parseInt(bits.substr(i, 8), 2));
+  return Buffer.from(bytes);
+}
+function totpAt(secretBase32, timestampSec) {
+  const key = base32Decode(secretBase32);
+  const counter = Math.floor(timestampSec / 30);
+  const buf = Buffer.alloc(8);
+  buf.writeBigUInt64BE(BigInt(counter));
+  const crypto = require('crypto');
+  const hmac = crypto.createHmac('sha1', key).update(buf).digest();
+  const offset = hmac[hmac.length - 1] & 0x0f;
+  const bin = ((hmac[offset] & 0x7f) << 24) |
+              ((hmac[offset + 1] & 0xff) << 16) |
+              ((hmac[offset + 2] & 0xff) << 8) |
+              (hmac[offset + 3] & 0xff);
+  return String(bin % 1000000).padStart(6, '0');
+}
+function verifyTotp(secretBase32, code, window = 1) {
+  if (!secretBase32 || !/^\d{6}$/.test(String(code || '').trim())) return false;
+  const sec = Math.floor(Date.now() / 1000);
+  for (let w = -window; w <= window; w++) {
+    if (totpAt(secretBase32, sec + w * 30) === String(code).trim()) return true;
+  }
+  return false;
+}
+function generateTotpSecret() {
+  return base32Encode(require('crypto').randomBytes(20));
+}
+
 function isTruthy(v) {
   if (v === true) return true;
   if (v === false) return false;
@@ -7566,6 +7650,92 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       return res.status(403).json({ error: 'Admin access required.' });
     }
 
+    // ─── Governance: only owner+finance can disburse money ───
+    const adminTier = resolveAdminTier(decoded);
+    if (!adminTier || !['owner', 'finance'].includes(adminTier)) {
+      return res.status(403).json({
+        error: 'Insufficient admin tier',
+        message: `Payouts require owner or finance tier. Your tier: ${adminTier || 'none'}.`,
+      });
+    }
+
+    // ─── Gap #9: Idle re-auth (10 minutes) ───
+    // The session must be either freshly signed-in (auth_time within 10min)
+    // OR have a recent biometric confirmation written to
+    // admin_biometric_confirms/{uid} within the last 5 minutes by the admin
+    // app after a successful local_auth prompt. Owner can bypass via env
+    // `MFA_BYPASS_OWNER=true` (NOT recommended for prod).
+    try {
+      const nowSec = Math.floor(Date.now() / 1000);
+      const authTime = Number(decoded.auth_time || 0);
+      const freshSignin = authTime > 0 && (nowSec - authTime) < 600; // 10min
+      let freshBiometric = false;
+      if (!freshSignin) {
+        const bioSnap = await db.collection('admin_biometric_confirms').doc(adminUid).get();
+        if (bioSnap.exists) {
+          const at = bioSnap.data()?.confirmed_at;
+          const tsSec = at ? Math.floor(new Date(String(at)).getTime() / 1000) : 0;
+          freshBiometric = tsSec > 0 && (nowSec - tsSec) < 300; // 5min
+        }
+      }
+      const ownerBypass = adminTier === 'owner' && env('MFA_BYPASS_OWNER') === 'true';
+      if (!freshSignin && !freshBiometric && !ownerBypass) {
+        return res.status(401).json({
+          error: 'reauth_required',
+          message: 'Re-authenticate (biometric or re-login) before disbursing funds.',
+          max_age_seconds: 600,
+        });
+      }
+    } catch (e) {
+      console.warn('[ozow-payout] idle re-auth check error:', e.message);
+      return res.status(503).json({ error: 'Internal control check failed.', stage: 'reauth' });
+    }
+
+    // ─── Gap #3: MFA TOTP enforcement ───
+    // If MFA is enrolled on this admin (admin_mfa/{uid} with enabled=true),
+    // require a current 6-digit code in `x-mfa-code` or req.body.mfa_code.
+    // If MFA_REQUIRED env is true, enrollment is mandatory for owner+finance
+    // tiers — payout will be refused until they enrol.
+    try {
+      const mfaSnap = await db.collection('admin_mfa').doc(adminUid).get();
+      const mfa = mfaSnap.exists ? (mfaSnap.data() || {}) : {};
+      const isEnrolled = mfa.enabled === true && !!mfa.secret;
+      const mfaRequired = env('MFA_REQUIRED') === 'true';
+      if (!isEnrolled) {
+        if (mfaRequired) {
+          return res.status(403).json({
+            error: 'mfa_enrollment_required',
+            message: 'You must enrol MFA before disbursing funds. Hit /api/admin/mfa/setup.',
+          });
+        }
+        // Soft mode: log but allow.
+        console.warn(`[ozow-payout] admin ${adminUid} has no MFA enrolled (soft-mode)`);
+      } else {
+        const code = String(req.headers['x-mfa-code'] || req.body?.mfa_code || '').trim();
+        if (!verifyTotp(mfa.secret, code)) {
+          await db.collection('fraud_alerts').add({
+            rule: 'mfa_failed_payout',
+            severity: 'high',
+            admin_id: adminUid,
+            attempted_amount: parseFloat(req.body?.amount || 0),
+            created_at: new Date().toISOString(),
+          });
+          return res.status(401).json({
+            error: 'mfa_invalid',
+            message: 'Invalid or missing MFA code. Provide 6-digit code in x-mfa-code header.',
+          });
+        }
+        // Touch last_used_at (non-blocking).
+        db.collection('admin_mfa').doc(adminUid).set(
+          { last_used_at: new Date().toISOString() },
+          { merge: true }
+        ).catch(() => {});
+      }
+    } catch (e) {
+      console.warn('[ozow-payout] MFA check error:', e.message);
+      return res.status(503).json({ error: 'Internal control check failed.', stage: 'mfa' });
+    }
+
     const { amount, recipient_id, recipient_type, recipient_name, bank_name,
             account_number, branch_code, account_type, booking_id, reason } = req.body;
 
@@ -7621,8 +7791,7 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
     // the admin's running total past their cap is refused before Ozow is hit.
     const DAILY_PAYOUT_CAP_DEFAULT = 50000;
     const DAILY_PAYOUT_CAP_OWNER = 500000; // R500k for owner role
-    const adminClaimRole = (decoded.role || '').toString().toLowerCase();
-    const isOwner = adminClaimRole === 'owner' || decoded.owner === true;
+    const isOwner = adminTier === 'owner';
     const adminDailyCap = isOwner ? DAILY_PAYOUT_CAP_OWNER : DAILY_PAYOUT_CAP_DEFAULT;
     try {
       const dayStart = new Date();
@@ -8412,6 +8581,156 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       );
     } catch (_) {}
     res.status(500).json({ error: 'EFT payout failed. Please try again.', detail: error && error.message });
+  }
+});
+
+// ─── Multi-Admin Governance Endpoints ─────────────────────────────────────
+
+// Owner-only: grant or revoke an admin tier on another user.
+// Sets the Firebase custom claim `role` on the target uid.
+app.post('/api/admin/grant-role', authMiddleware, async (req, res) => {
+  try {
+    const decoded = req.user;
+    const callerTier = resolveAdminTier(decoded);
+    if (callerTier !== 'owner') {
+      return res.status(403).json({ error: 'Only the owner can grant roles.' });
+    }
+    const { target_uid, role } = req.body || {};
+    if (!target_uid || !role) {
+      return res.status(400).json({ error: 'Missing target_uid or role.' });
+    }
+    const newRole = String(role).toLowerCase();
+    if (!ADMIN_TIERS.includes(newRole) && newRole !== 'none') {
+      return res.status(400).json({ error: `Invalid role. Must be one of: ${ADMIN_TIERS.join(', ')}, none.` });
+    }
+    // Preserve other claims (e.g. admin:true legacy). For 'none' we revoke.
+    const target = await admin.auth().getUser(String(target_uid)).catch(() => null);
+    if (!target) return res.status(404).json({ error: 'Target user not found.' });
+    const existingClaims = target.customClaims || {};
+    let newClaims;
+    if (newRole === 'none') {
+      newClaims = { ...existingClaims };
+      delete newClaims.role;
+      delete newClaims.admin;
+    } else {
+      newClaims = { ...existingClaims, role: newRole, admin: true };
+    }
+    await admin.auth().setCustomUserClaims(target.uid, newClaims);
+    await admin.firestore().collection('admin_role_audit').add({
+      target_uid: target.uid,
+      target_email: target.email || null,
+      changed_by: decoded.uid,
+      changed_by_email: decoded.email || null,
+      old_role: existingClaims.role || (existingClaims.admin ? 'admin(legacy)' : null),
+      new_role: newRole === 'none' ? null : newRole,
+      created_at: new Date().toISOString(),
+    });
+    res.json({ ok: true, target_uid: target.uid, new_role: newRole, message: 'Role updated. Target must re-login to refresh token.' });
+  } catch (e) {
+    console.error('grant-role error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Any authed admin: confirm a recent biometric prompt was passed. Used by
+// the admin Flutter app right after a local_auth success to unblock payouts
+// for the next 5 minutes without forcing a re-login.
+app.post('/api/admin/biometric-confirm', authMiddleware, async (req, res) => {
+  try {
+    const decoded = req.user;
+    const tier = resolveAdminTier(decoded);
+    if (!tier) return res.status(403).json({ error: 'Admin tier required.' });
+    await admin.firestore().collection('admin_biometric_confirms').doc(decoded.uid).set({
+      confirmed_at: new Date().toISOString(),
+      tier,
+    }, { merge: true });
+    res.json({ ok: true, valid_for_seconds: 300 });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// MFA: setup → returns secret + otpauth URI for QR scanning. Does NOT enable
+// until the admin confirms with a code at /enable.
+app.post('/api/admin/mfa/setup', authMiddleware, async (req, res) => {
+  try {
+    const decoded = req.user;
+    const tier = resolveAdminTier(decoded);
+    if (!tier) return res.status(403).json({ error: 'Admin tier required.' });
+    const secret = generateTotpSecret();
+    const issuer = encodeURIComponent('Square15');
+    const label = encodeURIComponent(decoded.email || decoded.uid);
+    const otpauth = `otpauth://totp/${issuer}:${label}?secret=${secret}&issuer=${issuer}&algorithm=SHA1&digits=6&period=30`;
+    await admin.firestore().collection('admin_mfa').doc(decoded.uid).set({
+      secret,
+      enabled: false,
+      pending_setup: true,
+      created_at: new Date().toISOString(),
+    }, { merge: true });
+    res.json({ secret, otpauth_uri: otpauth, message: 'Scan QR in Google Authenticator / Authy, then call /enable with the 6-digit code.' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/admin/mfa/enable', authMiddleware, async (req, res) => {
+  try {
+    const decoded = req.user;
+    const tier = resolveAdminTier(decoded);
+    if (!tier) return res.status(403).json({ error: 'Admin tier required.' });
+    const code = String(req.body?.code || '').trim();
+    const snap = await admin.firestore().collection('admin_mfa').doc(decoded.uid).get();
+    if (!snap.exists) return res.status(400).json({ error: 'Call /setup first.' });
+    const data = snap.data() || {};
+    if (!verifyTotp(data.secret, code)) {
+      return res.status(401).json({ error: 'Invalid code. Verify the time on your phone is correct and retry.' });
+    }
+    await snap.ref.set({ enabled: true, pending_setup: false, enabled_at: new Date().toISOString() }, { merge: true });
+    res.json({ ok: true, message: 'MFA enabled. Code will be required for payouts.' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/admin/mfa/disable', authMiddleware, async (req, res) => {
+  try {
+    const decoded = req.user;
+    const tier = resolveAdminTier(decoded);
+    if (!tier) return res.status(403).json({ error: 'Admin tier required.' });
+    const code = String(req.body?.code || '').trim();
+    const snap = await admin.firestore().collection('admin_mfa').doc(decoded.uid).get();
+    if (!snap.exists) return res.json({ ok: true, message: 'MFA already disabled.' });
+    const data = snap.data() || {};
+    if (!data.enabled) return res.json({ ok: true, message: 'MFA already disabled.' });
+    if (!verifyTotp(data.secret, code)) {
+      return res.status(401).json({ error: 'Invalid code. Cannot disable without proof of possession.' });
+    }
+    await snap.ref.set({ enabled: false, disabled_at: new Date().toISOString() }, { merge: true });
+    await admin.firestore().collection('admin_role_audit').add({
+      action: 'mfa_disabled',
+      target_uid: decoded.uid,
+      created_at: new Date().toISOString(),
+    });
+    res.json({ ok: true, message: 'MFA disabled.' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/admin/mfa/status', authMiddleware, async (req, res) => {
+  try {
+    const tier = resolveAdminTier(req.user);
+    if (!tier) return res.status(403).json({ error: 'Admin tier required.' });
+    const snap = await admin.firestore().collection('admin_mfa').doc(req.user.uid).get();
+    const data = snap.exists ? (snap.data() || {}) : {};
+    res.json({
+      enabled: data.enabled === true,
+      enrolled: snap.exists,
+      tier,
+      mfa_required_env: env('MFA_REQUIRED') === 'true',
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -12061,7 +12380,7 @@ if (require.main === module) {
     // DO NOT exit for non-fatal errors. Render will restart us only if truly broken.
   });
 
-  app.listen(PORT, () => {
+  app.listen(PORT, async () => {
     console.log('?? Square 15 Livekit Backend');
     console.log(`?? Server running on port ${PORT}`);
     console.log(`?? Health check: http://localhost:${PORT}/health`);
@@ -12088,6 +12407,38 @@ if (require.main === module) {
         console.log('✅ Ozow: LIVE mode — credentials passed safety check.');
       }
     } catch (e) { console.warn('Ozow safety assertion threw:', e.message); }
+
+    // ─── Owner bootstrap ───
+    // If OWNER_UID is set in env, ensure that uid has the `owner` custom
+    // claim. Idempotent and safe to run on every startup.
+    try {
+      const ownerUid = env('OWNER_UID');
+      if (ownerUid) {
+        const user = await admin.auth().getUser(ownerUid).catch(() => null);
+        if (user) {
+          const existing = user.customClaims || {};
+          if (existing.role !== 'owner') {
+            await admin.auth().setCustomUserClaims(ownerUid, { ...existing, role: 'owner', admin: true });
+            await admin.firestore().collection('admin_role_audit').add({
+              action: 'owner_bootstrapped',
+              target_uid: ownerUid,
+              target_email: user.email || null,
+              old_role: existing.role || null,
+              new_role: 'owner',
+              changed_by: 'system_bootstrap',
+              created_at: new Date().toISOString(),
+            });
+            console.log(`👑 Owner role granted to ${ownerUid} (${user.email || '?'})`);
+          } else {
+            console.log(`👑 Owner already configured: ${ownerUid} (${user.email || '?'})`);
+          }
+        } else {
+          console.warn(`⚠️ OWNER_UID=${ownerUid} not found in Firebase Auth`);
+        }
+      } else {
+        console.warn('⚠️ No OWNER_UID env var set. No admin can grant roles or bypass daily caps until one is configured.');
+      }
+    } catch (e) { console.warn('Owner bootstrap error:', e.message); }
     // LK-13: hard refusal � if anyone leaves the no-auth voice flag enabled in
     // production, log loudly to error_logs and ALSO refuse to enable it (the
     // flag is read again at request time; we set NODE_ENV-dependent override).
