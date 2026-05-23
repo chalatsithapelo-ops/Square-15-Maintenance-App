@@ -7673,20 +7673,33 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
     // doc — kept as backlog work for the role-tier system.
     try {
       const masked = `****${String(account_number).slice(-4)}`;
-      // 1. Most recent successful payout to this recipient
+      // 1. Most recent successful/pending payout to this recipient.
+      // No `status in` here — that would require a composite index. We
+      // filter in-process below.
       const recentSnap = await db.collection('payout_records')
         .where('recipient_id', '==', recipient_id)
-        .where('status', 'in', ['success', 'pending'])
         .orderBy('created_at', 'desc')
-        .limit(5)
+        .limit(10)
         .get()
-        .catch(() => null);
+        .catch((err) => {
+          console.warn('[ozow-payout] recent payouts query failed:', err.message);
+          return null;
+        });
 
-      let recipientHasHistory = recentSnap && !recentSnap.empty;
+      let recipientHasHistory = false;
       let lastMasked = '';
-      if (recipientHasHistory) {
-        const lastDoc = recentSnap.docs[0].data() || {};
-        lastMasked = (lastDoc.account_number_masked || '').toString();
+      if (recentSnap && !recentSnap.empty) {
+        for (const doc of recentSnap.docs) {
+          const dd = doc.data() || {};
+          const st = String(dd.status || '').toLowerCase();
+          if (st === 'failed' || st === 'rejected' || st === 'cancelled') continue;
+          const m = (dd.account_number_masked || '').toString();
+          if (m) {
+            lastMasked = m;
+            recipientHasHistory = true;
+            break;
+          }
+        }
       }
 
       // 2. Check recipient profile doc for recent bank-account changes
