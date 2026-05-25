@@ -5272,6 +5272,42 @@ app.post('/api/voice/start', assistantLimiter, async (req, res) => {
       });
     }
 
+    // SECURITY: when an Authorization header IS provided we must verify it
+    // BEFORE the broad try below (whose catch silently swallows verifyIdToken
+    // failures). Without this, a bearer of any garbage string was getting a
+    // valid LiveKit access token (May 25 2026 audit finding).
+    if (idToken) {
+      try {
+        initFirebaseIfPossible();
+        if (!firebaseInitError) {
+          await admin.auth().verifyIdToken(idToken);
+        } else if (!allowVoiceStartWithoutAuth) {
+          return res.status(503).json({
+            error: 'auth_unavailable',
+            message: 'Firebase Admin not configured; cannot verify Authorization header',
+            request_id: req.requestId || null,
+          });
+        }
+      } catch (e) {
+        if (!allowVoiceStartWithoutAuth) {
+          return res.status(401).json({
+            error: 'Unauthorized',
+            message: 'Invalid Firebase ID token',
+            request_id: req.requestId || null,
+          });
+        }
+      }
+    }
+
+    // SECURITY: clamp room name to prevent abuse / log spam.
+    if (typeof req.body.roomName === 'string' && req.body.roomName.length > 128) {
+      return res.status(400).json({
+        error: 'invalid_room_name',
+        message: 'roomName must be \u2264 128 characters',
+        request_id: req.requestId || null,
+      });
+    }
+
     try {
       initFirebaseIfPossible();
       if (!firebaseInitError) {
