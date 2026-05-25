@@ -11301,18 +11301,40 @@ app.post('/api/admin/self-bootstrap-claims', adminLimiter, async (req, res) => {
     }
 
     const uid = decoded.uid;
+    // Short-circuit: if this token already carries an admin tier custom claim
+    // (e.g. an owner bootstrapped from OWNER_UID), there is nothing to do.
+    // Skipping the Firestore gate avoids locking owners out when their user
+    // doc was created without the legacy `isVerified` field.
+    const existingClaimRole = String(decoded.role || '').toLowerCase();
+    if (existingClaimRole === 'owner' || existingClaimRole === 'finance' ||
+        existingClaimRole === 'ops' || existingClaimRole === 'support' ||
+        existingClaimRole === 'auditor' || decoded.admin === true) {
+      return res.json({
+        success: true,
+        uid,
+        message: 'Admin claim already present. No action taken.',
+        existing_role: existingClaimRole || 'admin',
+      });
+    }
     const userDoc = await firestore.collection('users').doc(uid).get();
     if (!userDoc.exists) return res.status(403).json({ error: 'User not found in Firestore' });
     const u = userDoc.data() || {};
-    if (u.isAdmin !== true || u.isVerified !== true) {
-      console.warn(`[self-bootstrap-claims] DENIED for ${uid}: isAdmin=${u.isAdmin} isVerified=${u.isVerified}`);
+    // Accept either the legacy gate (isAdmin && isVerified) OR a Firestore
+    // `admin_tier` value set by the owner via the Admin Roles UI. This avoids
+    // having to backfill `isVerified` on every owner-created admin doc.
+    const tier = String(u.admin_tier || '').toLowerCase();
+    const tierGrants = ['owner', 'finance', 'ops', 'support', 'auditor'].includes(tier);
+    const legacyGrants = u.isAdmin === true && u.isVerified === true;
+    if (!tierGrants && !legacyGrants) {
+      console.warn(`[self-bootstrap-claims] DENIED for ${uid}: isAdmin=${u.isAdmin} isVerified=${u.isVerified} admin_tier=${u.admin_tier || 'none'}`);
       return res.status(403).json({ error: 'Not an admin user' });
     }
 
     // Preserve any other claims that may already be set.
     const existing = (decoded && decoded.claims) || {};
-    await admin.auth().setCustomUserClaims(uid, { ...existing, role: 'admin', admin: true });
-    console.log(`? self-bootstrap-claims: granted admin to ${uid} (${u.email || ''})`);
+    const grantRole = tierGrants ? tier : 'admin';
+    await admin.auth().setCustomUserClaims(uid, { ...existing, role: grantRole, admin: true });
+    console.log(`✅ self-bootstrap-claims: granted ${grantRole} to ${uid} (${u.email || ''})`);
     return res.json({
       success: true,
       uid,
