@@ -10689,6 +10689,33 @@ app.post('/debug/mint-id-token', async (req, res) => {
 });
 
 /**
+ * DEBUG: Voice agent breadcrumb sink. The voice agent worker POSTs here
+ * (no auth) whenever it receives a text_input or performs a key step.
+ * The /debug/voice-e2e endpoint can then return the crumbs alongside its
+ * Firestore diff so we can prove the agent saw the message.
+ */
+const _voiceBreadcrumbs = new Map(); // session_id -> [{event, text, ts, ...}]
+app.post('/debug/voice-breadcrumb', express.json(), (req, res) => {
+  try {
+    const b = req.body || {};
+    const sid = String(b.session_id || '').trim();
+    if (!sid) return res.status(400).json({ error: 'session_id required' });
+    const list = _voiceBreadcrumbs.get(sid) || [];
+    list.push({ ...b, ts: Date.now() });
+    if (list.length > 50) list.shift();
+    _voiceBreadcrumbs.set(sid, list);
+    // Cap map size
+    if (_voiceBreadcrumbs.size > 200) {
+      const firstKey = _voiceBreadcrumbs.keys().next().value;
+      _voiceBreadcrumbs.delete(firstKey);
+    }
+    return res.json({ ok: true });
+  } catch (e) {
+    return res.status(500).json({ error: 'breadcrumb_error', message: e && e.message });
+  }
+});
+
+/**
  * DEBUG: Real end-to-end Lizzy voice test (text-driven).
  * INTERNAL_API_SECRET-gated.
  * Body: { idToken, message, roomName?, waitMs? }
@@ -10829,6 +10856,7 @@ app.post('/debug/voice-e2e', async (req, res) => {
       dispatchId: dispatch && (dispatch.id || dispatch.dispatchId) || null,
       newBookings,
       newBookingsCount: newBookings.length,
+      breadcrumbs: _voiceBreadcrumbs.get(sessionId) || [],
       message: newBookings.length
         ? `agent created ${newBookings.length} new futureBookings doc(s)`
         : 'agent dispatched + text_input delivered; no new bookings detected (check agent logs)',

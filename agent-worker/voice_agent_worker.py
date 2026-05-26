@@ -187,6 +187,16 @@ except Exception as e:
     logger.info(f"dotenv not loaded (ok on Render): {e}")
 
 
+async def _post_breadcrumb(url: str, body: dict):
+    """Fire-and-forget POST so /debug/voice-e2e can trace what the agent received."""
+    try:
+        timeout = aiohttp.ClientTimeout(total=5)
+        async with aiohttp.ClientSession(timeout=timeout) as sess:
+            await sess.post(url, json=body)
+    except Exception as e:
+        logger.debug(f"breadcrumb post failed: {e}")
+
+
 # Backend API client for Square15
 class BackendAPIClient:
     """Client for calling Square15 backend action endpoints."""
@@ -2744,6 +2754,19 @@ async def entrypoint(ctx: JobContext):
                     text = (payload.get('text') or msg.get('text') or '').strip()
                     if text:
                         logger.info(f"🧪 text_input via data channel: {text[:120]}")
+                        # Fire-and-forget breadcrumb so /debug/voice-e2e can prove the
+                        # agent received the message even if the LLM doesn't call tools.
+                        try:
+                            crumb_url = f"{backend_url.rstrip('/')}/debug/voice-breadcrumb"
+                            crumb_body = {
+                                'session_id': session_id or '',
+                                'event': 'text_input_received',
+                                'text': text[:300],
+                                'had_backend_client': bool(backend_client),
+                            }
+                            asyncio.create_task(_post_breadcrumb(crumb_url, crumb_body))
+                        except Exception:
+                            pass
                         try:
                             session.generate_reply(user_input=text)
                         except Exception as ge:
