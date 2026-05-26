@@ -1353,6 +1353,61 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     return (await tryField('user_id')) || (await tryField('uid')) || (await tryField('userId')) || (await tryField('provider_id'));
   }
 
+  async function actorMatchesArtisanAssignment(assignedArtisanId, actorUid) {
+    const assigned = String(assignedArtisanId || '').trim();
+    const actor = String(actorUid || '').trim();
+    if (!assigned || !actor) return false;
+    if (assigned === actor) return true;
+
+    const providerDoc = await getServiceProviderDocByAnyId(assigned);
+    if (!providerDoc || !providerDoc.exists) return false;
+
+    const provider = providerDoc.data() || {};
+    const candidates = [
+      providerDoc.id,
+      provider.uid,
+      provider.user_id,
+      provider.userId,
+      provider.provider_id,
+      provider.auth_uid,
+    ]
+      .map((value) => String(value || '').trim())
+      .filter(Boolean);
+
+    return candidates.includes(actor);
+  }
+
+  async function artisanAssignmentDebug(assignedArtisanId, actorUid) {
+    const assigned = String(assignedArtisanId || '').trim();
+    const actor = String(actorUid || '').trim();
+    const providerDoc = assigned ? await getServiceProviderDocByAnyId(assigned) : null;
+    const provider = providerDoc && providerDoc.exists ? (providerDoc.data() || {}) : null;
+    const candidates = provider
+      ? [
+          providerDoc.id,
+          provider.uid,
+          provider.user_id,
+          provider.userId,
+          provider.provider_id,
+          provider.auth_uid,
+        ]
+          .map((value) => String(value || '').trim())
+          .filter(Boolean)
+      : [];
+
+    return {
+      assigned_artisan_id: assigned || null,
+      actor_uid: actor || null,
+      provider_doc_found: Boolean(providerDoc && providerDoc.exists),
+      provider_doc_id: providerDoc && providerDoc.exists ? String(providerDoc.id || '').trim() || null : null,
+      provider_uid: provider ? String(provider.uid || '').trim() || null : null,
+      provider_user_id: provider ? String(provider.user_id || provider.userId || '').trim() || null : null,
+      provider_auth_uid: provider ? String(provider.auth_uid || '').trim() || null : null,
+      candidate_ids: candidates,
+      matched: actor ? candidates.includes(actor) || assigned === actor : false,
+    };
+  }
+
   function artisanHasTask({ artisanData, taskId, categoryId, categoryName }) {
     const matchesTaskId = (candidate) => {
       const c = String(candidate || '').trim();
@@ -1515,11 +1570,15 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         const distance = clientLat !== 0.0 && clientLng !== 0.0 && aLat !== 0.0 && aLng !== 0.0 ? calculateDistanceKm(clientLat, clientLng, aLat, aLng) : 9999.0;
         availableWithDistance.push({ artisan_id: artisanDocId, distance });
       }
-    } else {
+    }
+
+    // If no task-mapped artisan was available, fall back to broad category matching.
+    if (availableWithDistance.length === 0) {
       let snap;
       try {
-        snap = await firestore.collection('serviceProvider').where('status', '==', 'publish').limit(200).get();
-        if (snap.empty) snap = await firestore.collection('serviceProvider').limit(200).get();
+        // Read all providers then filter with isPublished().
+        // Some valid artisans have empty status, and isPublished('') is true.
+        snap = await firestore.collection('serviceProvider').limit(200).get();
       } catch (e) { console.warn('\u26a0\ufe0f findAvailableArtisan fallback query:', e.message);
         snap = await firestore.collection('serviceProvider').limit(200).get();
       }
@@ -2527,7 +2586,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     const tmArtisanId = String(tmData2.service_provider_id || tmData2.serviceProviderId || '').trim();
     const msgAllowed = actorRole === 'admin' ||
       (actorRole === 'client' && tmUserId === actorUid) ||
-      (actorRole === 'artisan' && tmArtisanId === actorUid);
+      (actorRole === 'artisan' && await actorMatchesArtisanAssignment(tmArtisanId, actorUid));
     if (!msgAllowed) return { ok: false, status: 403, error: 'forbidden' };
 
     const messagesQuery = await tmRef2.collection('chat').orderBy('timestamp', 'desc').limit(msgLimit).get();
@@ -2624,7 +2683,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     const scTmId = String(scBookingData.tasks_management_id || '').trim();
 
     // Only the assigned artisan or admin can message the client
-    if (actorRole !== 'admin' && !(actorRole === 'artisan' && scArtisanId === actorUid)) {
+    if (actorRole !== 'admin' && !(actorRole === 'artisan' && await actorMatchesArtisanAssignment(scArtisanId, actorUid))) {
       return { ok: false, status: 403, error: 'forbidden' };
     }
     if (!scClientId) return { ok: false, status: 400, error: 'no_client_on_booking' };
@@ -3692,9 +3751,21 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     const artisanId = String(data.service_provider_id || '').trim();
     const allowed =
       (actorRole === 'client' && userId === actorUid) ||
-      (actorRole === 'artisan' && artisanId === actorUid) ||
+      (actorRole === 'artisan' && await actorMatchesArtisanAssignment(artisanId, actorUid)) ||
       actorRole === 'admin';
-    if (!allowed) return { ok: false, status: 403, error: 'forbidden' };
+    if (!allowed) {
+      return {
+        ok: false,
+        status: 403,
+        error: 'forbidden',
+        debug: {
+          action,
+          actor_role: actorRole,
+          booking_user_id: userId || null,
+          artisan_match: actorRole === 'artisan' ? await artisanAssignmentDebug(artisanId, actorUid) : null,
+        },
+      };
+    }
 
     // Enrich with artisan name/phone from serviceProvider collection
     let artisanInfo = null;
@@ -3755,7 +3826,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
             const rfqData = rfqDoc.data() || {};
             const rfqUserId = String(rfqData.user_id || rfqData.client_id || '').trim();
             const rfqArtisanId = String(rfqData.service_provider_id || '').trim();
-            if (actorRole !== 'admin' && rfqUserId !== actorUid && rfqArtisanId !== actorUid) {
+            if (actorRole !== 'admin' && rfqUserId !== actorUid && !(await actorMatchesArtisanAssignment(rfqArtisanId, actorUid))) {
               return { ok: false, status: 403, error: 'forbidden' };
             }
             const result = {
@@ -3785,7 +3856,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
 
     const bUserId = String(data.user_id || data.client_id || '').trim();
     const bArtisanId = String(data.service_provider_id || '').trim();
-    if (actorRole !== 'admin' && bUserId !== actorUid && bArtisanId !== actorUid) {
+    if (actorRole !== 'admin' && bUserId !== actorUid && !(await actorMatchesArtisanAssignment(bArtisanId, actorUid))) {
       return { ok: false, status: 403, error: 'forbidden' };
     }
 
@@ -4263,8 +4334,18 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
   }
 
   if (action === 'mark_booking_in_progress') {
-    if (!(actorRole === 'artisan' && artisanId === actorUid)) {
-      return { ok: false, status: 403, error: 'forbidden' };
+    if (!(actorRole === 'artisan' && await actorMatchesArtisanAssignment(artisanId, actorUid))) {
+      return {
+        ok: false,
+        status: 403,
+        error: 'forbidden',
+        debug: {
+          action,
+          actor_role: actorRole,
+          booking_user_id: userId || null,
+          artisan_match: await artisanAssignmentDebug(artisanId, actorUid),
+        },
+      };
     }
 
     // Atomic in-progress flip across both collections so the UI and
@@ -4297,10 +4378,20 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
 
   if (action === 'request_reassignment' || action === 'artisan_cancel_and_reassign' || action === 'reassign_booking') {
     const isOwnerClient = actorRole === 'client' && userId === actorUid;
-    const isAssignedArtisan = actorRole === 'artisan' && artisanId === actorUid;
+    const isAssignedArtisan = actorRole === 'artisan' && await actorMatchesArtisanAssignment(artisanId, actorUid);
     const isAdmin = actorRole === 'admin';
     if (!(isOwnerClient || isAssignedArtisan || isAdmin)) {
-      return { ok: false, status: 403, error: 'forbidden' };
+      return {
+        ok: false,
+        status: 403,
+        error: 'forbidden',
+        debug: {
+          action,
+          actor_role: actorRole,
+          booking_user_id: userId || null,
+          artisan_match: actorRole === 'artisan' ? await artisanAssignmentDebug(artisanId, actorUid) : null,
+        },
+      };
     }
 
     const reason = String(payload.reason || payload.cancel_reason || payload.additional_notes || 'reassignment_requested').trim();
@@ -5601,6 +5692,7 @@ app.post('/api/action/execute', assistantLimiter, async (req, res) => {
           updated_at: nowIso(),
           error: result.error,
           http_status: result.status,
+          debug: result.debug || null,
         },
       });
       return res.status(result.status).json({
