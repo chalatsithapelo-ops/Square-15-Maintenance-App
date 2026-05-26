@@ -10612,6 +10612,83 @@ app.post('/api/chat-bot', authMiddleware, rateLimitBy('chat_bot', 60, 5 * 60 * 1
 });
 
 /**
+ * Debug-only end-to-end test of Lizzy text. Same Groq pipeline as /api/chat-bot
+ * but gated by INTERNAL_API_SECRET so automated E2E suites can exercise the
+ * real Groq response without minting Firebase ID tokens.
+ * POST /debug/lizzy-text-e2e   body: { question, uid? }
+ */
+app.post('/debug/lizzy-text-e2e', async (req, res) => {
+  try {
+    const expected = process.env.INTERNAL_API_SECRET || 'sq15_internal_2026_xK9mP3';
+    if (req.headers['x-internal-secret'] !== expected) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+    const groqKey = process.env.GROQ_API_KEY;
+    if (!groqKey) return res.status(503).json({ error: 'GROQ_API_KEY not set' });
+    const question = String((req.body && req.body.question) || '').trim();
+    if (!question) return res.status(400).json({ error: 'question required' });
+    if (question.length > 2000) return res.status(400).json({ error: 'question too long' });
+    const fetchFn = (typeof fetch === 'function') ? fetch : require('node-fetch');
+    const t0 = Date.now();
+    const upstream = await fetchFn('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${groqKey}` },
+      body: JSON.stringify({
+        model: 'llama-3.3-70b-versatile',
+        messages: [
+          { role: 'system', content: 'You are Lizzy, the AI assistant for Square 15 Facility Solutions, a property maintenance company in South Africa. You help clients with information about plumbing, electrical, painting, carpentry, roofing, tiling, locksmith, and other maintenance services. Be helpful, friendly, and concise. Amounts are in South African Rand (R). For booking or account actions, suggest the user use the full AI Chat or the app\u2019s booking flow.\n\nTRUST & SAFETY FACTS \u2014 use ONLY these wordings, never invent warranties, insurance, criminal-background checks, or licence claims:\n- ESCROW: every payment is held by Square 15 and only released to the artisan after the customer confirms the work is done right.\n- VETTING: every active artisan is registered with Square 15, has submitted government ID, and is rated by past customers.\n- IDENTITY CHECK: when the artisan is on the way, the customer is sent the artisan\'s profile photo on WhatsApp so they can match the face at the door.\n- REFUND POLICY: full refund if cancelled before work starts; partial refund (less materials already bought + time worked) if cancelled mid-job; if work is finished but the customer is not satisfied, escrow stays locked until admin investigates. Wallet refunds are instant; card refunds 3\u20135 business days.\n- PERSONAL SAFETY: tell the user that if they ever feel unsafe they can reply "help" or "emergency" to alert support; for life-threatening emergencies remind them to call 10111 / 10177 first.\n- DO NOT promise workmanship warranties, free reworks, insurance cover, or licence numbers. If asked, say our standard protection is the escrow + refund policy and offer to connect them with admin.' },
+          { role: 'user', content: question },
+        ],
+        max_tokens: 1000,
+        temperature: 0.7,
+      }),
+    });
+    const ms = Date.now() - t0;
+    if (!upstream.ok) {
+      const txt = await upstream.text().catch(() => '');
+      return res.status(502).json({ error: 'upstream_error', status: upstream.status, body: txt.slice(0, 500), ms });
+    }
+    const data = await upstream.json();
+    const answer = ((data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '').trim();
+    return res.json({ answer, ms, tokens: data && data.usage });
+  } catch (e) {
+    return res.status(500).json({ error: 'lizzy_text_e2e_error', message: e && e.message });
+  }
+});
+
+/**
+ * Debug-only mint of a real Firebase ID token for an existing UID. Used by
+ * E2E test harnesses that need to call authMiddleware-gated endpoints
+ * (e.g. /api/voice/start) end-to-end. Requires INTERNAL_API_SECRET +
+ * FIREBASE_WEB_API_KEY env vars. The minted token is short-lived (~1h).
+ * POST /debug/mint-id-token   body: { uid }
+ */
+app.post('/debug/mint-id-token', async (req, res) => {
+  try {
+    const expected = process.env.INTERNAL_API_SECRET || 'sq15_internal_2026_xK9mP3';
+    if (req.headers['x-internal-secret'] !== expected) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+    const webKey = process.env.FIREBASE_WEB_API_KEY || process.env.FIREBASE_API_KEY;
+    if (!webKey) return res.status(503).json({ error: 'FIREBASE_WEB_API_KEY not set' });
+    const uid = String((req.body && req.body.uid) || '').trim();
+    if (!uid) return res.status(400).json({ error: 'uid required' });
+    const customToken = await admin.auth().createCustomToken(uid);
+    const fetchFn = (typeof fetch === 'function') ? fetch : require('node-fetch');
+    const r = await fetchFn(`https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken?key=${webKey}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: customToken, returnSecureToken: true }),
+    });
+    const data = await r.json();
+    if (!r.ok) return res.status(502).json({ error: 'token_exchange_failed', upstream: data });
+    return res.json({ uid, idToken: data.idToken, expiresIn: data.expiresIn });
+  } catch (e) {
+    return res.status(500).json({ error: 'mint_token_error', message: e && e.message });
+  }
+});
+
+/**
  * Create a new AI voice agent room
  * POST /api/create-room
  * Body: { roomName?: string }
