@@ -10856,20 +10856,11 @@ app.post('/debug/voice-e2e', async (req, res) => {
       _crumb('text_input_send_err', e && e.message || String(e));
     }
 
-    // Belt-and-suspenders: re-send without topic in case the agent's room.on
-    // is registered before topic-filtered delivery is set up.
-    await new Promise(r => setTimeout(r, 500));
-    try {
-      await roomSvc.sendData(
-        roomName,
-        encoder.encode(JSON.stringify(textInput)),
-        DataPacket_Kind.RELIABLE,
-        {}
-      );
-      _crumb('text_input_sent_notopic', 'ok');
-    } catch (e) {
-      _crumb('text_input_notopic_err', e && e.message || String(e));
-    }
+    // NOTE: deliberately NOT re-sending without topic. The duplicate delivery
+    // pollutes session.history with two identical [user] turns within ~1s,
+    // which causes gpt-4o-mini to emit empty completions. Topic-filtered
+    // delivery via `square15_app` is reliable (confirmed by text_input_received
+    // breadcrumbs firing 100% of runs).
 
     // 4) Wait for the agent to run its LLM + tools
     await new Promise(r => setTimeout(r, waitMs));
