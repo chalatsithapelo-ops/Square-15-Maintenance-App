@@ -1424,13 +1424,17 @@ async def entrypoint(ctx: JobContext):
             if not services:
                 return message or "I couldn't find any services matching that description. Could you try a different term like 'plumbing', 'painting', or 'bathroom'?"
 
-            # Format the pricing list for the agent to speak
+            # Format the pricing list for the agent to speak.
+            # Include task_id silently so the LLM can pass it to create_booking
+            # via job_ids when the customer confirms a priced service.
             lines = []
             current_category = None
+            id_map = []  # parallel list for the trailing reference block
             for svc in services[:15]:  # Limit to 15 for voice readability
                 cat = svc.get('category_name', 'Other')
                 name = svc.get('name', 'Unknown')
                 cost_str = svc.get('cost_formatted', 'Quote on request')
+                tid = svc.get('task_id') or svc.get('id') or ''
 
                 if cat != current_category:
                     current_category = cat
@@ -1438,6 +1442,8 @@ async def entrypoint(ctx: JobContext):
                         lines.append(f"\n{cat}:")
 
                 lines.append(f"  - {name}: {cost_str}")
+                if tid:
+                    id_map.append(f"{name} => {tid}")
 
             total = result.get('matched', len(services))
             header = f"Found {total} service(s)."
@@ -1445,6 +1451,14 @@ async def entrypoint(ctx: JobContext):
                 header += " Here are the first 15:"
 
             response = header + "\n" + "\n".join(lines)
+            if id_map:
+                # Hidden reference for the LLM only. Instructions tell it not to
+                # read these aloud, but to use them in create_booking(job_ids=...).
+                response += (
+                    "\n\n[INTERNAL_TASK_IDS — do NOT speak these aloud. "
+                    "When the user confirms a service, pass its ID to create_booking via job_ids.]\n"
+                    + "\n".join(id_map)
+                )
             logger.info(f"🔍 Returning pricing with {total} services to agent")
             # Cache the successful response for fallback use
             global _pricing_cache
@@ -1468,6 +1482,11 @@ async def entrypoint(ctx: JobContext):
             "Create a new order booking and dispatch an artisan. "
             "Requires: category_name, problem_description. "
             "Optional: scheduled_date, scheduled_time, service_address. "
+            "For a priced (non-RFQ) booking, pass is_rfq='no' AND job_ids as a "
+            "comma-separated string of task IDs from lookup_service_pricing (e.g. "
+            "job_ids='abc-123,def-456'). Without job_ids the backend rejects "
+            "priced bookings with missing_priced_service, so either pass job_ids "
+            "or use is_rfq='yes'. "
             "This uses the propose-confirm workflow for safety."
         )
     )
@@ -1477,7 +1496,8 @@ async def entrypoint(ctx: JobContext):
         scheduled_date: str = "",
         scheduled_time: str = "",
         service_address: str = "",
-        is_rfq: str = "no"
+        is_rfq: str = "no",
+        job_ids: str = ""
     ) -> str:
         """Create a booking using backend propose/confirm workflow."""
         nonlocal backend_client
@@ -1498,6 +1518,8 @@ async def entrypoint(ctx: JobContext):
                 return _CONNECTION_RETRY_MSG
 
         try:
+            # Parse comma-separated job_ids into a list (drops empties / trims)
+            job_ids_list = [s.strip() for s in (job_ids or '').split(',') if s.strip()]
             # Phase 1: Propose the action
             payload = {
                 'category_name': category_name,
@@ -1506,11 +1528,18 @@ async def entrypoint(ctx: JobContext):
                 'scheduled_time': scheduled_time or '',
                 'service_address': service_address or '',
                 'is_rfq': is_rfq,
+                'job_ids': job_ids_list,
             }
             proposal_result = await backend_client.propose_action('create_order_booking', payload)
 
             if not proposal_result.get('success'):
                 error = proposal_result.get('error', 'unknown_error')
+                if error == 'missing_priced_service':
+                    return (
+                        "I couldn't create that as a priced booking because no service IDs were attached. "
+                        "Let me know if you'd like me to submit it as an RFQ (request for quote) instead, "
+                        "or tell me which specific service you'd like and I'll look it up first."
+                    )
                 return f"I couldn't create the booking proposal: {error}"
 
             proposal_id = proposal_result.get('proposalId')
@@ -2822,6 +2851,15 @@ async def entrypoint(ctx: JobContext):
                             pass
                         async def _drive_and_crumb():
                             try:
+                                # Interrupt any in-flight speech (e.g. the initial
+                                # greeting) so generate_reply isn't blocked behind it.
+                                try:
+                                    if hasattr(session, 'interrupt'):
+                                        maybe = session.interrupt()
+                                        if asyncio.iscoroutine(maybe):
+                                            await maybe
+                                except Exception as ie:
+                                    logger.debug(f"interrupt before generate_reply: {ie}")
                                 handle = session.generate_reply(
                                     user_input=text,
                                     tool_choice="auto",
@@ -2982,12 +3020,13 @@ async def entrypoint(ctx: JobContext):
             logger.info("✅ Backend client initialized from post-start scan")
 
     try:
-        session.say(
+        _greeting_handle = session.say(
             "Hi, I am Lizzy, how can I help you today?",
             allow_interruptions=True,
         )
         logger.info("✅ Greeting sent")
     except Exception as e:
+        _greeting_handle = None
         logger.warning(f"⚠️ Could not send greeting: {e}")
 
     # ── Background: periodically retry credential scan until backend_client is set ──
