@@ -1544,13 +1544,14 @@ const waTools = [
     type: 'function',
     function: {
       name: 'pay_with_wallet',
-      description: 'Pay for a booking using the customer\'s wallet balance. Use this WHENEVER the customer explicitly says they want to pay from their wallet (e.g. "pay from my wallet", "use my wallet", "from wallet"). Handles deposit OR balance automatically based on current booking status. Do NOT call request_payment_link in that case.',
+      description: 'Pay for a booking using the customer\'s wallet balance. Use this WHENEVER the customer explicitly says they want to pay from their wallet (e.g. "pay from my wallet", "use my wallet", "from wallet"). MUST ask the customer whether they want to pay the FULL amount or a 35% DEPOSIT first, then pass their choice as paymentType. If the deposit is already paid, the tool will charge the remaining balance regardless of paymentType.',
       parameters: {
         type: 'object',
         properties: {
           bookingId: { type: 'string', description: 'The booking ID to pay for' },
+          paymentType: { type: 'string', enum: ['full', 'deposit'], description: 'Whether the customer is paying the full amount or a 35% deposit. MUST ask the customer before calling.' },
         },
-        required: ['bookingId'],
+        required: ['bookingId', 'paymentType'],
       },
     },
   },
@@ -3901,21 +3902,45 @@ async function executeWaTool(name, args, session) {
       // Handle deposit/balance split: if deposit already paid, only charge the remaining balance
       const isDepositPaid = bookData.payment_status === 'deposit_paid';
       const balanceDone = bookData.balance_paid === true;
+      // HIGH (audit May-2026): honour args.paymentType so a customer asking
+      // for the 35% deposit is NOT silently charged the full amount. Default
+      // to 'full' only if the caller omitted the field (schema now requires
+      // it, but keep the fallback for legacy callers).
+      const requestedPaymentType = String(args.paymentType || 'full').toLowerCase() === 'deposit'
+        ? 'deposit'
+        : 'full';
       let chargeAmount, paymentLabel, newPaymentStatus, balanceFields;
 
       if (isDepositPaid && !balanceDone) {
-        // Only charge the remaining balance (65%)
+        // Only charge the remaining balance (65%) — paymentType is ignored
+        // once the deposit is already on the booking.
         const depositAmt = parseFloat(bookData.deposit_amount || '0') || Math.round(totalCost * 0.35 * 100) / 100;
         chargeAmount = parseFloat(bookData.balance_remaining || bookData.balance_amount || '0') || Math.round((totalCost - depositAmt) * 100) / 100;
         paymentLabel = `balance payment of R${chargeAmount.toFixed(2)}`;
         newPaymentStatus = 'paid';
         balanceFields = { balance_paid: true, balance_paid_at: new Date().toISOString(), balance_payment_method: 'wallet' };
+      } else if (requestedPaymentType === 'deposit') {
+        // 35% deposit now, remaining 65% on completion.
+        const depositAmt = Math.round(totalCost * 0.35 * 100) / 100;
+        const balanceAmt = Math.round((totalCost - depositAmt) * 100) / 100;
+        chargeAmount = depositAmt;
+        paymentLabel = `deposit of R${chargeAmount.toFixed(2)}`;
+        newPaymentStatus = 'deposit_paid';
+        balanceFields = {
+          payment_type: 'deposit',
+          deposit_amount: depositAmt.toFixed(2),
+          balance_remaining: balanceAmt.toFixed(2),
+          balance_amount: balanceAmt.toFixed(2),
+          deposit_paid_at: new Date().toISOString(),
+          deposit_payment_method: 'wallet',
+          balance_paid: false,
+        };
       } else {
         // Full payment
         chargeAmount = totalCost;
         paymentLabel = `payment of R${chargeAmount.toFixed(2)}`;
         newPaymentStatus = 'paid';
-        balanceFields = {};
+        balanceFields = { payment_type: 'full' };
       }
 
       // Get user balance (atomic transaction)
@@ -3978,7 +4003,17 @@ async function executeWaTool(name, args, session) {
           created_at: admin.firestore.FieldValue.serverTimestamp(),
         });
 
-        return { success: true, message: `${isDepositPaid ? 'Balance' : 'Full'} ${paymentLabel} successful via wallet! Your booking ${bid} is now fully paid.`, paid: `R${chargeAmount.toFixed(2)}` };
+        // Build a precise success message that matches what was actually charged.
+        let successMsg;
+        if (isDepositPaid) {
+          successMsg = `Balance ${paymentLabel} successful via wallet! Your booking ${bid} is now fully paid.`;
+        } else if (newPaymentStatus === 'deposit_paid') {
+          const balanceRem = (balanceFields.balance_remaining || '0.00');
+          successMsg = `Deposit ${paymentLabel} paid successfully via wallet! Remaining balance of R${balanceRem} will be due once the artisan completes the job.`;
+        } else {
+          successMsg = `Full ${paymentLabel} successful via wallet! Your booking ${bid} is now fully paid.`;
+        }
+        return { success: true, message: successMsg, paid: `R${chargeAmount.toFixed(2)}`, paymentType: newPaymentStatus === 'deposit_paid' ? 'deposit' : 'full' };
       } catch (e) {
         if (e && e.message === 'ALREADY_PAID') {
           return { message: 'This booking is already paid.' };
