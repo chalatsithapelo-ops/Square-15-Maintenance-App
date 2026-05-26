@@ -10800,12 +10800,25 @@ app.post('/debug/voice-e2e', async (req, res) => {
       return res.status(504).json({ error: 'agent_did_not_join', roomName, dispatch });
     }
 
-    await roomSvc.sendData(
-      roomName,
-      encoder.encode(JSON.stringify(credentials)),
-      DataPacket_Kind.RELIABLE,
-      { topic: 'square15_creds' }
-    );
+    const _crumb = (event, text) => {
+      const list = _voiceBreadcrumbs.get(sessionId) || [];
+      list.push({ session_id: sessionId, event, text, ts: Date.now() });
+      _voiceBreadcrumbs.set(sessionId, list);
+    };
+
+    _crumb('agent_joined', `participants=${(await roomSvc.listParticipants(roomName)).map(p=>p.identity).join(',')}`);
+
+    try {
+      await roomSvc.sendData(
+        roomName,
+        encoder.encode(JSON.stringify(credentials)),
+        DataPacket_Kind.RELIABLE,
+        { topic: 'square15_creds' }
+      );
+      _crumb('creds_sent', `topic=square15_creds bytes=${JSON.stringify(credentials).length}`);
+    } catch (e) {
+      _crumb('creds_send_err', e && e.message || String(e));
+    }
 
     // Give the agent a moment to ingest credentials before sending the user turn.
     await new Promise(r => setTimeout(r, 1500));
@@ -10816,12 +10829,32 @@ app.post('/debug/voice-e2e', async (req, res) => {
       action: 'text_input',
       payload: { text: message },
     };
-    await roomSvc.sendData(
-      roomName,
-      encoder.encode(JSON.stringify(textInput)),
-      DataPacket_Kind.RELIABLE,
-      { topic: 'square15_app' }
-    );
+    try {
+      await roomSvc.sendData(
+        roomName,
+        encoder.encode(JSON.stringify(textInput)),
+        DataPacket_Kind.RELIABLE,
+        { topic: 'square15_app' }
+      );
+      _crumb('text_input_sent', `topic=square15_app text="${message.slice(0,80)}"`);
+    } catch (e) {
+      _crumb('text_input_send_err', e && e.message || String(e));
+    }
+
+    // Belt-and-suspenders: re-send without topic in case the agent's room.on
+    // is registered before topic-filtered delivery is set up.
+    await new Promise(r => setTimeout(r, 500));
+    try {
+      await roomSvc.sendData(
+        roomName,
+        encoder.encode(JSON.stringify(textInput)),
+        DataPacket_Kind.RELIABLE,
+        {}
+      );
+      _crumb('text_input_sent_notopic', 'ok');
+    } catch (e) {
+      _crumb('text_input_notopic_err', e && e.message || String(e));
+    }
 
     // 4) Wait for the agent to run its LLM + tools
     await new Promise(r => setTimeout(r, waitMs));
