@@ -1240,7 +1240,6 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
   function hasUsableArtisanAuthIdentity(artisanDocId, artisanData) {
     const data = artisanData && typeof artisanData === 'object' ? artisanData : {};
     const idValues = [
-      artisanDocId,
       data.uid,
       data.user_id,
       data.userId,
@@ -1250,7 +1249,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       .map((value) => String(value || '').trim())
       .filter(Boolean);
 
-    // Assignment should prefer artisans that can later authenticate to act on the booking.
+    // The Firestore document id alone is not sufficient to authenticate later.
     return idValues.length > 0;
   }
 
