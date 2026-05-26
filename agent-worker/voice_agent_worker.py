@@ -2735,6 +2735,26 @@ async def entrypoint(ctx: JobContext):
             if msg_type == 'square15_voice_credentials':
                 if _try_init_backend_from_msg(msg):
                     logger.info(f"✅ Backend client initialized via DATA CHANNEL (session: {session_id[:12] if session_id else 'none'}...)")
+            elif msg_type == 'square15_app':
+                # DEBUG / E2E: allow injecting text as if the user spoke it.
+                # Used by /debug/voice-e2e to drive real RFQ/booking creation from a Node script.
+                action = (msg.get('action') or '').strip()
+                payload = msg.get('payload') if isinstance(msg.get('payload'), dict) else {}
+                if action == 'text_input':
+                    text = (payload.get('text') or msg.get('text') or '').strip()
+                    if text:
+                        logger.info(f"🧪 text_input via data channel: {text[:120]}")
+                        try:
+                            session.generate_reply(user_input=text)
+                        except Exception as ge:
+                            logger.warning(f"text_input generate_reply error: {ge}")
+                elif action == 'speak':
+                    text = (payload.get('text') or msg.get('text') or '').strip()
+                    if text:
+                        try:
+                            session.say(text, allow_interruptions=True)
+                        except Exception as se:
+                            logger.debug(f"speak via data channel error: {se}")
         except Exception as e:
             logger.debug(f"data_received handler note: {e}")
 

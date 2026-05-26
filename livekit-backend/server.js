@@ -1,7 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
-const { AccessToken, AgentDispatchClient } = require('livekit-server-sdk');
+const { AccessToken, AgentDispatchClient, RoomServiceClient, DataPacket_Kind } = require('livekit-server-sdk');
 const admin = require('firebase-admin');
 const crypto = require('crypto');
 const fs = require('fs');
@@ -10685,6 +10685,119 @@ app.post('/debug/mint-id-token', async (req, res) => {
     return res.json({ uid, idToken: data.idToken, expiresIn: data.expiresIn });
   } catch (e) {
     return res.status(500).json({ error: 'mint_token_error', message: e && e.message });
+  }
+});
+
+/**
+ * DEBUG: Real end-to-end Lizzy voice test (text-driven).
+ * INTERNAL_API_SECRET-gated.
+ * Body: { idToken, message, roomName?, waitMs? }
+ *   - Dispatches the voice agent into a fresh room
+ *   - Publishes credentials (firebase_token) via LiveKit data channel
+ *   - Publishes a square15_app text_input action so the agent's LLM processes the
+ *     message AS IF the user spoke it — agent tools fire, real Firestore artifacts created.
+ * Returns the room name + dispatch info so the caller can poll Firestore.
+ */
+app.post('/debug/voice-e2e', async (req, res) => {
+  try {
+    const expected = process.env.INTERNAL_API_SECRET || 'sq15_internal_2026_xK9mP3';
+    if (req.headers['x-internal-secret'] !== expected) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+    const idToken = String((req.body && req.body.idToken) || '').trim();
+    const message = String((req.body && req.body.message) || '').trim();
+    if (!idToken) return res.status(400).json({ error: 'idToken required' });
+    if (!message) return res.status(400).json({ error: 'message required' });
+    const waitMs = Math.min(20000, Math.max(500, Number(req.body && req.body.waitMs) || 6000));
+
+    // Verify the ID token so we can return uid in the response
+    let uid = null;
+    try {
+      const decoded = await admin.auth().verifyIdToken(idToken);
+      uid = decoded.uid;
+    } catch (e) {
+      return res.status(401).json({ error: 'invalid_id_token', message: e && e.message });
+    }
+
+    const wsUrl = getLiveKitWsUrl();
+    const httpUrl = getLiveKitHttpUrl();
+    const apiKey = env('LIVEKIT_API_KEY');
+    const apiSecret = env('LIVEKIT_API_SECRET');
+    if (!wsUrl || !apiKey || !apiSecret) {
+      return res.status(503).json({ error: 'livekit_env_missing' });
+    }
+    const agentName = getAgentName();
+    const roomName = (req.body && req.body.roomName) || `voice-e2e-${Date.now()}`;
+    const sessionId = `e2e-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+
+    // 1) Dispatch agent into the room (creates the room if it doesn't exist)
+    const dispatchClient = new AgentDispatchClient(httpUrl, apiKey, apiSecret);
+    const dispatch = await dispatchClient.createDispatch(roomName, agentName, {
+      metadata: JSON.stringify({ source: 'debug-voice-e2e', uid, sessionId }),
+    });
+
+    // 2) Push credentials packet so the agent can talk to backend on behalf of uid
+    const roomSvc = new RoomServiceClient(httpUrl, apiKey, apiSecret);
+    const encoder = new TextEncoder();
+    const credentials = {
+      type: 'square15_voice_credentials',
+      firebase_token: idToken,
+      session_id: sessionId,
+      session_nonce: sessionId,
+    };
+
+    // Wait for the agent worker to actually join the room before publishing.
+    // Without this, sendData will fail because the room has no participants.
+    const joinDeadline = Date.now() + 15000;
+    let agentReady = false;
+    while (Date.now() < joinDeadline) {
+      try {
+        const parts = await roomSvc.listParticipants(roomName);
+        if (parts && parts.length > 0) { agentReady = true; break; }
+      } catch (_) { /* room may not exist yet */ }
+      await new Promise(r => setTimeout(r, 500));
+    }
+    if (!agentReady) {
+      return res.status(504).json({ error: 'agent_did_not_join', roomName, dispatch });
+    }
+
+    await roomSvc.sendData(
+      roomName,
+      encoder.encode(JSON.stringify(credentials)),
+      DataPacket_Kind.RELIABLE,
+      { topic: 'square15_creds' }
+    );
+
+    // Give the agent a moment to ingest credentials before sending the user turn.
+    await new Promise(r => setTimeout(r, 1500));
+
+    // 3) Push the text_input action — agent will process it as user speech
+    const textInput = {
+      type: 'square15_app',
+      action: 'text_input',
+      payload: { text: message },
+    };
+    await roomSvc.sendData(
+      roomName,
+      encoder.encode(JSON.stringify(textInput)),
+      DataPacket_Kind.RELIABLE,
+      { topic: 'square15_app' }
+    );
+
+    // 4) Wait for the agent to run its LLM + tools
+    await new Promise(r => setTimeout(r, waitMs));
+
+    return res.json({
+      ok: true,
+      uid,
+      roomName,
+      sessionId,
+      dispatchId: dispatch && (dispatch.id || dispatch.dispatchId) || null,
+      message: 'agent dispatched + text_input delivered; poll Firestore for new RFQ/booking',
+    });
+  } catch (e) {
+    console.error('debug/voice-e2e error:', e);
+    return res.status(500).json({ error: 'voice_e2e_error', message: e && e.message });
   }
 });
 
