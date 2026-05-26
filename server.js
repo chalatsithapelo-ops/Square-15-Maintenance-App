@@ -1237,6 +1237,23 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     return isTruthyExtended(active);
   }
 
+  function hasUsableArtisanAuthIdentity(artisanDocId, artisanData) {
+    const data = artisanData && typeof artisanData === 'object' ? artisanData : {};
+    const idValues = [
+      artisanDocId,
+      data.uid,
+      data.user_id,
+      data.userId,
+      data.auth_uid,
+      data.provider_id,
+    ]
+      .map((value) => String(value || '').trim())
+      .filter(Boolean);
+
+    // Assignment should prefer artisans that can later authenticate to act on the booking.
+    return idValues.length > 0;
+  }
+
   function extractLatLng(artisanData) {
     const tryParse = (v) => {
       if (v == null) return null;
@@ -1556,6 +1573,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         const artisanData = providerDoc.data() || {};
         if (!isPublished(artisanData.status)) continue;
         if (!isArtisanActive(artisanData)) continue;
+        if (!hasUsableArtisanAuthIdentity(artisanDocId, artisanData)) continue;
         const isAvail = await checkArtisanAvailability({
           artisanId: artisanDocId,
           scheduledDate,
@@ -1589,6 +1607,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         const artisanData = doc.data() || {};
         if (!isPublished(artisanData.status)) continue;
         if (!isArtisanActive(artisanData)) continue;
+        if (!hasUsableArtisanAuthIdentity(artisanDocId, artisanData)) continue;
 
         const hasTask = artisanHasTask({ artisanData, taskId, categoryId, categoryName });
         const acceptAnyway = !hasTask && categoryName && String(categoryName).trim();
@@ -4151,6 +4170,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         for (const artDoc of artisanSnap.docs) {
           const ad = artDoc.data() || {};
           if (!isArtisanActive(ad)) continue;
+          if (!hasUsableArtisanAuthIdentity(artDoc.id, ad)) continue;
           const st = (ad.status || '').toString().toLowerCase();
           if (st && st !== 'publish' && st !== 'published' && st !== 'approved' && st !== 'approve') continue;
           if (ad.is_suspended === true) continue;
