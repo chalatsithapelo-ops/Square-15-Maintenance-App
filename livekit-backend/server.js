@@ -4016,6 +4016,13 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       accepted_via: payload.source || 'voice',
       updated_at: now,
     });
+    // ── Carry the customer's issue photos into the artisan-facing tm doc.
+    // Without this, artisans accepting an RFQ never see the pictures the
+    // client attached during voice/WA RFQ submission.
+    const _rfqImgs = (function () {
+      const cand = data.work_images || data.workImages || data.image_urls || data.imageUrls || data.work_image_urls || data.workImageUrls || data.images || [];
+      return Array.isArray(cand) ? cand.filter((u) => typeof u === 'string' && u.trim()) : [];
+    })();
     _acceptBatch.set(
       firestore.collection('tasksManagement').doc(bookingId),
       {
@@ -4032,6 +4039,14 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         rfq_status: 'accepted_converted',
         accepted_at: now,
         accepted_via: 'voice',
+        // Artisan-visible issue photos (4 field aliases mirror what the
+        // create_order_booking path writes to futureBookings).
+        attachment: _rfqImgs[0] || '',
+        additional_attachment: _rfqImgs[1] || '',
+        image_urls: _rfqImgs,
+        imageUrls: _rfqImgs,
+        work_images: _rfqImgs,
+        workImages: _rfqImgs,
       },
       { merge: true },
     );
