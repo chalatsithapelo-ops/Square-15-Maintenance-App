@@ -1,7 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
-const { AccessToken, AgentDispatchClient } = require('livekit-server-sdk');
+const { AccessToken, AgentDispatchClient, RoomServiceClient, DataPacket_Kind } = require('livekit-server-sdk');
 const admin = require('firebase-admin');
 const crypto = require('crypto');
 const fs = require('fs');
@@ -363,6 +363,40 @@ function isEnvTruthy(name) {
   if (v == null) return false;
   const s = String(v).trim().toLowerCase();
   return s === '1' || s === 'true' || s === 'yes' || s === 'y' || s === 'on';
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Cyber-security gap #14: Ozow production credential safety assertion.
+// Detect env-var desync (test key + prod URL, or live key + sandbox URL) that
+// could route real money to sandbox or sandbox calls to production. Returns
+// an array of human-readable errors; empty array means safe.
+// Heuristic only — Ozow does not publish a deterministic key-format spec, so
+// we rely on patterns observed in the credential pair they provided. The
+// helper is called at startup AND inline at the payout route for live mode.
+// ──────────────────────────────────────────────────────────────────────────────
+function assertOzowProdSafety() {
+  const errs = [];
+  const isTest = env('OZOW_IS_TEST') === 'true';
+  const apiKey = env('OZOW_PAYOUT_API_KEY') || env('OZOW_API_KEY') || '';
+  const siteCode = env('OZOW_SITE_CODE') || '';
+  // Only enforce when explicitly running in live mode. Sandbox is permissive.
+  if (isTest) return errs;
+  // Live mode: hard requirements.
+  if (!apiKey) errs.push('OZOW_PAYOUT_API_KEY missing in live mode');
+  if (!siteCode) errs.push('OZOW_SITE_CODE missing in live mode');
+  // Sandbox site codes Ozow has issued historically start with "TSTSTE" or
+  // include the literal "TEST". If those appear while OZOW_IS_TEST=false the
+  // env vars are mismatched.
+  const sc = String(siteCode).toUpperCase();
+  if (/^(TST|TEST|TSTSTE)/.test(sc) || sc.includes('TEST')) {
+    errs.push(`OZOW_SITE_CODE looks like a sandbox code ("${siteCode}") but OZOW_IS_TEST=false`);
+  }
+  // Sandbox API keys Ozow issues frequently include the word "TEST" or
+  // "STAGING" in the prefix/suffix. Treat that as a desync signal.
+  if (/TEST|STAGING|SANDBOX/i.test(apiKey)) {
+    errs.push('OZOW_PAYOUT_API_KEY appears to be a sandbox key but OZOW_IS_TEST=false');
+  }
+  return errs;
 }
 
 const app = express();
@@ -762,6 +796,90 @@ async function resolveRole({ firestore, uid, decodedToken }) {
   return 'client';
 }
 
+// ─── Multi-Admin Governance (May 23 2026) ─────────────────────────────────
+// Five admin tiers, distinguished by Firebase custom claim `role`:
+//   owner    — full power, can grant/revoke other admins' roles, R500k/day cap
+//   finance  — can disburse money (payouts, refunds), R50k/day cap
+//   ops      — bookings, dispatch, RFQs (no money movement)
+//   support  — view-only user data + send messages
+//   auditor  — view-only on transactions + audit logs
+// Legacy `admin` claim is treated as `finance` until explicitly migrated.
+const ADMIN_TIERS = ['owner', 'finance', 'ops', 'support', 'auditor'];
+
+function resolveAdminTier(decoded) {
+  if (!decoded) return null;
+  const raw = String(decoded.role || decoded.user_role || '').trim().toLowerCase();
+  if (ADMIN_TIERS.includes(raw)) return raw;
+  // Legacy single-tier admins → finance.
+  if (raw === 'admin' || decoded.admin === true) return 'finance';
+  return null;
+}
+
+function requireAdminTier(allowed) {
+  const allow = new Set(allowed);
+  return function (req, res, next) {
+    const tier = resolveAdminTier(req.user);
+    if (!tier || !allow.has(tier)) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: `This action requires one of: ${[...allow].join(', ')}. Your tier: ${tier || 'none'}.`,
+      });
+    }
+    req.adminTier = tier;
+    next();
+  };
+}
+
+// ─── TOTP (RFC 6238) — minimal pure-Node implementation ──────────────────
+// Avoids adding `speakeasy` to dependencies (smaller surface, no install risk
+// on Render). 30-second window, 6-digit codes, SHA-1, base32 secrets.
+const _b32alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+function base32Encode(buf) {
+  let bits = '';
+  for (const b of buf) bits += b.toString(2).padStart(8, '0');
+  let out = '';
+  for (let i = 0; i + 5 <= bits.length; i += 5) {
+    out += _b32alphabet[parseInt(bits.substr(i, 5), 2)];
+  }
+  return out;
+}
+function base32Decode(str) {
+  let bits = '';
+  for (const c of String(str || '').toUpperCase().replace(/=+$/, '')) {
+    const v = _b32alphabet.indexOf(c);
+    if (v < 0) continue;
+    bits += v.toString(2).padStart(5, '0');
+  }
+  const bytes = [];
+  for (let i = 0; i + 8 <= bits.length; i += 8) bytes.push(parseInt(bits.substr(i, 8), 2));
+  return Buffer.from(bytes);
+}
+function totpAt(secretBase32, timestampSec) {
+  const key = base32Decode(secretBase32);
+  const counter = Math.floor(timestampSec / 30);
+  const buf = Buffer.alloc(8);
+  buf.writeBigUInt64BE(BigInt(counter));
+  const crypto = require('crypto');
+  const hmac = crypto.createHmac('sha1', key).update(buf).digest();
+  const offset = hmac[hmac.length - 1] & 0x0f;
+  const bin = ((hmac[offset] & 0x7f) << 24) |
+              ((hmac[offset + 1] & 0xff) << 16) |
+              ((hmac[offset + 2] & 0xff) << 8) |
+              (hmac[offset + 3] & 0xff);
+  return String(bin % 1000000).padStart(6, '0');
+}
+function verifyTotp(secretBase32, code, window = 1) {
+  if (!secretBase32 || !/^\d{6}$/.test(String(code || '').trim())) return false;
+  const sec = Math.floor(Date.now() / 1000);
+  for (let w = -window; w <= window; w++) {
+    if (totpAt(secretBase32, sec + w * 30) === String(code).trim()) return true;
+  }
+  return false;
+}
+function generateTotpSecret() {
+  return base32Encode(require('crypto').randomBytes(20));
+}
+
 function isTruthy(v) {
   if (v === true) return true;
   if (v === false) return false;
@@ -820,6 +938,11 @@ const ACTION_TIERS = Object.freeze({
   cancel_booking: 'B',
   reschedule_booking: 'B',
   mark_booking_in_progress: 'B',
+  // RFQ quote lifecycle — handlers existed but were unreachable because they
+  // weren't in the tier map. Tier B = normal state change (propose+confirm).
+  generate_rfq_quote: 'B',
+  accept_rfq_quote: 'B',
+  reject_rfq_quote: 'B',
   request_reassignment: 'B',
   artisan_cancel_and_reassign: 'B',
   reassign_booking: 'B',
@@ -3893,6 +4016,13 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       accepted_via: payload.source || 'voice',
       updated_at: now,
     });
+    // ── Carry the customer's issue photos into the artisan-facing tm doc.
+    // Without this, artisans accepting an RFQ never see the pictures the
+    // client attached during voice/WA RFQ submission.
+    const _rfqImgs = (function () {
+      const cand = data.work_images || data.workImages || data.image_urls || data.imageUrls || data.work_image_urls || data.workImageUrls || data.images || [];
+      return Array.isArray(cand) ? cand.filter((u) => typeof u === 'string' && u.trim()) : [];
+    })();
     _acceptBatch.set(
       firestore.collection('tasksManagement').doc(bookingId),
       {
@@ -3909,6 +4039,14 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         rfq_status: 'accepted_converted',
         accepted_at: now,
         accepted_via: 'voice',
+        // Artisan-visible issue photos (4 field aliases mirror what the
+        // create_order_booking path writes to futureBookings).
+        attachment: _rfqImgs[0] || '',
+        additional_attachment: _rfqImgs[1] || '',
+        image_urls: _rfqImgs,
+        imageUrls: _rfqImgs,
+        work_images: _rfqImgs,
+        workImages: _rfqImgs,
       },
       { merge: true },
     );
@@ -5150,6 +5288,42 @@ app.post('/api/voice/start', assistantLimiter, async (req, res) => {
       return res.status(401).json({
         error: 'Unauthorized',
         message: 'Missing Authorization: Bearer <Firebase ID token>',
+        request_id: req.requestId || null,
+      });
+    }
+
+    // SECURITY: when an Authorization header IS provided we must verify it
+    // BEFORE the broad try below (whose catch silently swallows verifyIdToken
+    // failures). Without this, a bearer of any garbage string was getting a
+    // valid LiveKit access token (May 25 2026 audit finding).
+    if (idToken) {
+      try {
+        initFirebaseIfPossible();
+        if (!firebaseInitError) {
+          await admin.auth().verifyIdToken(idToken);
+        } else if (!allowVoiceStartWithoutAuth) {
+          return res.status(503).json({
+            error: 'auth_unavailable',
+            message: 'Firebase Admin not configured; cannot verify Authorization header',
+            request_id: req.requestId || null,
+          });
+        }
+      } catch (e) {
+        if (!allowVoiceStartWithoutAuth) {
+          return res.status(401).json({
+            error: 'Unauthorized',
+            message: 'Invalid Firebase ID token',
+            request_id: req.requestId || null,
+          });
+        }
+      }
+    }
+
+    // SECURITY: clamp room name to prevent abuse / log spam.
+    if (typeof req.body.roomName === 'string' && req.body.roomName.length > 128) {
+      return res.status(400).json({
+        error: 'invalid_room_name',
+        message: 'roomName must be \u2264 128 characters',
         request_id: req.requestId || null,
       });
     }
@@ -6631,9 +6805,13 @@ app.post('/api/payment/initiate', authMiddleware, assistantLimiter, async (req, 
     paymentData.item_name = String(item_name);
     if (custom_str1) paymentData.custom_str1 = custom_str1;
 
-    // Force card-only checkout when payment_method is 'cc'
-    if (payment_method === 'cc') {
-      paymentData.payment_method = 'cc';
+    // Force a specific PayFast payment method when requested.
+    // Accepted codes: 'cc' (card), 'eft' (instant EFT), 'mc' (Mobicred),
+    // 'mt' (MoreTyme), 'rc' (RCS Store Card), 'sc' (SnapScan), 'zp' (Zapper),
+    // 'mp' (Masterpass), 'ap' (ApplePay), 'sp' (SamsungPay).
+    const allowedMethods = new Set(['cc', 'eft', 'mc', 'mt', 'rc', 'sc', 'zp', 'mp', 'ap', 'sp']);
+    if (payment_method && allowedMethods.has(String(payment_method))) {
+      paymentData.payment_method = String(payment_method);
     }
 
     // Enable ad-hoc tokenization (save card) only when explicitly enabled in env.
@@ -7528,14 +7706,100 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       return res.status(403).json({ error: 'Admin access required.' });
     }
 
+    // ─── Governance: only owner+finance can disburse money ───
+    const adminTier = resolveAdminTier(decoded);
+    if (!adminTier || !['owner', 'finance'].includes(adminTier)) {
+      return res.status(403).json({
+        error: 'Insufficient admin tier',
+        message: `Payouts require owner or finance tier. Your tier: ${adminTier || 'none'}.`,
+      });
+    }
+
+    // ─── Gap #9: Idle re-auth (10 minutes) ───
+    // The session must be either freshly signed-in (auth_time within 10min)
+    // OR have a recent biometric confirmation written to
+    // admin_biometric_confirms/{uid} within the last 5 minutes by the admin
+    // app after a successful local_auth prompt. Owner can bypass via env
+    // `MFA_BYPASS_OWNER=true` (NOT recommended for prod).
+    try {
+      const nowSec = Math.floor(Date.now() / 1000);
+      const authTime = Number(decoded.auth_time || 0);
+      const freshSignin = authTime > 0 && (nowSec - authTime) < 600; // 10min
+      let freshBiometric = false;
+      if (!freshSignin) {
+        const bioSnap = await db.collection('admin_biometric_confirms').doc(adminUid).get();
+        if (bioSnap.exists) {
+          const at = bioSnap.data()?.confirmed_at;
+          const tsSec = at ? Math.floor(new Date(String(at)).getTime() / 1000) : 0;
+          freshBiometric = tsSec > 0 && (nowSec - tsSec) < 300; // 5min
+        }
+      }
+      const ownerBypass = adminTier === 'owner' && env('MFA_BYPASS_OWNER') === 'true';
+      if (!freshSignin && !freshBiometric && !ownerBypass) {
+        return res.status(401).json({
+          error: 'reauth_required',
+          message: 'Re-authenticate (biometric or re-login) before disbursing funds.',
+          max_age_seconds: 600,
+        });
+      }
+    } catch (e) {
+      console.warn('[ozow-payout] idle re-auth check error:', e.message);
+      return res.status(503).json({ error: 'Internal control check failed.', stage: 'reauth' });
+    }
+
+    // ─── Gap #3: MFA TOTP enforcement ───
+    // If MFA is enrolled on this admin (admin_mfa/{uid} with enabled=true),
+    // require a current 6-digit code in `x-mfa-code` or req.body.mfa_code.
+    // If MFA_REQUIRED env is true, enrollment is mandatory for owner+finance
+    // tiers — payout will be refused until they enrol.
+    try {
+      const mfaSnap = await db.collection('admin_mfa').doc(adminUid).get();
+      const mfa = mfaSnap.exists ? (mfaSnap.data() || {}) : {};
+      const isEnrolled = mfa.enabled === true && !!mfa.secret;
+      const mfaRequired = env('MFA_REQUIRED') === 'true';
+      if (!isEnrolled) {
+        if (mfaRequired) {
+          return res.status(403).json({
+            error: 'mfa_enrollment_required',
+            message: 'You must enrol MFA before disbursing funds. Hit /api/admin/mfa/setup.',
+          });
+        }
+        // Soft mode: log but allow.
+        console.warn(`[ozow-payout] admin ${adminUid} has no MFA enrolled (soft-mode)`);
+      } else {
+        const code = String(req.headers['x-mfa-code'] || req.body?.mfa_code || '').trim();
+        if (!verifyTotp(mfa.secret, code)) {
+          await db.collection('fraud_alerts').add({
+            rule: 'mfa_failed_payout',
+            severity: 'high',
+            admin_id: adminUid,
+            attempted_amount: parseFloat(req.body?.amount || 0),
+            created_at: new Date().toISOString(),
+          });
+          return res.status(401).json({
+            error: 'mfa_invalid',
+            message: 'Invalid or missing MFA code. Provide 6-digit code in x-mfa-code header.',
+          });
+        }
+        // Touch last_used_at (non-blocking).
+        db.collection('admin_mfa').doc(adminUid).set(
+          { last_used_at: new Date().toISOString() },
+          { merge: true }
+        ).catch(() => {});
+      }
+    } catch (e) {
+      console.warn('[ozow-payout] MFA check error:', e.message);
+      return res.status(503).json({ error: 'Internal control check failed.', stage: 'mfa' });
+    }
+
     const { amount, recipient_id, recipient_type, recipient_name, bank_name,
             account_number, branch_code, account_type, booking_id, reason } = req.body;
 
     if (!amount || !recipient_id || !recipient_type || !account_number || !branch_code || !bank_name) {
       return res.status(400).json({ error: 'Missing required fields: amount, recipient_id, recipient_type, bank_name, account_number, branch_code' });
     }
-    if (recipient_type !== 'artisan' && recipient_type !== 'partner') {
-      return res.status(400).json({ error: 'recipient_type must be "artisan" or "partner"' });
+    if (recipient_type !== 'artisan' && recipient_type !== 'partner' && recipient_type !== 'client') {
+      return res.status(400).json({ error: 'recipient_type must be "artisan", "partner", or "client"' });
     }
 
     const payoutAmount = parseFloat(amount);
@@ -7551,141 +7815,345 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       return res.status(503).json({ error: 'Ozow payout credentials not configured. Set OZOW_PAYOUT_API_KEY and OZOW_SITE_CODE in environment.' });
     }
 
-    // -- Map South African bank names to Ozow bank codes --
-    const bankCodeMap = {
-      'absa': '632005',
-      'african bank': '430000',
-      'bank zero': '888000',
-      'capitec bank': '470010',
-      'capitec': '470010',
-      'discovery bank': '679000',
-      'discovery': '679000',
-      'fnb': '250655',
-      'fnb (first national bank)': '250655',
-      'first national bank': '250655',
-      'investec': '580105',
-      'nedbank': '198765',
-      'standard bank': '051001',
-      'tymebank': '678910',
-      'tyme bank': '678910',
-    };
-
-    const bankKey = bank_name.toLowerCase().trim();
-    const ozowBankCode = bankCodeMap[bankKey] || branch_code;
-
-    // -- Map account type --
-    const accountTypeMap = {
-      'cheque/current': '1',
-      'cheque': '1',
-      'current': '1',
-      'savings': '2',
-      'transmission': '3',
-    };
-    const ozowAccountType = accountTypeMap[(account_type || 'cheque').toLowerCase()] || '1';
-
     const now = new Date().toISOString();
-    // Ozow bankReference max 20 chars � use compact format
+
+    // ─── Gap #14: Ozow prod credential safety assertion ───
+    // If we're in live mode but env vars look like a sandbox setup, refuse
+    // to send money. This protects against desync after a partial cutover.
+    const ozowSafetyErrs = assertOzowProdSafety();
+    if (ozowSafetyErrs.length > 0) {
+      console.error('🚨 OZOW PROD SAFETY BLOCK:', ozowSafetyErrs);
+      try {
+        await db.collection('error_logs').add({
+          error_type: 'ozow_prod_safety_block',
+          severity: 'critical',
+          source: 'ozow_payout_route',
+          errors: ozowSafetyErrs,
+          admin_id: adminUid,
+          attempted_amount: payoutAmount,
+          created_at: now,
+        });
+      } catch (_) {}
+      return res.status(503).json({
+        error: 'Ozow credential safety check failed. Cannot process payouts.',
+        details: ozowSafetyErrs,
+      });
+    }
+
+    // ─── Gap #4: Daily payout hard block (per-admin) ───
+    // Owner role may exceed daily limit; everyone else is hard-capped.
+    // The R50k DAILY_LIMITS.payout was previously *alerted* in fraud rules but
+    // not actually blocking — convert to a hard block here. Any payout pushing
+    // the admin's running total past their cap is refused before Ozow is hit.
+    const DAILY_PAYOUT_CAP_DEFAULT = 50000;
+    const DAILY_PAYOUT_CAP_OWNER = 500000; // R500k for owner role
+    const isOwner = adminTier === 'owner';
+    const adminDailyCap = isOwner ? DAILY_PAYOUT_CAP_OWNER : DAILY_PAYOUT_CAP_DEFAULT;
+    try {
+      const dayStart = new Date();
+      dayStart.setHours(0, 0, 0, 0);
+      const dayStartIso = dayStart.toISOString();
+      const todaySnap = await db.collection('payout_records')
+        .where('admin_id', '==', adminUid)
+        .limit(500)
+        .get()
+        .catch((err) => {
+          console.warn('[ozow-payout] daily cap query error:', err.code, err.message);
+          throw err;
+        });
+      let todayTotal = 0;
+      todaySnap.docs.forEach(d => {
+        const data = d.data() || {};
+        // Filter by date in-process to avoid needing a composite index.
+        const created = String(data.created_at || '');
+        if (created < dayStartIso) return;
+        // Only count successful/pending — failed/rejected don't move money.
+        const st = String(data.status || '').toLowerCase();
+        if (st === 'failed' || st === 'rejected' || st === 'cancelled') return;
+        const amt = parseFloat(data.amount || 0);
+        if (!isNaN(amt)) todayTotal += amt;
+      });
+      const projected = todayTotal + payoutAmount;
+      if (projected > adminDailyCap) {
+        await db.collection('fraud_alerts').add({
+          rule: 'daily_payout_cap_block',
+          severity: 'high',
+          admin_id: adminUid,
+          today_total: todayTotal,
+          attempted_amount: payoutAmount,
+          cap: adminDailyCap,
+          recipient_id, recipient_type,
+          created_at: now,
+        });
+        return res.status(403).json({
+          error: 'Daily payout cap exceeded for your role',
+          details: `Today total R${todayTotal.toFixed(2)} + R${payoutAmount.toFixed(2)} = R${projected.toFixed(2)} > R${adminDailyCap} cap`,
+          role: isOwner ? 'owner' : 'admin',
+        });
+      }
+    } catch (e) {
+      console.warn('[ozow-payout] daily cap check failed (fail-closed):', e.code || '', e.message);
+      return res.status(503).json({ error: 'Internal control check failed. Try again shortly.', stage: 'daily_cap', detail: e.message });
+    }
+
+    // ─── Gap #15: Bank-account-change cool-down (24h) ───
+    // Detect when the recipient's payout-bound bank account has changed
+    // recently. If the {recipient_id × account_number} pair is new (or the
+    // recipient's account was modified within the last 24h), block payout
+    // and raise a fraud alert. Owner can override by setting a fresh flag
+    // doc — kept as backlog work for the role-tier system.
+    try {
+      const masked = `****${String(account_number).slice(-4)}`;
+      // 1. Most recent successful/pending payout to this recipient.
+      // Use single-field query then sort in-process to avoid composite index.
+      const recentSnap = await db.collection('payout_records')
+        .where('recipient_id', '==', recipient_id)
+        .limit(50)
+        .get()
+        .catch((err) => {
+          console.warn('[ozow-payout] recent payouts query failed:', err.message);
+          return null;
+        });
+
+      let recipientHasHistory = false;
+      let lastMasked = '';
+      if (recentSnap && !recentSnap.empty) {
+        const docs = recentSnap.docs
+          .map(d => d.data() || {})
+          .sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')));
+        for (const dd of docs) {
+          const st = String(dd.status || '').toLowerCase();
+          if (st === 'failed' || st === 'rejected' || st === 'cancelled') continue;
+          const m = (dd.account_number_masked || '').toString();
+          if (m) {
+            lastMasked = m;
+            recipientHasHistory = true;
+            break;
+          }
+        }
+      }
+
+      // 2. Check recipient profile doc for recent bank-account changes
+      const profileCol = recipient_type === 'artisan'
+        ? 'serviceProvider'
+        : recipient_type === 'partner' ? 'corporate_partners' : 'users';
+      let profileBankUpdatedAt = null;
+      try {
+        const profSnap = await db.collection(profileCol).doc(recipient_id).get();
+        if (profSnap.exists) {
+          const pd = profSnap.data() || {};
+          const candidate = pd.bank_account_updated_at || pd.bank_details_updated_at || pd.bankAccountUpdatedAt;
+          if (candidate) profileBankUpdatedAt = new Date(String(candidate));
+        }
+      } catch (_) {}
+
+      const isAccountChanged = recipientHasHistory && lastMasked && lastMasked !== masked;
+      const isProfileRecentlyChanged = profileBankUpdatedAt &&
+        (Date.now() - profileBankUpdatedAt.getTime()) < (24 * 60 * 60 * 1000);
+
+      if (isAccountChanged || isProfileRecentlyChanged) {
+        await db.collection('fraud_alerts').add({
+          rule: 'bank_account_change_cooldown',
+          severity: 'critical',
+          admin_id: adminUid,
+          recipient_id, recipient_type,
+          new_account_masked: masked,
+          previous_account_masked: lastMasked || null,
+          profile_bank_updated_at: profileBankUpdatedAt ? profileBankUpdatedAt.toISOString() : null,
+          attempted_amount: payoutAmount,
+          created_at: now,
+        });
+        return res.status(403).json({
+          error: 'Bank account change cool-down active',
+          details: isAccountChanged
+            ? `Recipient's last successful payout used ${lastMasked}, now ${masked}. 24-hour cool-down active.`
+            : `Recipient's stored bank details changed within 24h. Cool-down active.`,
+          retry_after: '24h',
+        });
+      }
+    } catch (e) {
+      console.warn('[ozow-payout] bank-change cooldown check failed (fail-closed):', e.code || '', e.message);
+      return res.status(503).json({ error: 'Internal control check failed. Try again shortly.', stage: 'bank_change', detail: e.message });
+    }
+
+    // -- Map South African bank names to Ozow bankGroupId UUIDs --
+    // Source: live call to https://stagingpayoutsapi.ozow.com/v1/getavailablebanks (2026-05-21)
+    // These UUIDs are stable across staging + production.
+    const bankGroupIdMap = {
+      'absa':            { id: '3284a0ad-ba78-4838-8c2b-102981286a2b', branch: '632005' },
+      'african bank':    { id: '33a0840b-0cf4-4b8c-86e0-ec6c4be8c60e', branch: '430000' },
+      'capitec bank':    { id: '913999fa-3a32-4e3d-82f0-a1df7e9e4f7b', branch: '470010' },
+      'capitec':         { id: '913999fa-3a32-4e3d-82f0-a1df7e9e4f7b', branch: '470010' },
+      'discovery bank':  { id: 'b8f152a2-8bd2-46c4-930f-4cd5b2b37ef9', branch: '679000' },
+      'discovery':       { id: 'b8f152a2-8bd2-46c4-930f-4cd5b2b37ef9', branch: '679000' },
+      'fnb':             { id: '4816019c-3314-4c80-8b6b-b2cd16dcc4ec', branch: '250655' },
+      'first national bank': { id: '4816019c-3314-4c80-8b6b-b2cd16dcc4ec', branch: '250655' },
+      'nedbank':         { id: 'bf0561fd-4203-4a0c-9174-cb26fcd87a60', branch: '198765' },
+      'standard bank':   { id: 'ad7d8da4-1723-4066-94bb-6662d845e483', branch: '051001' },
+      'tymebank':        { id: '28fcc8fa-985b-480b-82fd-7d09bc19c9d0', branch: '678910' },
+      'tyme bank':       { id: '28fcc8fa-985b-480b-82fd-7d09bc19c9d0', branch: '678910' },
+      'access bank':     { id: 'fd4876ca-db3e-4385-831a-4e465083b1f3', branch: '410506' },
+      'investec':        { id: '4b45be85-b616-4bd1-9027-f8fcf8f9af7b', branch: '580105' },
+      'bidvest bank':    { id: '29c5ee92-46ec-4879-8ad9-5cd3f5502727', branch: '462005' },
+      'sasfin bank':     { id: '54a18018-a9fe-4adb-b752-38004ed735d6', branch: '683000' },
+      'sasfin':          { id: '54a18018-a9fe-4adb-b752-38004ed735d6', branch: '683000' },
+    };
+
+    const bankKey = String(bank_name || '').toLowerCase().trim();
+    const bankMatch = bankGroupIdMap[bankKey];
+    if (!bankMatch) {
+      return res.status(400).json({
+        ok: false,
+        error: `Unsupported bank "${bank_name}". Supported: ${Object.keys(bankGroupIdMap).join(', ')}`,
+      });
+    }
+    const ozowBankGroupId = bankMatch.id;
+    const ozowBranchCode = bankMatch.branch; // Use universal branch code from Ozow, not user-supplied
+
+    // Ozow merchantReference max 20 chars - compact base36 timestamp
     const payoutRef = `SQ${Date.now().toString(36).toUpperCase()}`;
+    // Ozow customerBankReference: alphanumeric + spaces + dashes only, max 20 chars
+    const customerBankReference = `Square15-${payoutRef}`.replace(/[^A-Za-z0-9 -]/g, '').slice(0, 20);
 
-    // -- Call Ozow Payout API --
-    // Ozow Payout API lives on pay.ozow.com (NOT api.ozow.com)
-    const ozowPayoutUrl = env('OZOW_IS_TEST') === 'true'
-      ? 'https://stagingpay.ozow.com/api/v1/sendpayout'
-      : 'https://pay.ozow.com/api/v1/sendpayout';
-
+    // -- Build Ozow Payouts API v1 request --
+    // API spec: https://hub.ozow.com/docs/payouts-api/te1u21qvzznh8-step-2-submit-payout-request
+    const ozowPayoutBaseUrl = env('OZOW_IS_TEST') === 'true'
+      ? 'https://stagingpayoutsapi.ozow.com'
+      : 'https://payoutsapi.ozow.com';
+    const ozowPayoutUrl = `${ozowPayoutBaseUrl}/v1/requestpayout`;
     const notifyUrl = `${env('RENDER_EXTERNAL_URL') || 'https://square15-livekit-backend.onrender.com'}/api/ozow-payout-notify`;
+    // Staging does NOT support RTC - must be false. Production can be true but
+    // requires separate RTC activation. Default to false until enabled.
+    const isRtc = false;
+    // amount must be numeric (R). Use 2-decimal float; Ozow accepts ints or floats.
+    const ozowAmount = parseFloat(payoutAmount.toFixed(2));
+
+    // -- AES-256-CBC account number encryption per Ozow spec --
+    // Generate random 32-byte (encoded as 64 hex chars) encryption key per payout.
+    // We persist it in payout_records.encryption_key, then return it to Ozow via
+    // the verify webhook (/api/ozow-payout-verify) when they call back.
+    const encryptionKey = crypto.randomBytes(32).toString('hex'); // 64 ASCII chars
+    // IV: SHA512(merchantRef + amountCents + encryptionKey, lowercased), first 16 bytes
+    const amountCents = Math.round(ozowAmount * 100);
+    const ivSource = `${payoutRef}${amountCents}${encryptionKey}`.toLowerCase();
+    const ivHexFull = crypto.createHash('sha512').update(ivSource, 'utf8').digest('hex');
+    const ivBytes = Buffer.from(ivHexFull.substring(0, 16), 'utf8'); // 16 ASCII bytes
+    // AES key: take first 32 chars of encryption key (already 64 chars, ASCII)
+    const aesKeyBytes = Buffer.from(encryptionKey.substring(0, 32), 'utf8');
+    const cipher = crypto.createCipheriv('aes-256-cbc', aesKeyBytes, ivBytes);
+    cipher.setAutoPadding(true); // PKCS7
+    const encryptedAccountNumber = Buffer.concat([
+      cipher.update(String(account_number), 'utf8'),
+      cipher.final(),
+    ]).toString('base64');
+
+    // -- hashCheck: SHA512 hex of lowercased concat per Ozow's C# reference
+    // (received from Itumeleng @ Ozow, 22 May 2026). Field order:
+    //   siteCode + Convert.ToInt32(amount*100) + merchantReference
+    //   + customerBankReference + isRtc("False"/"True") + notifyUrl
+    //   + bankGroupId + encryptedAccountNumber + branchCode + apiKey
+    // Then .ToLower() → SHA512 → hex (lowercase).
+    // Notes:
+    //   • Amount is integer cents with NO decimal/padding (R5.00 → "500").
+    //   • IsRtc is a C# bool → "False"/"True" then lowercased to "false"/"true".
+    //     JS String(false) === "false" lowercases to "false", same result.
+    //   • accountNumber field in the hash is the ENCRYPTED (AES) value.
+    //   • apiKey is the LAST field, NOT after customerBankReference.
+    const sha512 = (s) => crypto.createHash('sha512').update(s, 'utf8').digest('hex');
+    const hashInput = [
+      ozowSiteCode,
+      amountCents,              // integer cents, no decimal
+      payoutRef,                // merchantReference
+      customerBankReference,
+      isRtc ? 'True' : 'False', // matches C# bool.ToString()
+      notifyUrl,
+      ozowBankGroupId,
+      encryptedAccountNumber,   // AES-256-CBC base64
+      ozowBranchCode,
+      ozowApiKey,               // ★ LAST per Ozow C# reference
+    ].join('').toLowerCase();
+    let hashCheck = sha512(hashInput);
+    console.log(`[admin/ozow-payout] hashInput len=${hashInput.length} ref=${payoutRef} amtCents=${amountCents}`);
+
+    // Sandbox echo: in staging/test mode print the EXACT pre-hash string and
+    // computed hash so we can diff against Ozow's "Before Hashcheck" debug line
+    // from their C# reference. Never enabled in production (test_mode guard).
+    const isOzowSandbox = env('OZOW_IS_TEST') === 'true';
+    if (isOzowSandbox) {
+      // Redact apiKey from echoed string (last token) to keep secrets out of logs.
+      const apiKeyLc = ozowApiKey.toLowerCase();
+      const redactedInput = hashInput.endsWith(apiKeyLc)
+        ? hashInput.slice(0, -apiKeyLc.length) + `<apiKey:${apiKeyLc.length}chars>`
+        : hashInput;
+      console.log('[admin/ozow-payout][SANDBOX-ECHO] === PRE-HASH STRING ===');
+      console.log('[admin/ozow-payout][SANDBOX-ECHO] input :', redactedInput);
+      console.log('[admin/ozow-payout][SANDBOX-ECHO] hash  :', hashCheck);
+      console.log('[admin/ozow-payout][SANDBOX-ECHO] fields:', JSON.stringify({
+        siteCode: ozowSiteCode,
+        amountCents,
+        merchantReference: payoutRef,
+        customerBankReference,
+        isRtc: isRtc ? 'True' : 'False',
+        notifyUrl,
+        bankGroupId: ozowBankGroupId,
+        encryptedAccountNumber,
+        branchCode: ozowBranchCode,
+        apiKeyChars: ozowApiKey.length,
+      }));
+    }
 
     const payoutPayload = {
-      SiteCode: ozowSiteCode,
-      Amount: parseFloat(payoutAmount.toFixed(2)),
-      BankReference: payoutRef,
-      BeneficiaryName: (recipient_name || 'Square 15 Payout').slice(0, 50),
-      BeneficiaryBankCode: ozowBankCode,
-      BeneficiaryAccountNumber: account_number,
-      BeneficiaryAccountType: parseInt(ozowAccountType, 10),
-      IsRealTimeClearing: true,
-      NotifyUrl: notifyUrl,
-    };
-
-    // Fallback payload casing for environments that expect camelCase fields.
-    const payoutPayloadFallback = {
       siteCode: ozowSiteCode,
-      amount: parseFloat(payoutAmount.toFixed(2)),
-      bankReference: payoutRef,
-      beneficiaryName: (recipient_name || 'Square 15 Payout').slice(0, 50),
-      beneficiaryBankCode: ozowBankCode,
-      beneficiaryAccountNumber: account_number,
-      beneficiaryAccountType: parseInt(ozowAccountType, 10),
-      isRealTimeClearing: true,
+      amount: ozowAmount,
+      merchantReference: payoutRef,
+      customerBankReference: customerBankReference,
+      isRtc: isRtc,
       notifyUrl: notifyUrl,
+      bankingDetails: {
+        bankGroupId: ozowBankGroupId,
+        accountNumber: encryptedAccountNumber,
+        branchCode: ozowBranchCode,
+      },
+      hashCheck: hashCheck,
     };
 
-    console.log(`[admin/ozow-payout] Initiating R${payoutAmount.toFixed(2)} to ${recipient_type} ${recipient_id} (${bank_name} ****${account_number.slice(-4)})`);
-    console.log(`[admin/ozow-payout] URL: ${ozowPayoutUrl}`);
-    console.log(`[admin/ozow-payout] Payload:`, JSON.stringify(payoutPayload));
-
-    const ozowAttempts = [
-      {
-        name: 'primary_pascal_apiKey',
-        headers: {
-          'Content-Type': 'application/json',
-          'ApiKey': ozowApiKey,
-          'Accept': 'application/json',
-        },
-        payload: payoutPayload,
-      },
-      {
-        name: 'fallback_camel_bearer',
-        headers: {
-          'Content-Type': 'application/json',
-          'ApiKey': ozowApiKey,
-          'Authorization': `Bearer ${ozowApiKey}`,
-          'X-Api-Key': ozowApiKey,
-          'Accept': 'application/json',
-        },
-        payload: payoutPayloadFallback,
-      },
-    ];
+    console.log(`[admin/ozow-payout] Initiating R${payoutAmount.toFixed(2)} to ${recipient_type} ${recipient_id} (${bank_name} ****${String(account_number).slice(-4)})`);
+    console.log(`[admin/ozow-payout] URL: ${ozowPayoutUrl} ref=${payoutRef}`);
+    if (isOzowSandbox) {
+      console.log('[admin/ozow-payout][SANDBOX-ECHO] === OUTBOUND REQUEST ===');
+      console.log('[admin/ozow-payout][SANDBOX-ECHO] body  :', JSON.stringify(payoutPayload));
+    }
 
     let ozowResponse = null;
     let ozowResult = null;
     let ozowRawText = '';
+    let ozowRespHeaders = {};
 
-    for (const attempt of ozowAttempts) {
-      try {
-        const response = await fetch(ozowPayoutUrl, {
-          method: 'POST',
-          headers: attempt.headers,
-          body: JSON.stringify(attempt.payload),
-          signal: AbortSignal.timeout(30000),
-        });
-
-        const rawText = await response.text().catch(() => '');
-        let parsed;
-        try {
-          parsed = rawText ? JSON.parse(rawText) : {};
-        } catch (_) {
-          parsed = null;
-        }
-
-        const parsedPayoutId = parsed && (parsed.payoutId || parsed.PayoutId || parsed.id || parsed.Id);
-        ozowResponse = response;
-        ozowResult = parsed;
-        ozowRawText = rawText;
-
-        if (response.ok && parsedPayoutId) {
-          console.log(`[admin/ozow-payout] Ozow success via ${attempt.name}`);
-          break;
-        }
-
-        console.warn(`[admin/ozow-payout] Attempt ${attempt.name} failed (HTTP ${response.status})`);
-        if (response.status < 500) {
-          // 4xx is usually a real validation/auth error; don't keep retrying variants.
-          break;
-        }
-      } catch (attemptErr) {
-        console.warn(`[admin/ozow-payout] Attempt ${attempt.name} threw: ${attemptErr.message}`);
+    try {
+      const response = await fetch(ozowPayoutUrl, {
+        method: 'POST',
+        headers: {
+          'ApiKey': ozowApiKey,
+          'SiteCode': ozowSiteCode,
+          'Accept': 'application/json',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payoutPayload),
+        signal: AbortSignal.timeout(30000),
+      });
+      ozowRawText = await response.text().catch(() => '');
+      try { ozowResult = ozowRawText ? JSON.parse(ozowRawText) : {}; } catch (_) { ozowResult = null; }
+      try { response.headers.forEach((v, k) => { ozowRespHeaders[k] = v; }); } catch (_) {}
+      ozowResponse = response;
+      const errMsg = (ozowResult && ozowResult.payoutStatus && ozowResult.payoutStatus.errorMessage) || '';
+      console.log(`[admin/ozow-payout] HTTP ${response.status} msg="${errMsg.slice(0,80)}" ref=${payoutRef}`);
+      if (isOzowSandbox) {
+        console.log('[admin/ozow-payout][SANDBOX-ECHO] === INBOUND RESPONSE ===');
+        console.log('[admin/ozow-payout][SANDBOX-ECHO] status:', response.status);
+        console.log('[admin/ozow-payout][SANDBOX-ECHO] raw   :', ozowRawText || '(empty)');
       }
+    } catch (attemptErr) {
+      console.error(`[admin/ozow-payout] Ozow request threw: ${attemptErr.message}`);
     }
 
     if (!ozowResponse) {
@@ -7706,24 +8174,28 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
 
     console.log(`[admin/ozow-payout] Ozow response (${ozowResponse.status}):`, JSON.stringify(ozowResult));
 
-    // Ozow may return PascalCase or camelCase � handle both
-    const payoutId = ozowResult.payoutId || ozowResult.PayoutId || ozowResult.id || ozowResult.Id;
-    const ozowStatus = ozowResult.status || ozowResult.Status;
+    // Ozow Payouts v1 response shape: { payoutId, payoutStatus: { status, subStatus, errorMessage } }
+    const payoutId = ozowResult && (ozowResult.payoutId || ozowResult.PayoutId);
+    const payoutStatusObj = (ozowResult && (ozowResult.payoutStatus || ozowResult.PayoutStatus)) || {};
+    const ozowStatusCode = payoutStatusObj.status != null ? payoutStatusObj.status : (ozowResult && ozowResult.status);
+    const ozowSubStatus = payoutStatusObj.subStatus != null ? payoutStatusObj.subStatus : null;
+    const ozowErrorMessage = payoutStatusObj.errorMessage || payoutStatusObj.ErrorMessage || (ozowResult && (ozowResult.errorMessage || ozowResult.error)) || '';
+    // Status codes 1 (Received), 2 (Verification), 3 (SubmittedForProcessing), 5 (Complete) = OK.
+    // Status 4 (ProcessingError), 99 (Cancelled), 90 (Returned) = failure.
+    const isOzowSuccess = ozowResponse.ok && payoutId && [1, 2, 3, 5].includes(Number(ozowStatusCode));
+    const ozowStatus = isOzowSuccess ? 'pending' : 'failed';
 
-    if (!ozowResponse.ok || !payoutId) {
-      console.error(`[admin/ozow-payout] Ozow API error (HTTP ${ozowResponse.status}):`, JSON.stringify(ozowResult));
-      console.error(`[admin/ozow-payout] Ozow raw body:`, ozowRawText || '(empty)');
-      const errMsg = ozowResult.message || ozowResult.errorMessage || ozowResult.error
-        || (ozowResult.errors && JSON.stringify(ozowResult.errors))
+    if (!isOzowSuccess) {
+      console.error(`[admin/ozow-payout] Ozow rejected (HTTP ${ozowResponse.status}, status=${ozowStatusCode}, subStatus=${ozowSubStatus}): ${ozowErrorMessage}`);
+      const errMsg = ozowErrorMessage
         || (ozowRawText && ozowRawText.length < 500 ? ozowRawText : null)
-        || `Ozow payout failed (HTTP ${ozowResponse.status})`;
-      // Log to Live Issues so admin sees the root cause in the dashboard
+        || `Ozow payout failed (HTTP ${ozowResponse.status}, status=${ozowStatusCode})`;
       try {
         await logErrorToAdmin(
           'ozow_payout_error',
-          `Ozow rejected a R${payoutAmount.toFixed(2)} EFT payout to ${recipient_name || recipient_type} (${bank_name} ****${account_number.slice(-4)}). HTTP ${ozowResponse.status}. ${ozowResponse.status === 500 ? 'Usually means: (1) Ozow payout feature not yet activated on your merchant account, (2) wrong OZOW_PAYOUT_API_KEY / OZOW_SITE_CODE in Render env, or (3) server IP not whitelisted in Ozow payout portal.' : 'See ozow_raw detail for the actual rejection reason.'}`,
+          `Ozow rejected a R${payoutAmount.toFixed(2)} EFT payout to ${recipient_name || recipient_type} (${bank_name} ****${String(account_number).slice(-4)}). HTTP ${ozowResponse.status} status=${ozowStatusCode} subStatus=${ozowSubStatus}. ${ozowErrorMessage || 'See ozow_raw detail.'}`,
           'backend',
-          `status=${ozowResponse.status} raw=${ozowRawText || '(empty)'} parsed=${JSON.stringify(ozowResult).slice(0, 500)} bank_code=${ozowBankCode} account_type=${ozowAccountType} site_code=${ozowSiteCode ? 'set' : 'MISSING'} api_key=${ozowApiKey ? 'set' : 'MISSING'} test_mode=${env('OZOW_IS_TEST') === 'true'}`,
+          `status=${ozowResponse.status} ozow_status=${ozowStatusCode} ozow_sub=${ozowSubStatus} err=${ozowErrorMessage} resp_headers=${JSON.stringify(ozowRespHeaders).slice(0,400)} raw=${ozowRawText || '(empty)'} parsed=${JSON.stringify(ozowResult).slice(0, 500)} bank_group_id=${ozowBankGroupId} branch=${ozowBranchCode} site_code=${ozowSiteCode ? 'set' : 'MISSING'} api_key=${ozowApiKey ? 'set' : 'MISSING'} test_mode=${env('OZOW_IS_TEST') === 'true'} ref=${payoutRef}`,
           booking_id || null,
           'high'
         );
@@ -7732,12 +8204,38 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
         ok: false,
         error: errMsg,
         ozow_status: ozowResponse.status,
+        ozow_status_code: ozowStatusCode,
+        ozow_sub_status: ozowSubStatus,
         ozow_response: ozowResult,
         ozow_raw: ozowRawText && ozowRawText.length < 500 ? ozowRawText : undefined,
+        // Sandbox-only diagnostic fields so the test client can see the exact
+        // pre-hash string and outbound body. apiKey redacted from input string.
+        sandbox_echo: isOzowSandbox ? {
+          pre_hash_input: (() => {
+            const k = ozowApiKey.toLowerCase();
+            return hashInput.endsWith(k)
+              ? hashInput.slice(0, -k.length) + `<apiKey:${k.length}chars>`
+              : hashInput;
+          })(),
+          hash_check: hashCheck,
+          outbound_body: payoutPayload,
+          fields: {
+            siteCode: ozowSiteCode,
+            amountCents,
+            merchantReference: payoutRef,
+            customerBankReference,
+            isRtc: isRtc ? 'True' : 'False',
+            notifyUrl,
+            bankGroupId: ozowBankGroupId,
+            encryptedAccountNumber,
+            branchCode: ozowBranchCode,
+            apiKeyChars: ozowApiKey.length,
+          },
+        } : undefined,
       });
     }
 
-    console.log(`? Ozow payout created: ${payoutId} ref=${payoutRef}`);
+    console.log(`✓ Ozow payout created: ${payoutId} ref=${payoutRef} status=${ozowStatusCode} sub=${ozowSubStatus}`);
 
     // -- Record payout in Firestore --
     const txId = crypto.randomUUID();
@@ -7745,18 +8243,26 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       id: txId,
       ozow_payout_id: payoutId,
       payout_reference: payoutRef,
-      type: recipient_type === 'partner' ? 'partner_payout' : 'artisan_payout',
+      merchant_reference: payoutRef,
+      customer_bank_reference: customerBankReference,
+      // ★ Required for /api/ozow-payout-verify to respond with the AES key
+      // when Ozow calls back. Without these the payout will fail at verification.
+      encryption_key: encryptionKey,
+      amount_cents: amountCents,
+      bank_group_id: ozowBankGroupId,
+      type: recipient_type === 'partner' ? 'partner_payout' : (recipient_type === 'client' ? 'client_refund' : 'artisan_payout'),
       method: 'ozow_eft',
       recipient_id,
       recipient_name: recipient_name || '',
       recipient_type,
       amount: payoutAmount.toFixed(2),
       bank_name,
-      account_number_masked: `****${account_number.slice(-4)}`,
-      branch_code,
+      account_number_masked: `****${String(account_number).slice(-4)}`,
+      branch_code: ozowBranchCode,
       account_type: account_type || 'cheque',
-      status: ozowStatus || 'pending',
-      ozow_status: ozowStatus || 'Pending',
+      status: 'pending',
+      ozow_status: ozowStatusCode,
+      ozow_sub_status: ozowSubStatus,
       admin_id: adminUid,
       reason: reason || `Admin EFT payout to ${recipient_type}`,
       ...(booking_id ? { tasks_management_id: booking_id } : {}),
@@ -7766,13 +8272,18 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
 
     await db.collection('payout_records').doc(txId).set(payoutRecord);
 
-    // Also log to transactionLogs
+    // Also log to transactionLogs — include queryable id fields so the record
+    // appears on the relevant admin detail screen for that recipient.
+    //   - client refunds: user_id (admin user_detail queries on user_id)
+    //   - artisan payouts: service_provider_id + artisan_id
+    //   - partner payouts: partner_id + corporate_partner_id
+    // `transaction_by` is the canonical "who is this transaction for" field.
     await db.collection('transactionLogs').doc(txId).set({
       id: txId,
       amount: payoutAmount.toFixed(2),
       transaction_at: now,
       status: 'pending',
-      type: recipient_type === 'partner' ? 'partner_eft_payout' : 'artisan_eft_payout',
+      type: recipient_type === 'partner' ? 'partner_eft_payout' : (recipient_type === 'client' ? 'client_refund_eft' : 'artisan_eft_payout'),
       subtype: `${recipient_type}_payout`,
       direction: 'out',
       cash_movement: true,
@@ -7782,6 +8293,11 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       ozow_payout_id: payoutId,
       recipient_id,
       recipient_name: recipient_name || '',
+      recipient_type,
+      transaction_by: recipient_id,
+      ...(recipient_type === 'client' ? { user_id: recipient_id } : {}),
+      ...(recipient_type === 'artisan' ? { service_provider_id: recipient_id, artisan_id: recipient_id } : {}),
+      ...(recipient_type === 'partner' ? { partner_id: recipient_id, corporate_partner_id: recipient_id } : {}),
       admin_id: adminUid,
       reason: reason || `Admin EFT payout`,
       ...(booking_id ? { tasks_management_id: booking_id } : {}),
@@ -7847,6 +8363,28 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       }
     }
 
+    // Update client refund_request if applicable (booking_id may carry refund_request id)
+    if (recipient_type === 'client' && booking_id) {
+      try {
+        const refundRef = db.collection('refund_requests').doc(booking_id);
+        const refundSnap = await refundRef.get();
+        if (refundSnap.exists) {
+          await refundRef.update({
+            status: 'processed',
+            refund_method: 'ozow_eft',
+            payout_id: txId,
+            ozow_payout_id: payoutId,
+            payout_reference: payoutRef,
+            processed_at: now,
+            processed_by: adminUid,
+            updated_at: now,
+          });
+        }
+      } catch (refundErr) {
+        console.error('? Client refund_request update failed:', refundErr.message);
+      }
+    }
+
     // ── Sync with any pending weekly payout batch ─────────────────────────
     // If this manual payout covers a recipient that is also in a draft batch,
     // deduct the manual amount from that batch line item so it doesn't get
@@ -7890,6 +8428,194 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       console.warn('[ozow-payout] batch-sync failed (non-fatal):', syncErr && syncErr.message);
     }
 
+    // ── Notifications ─────────────────────────────────────────────────────
+    // Every successful payout (any amount, any recipient type) must notify:
+    //   (a) all admins with an FCM push + a notifications doc, and
+    //   (b) the recipient (artisan or client) with a push + notifications doc.
+    // Partners have no app — partner notification = admin-only.
+    // Helpers are declared inline because the global notification helpers
+    // (writeAdminNotification / writePersonalNotification) are nested inside
+    // executeBookingAction's closure and not accessible from this route.
+    try {
+      const nowIsoStr = new Date().toISOString();
+      const recipientLabel = recipient_name || recipient_type;
+      const amountStr = `R${payoutAmount.toFixed(2)}`;
+      const acctMasked = `****${String(account_number).slice(-4)}`;
+      const typeLabel = recipient_type === 'partner'
+        ? 'Partner payout'
+        : (recipient_type === 'client' ? 'Client refund' : 'Artisan payout');
+
+      const _collectTokens = (docData) => {
+        const d = docData && typeof docData === 'object' ? docData : {};
+        const out = [];
+        const seen = new Set();
+        const push = (v) => {
+          const t = String(v || '').trim();
+          if (t && !seen.has(t)) { seen.add(t); out.push(t); }
+        };
+        push(d.deviceToken); push(d.device_token); push(d.fcm_token);
+        push(d.fcmToken); push(d.token); push(d.push_token); push(d.pushToken);
+        for (const list of [d.tokens, d.fcm_tokens, d.deviceTokens]) {
+          if (Array.isArray(list)) for (const item of list) push(item);
+        }
+        return out;
+      };
+
+      const _toStringMap = (v) => {
+        const obj = v && typeof v === 'object' ? v : {};
+        const out = {};
+        for (const [k, val] of Object.entries(obj)) {
+          if (val == null) continue;
+          out[String(k)] = String(val);
+        }
+        return out;
+      };
+
+      const _sendPush = async ({ tokens, title, body, data }) => {
+        if (!tokens || tokens.length === 0) return { attempted: 0, success: 0, failure: 0 };
+        try {
+          const resp = await admin.messaging().sendEachForMulticast({
+            tokens,
+            notification: {
+              title: String(title || '').trim() || undefined,
+              body: String(body || '').trim() || undefined,
+            },
+            data: _toStringMap(data),
+            android: { priority: 'high', notification: { channelId: 'high_importance_channel' } },
+          });
+          return { attempted: tokens.length, success: resp.successCount || 0, failure: resp.failureCount || 0 };
+        } catch (e) {
+          console.warn('[ozow-payout] FCM send failed:', e && e.message);
+          return { attempted: tokens.length, success: 0, failure: tokens.length };
+        }
+      };
+
+      const _writeNotifDoc = async ({ userId, userType, title, message, data }) => {
+        const ref = db.collection('notifications').doc();
+        await ref.set({
+          id: ref.id,
+          user_id: String(userId || ''),
+          user_type: String(userType || '').toLowerCase(),
+          title: String(title || ''),
+          message: String(message || ''),
+          type: String((data && data.type) || ''),
+          read: false,
+          view: false,
+          time: nowIsoStr,
+          created_at: nowIsoStr,
+          recipient_uid: String(userId || ''),
+          data: data || {},
+        });
+        return ref.id;
+      };
+
+      // (a) ADMIN notifications — every admin user, no amount threshold.
+      try {
+        const adminPayload = {
+          type: 'admin_payout_initiated',
+          recipient_type,
+          recipient_id: String(recipient_id || ''),
+          recipient_name: String(recipient_name || ''),
+          amount: payoutAmount.toFixed(2),
+          payout_id: String(payoutId || ''),
+          payout_reference: payoutRef,
+          payment_method: 'ozow_eft',
+          ...(booking_id ? { booking_id: String(booking_id) } : {}),
+        };
+        const adminTitle = `${typeLabel} initiated: ${amountStr}`;
+        const adminBody = `${amountStr} EFT to ${recipientLabel} (${bank_name} ${acctMasked}) ref ${payoutRef}.`;
+
+        const adminTokens = [];
+        const seenAdminTokens = new Set();
+        let adminSnap;
+        try {
+          adminSnap = await db.collection('users').where('isAdmin', '==', true).get();
+        } catch (qe) {
+          console.warn('[ozow-payout] admin lookup failed:', qe && qe.message);
+          adminSnap = { docs: [] };
+        }
+        for (const adminDoc of (adminSnap.docs || [])) {
+          const adminUidLocal = adminDoc.id;
+          // Write per-admin notification doc.
+          try {
+            await _writeNotifDoc({
+              userId: adminUidLocal,
+              userType: 'admin',
+              title: adminTitle,
+              message: adminBody,
+              data: adminPayload,
+            });
+          } catch (we) { console.warn('[ozow-payout] admin notif doc failed:', we && we.message); }
+          // Collect tokens.
+          for (const t of _collectTokens(adminDoc.data() || {})) {
+            if (!seenAdminTokens.has(t)) { seenAdminTokens.add(t); adminTokens.push(t); }
+          }
+        }
+        if (adminTokens.length > 0) {
+          await _sendPush({ tokens: adminTokens, title: adminTitle, body: adminBody, data: adminPayload });
+        }
+      } catch (anErr) {
+        console.warn('[ozow-payout] admin notification block failed (non-fatal):', anErr && anErr.message);
+      }
+
+      // (b) RECIPIENT notification — artisan / client only (partners have no app).
+      if (recipient_type === 'artisan' || recipient_type === 'client') {
+        try {
+          const recipientUType = recipient_type === 'client' ? 'user' : 'artisan';
+          const recipientTitle = recipient_type === 'client'
+            ? `Refund sent: ${amountStr}`
+            : `Payout sent: ${amountStr}`;
+          const recipientMsg = recipient_type === 'client'
+            ? `Your ${amountStr} refund has been sent to ${bank_name} ${acctMasked}. Funds arrive within minutes (RTC) or next business day. Ref ${payoutRef}.`
+            : `Your ${amountStr} payout has been sent to ${bank_name} ${acctMasked}. Funds arrive within minutes (RTC) or next business day. Ref ${payoutRef}.`;
+          const recipientPayload = {
+            type: recipient_type === 'client' ? 'refund_sent' : 'payout_sent',
+            amount: payoutAmount.toFixed(2),
+            payout_id: String(payoutId || ''),
+            payout_reference: payoutRef,
+            payment_method: 'ozow_eft',
+            bank_name: String(bank_name || ''),
+            account_masked: acctMasked,
+            ...(booking_id ? { booking_id: String(booking_id) } : {}),
+          };
+
+          await _writeNotifDoc({
+            userId: recipient_id,
+            userType: recipientUType,
+            title: recipientTitle,
+            message: recipientMsg,
+            data: recipientPayload,
+          });
+
+          // Collect tokens (users + serviceProvider for artisans).
+          const recipTokens = [];
+          const seenRecipTokens = new Set();
+          const addTokens = (arr) => {
+            for (const t of arr) {
+              if (!seenRecipTokens.has(t)) { seenRecipTokens.add(t); recipTokens.push(t); }
+            }
+          };
+          try {
+            const userDoc = await db.collection('users').doc(recipient_id).get();
+            if (userDoc.exists) addTokens(_collectTokens(userDoc.data() || {}));
+          } catch (_) {}
+          if (recipientUType === 'artisan') {
+            try {
+              const spDoc = await db.collection('serviceProvider').doc(recipient_id).get();
+              if (spDoc.exists) addTokens(_collectTokens(spDoc.data() || {}));
+            } catch (_) {}
+          }
+          if (recipTokens.length > 0) {
+            await _sendPush({ tokens: recipTokens, title: recipientTitle, body: recipientMsg, data: recipientPayload });
+          }
+        } catch (pnErr) {
+          console.warn('[ozow-payout] recipient notification failed (non-fatal):', pnErr && pnErr.message);
+        }
+      }
+    } catch (notifyErr) {
+      console.warn('[ozow-payout] notification block failed (non-fatal):', notifyErr && notifyErr.message);
+    }
+
     return res.json({
       ok: true,
       payout_id: payoutId,
@@ -7914,6 +8640,156 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
   }
 });
 
+// ─── Multi-Admin Governance Endpoints ─────────────────────────────────────
+
+// Owner-only: grant or revoke an admin tier on another user.
+// Sets the Firebase custom claim `role` on the target uid.
+app.post('/api/admin/grant-role', authMiddleware, async (req, res) => {
+  try {
+    const decoded = req.user;
+    const callerTier = resolveAdminTier(decoded);
+    if (callerTier !== 'owner') {
+      return res.status(403).json({ error: 'Only the owner can grant roles.' });
+    }
+    const { target_uid, role } = req.body || {};
+    if (!target_uid || !role) {
+      return res.status(400).json({ error: 'Missing target_uid or role.' });
+    }
+    const newRole = String(role).toLowerCase();
+    if (!ADMIN_TIERS.includes(newRole) && newRole !== 'none') {
+      return res.status(400).json({ error: `Invalid role. Must be one of: ${ADMIN_TIERS.join(', ')}, none.` });
+    }
+    // Preserve other claims (e.g. admin:true legacy). For 'none' we revoke.
+    const target = await admin.auth().getUser(String(target_uid)).catch(() => null);
+    if (!target) return res.status(404).json({ error: 'Target user not found.' });
+    const existingClaims = target.customClaims || {};
+    let newClaims;
+    if (newRole === 'none') {
+      newClaims = { ...existingClaims };
+      delete newClaims.role;
+      delete newClaims.admin;
+    } else {
+      newClaims = { ...existingClaims, role: newRole, admin: true };
+    }
+    await admin.auth().setCustomUserClaims(target.uid, newClaims);
+    await admin.firestore().collection('admin_role_audit').add({
+      target_uid: target.uid,
+      target_email: target.email || null,
+      changed_by: decoded.uid,
+      changed_by_email: decoded.email || null,
+      old_role: existingClaims.role || (existingClaims.admin ? 'admin(legacy)' : null),
+      new_role: newRole === 'none' ? null : newRole,
+      created_at: new Date().toISOString(),
+    });
+    res.json({ ok: true, target_uid: target.uid, new_role: newRole, message: 'Role updated. Target must re-login to refresh token.' });
+  } catch (e) {
+    console.error('grant-role error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Any authed admin: confirm a recent biometric prompt was passed. Used by
+// the admin Flutter app right after a local_auth success to unblock payouts
+// for the next 5 minutes without forcing a re-login.
+app.post('/api/admin/biometric-confirm', authMiddleware, async (req, res) => {
+  try {
+    const decoded = req.user;
+    const tier = resolveAdminTier(decoded);
+    if (!tier) return res.status(403).json({ error: 'Admin tier required.' });
+    await admin.firestore().collection('admin_biometric_confirms').doc(decoded.uid).set({
+      confirmed_at: new Date().toISOString(),
+      tier,
+    }, { merge: true });
+    res.json({ ok: true, valid_for_seconds: 300 });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// MFA: setup → returns secret + otpauth URI for QR scanning. Does NOT enable
+// until the admin confirms with a code at /enable.
+app.post('/api/admin/mfa/setup', authMiddleware, async (req, res) => {
+  try {
+    const decoded = req.user;
+    const tier = resolveAdminTier(decoded);
+    if (!tier) return res.status(403).json({ error: 'Admin tier required.' });
+    const secret = generateTotpSecret();
+    const issuer = encodeURIComponent('Square15');
+    const label = encodeURIComponent(decoded.email || decoded.uid);
+    const otpauth = `otpauth://totp/${issuer}:${label}?secret=${secret}&issuer=${issuer}&algorithm=SHA1&digits=6&period=30`;
+    await admin.firestore().collection('admin_mfa').doc(decoded.uid).set({
+      secret,
+      enabled: false,
+      pending_setup: true,
+      created_at: new Date().toISOString(),
+    }, { merge: true });
+    res.json({ secret, otpauth_uri: otpauth, message: 'Scan QR in Google Authenticator / Authy, then call /enable with the 6-digit code.' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/admin/mfa/enable', authMiddleware, async (req, res) => {
+  try {
+    const decoded = req.user;
+    const tier = resolveAdminTier(decoded);
+    if (!tier) return res.status(403).json({ error: 'Admin tier required.' });
+    const code = String(req.body?.code || '').trim();
+    const snap = await admin.firestore().collection('admin_mfa').doc(decoded.uid).get();
+    if (!snap.exists) return res.status(400).json({ error: 'Call /setup first.' });
+    const data = snap.data() || {};
+    if (!verifyTotp(data.secret, code)) {
+      return res.status(401).json({ error: 'Invalid code. Verify the time on your phone is correct and retry.' });
+    }
+    await snap.ref.set({ enabled: true, pending_setup: false, enabled_at: new Date().toISOString() }, { merge: true });
+    res.json({ ok: true, message: 'MFA enabled. Code will be required for payouts.' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/admin/mfa/disable', authMiddleware, async (req, res) => {
+  try {
+    const decoded = req.user;
+    const tier = resolveAdminTier(decoded);
+    if (!tier) return res.status(403).json({ error: 'Admin tier required.' });
+    const code = String(req.body?.code || '').trim();
+    const snap = await admin.firestore().collection('admin_mfa').doc(decoded.uid).get();
+    if (!snap.exists) return res.json({ ok: true, message: 'MFA already disabled.' });
+    const data = snap.data() || {};
+    if (!data.enabled) return res.json({ ok: true, message: 'MFA already disabled.' });
+    if (!verifyTotp(data.secret, code)) {
+      return res.status(401).json({ error: 'Invalid code. Cannot disable without proof of possession.' });
+    }
+    await snap.ref.set({ enabled: false, disabled_at: new Date().toISOString() }, { merge: true });
+    await admin.firestore().collection('admin_role_audit').add({
+      action: 'mfa_disabled',
+      target_uid: decoded.uid,
+      created_at: new Date().toISOString(),
+    });
+    res.json({ ok: true, message: 'MFA disabled.' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/admin/mfa/status', authMiddleware, async (req, res) => {
+  try {
+    const tier = resolveAdminTier(req.user);
+    if (!tier) return res.status(403).json({ error: 'Admin tier required.' });
+    const snap = await admin.firestore().collection('admin_mfa').doc(req.user.uid).get();
+    const data = snap.exists ? (snap.data() || {}) : {};
+    res.json({
+      enabled: data.enabled === true,
+      enrolled: snap.exists,
+      tier,
+      mfa_required_env: env('MFA_REQUIRED') === 'true',
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // -- Ozow Payout Verification Webhook --
 // Ozow calls this BEFORE executing a payout to confirm the request is
 // legitimate. We respond 200 with `verified:true` and echo the payoutId
@@ -7922,50 +8798,76 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
 // approve a fabricated payoutId.
 app.post('/api/ozow-payout-verify', async (req, res) => {
   try {
+    // Optional OZOW_ACCESS_TOKEN gate. Ozow's verification webhook does NOT
+    // send a custom token by default — it relies on the payoutId being
+    // unguessable + IP whitelist on their side. If you configure
+    // OZOW_ACCESS_TOKEN (24 chars) here AND in Ozow's portal webhook
+    // settings, we'll enforce it; otherwise allow Ozow's call through.
     const expected = process.env.OZOW_ACCESS_TOKEN || '';
-    if (!expected || expected.length !== 24) {
-      console.error('[ozow-payout-verify] BLOCKED: OZOW_ACCESS_TOKEN missing or not 24 chars');
-      return res.status(503).json({ verified: false, error: 'Verification not configured' });
+    if (expected && expected.length === 24) {
+      const provided = String(
+        req.headers['x-ozow-access-token'] ||
+        req.headers['access-token'] ||
+        req.body.accessToken ||
+        req.body.AccessToken ||
+        req.query.token ||
+        ''
+      );
+      const ok = provided.length === expected.length &&
+        crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(expected));
+      if (!ok) {
+        console.warn(`[ozow-payout-verify] UNAUTHENTICATED from ${req.ip}`);
+        return res.status(401).json({ verified: false, error: 'Invalid access token' });
+      }
     }
-    const provided = String(
-      req.headers['x-ozow-access-token'] ||
-      req.headers['access-token'] ||
-      req.body.accessToken ||
-      req.body.AccessToken ||
-      req.query.token ||
-      ''
-    );
-    const ok = provided.length === expected.length &&
-      crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(expected));
-    if (!ok) {
-      console.warn(`[ozow-payout-verify] UNAUTHENTICATED from ${req.ip}`);
-      return res.status(401).json({ verified: false, error: 'Invalid access token' });
-    }
+    console.log(`[ozow-payout-verify] incoming from ${req.ip} body=${JSON.stringify(req.body).slice(0,500)}`);
 
     const payoutId = req.body.payoutId || req.body.PayoutId || req.query.payoutId || null;
-    const bankReference = req.body.bankReference || req.body.BankReference || null;
+    const bankReference = req.body.bankReference || req.body.BankReference || req.body.merchantReference || req.body.MerchantReference || null;
 
     const db = admin.firestore();
-    let found = false;
+    let foundDoc = null;
     if (payoutId) {
       const s = await db.collection('payout_records').where('ozow_payout_id', '==', payoutId).limit(1).get();
-      if (!s.empty) found = true;
+      if (!s.empty) foundDoc = s.docs[0];
     }
-    if (!found && bankReference) {
-      const s = await db.collection('payout_records').where('bank_reference', '==', bankReference).limit(1).get();
-      if (!s.empty) found = true;
+    if (!foundDoc && bankReference) {
+      // Try merchant_reference first (current schema), then legacy bank_reference field.
+      let s = await db.collection('payout_records').where('merchant_reference', '==', bankReference).limit(1).get();
+      if (s.empty) s = await db.collection('payout_records').where('bank_reference', '==', bankReference).limit(1).get();
+      if (!s.empty) foundDoc = s.docs[0];
     }
 
-    if (!found) {
+    if (!foundDoc) {
       console.warn(`[ozow-payout-verify] payoutId=${payoutId} ref=${bankReference} not found in payout_records`);
       return res.status(404).json({ verified: false, error: 'Payout not found' });
     }
 
-    console.log(`[ozow-payout-verify] APPROVED payoutId=${payoutId} ref=${bankReference}`);
+    const rec = foundDoc.data() || {};
+    const encryptionKey = rec.encryption_key || rec.encryptionKey || null;
+    if (!encryptionKey) {
+      console.warn(`[ozow-payout-verify] payout ${foundDoc.id} has no encryption_key (legacy record?)`);
+      return res.status(409).json({ verified: false, error: 'Encryption key missing on payout record' });
+    }
+
+    // Mark record as verified for audit
+    try {
+      await foundDoc.ref.update({
+        verification_at: new Date().toISOString(),
+        verified: true,
+      });
+    } catch (_) {}
+
+    console.log(`[ozow-payout-verify] APPROVED payoutId=${payoutId} ref=${bankReference} - returning encryption key`);
+    // Ozow expects the encryption key in the response so it can decrypt the
+    // accountNumber field. Field names tried by Ozow: encryptionKey / EncryptionKey.
     return res.status(200).json({
       verified: true,
-      payoutId: payoutId || bankReference,
-      bankReference: bankReference,
+      payoutId: payoutId || rec.ozow_payout_id || null,
+      bankReference: bankReference || rec.merchant_reference || null,
+      merchantReference: rec.merchant_reference || null,
+      encryptionKey: encryptionKey,
+      EncryptionKey: encryptionKey,
     });
   } catch (e) {
     console.error('[ozow-payout-verify] error:', e && e.message);
@@ -8372,11 +9274,11 @@ app.post('/api/admin/payout-batches/rebuild-now', authMiddleware, async (req, re
     const monDate = new Date(sast); monDate.setUTCDate(sast.getUTCDate() - ((sast.getUTCDay() + 6) % 7));
     const weekKey = `wk_${monDate.toISOString().slice(0, 10)}`;
     const existing = await db.collection('payout_batches').doc(weekKey).get();
-    if (existing.exists && existing.data().status === 'pending_approval') {
-      await db.collection('payout_batches').doc(weekKey).delete();
-    } else if (existing.exists) {
+    if (existing.exists && existing.data().status !== 'pending_approval') {
       return res.status(409).json({ error: `Batch ${weekKey} is in status "${existing.data().status}" — cannot rebuild.` });
     }
+    // Don't delete — _maybeBuildWeeklyBatch will overwrite via .set() and
+    // preserve notified_at so we don't re-spam admins on every rebuild.
     const result = await _maybeBuildWeeklyBatch(true);
     if (result && result.error) return res.status(500).json(result);
     res.json({ ok: true, ...result });
@@ -9670,9 +10572,9 @@ app.post('/api/openai-debug', async (req, res) => {
 
 app.post('/api/chat-bot', authMiddleware, rateLimitBy('chat_bot', 60, 5 * 60 * 1000), async (req, res) => {
   try {
-    const groqKey = process.env.GROQ_API_KEY;
-    if (!groqKey) {
-      return res.status(503).json({ error: 'chat_bot_unconfigured', message: 'GROQ_API_KEY not set in server env' });
+    const openaiKey = process.env.OPENAI_API_KEY;
+    if (!openaiKey) {
+      return res.status(503).json({ error: 'chat_bot_unconfigured', message: 'OPENAI_API_KEY not set in server env' });
     }
     const question = String((req.body && req.body.question) || '').trim();
     if (!question) {
@@ -9683,14 +10585,14 @@ app.post('/api/chat-bot', authMiddleware, rateLimitBy('chat_bot', 60, 5 * 60 * 1
     }
 
     const fetchFn = (typeof fetch === 'function') ? fetch : require('node-fetch');
-    const upstream = await fetchFn('https://api.groq.com/openai/v1/chat/completions', {
+    const upstream = await fetchFn('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${groqKey}`,
+        'Authorization': `Bearer ${openaiKey}`,
       },
       body: JSON.stringify({
-        model: 'llama-3.3-70b-versatile',
+        model: process.env.LIZZY_MODEL || 'gpt-4o-mini',
         messages: [
           {
             role: 'system',
@@ -9716,7 +10618,7 @@ app.post('/api/chat-bot', authMiddleware, rateLimitBy('chat_bot', 60, 5 * 60 * 1
 
     if (!upstream.ok) {
       const txt = await upstream.text().catch(() => '');
-      console.warn('[chat_bot] Groq upstream error', upstream.status, txt.slice(0, 300));
+      console.warn('[chat_bot] OpenAI upstream error', upstream.status, txt.slice(0, 300));
       return res.status(502).json({ error: 'upstream_error', status: upstream.status });
     }
 
@@ -9726,6 +10628,313 @@ app.post('/api/chat-bot', authMiddleware, rateLimitBy('chat_bot', 60, 5 * 60 * 1
   } catch (e) {
     console.error('[chat_bot] error:', e && e.message);
     return res.status(500).json({ error: 'chat_bot_error', message: e && e.message });
+  }
+});
+
+/**
+ * Debug-only end-to-end test of Lizzy text. Same OpenAI pipeline as /api/chat-bot
+ * but gated by INTERNAL_API_SECRET so automated E2E suites can exercise the
+ * real OpenAI response without minting Firebase ID tokens.
+ * POST /debug/lizzy-text-e2e   body: { question }
+ */
+app.post('/debug/lizzy-text-e2e', async (req, res) => {
+  try {
+    const expected = process.env.INTERNAL_API_SECRET || 'sq15_internal_2026_xK9mP3';
+    if (req.headers['x-internal-secret'] !== expected) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+    const openaiKey = process.env.OPENAI_API_KEY;
+    if (!openaiKey) return res.status(503).json({ error: 'OPENAI_API_KEY not set' });
+    const question = String((req.body && req.body.question) || '').trim();
+    if (!question) return res.status(400).json({ error: 'question required' });
+    if (question.length > 2000) return res.status(400).json({ error: 'question too long' });
+    const fetchFn = (typeof fetch === 'function') ? fetch : require('node-fetch');
+    const t0 = Date.now();
+    const upstream = await fetchFn('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${openaiKey}` },
+      body: JSON.stringify({
+        model: process.env.LIZZY_MODEL || 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: 'You are Lizzy, the AI assistant for Square 15 Facility Solutions, a property maintenance company in South Africa. You help clients with information about plumbing, electrical, painting, carpentry, roofing, tiling, locksmith, and other maintenance services. Be helpful, friendly, and concise. Amounts are in South African Rand (R). For booking or account actions, suggest the user use the full AI Chat or the app\u2019s booking flow.\n\nTRUST & SAFETY FACTS \u2014 use ONLY these wordings, never invent warranties, insurance, criminal-background checks, or licence claims:\n- ESCROW: every payment is held by Square 15 and only released to the artisan after the customer confirms the work is done right.\n- VETTING: every active artisan is registered with Square 15, has submitted government ID, and is rated by past customers.\n- IDENTITY CHECK: when the artisan is on the way, the customer is sent the artisan\'s profile photo on WhatsApp so they can match the face at the door.\n- REFUND POLICY: full refund if cancelled before work starts; partial refund (less materials already bought + time worked) if cancelled mid-job; if work is finished but the customer is not satisfied, escrow stays locked until admin investigates. Wallet refunds are instant; card refunds 3\u20135 business days.\n- PERSONAL SAFETY: tell the user that if they ever feel unsafe they can reply "help" or "emergency" to alert support; for life-threatening emergencies remind them to call 10111 / 10177 first.\n- DO NOT promise workmanship warranties, free reworks, insurance cover, or licence numbers. If asked, say our standard protection is the escrow + refund policy and offer to connect them with admin.' },
+          { role: 'user', content: question },
+        ],
+        max_tokens: 1000,
+        temperature: 0.7,
+      }),
+    });
+    const ms = Date.now() - t0;
+    if (!upstream.ok) {
+      const txt = await upstream.text().catch(() => '');
+      return res.status(502).json({ error: 'upstream_error', status: upstream.status, body: txt.slice(0, 500), ms });
+    }
+    const data = await upstream.json();
+    const answer = ((data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '').trim();
+    return res.json({ answer, ms, tokens: data && data.usage });
+  } catch (e) {
+    return res.status(500).json({ error: 'lizzy_text_e2e_error', message: e && e.message });
+  }
+});
+
+/**
+ * Debug-only mint of a real Firebase ID token for an existing UID. Used by
+ * E2E test harnesses that need to call authMiddleware-gated endpoints
+ * (e.g. /api/voice/start) end-to-end. Requires INTERNAL_API_SECRET +
+ * FIREBASE_WEB_API_KEY env vars. The minted token is short-lived (~1h).
+ * POST /debug/mint-id-token   body: { uid }
+ */
+app.post('/debug/mint-id-token', async (req, res) => {
+  try {
+    const expected = process.env.INTERNAL_API_SECRET || 'sq15_internal_2026_xK9mP3';
+    if (req.headers['x-internal-secret'] !== expected) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+    const webKey = process.env.FIREBASE_WEB_API_KEY || process.env.FIREBASE_API_KEY;
+    if (!webKey) return res.status(503).json({ error: 'FIREBASE_WEB_API_KEY not set' });
+    const uid = String((req.body && req.body.uid) || '').trim();
+    if (!uid) return res.status(400).json({ error: 'uid required' });
+    const customToken = await admin.auth().createCustomToken(uid);
+    const fetchFn = (typeof fetch === 'function') ? fetch : require('node-fetch');
+    const r = await fetchFn(`https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken?key=${webKey}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: customToken, returnSecureToken: true }),
+    });
+    const data = await r.json();
+    if (!r.ok) return res.status(502).json({ error: 'token_exchange_failed', upstream: data });
+    return res.json({ uid, idToken: data.idToken, expiresIn: data.expiresIn });
+  } catch (e) {
+    return res.status(500).json({ error: 'mint_token_error', message: e && e.message });
+  }
+});
+
+/**
+ * DEBUG: Voice agent breadcrumb sink. The voice agent worker POSTs here
+ * (no auth) whenever it receives a text_input or performs a key step.
+ * The /debug/voice-e2e endpoint can then return the crumbs alongside its
+ * Firestore diff so we can prove the agent saw the message.
+ */
+const _voiceBreadcrumbs = new Map(); // session_id -> [{event, text, ts, ...}]
+app.post('/debug/voice-breadcrumb', express.json(), (req, res) => {
+  try {
+    const b = req.body || {};
+    const sid = String(b.session_id || '').trim();
+    if (!sid) return res.status(400).json({ error: 'session_id required' });
+    const list = _voiceBreadcrumbs.get(sid) || [];
+    list.push({ ...b, ts: Date.now() });
+    if (list.length > 50) list.shift();
+    _voiceBreadcrumbs.set(sid, list);
+    // Cap map size
+    if (_voiceBreadcrumbs.size > 200) {
+      const firstKey = _voiceBreadcrumbs.keys().next().value;
+      _voiceBreadcrumbs.delete(firstKey);
+    }
+    return res.json({ ok: true });
+  } catch (e) {
+    return res.status(500).json({ error: 'breadcrumb_error', message: e && e.message });
+  }
+});
+
+// GET helper to inspect all breadcrumbs (or filter by prefix)
+app.get('/debug/voice-breadcrumb', (req, res) => {
+  const expected = process.env.INTERNAL_API_SECRET || 'sq15_internal_2026_xK9mP3';
+  if (req.headers['x-internal-secret'] !== expected) return res.status(403).json({ error: 'forbidden' });
+  const prefix = String(req.query.prefix || '').trim();
+  const out = {};
+  for (const [k, v] of _voiceBreadcrumbs.entries()) {
+    if (!prefix || k.startsWith(prefix)) out[k] = v;
+  }
+  res.json({ count: Object.keys(out).length, entries: out });
+});
+
+/**
+ * DEBUG: Real end-to-end Lizzy voice test (text-driven).
+ * INTERNAL_API_SECRET-gated.
+ * Body: { idToken, message, roomName?, waitMs? }
+ *   - Dispatches the voice agent into a fresh room
+ *   - Publishes credentials (firebase_token) via LiveKit data channel
+ *   - Publishes a square15_app text_input action so the agent's LLM processes the
+ *     message AS IF the user spoke it — agent tools fire, real Firestore artifacts created.
+ * Returns the room name + dispatch info so the caller can poll Firestore.
+ */
+app.post('/debug/voice-e2e', async (req, res) => {
+  try {
+    const expected = process.env.INTERNAL_API_SECRET || 'sq15_internal_2026_xK9mP3';
+    if (req.headers['x-internal-secret'] !== expected) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+    const idToken = String((req.body && req.body.idToken) || '').trim();
+    const message = String((req.body && req.body.message) || '').trim();
+    if (!idToken) return res.status(400).json({ error: 'idToken required' });
+    if (!message) return res.status(400).json({ error: 'message required' });
+    const waitMs = Math.min(20000, Math.max(500, Number(req.body && req.body.waitMs) || 6000));
+
+    // Verify the ID token so we can return uid in the response
+    let uid = null;
+    try {
+      const decoded = await admin.auth().verifyIdToken(idToken);
+      uid = decoded.uid;
+    } catch (e) {
+      return res.status(401).json({ error: 'invalid_id_token', message: e && e.message });
+    }
+
+    const wsUrl = getLiveKitWsUrl();
+    const httpUrl = getLiveKitHttpUrl();
+    const apiKey = env('LIVEKIT_API_KEY');
+    const apiSecret = env('LIVEKIT_API_SECRET');
+    if (!wsUrl || !apiKey || !apiSecret) {
+      return res.status(503).json({ error: 'livekit_env_missing' });
+    }
+    const agentName = getAgentName();
+    const roomName = (req.body && req.body.roomName) || `voice-e2e-${Date.now()}`;
+    const sessionId = `e2e-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+
+    // 1) Dispatch agent into the room (creates the room if it doesn't exist)
+    const dispatchClient = new AgentDispatchClient(httpUrl, apiKey, apiSecret);
+    const dispatch = await dispatchClient.createDispatch(roomName, agentName, {
+      metadata: JSON.stringify({ source: 'debug-voice-e2e', uid, sessionId }),
+    });
+
+    // 2) Push credentials packet so the agent can talk to backend on behalf of uid
+    const roomSvc = new RoomServiceClient(httpUrl, apiKey, apiSecret);
+    const encoder = new TextEncoder();
+    const credentials = {
+      type: 'square15_voice_credentials',
+      firebase_token: idToken,
+      session_id: sessionId,
+      session_nonce: sessionId,
+    };
+
+    // Wait for the agent worker to actually join the room before publishing.
+    // Without this, sendData will fail because the room has no participants.
+    const joinDeadline = Date.now() + 15000;
+    let agentReady = false;
+    while (Date.now() < joinDeadline) {
+      try {
+        const parts = await roomSvc.listParticipants(roomName);
+        if (parts && parts.length > 0) { agentReady = true; break; }
+      } catch (_) { /* room may not exist yet */ }
+      await new Promise(r => setTimeout(r, 500));
+    }
+    if (!agentReady) {
+      return res.status(504).json({ error: 'agent_did_not_join', roomName, dispatch });
+    }
+
+    // Wait for the agent's session to be fully started (session.start() returned)
+    // — only then can generate_reply produce assistant turns. The agent posts
+    // a `session_started` event in the `agent-ready-{roomName}` breadcrumb.
+    const readyKey = `agent-ready-${roomName}`;
+    const readyDeadline = Date.now() + 60000;
+    let sessionStarted = false;
+    while (Date.now() < readyDeadline) {
+      const list = _voiceBreadcrumbs.get(readyKey) || [];
+      if (list.some(c => c.event === 'session_started')) { sessionStarted = true; break; }
+      await new Promise(r => setTimeout(r, 500));
+    }
+    if (!sessionStarted) {
+      console.warn(`voice-e2e: session_started breadcrumb not received for ${roomName} after 60s; sending anyway`);
+    }
+
+    const _crumb = (event, text) => {
+      const list = _voiceBreadcrumbs.get(sessionId) || [];
+      list.push({ session_id: sessionId, event, text, ts: Date.now() });
+      _voiceBreadcrumbs.set(sessionId, list);
+    };
+
+    _crumb('agent_joined', `participants=${(await roomSvc.listParticipants(roomName)).map(p=>p.identity).join(',')}`);
+
+    try {
+      await roomSvc.sendData(
+        roomName,
+        encoder.encode(JSON.stringify(credentials)),
+        DataPacket_Kind.RELIABLE,
+        { topic: 'square15_creds' }
+      );
+      _crumb('creds_sent', `topic=square15_creds bytes=${JSON.stringify(credentials).length}`);
+    } catch (e) {
+      _crumb('creds_send_err', e && e.message || String(e));
+    }
+
+    // Give the agent a moment to ingest credentials before sending the user turn.
+    await new Promise(r => setTimeout(r, 1500));
+
+    // 3) Push the text_input action — agent will process it as user speech
+    const textInput = {
+      type: 'square15_app',
+      action: 'text_input',
+      payload: { text: message },
+    };
+    try {
+      await roomSvc.sendData(
+        roomName,
+        encoder.encode(JSON.stringify(textInput)),
+        DataPacket_Kind.RELIABLE,
+        { topic: 'square15_app' }
+      );
+      _crumb('text_input_sent', `topic=square15_app text="${message.slice(0,80)}"`);
+    } catch (e) {
+      _crumb('text_input_send_err', e && e.message || String(e));
+    }
+
+    // NOTE: deliberately NOT re-sending without topic. The duplicate delivery
+    // pollutes session.history with two identical [user] turns within ~1s,
+    // which causes gpt-4o-mini to emit empty completions. Topic-filtered
+    // delivery via `square15_app` is reliable (confirmed by text_input_received
+    // breadcrumbs firing 100% of runs).
+
+    // 4) Wait for the agent to run its LLM + tools
+    await new Promise(r => setTimeout(r, waitMs));
+
+    // 5) Diff Firestore — return newly-created futureBookings for this uid
+    let newBookings = [];
+    try {
+      const cutoffMs = Date.now() - waitMs - 30000;
+      const snap = await firestore.collection('futureBookings')
+        .where('user_id', '==', uid)
+        .orderBy('created_at', 'desc')
+        .limit(10)
+        .get();
+      snap.forEach(doc => {
+        const d = doc.data() || {};
+        let createdMs = 0;
+        try {
+          const c = d.created_at;
+          if (c && typeof c.toMillis === 'function') createdMs = c.toMillis();
+          else if (typeof c === 'string') createdMs = Date.parse(c);
+          else if (typeof c === 'number') createdMs = c;
+        } catch (_) {}
+        if (createdMs >= cutoffMs) {
+          newBookings.push({
+            id: doc.id,
+            category: d.category_name || d.category || null,
+            problem_description: d.problem_description || null,
+            is_rfq: !!(d.is_rfq || d.isRFQ),
+            service_address: d.service_address || null,
+            created_by: d.created_by || d.createdBy || null,
+            created_at_ms: createdMs,
+          });
+        }
+      });
+    } catch (qe) {
+      console.warn('voice-e2e firestore diff error:', qe.message);
+    }
+
+    return res.json({
+      ok: true,
+      uid,
+      roomName,
+      sessionId,
+      dispatchId: dispatch && (dispatch.id || dispatch.dispatchId) || null,
+      newBookings,
+      newBookingsCount: newBookings.length,
+      breadcrumbs: _voiceBreadcrumbs.get(sessionId) || [],
+      message: newBookings.length
+        ? `agent created ${newBookings.length} new futureBookings doc(s)`
+        : 'agent dispatched + text_input delivered; no new bookings detected (check agent logs)',
+    });
+  } catch (e) {
+    console.error('debug/voice-e2e error:', e);
+    return res.status(500).json({ error: 'voice_e2e_error', message: e && e.message });
   }
 });
 
@@ -10455,18 +11664,40 @@ app.post('/api/admin/self-bootstrap-claims', adminLimiter, async (req, res) => {
     }
 
     const uid = decoded.uid;
+    // Short-circuit: if this token already carries an admin tier custom claim
+    // (e.g. an owner bootstrapped from OWNER_UID), there is nothing to do.
+    // Skipping the Firestore gate avoids locking owners out when their user
+    // doc was created without the legacy `isVerified` field.
+    const existingClaimRole = String(decoded.role || '').toLowerCase();
+    if (existingClaimRole === 'owner' || existingClaimRole === 'finance' ||
+        existingClaimRole === 'ops' || existingClaimRole === 'support' ||
+        existingClaimRole === 'auditor' || decoded.admin === true) {
+      return res.json({
+        success: true,
+        uid,
+        message: 'Admin claim already present. No action taken.',
+        existing_role: existingClaimRole || 'admin',
+      });
+    }
     const userDoc = await firestore.collection('users').doc(uid).get();
     if (!userDoc.exists) return res.status(403).json({ error: 'User not found in Firestore' });
     const u = userDoc.data() || {};
-    if (u.isAdmin !== true || u.isVerified !== true) {
-      console.warn(`[self-bootstrap-claims] DENIED for ${uid}: isAdmin=${u.isAdmin} isVerified=${u.isVerified}`);
+    // Accept either the legacy gate (isAdmin && isVerified) OR a Firestore
+    // `admin_tier` value set by the owner via the Admin Roles UI. This avoids
+    // having to backfill `isVerified` on every owner-created admin doc.
+    const tier = String(u.admin_tier || '').toLowerCase();
+    const tierGrants = ['owner', 'finance', 'ops', 'support', 'auditor'].includes(tier);
+    const legacyGrants = u.isAdmin === true && u.isVerified === true;
+    if (!tierGrants && !legacyGrants) {
+      console.warn(`[self-bootstrap-claims] DENIED for ${uid}: isAdmin=${u.isAdmin} isVerified=${u.isVerified} admin_tier=${u.admin_tier || 'none'}`);
       return res.status(403).json({ error: 'Not an admin user' });
     }
 
     // Preserve any other claims that may already be set.
     const existing = (decoded && decoded.claims) || {};
-    await admin.auth().setCustomUserClaims(uid, { ...existing, role: 'admin', admin: true });
-    console.log(`? self-bootstrap-claims: granted admin to ${uid} (${u.email || ''})`);
+    const grantRole = tierGrants ? tier : 'admin';
+    await admin.auth().setCustomUserClaims(uid, { ...existing, role: grantRole, admin: true });
+    console.log(`✅ self-bootstrap-claims: granted ${grantRole} to ${uid} (${u.email || ''})`);
     return res.json({
       success: true,
       uid,
@@ -11335,12 +12566,187 @@ app.post('/api/finance/fraud-alerts/dismiss', adminLimiter, async (req, res) => 
 });
 
 // 404 handler
-app.use((req, res) => {
-  res.status(404).json({
-    error: 'Not found',
-    message: 'The requested endpoint does not exist'
-  });
+// ─────────────────────────────────────────────────────────────────────────────
+// PayJustNow direct integration (scaffolding — keys arrive later).
+//
+// Flow when live:
+//   1. Client POSTs /api/bnpl/payjustnow/create-order with { amount, taskId, ... }
+//   2. Backend reads app_config/bnpl_payJustNow → api_key, sandbox/prod flag.
+//   3. Backend POSTs to PayJustNow /order endpoint, receives token + redirectUrl.
+//   4. Backend stores bnpl_orders/{orderId} with status='pending'.
+//   5. Returns { redirect_url, token, order_id } to client.
+//   6. Client opens WebView → on confirm redirect, client posts /api/bnpl/payjustnow/capture.
+//   7. Backend posts to PayJustNow /order/{token}/capture, marks bnpl_orders captured.
+//   8. PayJustNow webhook → /api/bnpl/payjustnow/webhook (signed; we verify).
+//
+// Right now every endpoint returns 503 because we have no API key.
+// When PayJustNow sends us their keys, fill PAYJUSTNOW_* config values and
+// flip the COMING_SOON guard at the top — no client changes needed.
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function getPayJustNowConfig() {
+  try {
+    const snap = await admin.firestore()
+      .collection('app_config').doc('bnpl_payJustNow').get();
+    if (!snap.exists) return null;
+    const d = snap.data() || {};
+    if (d.enabled !== true) return null;
+    const apiKey = (d.api_key || '').toString();
+    if (!apiKey) return null;
+    return {
+      apiKey,
+      useSandbox: d.use_sandbox !== false,
+      confirmUrl: d.confirm_url || 'https://square15.co.za/bnpl/payJustNow/confirm',
+      cancelUrl:  d.cancel_url  || 'https://square15.co.za/bnpl/payJustNow/cancel',
+      // Real base URLs will be confirmed by PayJustNow during onboarding.
+      // Until then they live in env so we don't have to redeploy to fix them.
+      sandboxBase: env('PAYJUSTNOW_SANDBOX_BASE') || '',
+      productionBase: env('PAYJUSTNOW_PRODUCTION_BASE') || '',
+      webhookSecret: env('PAYJUSTNOW_WEBHOOK_SECRET') || '',
+    };
+  } catch (e) {
+    console.error('[payjustnow] config load error:', e.message);
+    return null;
+  }
+}
+
+app.post('/api/bnpl/payjustnow/create-order', authMiddleware, assistantLimiter, async (req, res) => {
+  const cfg = await getPayJustNowConfig();
+  if (!cfg) {
+    return res.status(503).json({
+      ok: false,
+      error: 'payjustnow_not_configured',
+      message: 'PayJustNow integration is pending merchant approval. Please use another payment method.',
+    });
+  }
+  const base = cfg.useSandbox ? cfg.sandboxBase : cfg.productionBase;
+  if (!base) {
+    return res.status(503).json({
+      ok: false,
+      error: 'payjustnow_base_url_missing',
+      message: 'PayJustNow base URL not configured. Set PAYJUSTNOW_SANDBOX_BASE / PAYJUSTNOW_PRODUCTION_BASE on Render.',
+    });
+  }
+
+  const { amount, taskId, consumer } = req.body || {};
+  if (!amount || isNaN(parseFloat(amount))) {
+    return res.status(400).json({ ok: false, error: 'invalid_amount' });
+  }
+  const orderId = `SQ15-PJN-${Date.now()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+  const body = {
+    amount: parseFloat(amount).toFixed(2),
+    merchantReference: orderId,
+    merchant: {
+      redirectConfirmUrl: cfg.confirmUrl,
+      redirectCancelUrl: cfg.cancelUrl,
+    },
+    consumer: consumer || {},
+    description: `Square 15 Maintenance - Job ${taskId || ''}`,
+    taxAmount: '0.00',
+    shippingAmount: '0.00',
+  };
+
+  try {
+    const fetch = (await import('node-fetch')).default;
+    const resp = await fetch(`${base}/order`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${cfg.apiKey}`,
+      },
+      body: JSON.stringify(body),
+    });
+    const text = await resp.text();
+    let data = {};
+    try { data = JSON.parse(text); } catch (_) {}
+    if (!resp.ok) {
+      console.warn(`[payjustnow] create-order ${resp.status}: ${text.slice(0, 300)}`);
+      return res.status(502).json({ ok: false, error: 'provider_error', status: resp.status });
+    }
+    const token = data.token || data.id || '';
+    const redirectUrl = data.redirectCheckoutUrl || data.redirect_url || data.checkoutUrl || '';
+    if (!token || !redirectUrl) {
+      return res.status(502).json({ ok: false, error: 'provider_response_missing_fields' });
+    }
+    await admin.firestore().collection('bnpl_orders').doc(orderId).set({
+      order_id: orderId,
+      provider: 'payJustNow',
+      provider_name: 'PayJustNow',
+      token,
+      amount: parseFloat(amount).toFixed(2),
+      task_id: taskId || null,
+      uid: req.user && req.user.uid || null,
+      status: 'pending',
+      sandbox: cfg.useSandbox,
+      created_at: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+    return res.json({ ok: true, order_id: orderId, token, redirect_url: redirectUrl });
+  } catch (e) {
+    console.error('[payjustnow] create-order error:', e.message);
+    return res.status(502).json({ ok: false, error: 'network_error', message: e.message });
+  }
 });
+
+app.post('/api/bnpl/payjustnow/capture', authMiddleware, async (req, res) => {
+  const cfg = await getPayJustNowConfig();
+  if (!cfg) return res.status(503).json({ ok: false, error: 'payjustnow_not_configured' });
+  const base = cfg.useSandbox ? cfg.sandboxBase : cfg.productionBase;
+  const { token, orderId } = req.body || {};
+  if (!token) return res.status(400).json({ ok: false, error: 'missing_token' });
+
+  try {
+    const fetch = (await import('node-fetch')).default;
+    const resp = await fetch(`${base}/order/${encodeURIComponent(token)}/capture`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${cfg.apiKey}` },
+    });
+    const ok = resp.ok;
+    if (orderId) {
+      await admin.firestore().collection('bnpl_orders').doc(orderId).set({
+        status: ok ? 'captured' : 'capture_failed',
+        captured_at: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+    }
+    return res.json({ ok, status: resp.status });
+  } catch (e) {
+    console.error('[payjustnow] capture error:', e.message);
+    return res.status(502).json({ ok: false, error: 'network_error' });
+  }
+});
+
+// PayJustNow webhook (signature verification — exact header name TBD by PJN docs).
+app.post('/api/bnpl/payjustnow/webhook', express.raw({ type: '*/*' }), async (req, res) => {
+  const cfg = await getPayJustNowConfig();
+  if (!cfg) return res.status(503).send('not_configured');
+  const rawBody = req.body && req.body.length ? req.body.toString('utf8') : '';
+  const signature = req.header('x-payjustnow-signature') || req.header('x-signature') || '';
+  if (cfg.webhookSecret) {
+    const expected = crypto.createHmac('sha256', cfg.webhookSecret)
+      .update(rawBody).digest('hex');
+    if (signature && signature.toLowerCase() !== expected.toLowerCase()) {
+      console.warn('[payjustnow] webhook signature mismatch');
+      return res.status(401).send('invalid_signature');
+    }
+  }
+  let payload = {};
+  try { payload = JSON.parse(rawBody); } catch (_) {}
+  const orderId = payload.merchantReference || payload.order_id || '';
+  const status = (payload.orderStatus || payload.status || '').toString().toLowerCase();
+  if (orderId) {
+    try {
+      await admin.firestore().collection('bnpl_orders').doc(orderId).set({
+        webhook_status: status,
+        webhook_received_at: admin.firestore.FieldValue.serverTimestamp(),
+        webhook_payload: payload,
+      }, { merge: true });
+    } catch (e) {
+      console.error('[payjustnow] webhook persist error:', e.message);
+    }
+  }
+  res.json({ ok: true });
+});
+
+
 
 // Export app for serverless/tests
 module.exports = app;
@@ -11359,13 +12765,70 @@ if (require.main === module) {
     // DO NOT exit for non-fatal errors. Render will restart us only if truly broken.
   });
 
-  app.listen(PORT, () => {
+  app.listen(PORT, async () => {
     console.log('?? Square 15 Livekit Backend');
     console.log(`?? Server running on port ${PORT}`);
     console.log(`?? Health check: http://localhost:${PORT}/health`);
     console.log(`?? Token endpoint: http://localhost:${PORT}/api/token`);
     console.log(`?? Voice start endpoint: http://localhost:${PORT}/api/voice/start`);
     console.log(`?? Environment: ${process.env.NODE_ENV}`);
+    // ─── Gap #14: Ozow prod safety at startup ───
+    try {
+      const ozowErrs = assertOzowProdSafety();
+      if (ozowErrs.length > 0) {
+        console.error('🚨 OZOW PROD SAFETY WARNING AT STARTUP:', ozowErrs);
+        try {
+          admin.firestore().collection('error_logs').add({
+            error_type: 'ozow_prod_safety_warning_startup',
+            severity: 'critical',
+            source: 'livekit_backend',
+            errors: ozowErrs,
+            created_at: new Date().toISOString(),
+          });
+        } catch (_) {}
+      } else if (env('OZOW_IS_TEST') === 'true') {
+        console.log('✅ Ozow: SANDBOX mode (no money will move).');
+      } else {
+        console.log('✅ Ozow: LIVE mode — credentials passed safety check.');
+      }
+    } catch (e) { console.warn('Ozow safety assertion threw:', e.message); }
+
+    // ─── Owner bootstrap ───
+    // If OWNER_UID is set in env, ensure that uid has the `owner` custom
+    // claim. Idempotent and safe to run on every startup.
+    try {
+      initFirebaseIfPossible();
+      if (firebaseInitError) {
+        console.warn('Owner bootstrap skipped (Firebase not configured):', firebaseInitError.message);
+        throw firebaseInitError;
+      }
+      const ownerUid = env('OWNER_UID');
+      if (ownerUid) {
+        const user = await admin.auth().getUser(ownerUid).catch(() => null);
+        if (user) {
+          const existing = user.customClaims || {};
+          if (existing.role !== 'owner') {
+            await admin.auth().setCustomUserClaims(ownerUid, { ...existing, role: 'owner', admin: true });
+            await admin.firestore().collection('admin_role_audit').add({
+              action: 'owner_bootstrapped',
+              target_uid: ownerUid,
+              target_email: user.email || null,
+              old_role: existing.role || null,
+              new_role: 'owner',
+              changed_by: 'system_bootstrap',
+              created_at: new Date().toISOString(),
+            });
+            console.log(`👑 Owner role granted to ${ownerUid} (${user.email || '?'})`);
+          } else {
+            console.log(`👑 Owner already configured: ${ownerUid} (${user.email || '?'})`);
+          }
+        } else {
+          console.warn(`⚠️ OWNER_UID=${ownerUid} not found in Firebase Auth`);
+        }
+      } else {
+        console.warn('⚠️ No OWNER_UID env var set. No admin can grant roles or bypass daily caps until one is configured.');
+      }
+    } catch (e) { console.warn('Owner bootstrap error:', e.message); }
     // LK-13: hard refusal � if anyone leaves the no-auth voice flag enabled in
     // production, log loudly to error_logs and ALSO refuse to enable it (the
     // flag is read again at request time; we set NODE_ENV-dependent override).
