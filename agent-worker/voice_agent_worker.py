@@ -2738,6 +2738,23 @@ async def entrypoint(ctx: JobContext):
             if not text or not text.strip():
                 return
             logger.info(f"📦 data_received: len={len(text)}, preview={text[:100]}...")
+            # ALWAYS breadcrumb so we know the data channel reached the agent
+            try:
+                crumb_url = f"{backend_url.rstrip('/')}/debug/voice-breadcrumb"
+                # Try to extract session_id from the payload itself; if not present
+                # we still want to know SOMETHING arrived, so use a wildcard key.
+                try:
+                    parsed = json.loads(text)
+                except Exception:
+                    parsed = {}
+                sid_for_crumb = (parsed.get('session_id') if isinstance(parsed, dict) else None) or session_id or 'unknown'
+                asyncio.create_task(_post_breadcrumb(crumb_url, {
+                    'session_id': sid_for_crumb,
+                    'event': 'data_received',
+                    'text': text[:300],
+                }))
+            except Exception:
+                pass
             msg = json.loads(text)
             if not isinstance(msg, dict):
                 return
