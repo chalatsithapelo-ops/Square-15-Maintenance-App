@@ -8344,6 +8344,26 @@ app.post('/debug/inject-message', requireInternalSecret, async (req, res) => {
   }
 });
 
+// 1b) Mint a Firebase ID token for any uid (E2E auth for livekit-backend endpoints).
+app.post('/debug/mint-id-token', requireInternalSecret, async (req, res) => {
+  try {
+    const uid = String((req.body && req.body.uid) || '').trim();
+    if (!uid) return res.status(400).json({ error: 'uid required' });
+    const webKey = process.env.FIREBASE_WEB_API_KEY || process.env.FIREBASE_API_KEY || 'AIzaSyA2GPzutbQqSdLioBgiCrzAQF171Wdd2gE';
+    const customToken = await admin.auth().createCustomToken(uid);
+    const fetchFn = (typeof fetch === 'function') ? fetch : require('node-fetch');
+    const r = await fetchFn(`https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken?key=${webKey}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: customToken, returnSecureToken: true }),
+    });
+    const data = await r.json();
+    if (!r.ok) return res.status(502).json({ error: 'token_exchange_failed', upstream: data });
+    return res.json({ uid, idToken: data.idToken, expiresIn: data.expiresIn });
+  } catch (e) {
+    return res.status(500).json({ error: 'mint_token_error', message: e && e.message });
+  }
+});
+
 // 2) Look up wallet balance + linked user + an active artisan to use in the test.
 app.get('/debug/test-info', requireInternalSecret, async (req, res) => {
   try {
