@@ -2948,6 +2948,18 @@ async def entrypoint(ctx: JobContext):
 
     await session.start(agent, room=ctx.room)
     logger.info("✅ Agent session started and running!")
+    # E2E breadcrumb: agent fully ready (session.start() returned) — backend can now sendData
+    try:
+        asyncio.create_task(_post_breadcrumb(
+            f"{backend_url.rstrip('/')}/debug/voice-breadcrumb",
+            {
+                'session_id': f'agent-ready-{room_name}',
+                'event': 'session_started',
+                'text': 'session.start() returned',
+            }
+        ))
+    except Exception:
+        pass
 
     # ── Post-start: re-scan in case metadata arrived during start ──
     if not backend_client:
