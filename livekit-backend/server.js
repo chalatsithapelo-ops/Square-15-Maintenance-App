@@ -10715,6 +10715,18 @@ app.post('/debug/voice-breadcrumb', express.json(), (req, res) => {
   }
 });
 
+// GET helper to inspect all breadcrumbs (or filter by prefix)
+app.get('/debug/voice-breadcrumb', (req, res) => {
+  const expected = process.env.INTERNAL_API_SECRET || 'sq15_internal_2026_xK9mP3';
+  if (req.headers['x-internal-secret'] !== expected) return res.status(403).json({ error: 'forbidden' });
+  const prefix = String(req.query.prefix || '').trim();
+  const out = {};
+  for (const [k, v] of _voiceBreadcrumbs.entries()) {
+    if (!prefix || k.startsWith(prefix)) out[k] = v;
+  }
+  res.json({ count: Object.keys(out).length, entries: out });
+});
+
 /**
  * DEBUG: Real end-to-end Lizzy voice test (text-driven).
  * INTERNAL_API_SECRET-gated.

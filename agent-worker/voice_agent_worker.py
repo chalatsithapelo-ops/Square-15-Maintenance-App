@@ -406,6 +406,19 @@ async def entrypoint(ctx: JobContext):
 
     logger.info(f"📡 Connecting to room: {room_name}")
 
+    # Build version breadcrumb so /debug/voice-e2e can confirm deployment.
+    try:
+        asyncio.create_task(_post_breadcrumb(
+            f"{backend_url.rstrip('/')}/debug/voice-breadcrumb",
+            {
+                'session_id': f'agent-startup-{room_name}',
+                'event': 'agent_entrypoint',
+                'text': f'room={room_name} build=voice-e2e-v2',
+            }
+        ))
+    except Exception:
+        pass
+
     max_retries = 3
     for attempt in range(max_retries):
         try:
