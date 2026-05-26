@@ -2823,6 +2823,7 @@ async def entrypoint(ctx: JobContext):
                         try:
                             session.generate_reply(
                                 user_input=text,
+                                tool_choice="auto",
                                 instructions=(
                                     "The user just spoke. If they described a maintenance problem "
                                     "with enough detail (category + location + description), "
@@ -2838,26 +2839,29 @@ async def entrypoint(ctx: JobContext):
                         # what the LLM actually said (and whether it picked a tool).
                         async def _crumb_last_msg():
                             try:
-                                await asyncio.sleep(10.0)
+                                await asyncio.sleep(15.0)
                                 hist = session.history if hasattr(session, 'history') else None
                                 items = getattr(hist, 'items', None) if hist else None
-                                last_text = ''
+                                dump = []
                                 if items:
-                                    for it in reversed(items):
-                                        role = getattr(it, 'role', None)
-                                        if role == 'assistant':
-                                            c = getattr(it, 'content', None)
-                                            if isinstance(c, list):
-                                                last_text = ' '.join(str(x) for x in c)[:400]
-                                            else:
-                                                last_text = str(c)[:400]
-                                            break
+                                    for it in items[-12:]:
+                                        role = getattr(it, 'role', None) or getattr(it, 'type', '?')
+                                        c = getattr(it, 'content', None)
+                                        if isinstance(c, list):
+                                            ctext = ' | '.join(str(x)[:120] for x in c)
+                                        else:
+                                            ctext = str(c)[:120] if c else ''
+                                        # Capture tool/function call info if present
+                                        name = getattr(it, 'name', '') or getattr(it, 'tool_name', '')
+                                        args = getattr(it, 'arguments', '')
+                                        extra = f' name={name} args={str(args)[:80]}' if (name or args) else ''
+                                        dump.append(f'[{role}] {ctext}{extra}')
                                 await _post_breadcrumb(
                                     f"{backend_url.rstrip('/')}/debug/voice-breadcrumb",
                                     {
                                         'session_id': session_id or 'unknown',
-                                        'event': 'llm_response',
-                                        'text': last_text or '<no assistant message>',
+                                        'event': 'llm_history',
+                                        'text': (' ;; '.join(dump))[:1200] or '<empty history>',
                                     }
                                 )
                             except Exception as ce:
