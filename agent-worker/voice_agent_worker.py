@@ -2815,6 +2815,20 @@ async def entrypoint(ctx: JobContext):
         ctx.room.on("participant_metadata_changed", on_participant_metadata_changed)
         ctx.room.on("data_received", on_data_received)
         logger.info("✅ Listening for app metadata + data channel (square15_app)")
+        # Breadcrumb so /debug/voice-e2e can poll until the agent is actually
+        # ready to receive data packets (handlers are registered ~5-10s after
+        # ctx.connect because of LLM/STT/TTS bootstrap).
+        try:
+            asyncio.create_task(_post_breadcrumb(
+                f"{backend_url.rstrip('/')}/debug/voice-breadcrumb",
+                {
+                    'session_id': f'agent-ready-{room_name}',
+                    'event': 'handlers_ready',
+                    'text': 'data_received listener attached',
+                }
+            ))
+        except Exception:
+            pass
     except Exception as e:
         logger.warning(f"⚠️ Could not attach metadata listener: {e}")
 

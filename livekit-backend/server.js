@@ -10800,6 +10800,21 @@ app.post('/debug/voice-e2e', async (req, res) => {
       return res.status(504).json({ error: 'agent_did_not_join', roomName, dispatch });
     }
 
+    // Wait for the agent's data_received listener to actually be attached
+    // (happens ~5-10s after ctx.connect due to LLM/STT/TTS bootstrap).
+    // The agent posts an `agent-ready-{roomName}` breadcrumb when it's ready.
+    const readyKey = `agent-ready-${roomName}`;
+    const readyDeadline = Date.now() + 30000;
+    let handlersReady = false;
+    while (Date.now() < readyDeadline) {
+      const list = _voiceBreadcrumbs.get(readyKey);
+      if (list && list.length > 0) { handlersReady = true; break; }
+      await new Promise(r => setTimeout(r, 500));
+    }
+    if (!handlersReady) {
+      console.warn(`voice-e2e: agent handlers_ready breadcrumb not received for ${roomName} after 30s; sending anyway`);
+    }
+
     const _crumb = (event, text) => {
       const list = _voiceBreadcrumbs.get(sessionId) || [];
       list.push({ session_id: sessionId, event, text, ts: Date.now() });
