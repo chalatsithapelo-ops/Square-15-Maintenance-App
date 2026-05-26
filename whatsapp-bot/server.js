@@ -1521,7 +1521,7 @@ const waTools = [
     type: 'function',
     function: {
       name: 'request_payment_link',
-      description: 'Generate a payment link for an unpaid booking so the customer can pay via card. MUST ask the customer whether they want to pay the full amount or a 35% deposit first, then pass their choice as paymentType.',
+      description: 'Generate a CARD payment link for an unpaid booking. Use ONLY when the customer asks to pay by card / link / online — NEVER call this when the customer says "from my wallet", "use my wallet", "pay from wallet": in that case call pay_with_wallet instead. MUST ask the customer whether they want to pay the full amount or a 35% deposit first, then pass their choice as paymentType.',
       parameters: {
         type: 'object',
         properties: {
@@ -1745,7 +1745,7 @@ const waTools = [
     type: 'function',
     function: {
       name: 'accept_rfq_quote',
-      description: 'Accept a quoted RFQ and proceed to payment. Customer confirms the AI-generated or admin-provided quote.',
+      description: 'Accept a quoted RFQ and proceed to payment. Customer confirms the AI-generated or admin-provided quote. AFTER this tool returns success: tell the customer the quote is ACCEPTED and the booking is confirmed (use the tool\'s returned message). NEVER say "admin will review and adjust" — that wording is for reject_rfq_quote ONLY. NEVER call reject_rfq_quote in the same turn as accept_rfq_quote.',
       parameters: {
         type: 'object',
         properties: {
@@ -7009,6 +7009,16 @@ RFQ FLOW (CRITICAL — Follow this exactly):
 7. If ACCEPT (the customer says "yes", "accept", "approve", "proceed", "sounds good", "let's do it", "go ahead", "ok", or any clear affirmation right after you presented a quote) → call accept_rfq_quote IMMEDIATELY → after success, ASK the client when they want the work done (date + optional time) and IMMEDIATELY call set_preferred_schedule with their answer (convert "Friday morning" / "tomorrow at 2pm" / "next Monday" into a real YYYY-MM-DD + HH:MM in 2026). NEVER call reschedule_booking for this — that tool is only for changing an already-set schedule. NEVER reply with "how can I assist you further" after a quote was just shown — a bare "yes" in that context ALWAYS means accept the quote.
 8. If NEGOTIATE (the customer says "no", "reject", "negotiate", "too expensive", "change", "lower", or any clear push-back) → call reject_rfq_quote with their feedback → admin reviews
 9. Customer can check RFQ status anytime with check_rfq_status
+
+🛡️ POST-ACCEPTANCE WORDING (NEVER MIX UP ACCEPT vs REJECT):
+- After accept_rfq_quote returns success, the quote is ACCEPTED and the booking is CONFIRMED. Use phrasing like "Your quote is accepted ✅ — the booking is confirmed". Then ask for the preferred date/time and call set_preferred_schedule.
+- NEVER say "admin will review and adjust", "admin will get back to you", or any wording that implies the quote is still being negotiated — that language belongs ONLY to reject_rfq_quote.
+- NEVER call reject_rfq_quote in the same turn (or immediately after) accept_rfq_quote. They are mutually exclusive.
+
+💳 WALLET vs CARD-LINK — TOOL CHOICE (NEVER GUESS):
+- Customer says "from my wallet" / "use my wallet" / "pay from wallet" / "wallet" → call pay_with_wallet (NEVER request_payment_link).
+- Customer says "card" / "payment link" / "online" / "EFT" / nothing specific → call request_payment_link.
+- Both tools REQUIRE paymentType ('full' or 'deposit'). If the customer already paid the deposit and is paying the balance, still ask "full or deposit?" only if it isn't obvious — the tool will charge the remaining balance regardless.
 
 ⚠️ IMPORTANT — REVISED QUOTES FROM ADMIN:
 If the client receives a "quote request has been reviewed" message from us (admin amended the quote) and replies YES / accept / approve / proceed, call accept_rfq_quote with their RFQ ID — the bot will use the admin-amended total (NOT the original AI quote).
