@@ -2820,53 +2820,62 @@ async def entrypoint(ctx: JobContext):
                             asyncio.create_task(_post_breadcrumb(crumb_url, crumb_body))
                         except Exception:
                             pass
-                        try:
-                            session.generate_reply(
-                                user_input=text,
-                                tool_choice="auto",
-                                instructions=(
-                                    "The user just spoke. If they described a maintenance problem "
-                                    "with enough detail (category + location + description), "
-                                    "IMMEDIATELY call the create_booking function tool. "
-                                    "If they explicitly mention 'RFQ' or 'quote request', pass is_rfq='yes'. "
-                                    "Do NOT ask for confirmation — they have already confirmed by speaking. "
-                                    "Use the address they provided as service_address."
-                                ),
-                            )
-                        except Exception as ge:
-                            logger.warning(f"text_input generate_reply error: {ge}")
-                        # Breadcrumb the LLM response after a short delay so we can see
-                        # what the LLM actually said (and whether it picked a tool).
-                        async def _crumb_last_msg():
+                        async def _drive_and_crumb():
                             try:
-                                await asyncio.sleep(15.0)
+                                handle = session.generate_reply(
+                                    user_input=text,
+                                    tool_choice="auto",
+                                    instructions=(
+                                        "The user just spoke. If they described a maintenance problem "
+                                        "with enough detail (category + location + description), "
+                                        "IMMEDIATELY call the create_booking function tool. "
+                                        "If they explicitly mention 'RFQ' or 'quote request', pass is_rfq='yes'. "
+                                        "Do NOT ask for confirmation — they have already confirmed by speaking. "
+                                        "Use the address they provided as service_address."
+                                    ),
+                                )
+                                # Await the SpeechHandle so we know when the LLM is fully done
+                                try:
+                                    if hasattr(handle, 'wait_for_playout'):
+                                        await asyncio.wait_for(handle.wait_for_playout(), timeout=40.0)
+                                    elif hasattr(handle, '__await__'):
+                                        await asyncio.wait_for(handle, timeout=40.0)
+                                except Exception as wfe:
+                                    await _post_breadcrumb(
+                                        f"{backend_url.rstrip('/')}/debug/voice-breadcrumb",
+                                        {'session_id': session_id or 'unknown',
+                                         'event': 'handle_wait_err',
+                                         'text': str(wfe)[:200]}
+                                    )
                                 hist = session.history if hasattr(session, 'history') else None
                                 items = getattr(hist, 'items', None) if hist else None
                                 dump = []
                                 if items:
-                                    for it in items[-12:]:
+                                    for it in items[-15:]:
                                         role = getattr(it, 'role', None) or getattr(it, 'type', '?')
                                         c = getattr(it, 'content', None)
                                         if isinstance(c, list):
                                             ctext = ' | '.join(str(x)[:120] for x in c)
                                         else:
                                             ctext = str(c)[:120] if c else ''
-                                        # Capture tool/function call info if present
                                         name = getattr(it, 'name', '') or getattr(it, 'tool_name', '')
                                         args = getattr(it, 'arguments', '')
-                                        extra = f' name={name} args={str(args)[:80]}' if (name or args) else ''
+                                        extra = f' name={name} args={str(args)[:100]}' if (name or args) else ''
                                         dump.append(f'[{role}] {ctext}{extra}')
                                 await _post_breadcrumb(
                                     f"{backend_url.rstrip('/')}/debug/voice-breadcrumb",
-                                    {
-                                        'session_id': session_id or 'unknown',
-                                        'event': 'llm_history',
-                                        'text': (' ;; '.join(dump))[:1200] or '<empty history>',
-                                    }
+                                    {'session_id': session_id or 'unknown',
+                                     'event': 'llm_done',
+                                     'text': (' ;; '.join(dump))[:1500] or '<empty>'}
                                 )
-                            except Exception as ce:
-                                logger.debug(f"crumb_last_msg err: {ce}")
-                        asyncio.create_task(_crumb_last_msg())
+                            except Exception as ge:
+                                await _post_breadcrumb(
+                                    f"{backend_url.rstrip('/')}/debug/voice-breadcrumb",
+                                    {'session_id': session_id or 'unknown',
+                                     'event': 'generate_reply_err',
+                                     'text': str(ge)[:300]}
+                                )
+                        asyncio.create_task(_drive_and_crumb())
                 elif action == 'speak':
                     text = (payload.get('text') or msg.get('text') or '').strip()
                     if text:
