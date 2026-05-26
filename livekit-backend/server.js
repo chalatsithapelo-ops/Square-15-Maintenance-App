@@ -10787,13 +10787,51 @@ app.post('/debug/voice-e2e', async (req, res) => {
     // 4) Wait for the agent to run its LLM + tools
     await new Promise(r => setTimeout(r, waitMs));
 
+    // 5) Diff Firestore — return newly-created futureBookings for this uid
+    let newBookings = [];
+    try {
+      const cutoffMs = Date.now() - waitMs - 30000;
+      const snap = await firestore.collection('futureBookings')
+        .where('user_id', '==', uid)
+        .orderBy('created_at', 'desc')
+        .limit(10)
+        .get();
+      snap.forEach(doc => {
+        const d = doc.data() || {};
+        let createdMs = 0;
+        try {
+          const c = d.created_at;
+          if (c && typeof c.toMillis === 'function') createdMs = c.toMillis();
+          else if (typeof c === 'string') createdMs = Date.parse(c);
+          else if (typeof c === 'number') createdMs = c;
+        } catch (_) {}
+        if (createdMs >= cutoffMs) {
+          newBookings.push({
+            id: doc.id,
+            category: d.category_name || d.category || null,
+            problem_description: d.problem_description || null,
+            is_rfq: !!(d.is_rfq || d.isRFQ),
+            service_address: d.service_address || null,
+            created_by: d.created_by || d.createdBy || null,
+            created_at_ms: createdMs,
+          });
+        }
+      });
+    } catch (qe) {
+      console.warn('voice-e2e firestore diff error:', qe.message);
+    }
+
     return res.json({
       ok: true,
       uid,
       roomName,
       sessionId,
       dispatchId: dispatch && (dispatch.id || dispatch.dispatchId) || null,
-      message: 'agent dispatched + text_input delivered; poll Firestore for new RFQ/booking',
+      newBookings,
+      newBookingsCount: newBookings.length,
+      message: newBookings.length
+        ? `agent created ${newBookings.length} new futureBookings doc(s)`
+        : 'agent dispatched + text_input delivered; no new bookings detected (check agent logs)',
     });
   } catch (e) {
     console.error('debug/voice-e2e error:', e);
