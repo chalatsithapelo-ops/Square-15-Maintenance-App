@@ -938,6 +938,11 @@ const ACTION_TIERS = Object.freeze({
   cancel_booking: 'B',
   reschedule_booking: 'B',
   mark_booking_in_progress: 'B',
+  // RFQ quote lifecycle — handlers existed but were unreachable because they
+  // weren't in the tier map. Tier B = normal state change (propose+confirm).
+  generate_rfq_quote: 'B',
+  accept_rfq_quote: 'B',
+  reject_rfq_quote: 'B',
   request_reassignment: 'B',
   artisan_cancel_and_reassign: 'B',
   reassign_booking: 'B',
