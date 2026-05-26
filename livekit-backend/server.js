@@ -10553,8 +10553,9 @@ app.post('/api/openai-debug', async (req, res) => {
 app.post('/api/chat-bot', authMiddleware, rateLimitBy('chat_bot', 60, 5 * 60 * 1000), async (req, res) => {
   try {
     const groqKey = process.env.GROQ_API_KEY;
-    if (!groqKey) {
-      return res.status(503).json({ error: 'chat_bot_unconfigured', message: 'GROQ_API_KEY not set in server env' });
+    const openaiKey = process.env.OPENAI_API_KEY;
+    if (!groqKey && !openaiKey) {
+      return res.status(503).json({ error: 'chat_bot_unconfigured', message: 'Neither GROQ_API_KEY nor OPENAI_API_KEY set in server env' });
     }
     const question = String((req.body && req.body.question) || '').trim();
     if (!question) {
@@ -10565,14 +10566,18 @@ app.post('/api/chat-bot', authMiddleware, rateLimitBy('chat_bot', 60, 5 * 60 * 1
     }
 
     const fetchFn = (typeof fetch === 'function') ? fetch : require('node-fetch');
-    const upstream = await fetchFn('https://api.groq.com/openai/v1/chat/completions', {
+    const useGroq = !!groqKey;
+    const upstreamUrl = useGroq ? 'https://api.groq.com/openai/v1/chat/completions' : 'https://api.openai.com/v1/chat/completions';
+    const upstreamKey = useGroq ? groqKey : openaiKey;
+    const upstreamModel = useGroq ? 'llama-3.3-70b-versatile' : 'gpt-4o-mini';
+    const upstream = await fetchFn(upstreamUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${groqKey}`,
+        'Authorization': `Bearer ${upstreamKey}`,
       },
       body: JSON.stringify({
-        model: 'llama-3.3-70b-versatile',
+        model: upstreamModel,
         messages: [
           {
             role: 'system',
@@ -10598,8 +10603,8 @@ app.post('/api/chat-bot', authMiddleware, rateLimitBy('chat_bot', 60, 5 * 60 * 1
 
     if (!upstream.ok) {
       const txt = await upstream.text().catch(() => '');
-      console.warn('[chat_bot] Groq upstream error', upstream.status, txt.slice(0, 300));
-      return res.status(502).json({ error: 'upstream_error', status: upstream.status });
+      console.warn('[chat_bot]', useGroq ? 'Groq' : 'OpenAI', 'upstream error', upstream.status, txt.slice(0, 300));
+      return res.status(502).json({ error: 'upstream_error', status: upstream.status, provider: useGroq ? 'groq' : 'openai' });
     }
 
     const data = await upstream.json();
