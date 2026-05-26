@@ -1481,6 +1481,18 @@ async def entrypoint(ctx: JobContext):
     ) -> str:
         """Create a booking using backend propose/confirm workflow."""
         nonlocal backend_client
+        # E2E breadcrumb so /debug/voice-e2e can see when the LLM picked this tool.
+        try:
+            asyncio.create_task(_post_breadcrumb(
+                f"{backend_url.rstrip('/')}/debug/voice-breadcrumb",
+                {
+                    'session_id': session_id or 'unknown',
+                    'event': 'tool_create_booking',
+                    'text': f'cat={category_name} rfq={is_rfq} desc={problem_description[:80]}',
+                }
+            ))
+        except Exception:
+            pass
         if not backend_client:
             if not await _ensure_backend_or_retry():
                 return _CONNECTION_RETRY_MSG
@@ -1515,6 +1527,17 @@ async def entrypoint(ctx: JobContext):
             result_data = confirm_result.get('result', {})
             booking_id = result_data.get('booking_id') or result_data.get('bookingId')
             is_rfq_flag = result_data.get('is_rfq') or result_data.get('isRFQ')
+            try:
+                asyncio.create_task(_post_breadcrumb(
+                    f"{backend_url.rstrip('/')}/debug/voice-breadcrumb",
+                    {
+                        'session_id': session_id or 'unknown',
+                        'event': 'booking_created',
+                        'text': f'id={booking_id} rfq={is_rfq_flag}',
+                    }
+                ))
+            except Exception:
+                pass
 
             if is_rfq_flag:
                 # Auto-generate AI quote for RFQ bookings
