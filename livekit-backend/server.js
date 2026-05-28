@@ -6607,6 +6607,21 @@ app.post('/api/notifications/send', authMiddleware, assistantLimiter, async (req
       apns: { headers: { 'apns-priority': '10' } },
     };
 
+    // Resolve recipient up-front (BEFORE potential prune) so the in-app
+    // inbox doc is still tagged to the correct user even if FCM fails
+    // and we end up deleting the deviceToken field below.
+    let recipientId = userId;
+    if (!recipientId) {
+      try {
+        const db = admin.firestore();
+        const trimmed = String(token).trim();
+        for (const col of ['users', 'serviceProvider']) {
+          const s = await db.collection(col).where('deviceToken', '==', trimmed).limit(1).get();
+          if (!s.empty) { recipientId = s.docs[0].id; break; }
+        }
+      } catch (_) { /* best-effort */ }
+    }
+
     let result = null;
     let fcmError = null;
     try {
@@ -6645,20 +6660,7 @@ app.post('/api/notifications/send', authMiddleware, assistantLimiter, async (req
 
     // Always store in-app notification doc so the recipient sees it even
     // when FCM is silenced (battery saver, OEM kill, dead token, etc).
-    // Use the recipient's uid as `user_id` so the in-app inbox query
-    // filters correctly. Falls back to caller-provided userId, then to
-    // the FCM token's owning user looked up via Firestore.
-    let recipientId = userId;
-    if (!recipientId) {
-      try {
-        const db = admin.firestore();
-        const trimmed = String(token).trim();
-        for (const col of ['users', 'serviceProvider']) {
-          const s = await db.collection(col).where('deviceToken', '==', trimmed).limit(1).get();
-          if (!s.empty) { recipientId = s.docs[0].id; break; }
-        }
-      } catch (_) { /* best-effort */ }
-    }
+    // recipientId was resolved above before any prune.
     try {
       const firestore = admin.firestore();
       await firestore.collection('notifications').add({
