@@ -365,15 +365,15 @@ function isEnvTruthy(name) {
   return s === '1' || s === 'true' || s === 'yes' || s === 'y' || s === 'on';
 }
 
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ──────────────────────────────────────────────────────────────────────────────
 // Cyber-security gap #14: Ozow production credential safety assertion.
 // Detect env-var desync (test key + prod URL, or live key + sandbox URL) that
 // could route real money to sandbox or sandbox calls to production. Returns
 // an array of human-readable errors; empty array means safe.
-// Heuristic only â€” Ozow does not publish a deterministic key-format spec, so
+// Heuristic only — Ozow does not publish a deterministic key-format spec, so
 // we rely on patterns observed in the credential pair they provided. The
 // helper is called at startup AND inline at the payout route for live mode.
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ──────────────────────────────────────────────────────────────────────────────
 function assertOzowProdSafety() {
   const errs = [];
   const isTest = env('OZOW_IS_TEST') === 'true';
@@ -637,7 +637,7 @@ async function verifyFirebaseAuth(req, res) {
   }
 }
 
-// Express middleware wrapper ï¿½ verifyFirebaseAuth returns a value but never
+// Express middleware wrapper � verifyFirebaseAuth returns a value but never
 // calls next(), so using it directly as middleware hangs the request.
 function authMiddleware(req, res, next) {
   verifyFirebaseAuth(req, res).then(decoded => {
@@ -651,7 +651,7 @@ function authMiddleware(req, res, next) {
 }
 
 // LK-14: lightweight in-memory rate limiter. Keyed by `${uid||ip}:${bucket}`.
-// Sliding window ï¿½ drops timestamps older than `windowMs`. Returns true if
+// Sliding window � drops timestamps older than `windowMs`. Returns true if
 // the request should proceed, false if it should be 429'd. No external dep.
 const _rateBuckets = new Map();
 function rateLimit(bucket, key, max, windowMs) {
@@ -762,14 +762,14 @@ async function resolveRole({ firestore, uid, decodedToken }) {
       if (r === 'artisan' || r === 'client') return r;
       // If Firestore says admin, require custom claims confirmation
       if (r === 'admin') {
-        console.warn(`?? User ${uid} has admin role in Firestore but NOT in custom claims ï¿½ denying admin access`);
+        console.warn(`?? User ${uid} has admin role in Firestore but NOT in custom claims � denying admin access`);
         return 'client';
       }
 
       // Check boolean flag schema (isAdmin, isServiceProvider, isUser)
       // This handles apps that use boolean flags instead of string roles.
       if (data.isAdmin === true) {
-        console.warn(`?? User ${uid} has isAdmin=true in Firestore but NOT in custom claims ï¿½ denying admin access`);
+        console.warn(`?? User ${uid} has isAdmin=true in Firestore but NOT in custom claims � denying admin access`);
         return 'client';
       }
       if (data.isServiceProvider === true) return 'artisan';
@@ -779,7 +779,7 @@ async function resolveRole({ firestore, uid, decodedToken }) {
     console.warn(`?? Role lookup (users doc) failed for ${uid}:`, e.message);
   }
 
-  // Fallback: check the serviceProvider collection ï¿½ artisan profiles live
+  // Fallback: check the serviceProvider collection � artisan profiles live
   // there keyed by UID (or linked via user_id/uid fields), not in 'users'.
   try {
     const spSnap = await firestore.collection('serviceProvider').doc(uid).get();
@@ -796,13 +796,13 @@ async function resolveRole({ firestore, uid, decodedToken }) {
   return 'client';
 }
 
-// â”€â”€â”€ Multi-Admin Governance (May 23 2026) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─── Multi-Admin Governance (May 23 2026) ─────────────────────────────────
 // Five admin tiers, distinguished by Firebase custom claim `role`:
-//   owner    â€” full power, can grant/revoke other admins' roles, R500k/day cap
-//   finance  â€” can disburse money (payouts, refunds), R50k/day cap
-//   ops      â€” bookings, dispatch, RFQs (no money movement)
-//   support  â€” view-only user data + send messages
-//   auditor  â€” view-only on transactions + audit logs
+//   owner    — full power, can grant/revoke other admins' roles, R500k/day cap
+//   finance  — can disburse money (payouts, refunds), R50k/day cap
+//   ops      — bookings, dispatch, RFQs (no money movement)
+//   support  — view-only user data + send messages
+//   auditor  — view-only on transactions + audit logs
 // Legacy `admin` claim is treated as `finance` until explicitly migrated.
 const ADMIN_TIERS = ['owner', 'finance', 'ops', 'support', 'auditor'];
 
@@ -810,7 +810,7 @@ function resolveAdminTier(decoded) {
   if (!decoded) return null;
   const raw = String(decoded.role || decoded.user_role || '').trim().toLowerCase();
   if (ADMIN_TIERS.includes(raw)) return raw;
-  // Legacy single-tier admins â†’ finance.
+  // Legacy single-tier admins → finance.
   if (raw === 'admin' || decoded.admin === true) return 'finance';
   return null;
 }
@@ -830,7 +830,7 @@ function requireAdminTier(allowed) {
   };
 }
 
-// â”€â”€â”€ TOTP (RFC 6238) â€” minimal pure-Node implementation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─── TOTP (RFC 6238) — minimal pure-Node implementation ──────────────────
 // Avoids adding `speakeasy` to dependencies (smaller surface, no install risk
 // on Render). 30-second window, 6-digit codes, SHA-1, base32 secrets.
 const _b32alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
@@ -938,7 +938,7 @@ const ACTION_TIERS = Object.freeze({
   cancel_booking: 'B',
   reschedule_booking: 'B',
   mark_booking_in_progress: 'B',
-  // RFQ quote lifecycle â€” handlers existed but were unreachable because they
+  // RFQ quote lifecycle — handlers existed but were unreachable because they
   // weren't in the tier map. Tier B = normal state change (propose+confirm).
   generate_rfq_quote: 'B',
   accept_rfq_quote: 'B',
@@ -959,7 +959,7 @@ const ACTION_TIERS = Object.freeze({
   submit_complaint: 'B',
   request_payment_link: 'B',
   pay_with_wallet: 'B',
-  // Phase 4: Admin automation tools (Tier B ï¿½ admin role required)
+  // Phase 4: Admin automation tools (Tier B � admin role required)
   admin_bulk_reassign: 'B',
   admin_close_stale_cases: 'B',
   admin_broadcast_notification: 'B',
@@ -971,7 +971,7 @@ const ACTION_TIERS = Object.freeze({
   get_refund_history: 'A',
   get_payout_status: 'A',
   get_fraud_alerts: 'A',
-  // Phase 5.2: Money-moving (Tier C ï¿½ requires approval pipeline)
+  // Phase 5.2: Money-moving (Tier C � requires approval pipeline)
   request_refund: 'C',
   request_wallet_adjustment: 'C',
   request_payout: 'C',
@@ -3341,7 +3341,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       const qs = await orderedQuery.get();
       bookings = qs.docs.map(_extractBooking);
     } catch (err) {
-      // Composite index missing ï¿½ fall back to unordered query + JS sort
+      // Composite index missing � fall back to unordered query + JS sort
       if (err.code === 9 || (err.message && err.message.includes('index'))) {
         console.warn('[list_bookings] composite index missing, falling back to JS sort');
         try {
@@ -3470,7 +3470,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     }
   }
 
-  // -- Request Payment Link ï¿½ generates PayFast URL + stores in payment_links + sends notification --
+  // -- Request Payment Link � generates PayFast URL + stores in payment_links + sends notification --
   if (action === 'request_payment_link') {
     try {
       const bid = bookingId || String(payload.tasks_management_id || '').trim();
@@ -3669,7 +3669,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       // has been paid. Without this guard a caller could request
       // payment_type='balance' on a fresh booking and the implicit branch
       // below would silently fall back to charging the full amount or 65%
-      // ï¿½ confusing the customer and breaking transactionLogs accounting.
+      // � confusing the customer and breaking transactionLogs accounting.
       if (paymentType === 'balance' && bData.deposit_paid !== true) {
         return { ok: false, status: 400, error: 'cannot_pay_balance_before_deposit' };
       }
@@ -4056,7 +4056,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         learning_factor: r2(learningFactor),
         pricing_sources: { builders: buildersCount, catalog: catalogCount, ai_estimate: aiCount },
         breakdown: [
-          { description: `Labour (${laborHours}hrs @ R${lrUsed}/hr${learningFactor !== 1 ? ` ï¿½ ${learningFactor.toFixed(2)} adj` : ''})`, cost: laborCost.toFixed(2) },
+          { description: `Labour (${laborHours}hrs @ R${lrUsed}/hr${learningFactor !== 1 ? ` � ${learningFactor.toFixed(2)} adj` : ''})`, cost: laborCost.toFixed(2) },
           ...(artisanBuys && bom.length > 0 ? [{ description: `Materials & Supplies (${buildersCount} Builders-priced, ${catalogCount} catalog, ${aiCount} estimated)`, cost: matWithMarkup.toFixed(2) }] : []),
           ...(eqCost > 0 ? [{ description: 'Equipment & Tools', cost: eqCost.toFixed(2) }] : []),
           { description: 'Contingency (15%)', cost: contingency.toFixed(2) },
@@ -4105,7 +4105,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       accepted_via: payload.source || 'voice',
       updated_at: now,
     });
-    // â”€â”€ Carry the customer's issue photos into the artisan-facing tm doc.
+    // ── Carry the customer's issue photos into the artisan-facing tm doc.
     // Without this, artisans accepting an RFQ never see the pictures the
     // client attached during voice/WA RFQ submission.
     const _rfqImgs = (function () {
@@ -4209,7 +4209,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
             try {
               await admin.messaging().send({
                 token: art.token,
-                notification: { title: '?? New RFQ Job Available', body: `RFQ ${data.rfq_no || bookingId} ï¿½ R${priceNum.toFixed(2)}. Tap to view and accept.` },
+                notification: { title: '?? New RFQ Job Available', body: `RFQ ${data.rfq_no || bookingId} � R${priceNum.toFixed(2)}. Tap to view and accept.` },
                 data: { type: 'rfq_accepted', booking_id: bookingId },
                 android: { notification: { channelId: 'order_request_channel', sound: 'sound' } },
               });
@@ -4223,7 +4223,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
 
     if (!autoDispatched) {
       await writeAdminNotification({
-        title: 'RFQ Quote Accepted ï¿½ Assign Artisan',
+        title: 'RFQ Quote Accepted � Assign Artisan',
         message: `Customer accepted RFQ ${data.rfq_no || bookingId} (R${priceNum.toFixed(2)}) via voice. Please assign an artisan.`,
         data: { type: 'rfq_accepted', bookingId },
       });
@@ -4669,7 +4669,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       });
       return { ok: true, status: 200, data: { notifications: items, count: items.length } };
     } catch (e) {
-      // Notifications subcollection may not exist ï¿½ return empty
+      // Notifications subcollection may not exist � return empty
       return { ok: true, status: 200, data: { notifications: [], count: 0 } };
     }
   }
@@ -4825,7 +4825,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
   }
 
   // ---------------------------------------------------------------------------
-  // PHASE 4 ï¿½ Admin Automation Tools (Tier B, admin-only)
+  // PHASE 4 � Admin Automation Tools (Tier B, admin-only)
   // ---------------------------------------------------------------------------
 
   if (action === 'admin_bulk_reassign') {
@@ -4946,7 +4946,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
   }
 
   // ---------------------------------------------------------------------------
-  // PHASE 5.1 ï¿½ Finance Read-Only Tools (Tier A)
+  // PHASE 5.1 � Finance Read-Only Tools (Tier A)
   // ---------------------------------------------------------------------------
 
   if (action === 'get_finance_summary') {
@@ -5216,7 +5216,7 @@ app.get('/health', (req, res) => {
 
 // -- Public pricing test endpoint (dev only) --
 app.get('/api/test-pricing', async (req, res) => {
-  // Public pricing endpoint ï¿½ used by voice agent for service/pricing lookups.
+  // Public pricing endpoint � used by voice agent for service/pricing lookups.
   try {
     const firestore = (() => { initFirebaseIfPossible(); if (firebaseInitError) return null; return admin.firestore(); })();
     if (!firestore) return res.status(500).json({ error: 'firebase_not_configured' });
@@ -5490,7 +5490,7 @@ app.post('/api/voice/start', assistantLimiter, async (req, res) => {
     let enrichedMetadata = metadata;
     try {
       const parsed = metadata ? JSON.parse(metadata) : {};
-      // Do NOT embed the raw Firebase ID token ï¿½ it would leak to all room participants.
+      // Do NOT embed the raw Firebase ID token � it would leak to all room participants.
       parsed.voice_session_id = sessionId;
       parsed.voice_session_nonce = sessionNonce;
       enrichedMetadata = JSON.stringify(parsed);
@@ -6567,7 +6567,7 @@ app.post('/api/admin/fix/service-provider-uid-mapping', async (req, res) => {
 });
 
 // -- Server-side FCM Notification Endpoint --
-// Replaces client-side admin SDK usage ï¿½ clients call this instead of loading firebase-adminsdk.json
+// Replaces client-side admin SDK usage � clients call this instead of loading firebase-adminsdk.json
 app.post('/api/notifications/send', authMiddleware, assistantLimiter, async (req, res) => {
   try {
     initFirebaseIfPossible();
@@ -6593,7 +6593,7 @@ app.post('/api/notifications/send', authMiddleware, assistantLimiter, async (req
       ? 'order_request_channel'
       : 'high_importance_channel';
 
-    // Send FCM via Admin SDK (server-side ï¿½ no private key exposed to clients)
+    // Send FCM via Admin SDK (server-side � no private key exposed to clients)
     const message = {
       token: String(token).trim(),
       notification: { title: String(title), body: String(body) },
@@ -6607,25 +6607,91 @@ app.post('/api/notifications/send', authMiddleware, assistantLimiter, async (req
       apns: { headers: { 'apns-priority': '10' } },
     };
 
-    const result = await admin.messaging().send(message);
-    console.log(`? FCM sent via backend: ${result}`);
+    let result = null;
+    let fcmError = null;
+    try {
+      result = await admin.messaging().send(message);
+      console.log(`? FCM sent via backend: ${result}`);
+    } catch (err) {
+      fcmError = err;
+      const code = err && err.code ? String(err.code) : '';
+      const dead = code === 'messaging/registration-token-not-registered'
+                || code === 'messaging/invalid-registration-token'
+                || code === 'messaging/invalid-argument';
+      if (dead) {
+        try {
+          const db = admin.firestore();
+          const trimmed = String(token).trim();
+          const collections = ['users', 'serviceProvider', 'partners', 'corporate_partners'];
+          let pruned = 0;
+          for (const col of collections) {
+            const snap = await db.collection(col).where('deviceToken', '==', trimmed).get();
+            for (const d of snap.docs) {
+              await d.ref.update({
+                deviceToken: admin.firestore.FieldValue.delete(),
+                deviceTokenInvalidatedAt: new Date().toISOString(),
+              });
+              pruned++;
+            }
+          }
+          console.log(`[FCM] pruned ${pruned} stale token refs (code=${code})`);
+        } catch (pruneErr) {
+          console.warn('[FCM] prune failed:', pruneErr && pruneErr.message);
+        }
+      } else {
+        console.warn('[FCM] send error:', code, err && err.message);
+      }
+    }
 
-    // Optionally store in-app notification doc
-    if (userId) {
+    // Always store in-app notification doc so the recipient sees it even
+    // when FCM is silenced (battery saver, OEM kill, dead token, etc).
+    // Use the recipient's uid as `user_id` so the in-app inbox query
+    // filters correctly. Falls back to caller-provided userId, then to
+    // the FCM token's owning user looked up via Firestore.
+    let recipientId = userId;
+    if (!recipientId) {
+      try {
+        const db = admin.firestore();
+        const trimmed = String(token).trim();
+        for (const col of ['users', 'serviceProvider']) {
+          const s = await db.collection(col).where('deviceToken', '==', trimmed).limit(1).get();
+          if (!s.empty) { recipientId = s.docs[0].id; break; }
+        }
+      } catch (_) { /* best-effort */ }
+    }
+    try {
       const firestore = admin.firestore();
       await firestore.collection('notifications').add({
-        user_id: userId,
+        user_id: recipientId || null,
         user_type: userType || 'user',
         title: String(title),
         message: String(body),
+        body: String(body),
         ...(bookingId ? { booking_id: bookingId } : {}),
-        type: type || 'general',
+        type: type || (data && data.type) || 'general',
         read: false,
         view: false,
+        time: new Date().toString(),
         created_at: new Date().toISOString(),
+        delivery_status: fcmError ? 'fcm_failed' : 'fcm_sent',
+        ...(fcmError ? { fcm_error_code: String(fcmError.code || 'unknown') } : {}),
       });
+    } catch (inboxErr) {
+      console.warn('[notifications] inbox write failed:', inboxErr && inboxErr.message);
     }
 
+    if (fcmError && !result) {
+      // FCM failed but inbox doc was written. Tell caller so admin UI can
+      // show "in-app only" hint, but don't treat as a hard 5xx (payout
+      // already succeeded before this call).
+      return res.json({
+        ok: true,
+        success: false,
+        fcm: 'failed',
+        fcm_error: String(fcmError.code || 'unknown'),
+        inbox: 'written',
+      });
+    }
     res.json({ ok: true, success: true, messageId: result });
   } catch (error) {
     console.error('? FCM send error:', error);
@@ -6699,7 +6765,7 @@ function _paymentCallbackSecret() {
 function signPaymentCallback(bookingId) {
   const secret = _paymentCallbackSecret();
   if (!secret) {
-    console.warn('[payment-callback] no PAYMENT_CALLBACK_SECRET/PAYFAST_PASSPHRASE ï¿½ callbacks will be unsigned and rejected');
+    console.warn('[payment-callback] no PAYMENT_CALLBACK_SECRET/PAYFAST_PASSPHRASE � callbacks will be unsigned and rejected');
     return '';
   }
   const exp = Date.now() + PAYMENT_CALLBACK_TTL_MS;
@@ -6728,7 +6794,7 @@ function verifyPaymentCallback(bookingId, t, exp) {
   return { ok: true };
 }
 
-// -- GET checkout page ï¿½ renders auto-submit POST form to PayFast --
+// -- GET checkout page � renders auto-submit POST form to PayFast --
 app.get('/api/payment/checkout/:sessionId', (req, res) => {
   const session = paymentSessions.get(req.params.sessionId);
   if (!session) {
@@ -6750,7 +6816,7 @@ app.get('/api/payment/checkout/:sessionId', (req, res) => {
   // Garbage-collect session after 5 minutes
   setTimeout(() => paymentSessions.delete(req.params.sessionId), 5 * 60 * 1000);
 
-  // Build hidden form fields ï¿½ escape values for HTML safety
+  // Build hidden form fields � escape values for HTML safety
   const esc = (s) => String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   const fields = Object.entries(session.paymentData)
     .map(([k, v]) => `<input type="hidden" name="${esc(k)}" value="${esc(v)}">`)
@@ -6759,7 +6825,7 @@ app.get('/api/payment/checkout/:sessionId', (req, res) => {
   res.send(`
     <html>
     <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-    <title>Square 15 ï¿½ Redirecting to Payment</title></head>
+    <title>Square 15 � Redirecting to Payment</title></head>
     <body style="font-family:sans-serif;text-align:center;padding:60px">
       <h2>Redirecting to secure payment...</h2>
       <p>Amount: <strong>R${esc(session.paymentData.amount)}</strong></p>
@@ -6780,7 +6846,7 @@ app.post('/api/payment/whatsapp-initiate', assistantLimiter, async (req, res) =>
     // Verify internal shared secret
     const internalSecret = (process.env.INTERNAL_API_SECRET || '').trim();
     if (!internalSecret) {
-      console.error('FATAL: INTERNAL_API_SECRET not set ï¿½ rejecting request');
+      console.error('FATAL: INTERNAL_API_SECRET not set � rejecting request');
       return res.status(503).json({ error: 'Server misconfigured' });
     }
     const providedSecret = (req.headers['x-internal-secret'] || '').trim();
@@ -6958,13 +7024,13 @@ app.post('/api/payment/initiate', authMiddleware, assistantLimiter, async (req, 
     const signature = crypto.createHash('md5').update(sigInput).digest('hex');
     paymentData.signature = signature;
 
-    // Build full payment URL with query params ï¿½ use + encoding (matches signature)
+    // Build full payment URL with query params � use + encoding (matches signature)
     const queryString = Object.entries(paymentData)
       .map(([k, v]) => `${encodeURIComponent(k).replace(/%20/g, '+')}=${encodeURIComponent(String(v || '')).replace(/%20/g, '+')}`)
       .join('&');
     const fullPaymentUrl = `${payfastUrl}?${queryString}`;
 
-    // Build auto-submitting HTML form (POST) ï¿½ most reliable PayFast integration method
+    // Build auto-submitting HTML form (POST) � most reliable PayFast integration method
     const formFields = Object.entries(paymentData)
       .map(([k, v]) => `<input type="hidden" name="${k}" value="${String(v || '').replace(/"/g, '&quot;')}" />`)
       .join('\n      ');
@@ -7154,7 +7220,7 @@ app.get('/api/payment/saved-cards', authMiddleware, async (req, res) => {
         created_at: d.created_at,
         last_used_at: d.last_used_at,
       };
-      // Note: token is NEVER sent to the client ï¿½ stays server-side only
+      // Note: token is NEVER sent to the client � stays server-side only
     });
 
     res.json({ ok: true, cards });
@@ -7209,7 +7275,7 @@ app.post('/api/payment/refund', authMiddleware, assistantLimiter, async (req, re
     const now = new Date().toISOString();
     const db = admin.firestore();
 
-    // -- Anti-fraud: rate limit ï¿½ max 3 refunds per user per 24 hours --
+    // -- Anti-fraud: rate limit � max 3 refunds per user per 24 hours --
     const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
     const recentRefunds = await db.collection('transactionLogs')
       .where('user_id', '==', userId)
@@ -7251,7 +7317,7 @@ app.post('/api/payment/refund', authMiddleware, assistantLimiter, async (req, re
       return res.json({ ok: true, already_refunded: true, message: 'This booking has already been refunded.' });
     }
 
-    // -- Anti-fraud: cooldown ï¿½ booking must be at least 5 minutes old --
+    // -- Anti-fraud: cooldown � booking must be at least 5 minutes old --
     const createdAt = data.created_at || data.createdAt || data.creation_date || '';
     if (createdAt) {
       const bookingAge = Date.now() - new Date(createdAt).getTime();
@@ -7378,7 +7444,7 @@ app.post('/api/payment/refund', authMiddleware, assistantLimiter, async (req, re
       // Find the original PayFast payment ID
       const pfPaymentId = data.payfast_payment_id || '';
       if (!pfPaymentId) {
-        // No PayFast payment ID ï¿½ fall back to creating a refund request for admin
+        // No PayFast payment ID � fall back to creating a refund request for admin
         await db.collection('refund_requests').doc(txId).set({
           id: txId,
           source_doc_id: booking_id,
@@ -7475,7 +7541,7 @@ app.post('/api/payment/refund', authMiddleware, assistantLimiter, async (req, re
             message: `R${refundAmount.toFixed(2)} card refund initiated. It will reflect in 3-5 business days.`,
           });
         } else {
-          // PayFast refund API failed ï¿½ fall back to admin review
+          // PayFast refund API failed � fall back to admin review
           console.error(`[refund] PayFast refund API failed:`, refundResult);
           await db.collection('refund_requests').doc(txId).set({
             id: txId,
@@ -7714,7 +7780,7 @@ app.post('/api/admin/payout', authMiddleware, assistantLimiter, async (req, res)
 
       console.log(`?? Admin refund R${payoutAmount.toFixed(2)} credited to client ${recipient_id} wallet`);
     } else {
-      // Credit artisan balance ï¿½ wrapped in a transaction so the read+update
+      // Credit artisan balance � wrapped in a transaction so the read+update
       // of `serviceProvider.balance` and the matching transactionLogs entry
       // commit atomically. Previously a concurrent payout could read the
       // same `currentBalance` twice and overwrite each other's update,
@@ -7817,7 +7883,7 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       return res.status(403).json({ error: 'Admin access required.' });
     }
 
-    // â”€â”€â”€ Governance: only owner+finance can disburse money â”€â”€â”€
+    // ─── Governance: only owner+finance can disburse money ───
     const adminTier = resolveAdminTier(decoded);
     if (!adminTier || !['owner', 'finance'].includes(adminTier)) {
       return res.status(403).json({
@@ -7826,7 +7892,7 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       });
     }
 
-    // â”€â”€â”€ Gap #9: Idle re-auth (10 minutes) â”€â”€â”€
+    // ─── Gap #9: Idle re-auth (10 minutes) ───
     // The session must be either freshly signed-in (auth_time within 10min)
     // OR have a recent biometric confirmation written to
     // admin_biometric_confirms/{uid} within the last 5 minutes by the admin
@@ -7858,11 +7924,11 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       return res.status(503).json({ error: 'Internal control check failed.', stage: 'reauth' });
     }
 
-    // â”€â”€â”€ Gap #3: MFA TOTP enforcement â”€â”€â”€
+    // ─── Gap #3: MFA TOTP enforcement ───
     // If MFA is enrolled on this admin (admin_mfa/{uid} with enabled=true),
     // require a current 6-digit code in `x-mfa-code` or req.body.mfa_code.
     // If MFA_REQUIRED env is true, enrollment is mandatory for owner+finance
-    // tiers â€” payout will be refused until they enrol.
+    // tiers — payout will be refused until they enrol.
     try {
       const mfaSnap = await db.collection('admin_mfa').doc(adminUid).get();
       const mfa = mfaSnap.exists ? (mfaSnap.data() || {}) : {};
@@ -7928,12 +7994,12 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
 
     const now = new Date().toISOString();
 
-    // â”€â”€â”€ Gap #14: Ozow prod credential safety assertion â”€â”€â”€
+    // ─── Gap #14: Ozow prod credential safety assertion ───
     // If we're in live mode but env vars look like a sandbox setup, refuse
     // to send money. This protects against desync after a partial cutover.
     const ozowSafetyErrs = assertOzowProdSafety();
     if (ozowSafetyErrs.length > 0) {
-      console.error('ðŸš¨ OZOW PROD SAFETY BLOCK:', ozowSafetyErrs);
+      console.error('🚨 OZOW PROD SAFETY BLOCK:', ozowSafetyErrs);
       try {
         await db.collection('error_logs').add({
           error_type: 'ozow_prod_safety_block',
@@ -7951,10 +8017,10 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       });
     }
 
-    // â”€â”€â”€ Gap #4: Daily payout hard block (per-admin) â”€â”€â”€
+    // ─── Gap #4: Daily payout hard block (per-admin) ───
     // Owner role may exceed daily limit; everyone else is hard-capped.
     // The R50k DAILY_LIMITS.payout was previously *alerted* in fraud rules but
-    // not actually blocking â€” convert to a hard block here. Any payout pushing
+    // not actually blocking — convert to a hard block here. Any payout pushing
     // the admin's running total past their cap is refused before Ozow is hit.
     const DAILY_PAYOUT_CAP_DEFAULT = 50000;
     const DAILY_PAYOUT_CAP_OWNER = 500000; // R500k for owner role
@@ -7978,7 +8044,7 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
         // Filter by date in-process to avoid needing a composite index.
         const created = String(data.created_at || '');
         if (created < dayStartIso) return;
-        // Only count successful/pending â€” failed/rejected don't move money.
+        // Only count successful/pending — failed/rejected don't move money.
         const st = String(data.status || '').toLowerCase();
         if (st === 'failed' || st === 'rejected' || st === 'cancelled') return;
         const amt = parseFloat(data.amount || 0);
@@ -8007,12 +8073,12 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       return res.status(503).json({ error: 'Internal control check failed. Try again shortly.', stage: 'daily_cap', detail: e.message });
     }
 
-    // â”€â”€â”€ Gap #15: Bank-account-change cool-down (24h) â”€â”€â”€
+    // ─── Gap #15: Bank-account-change cool-down (24h) ───
     // Detect when the recipient's payout-bound bank account has changed
-    // recently. If the {recipient_id Ã— account_number} pair is new (or the
+    // recently. If the {recipient_id × account_number} pair is new (or the
     // recipient's account was modified within the last 24h), block payout
     // and raise a fraud alert. Owner can override by setting a fresh flag
-    // doc â€” kept as backlog work for the role-tier system.
+    // doc — kept as backlog work for the role-tier system.
     try {
       const masked = `****${String(account_number).slice(-4)}`;
       // 1. Most recent successful/pending payout to this recipient.
@@ -8163,13 +8229,13 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
     //   siteCode + Convert.ToInt32(amount*100) + merchantReference
     //   + customerBankReference + isRtc("False"/"True") + notifyUrl
     //   + bankGroupId + encryptedAccountNumber + branchCode + apiKey
-    // Then .ToLower() â†’ SHA512 â†’ hex (lowercase).
+    // Then .ToLower() → SHA512 → hex (lowercase).
     // Notes:
-    //   â€¢ Amount is integer cents with NO decimal/padding (R5.00 â†’ "500").
-    //   â€¢ IsRtc is a C# bool â†’ "False"/"True" then lowercased to "false"/"true".
+    //   • Amount is integer cents with NO decimal/padding (R5.00 → "500").
+    //   • IsRtc is a C# bool → "False"/"True" then lowercased to "false"/"true".
     //     JS String(false) === "false" lowercases to "false", same result.
-    //   â€¢ accountNumber field in the hash is the ENCRYPTED (AES) value.
-    //   â€¢ apiKey is the LAST field, NOT after customerBankReference.
+    //   • accountNumber field in the hash is the ENCRYPTED (AES) value.
+    //   • apiKey is the LAST field, NOT after customerBankReference.
     const sha512 = (s) => crypto.createHash('sha512').update(s, 'utf8').digest('hex');
     const hashInput = [
       ozowSiteCode,
@@ -8181,7 +8247,7 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       ozowBankGroupId,
       encryptedAccountNumber,   // AES-256-CBC base64
       ozowBranchCode,
-      ozowApiKey,               // â˜… LAST per Ozow C# reference
+      ozowApiKey,               // ★ LAST per Ozow C# reference
     ].join('').toLowerCase();
     let hashCheck = sha512(hashInput);
     console.log(`[admin/ozow-payout] hashInput len=${hashInput.length} ref=${payoutRef} amtCents=${amountCents}`);
@@ -8346,7 +8412,7 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       });
     }
 
-    console.log(`âœ“ Ozow payout created: ${payoutId} ref=${payoutRef} status=${ozowStatusCode} sub=${ozowSubStatus}`);
+    console.log(`✓ Ozow payout created: ${payoutId} ref=${payoutRef} status=${ozowStatusCode} sub=${ozowSubStatus}`);
 
     // -- Record payout in Firestore --
     const txId = crypto.randomUUID();
@@ -8356,7 +8422,7 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       payout_reference: payoutRef,
       merchant_reference: payoutRef,
       customer_bank_reference: customerBankReference,
-      // â˜… Required for /api/ozow-payout-verify to respond with the AES key
+      // ★ Required for /api/ozow-payout-verify to respond with the AES key
       // when Ozow calls back. Without these the payout will fail at verification.
       encryption_key: encryptionKey,
       amount_cents: amountCents,
@@ -8383,7 +8449,7 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
 
     await db.collection('payout_records').doc(txId).set(payoutRecord);
 
-    // Also log to transactionLogs â€” include queryable id fields so the record
+    // Also log to transactionLogs — include queryable id fields so the record
     // appears on the relevant admin detail screen for that recipient.
     //   - client refunds: user_id (admin user_detail queries on user_id)
     //   - artisan payouts: service_provider_id + artisan_id
@@ -8470,7 +8536,7 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
         });
       } catch (txErr) {
         console.error('? Artisan balance deduction failed:', txErr.message);
-        // The Ozow payout was already initiated ï¿½ log for manual reconciliation
+        // The Ozow payout was already initiated � log for manual reconciliation
       }
     }
 
@@ -8496,7 +8562,7 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       }
     }
 
-    // â”€â”€ Sync with any pending weekly payout batch â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── Sync with any pending weekly payout batch ─────────────────────────
     // If this manual payout covers a recipient that is also in a draft batch,
     // deduct the manual amount from that batch line item so it doesn't get
     // double-paid when the admin approves the batch.
@@ -8539,11 +8605,11 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
       console.warn('[ozow-payout] batch-sync failed (non-fatal):', syncErr && syncErr.message);
     }
 
-    // â”€â”€ Notifications â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── Notifications ─────────────────────────────────────────────────────
     // Every successful payout (any amount, any recipient type) must notify:
     //   (a) all admins with an FCM push + a notifications doc, and
     //   (b) the recipient (artisan or client) with a push + notifications doc.
-    // Partners have no app â€” partner notification = admin-only.
+    // Partners have no app — partner notification = admin-only.
     // Helpers are declared inline because the global notification helpers
     // (writeAdminNotification / writePersonalNotification) are nested inside
     // executeBookingAction's closure and not accessible from this route.
@@ -8620,7 +8686,7 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
         return ref.id;
       };
 
-      // (a) ADMIN notifications â€” every admin user, no amount threshold.
+      // (a) ADMIN notifications — every admin user, no amount threshold.
       try {
         const adminPayload = {
           type: 'admin_payout_initiated',
@@ -8669,7 +8735,7 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
         console.warn('[ozow-payout] admin notification block failed (non-fatal):', anErr && anErr.message);
       }
 
-      // (b) RECIPIENT notification â€” artisan / client only (partners have no app).
+      // (b) RECIPIENT notification — artisan / client only (partners have no app).
       if (recipient_type === 'artisan' || recipient_type === 'client') {
         try {
           const recipientUType = recipient_type === 'client' ? 'user' : 'artisan';
@@ -8751,7 +8817,7 @@ app.post('/api/admin/ozow-payout', authMiddleware, async (req, res) => {
   }
 });
 
-// â”€â”€â”€ Multi-Admin Governance Endpoints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─── Multi-Admin Governance Endpoints ─────────────────────────────────────
 
 // Owner-only: grant or revoke an admin tier on another user.
 // Sets the Firebase custom claim `role` on the target uid.
@@ -8817,7 +8883,7 @@ app.post('/api/admin/biometric-confirm', authMiddleware, async (req, res) => {
   }
 });
 
-// MFA: setup â†’ returns secret + otpauth URI for QR scanning. Does NOT enable
+// MFA: setup → returns secret + otpauth URI for QR scanning. Does NOT enable
 // until the admin confirms with a code at /enable.
 app.post('/api/admin/mfa/setup', authMiddleware, async (req, res) => {
   try {
@@ -8905,12 +8971,12 @@ app.get('/api/admin/mfa/status', authMiddleware, async (req, res) => {
 // Ozow calls this BEFORE executing a payout to confirm the request is
 // legitimate. We respond 200 with `verified:true` and echo the payoutId
 // only when (a) the 24-char static OZOW_ACCESS_TOKEN matches and (b) we
-// have a matching `payout_records` doc ï¿½ so a leaked token alone can't
+// have a matching `payout_records` doc � so a leaked token alone can't
 // approve a fabricated payoutId.
 app.post('/api/ozow-payout-verify', async (req, res) => {
   try {
     // Optional OZOW_ACCESS_TOKEN gate. Ozow's verification webhook does NOT
-    // send a custom token by default â€” it relies on the payoutId being
+    // send a custom token by default — it relies on the payoutId being
     // unguessable + IP whitelist on their side. If you configure
     // OZOW_ACCESS_TOKEN (24 chars) here AND in Ozow's portal webhook
     // settings, we'll enforce it; otherwise allow Ozow's call through.
@@ -9187,7 +9253,7 @@ app.get('/api/admin/ozow-payout-status/:payoutId', authMiddleware, async (req, r
   }
 });
 
-// â”€â”€â”€ Weekly Payout Batches (admin review/edit/approve) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─── Weekly Payout Batches (admin review/edit/approve) ────────────────────
 
 // List recent batches
 app.get('/api/admin/payout-batches', authMiddleware, async (req, res) => {
@@ -9351,7 +9417,7 @@ app.post('/api/admin/payout-batches/:batchId/approve', authMiddleware, async (re
           if (r.ok) { okCount++; results.push({ item_id: it.item_id, status: 'ok', payout_id: j.payout_id || j.ozow_payout_id }); }
           else { failCount++; results.push({ item_id: it.item_id, status: 'failed', error: j.error || `http_${r.status}` }); }
         } else {
-          // No internal secret â†’ queue for manual retry from existing screen.
+          // No internal secret → queue for manual retry from existing screen.
           results.push({ item_id: it.item_id, status: 'queued_for_manual_retry' });
         }
       } catch (e) {
@@ -9386,9 +9452,9 @@ app.post('/api/admin/payout-batches/rebuild-now', authMiddleware, async (req, re
     const weekKey = `wk_${monDate.toISOString().slice(0, 10)}`;
     const existing = await db.collection('payout_batches').doc(weekKey).get();
     if (existing.exists && existing.data().status !== 'pending_approval') {
-      return res.status(409).json({ error: `Batch ${weekKey} is in status "${existing.data().status}" â€” cannot rebuild.` });
+      return res.status(409).json({ error: `Batch ${weekKey} is in status "${existing.data().status}" — cannot rebuild.` });
     }
-    // Don't delete â€” _maybeBuildWeeklyBatch will overwrite via .set() and
+    // Don't delete — _maybeBuildWeeklyBatch will overwrite via .set() and
     // preserve notified_at so we don't re-spam admins on every rebuild.
     const result = await _maybeBuildWeeklyBatch(true);
     if (result && result.error) return res.status(500).json(result);
@@ -9468,7 +9534,7 @@ app.post('/api/admin/save-card', authMiddleware, async (req, res) => {
     // Only add it if the merchant has explicitly enabled it
     paymentData.subscription_type = '2';
 
-    // Generate PayFast signature ï¿½ use + for spaces (PayFast standard)
+    // Generate PayFast signature � use + for spaces (PayFast standard)
     const passphrase = env('PAYFAST_PASSPHRASE') || '';
     const pfParamString = Object.entries(paymentData)
       .map(([k, v]) => `${encodeURIComponent(k).replace(/%20/g, '+')}=${encodeURIComponent(String(v || '')).replace(/%20/g, '+')}`)
@@ -9479,7 +9545,7 @@ app.post('/api/admin/save-card', authMiddleware, async (req, res) => {
     }
     paymentData.signature = crypto.createHash('md5').update(sigInput).digest('hex');
 
-    // Build auto-submitting HTML form (POST) ï¿½ PayFast requires form POST for reliable signature validation
+    // Build auto-submitting HTML form (POST) � PayFast requires form POST for reliable signature validation
     const formFields = Object.entries(paymentData)
       .map(([k, v]) => `<input type="hidden" name="${k}" value="${String(v || '').replace(/"/g, '&quot;')}" />`)
       .join('\n      ');
@@ -9520,7 +9586,7 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
 
   if (!taskSnap.exists) {
     // -- SAFETY NET: If doc doesn't exist, create a minimal one so payment is not lost --
-    console.warn(`[processPayment] tasksManagement/${bookingId} not found ï¿½ creating minimal doc to preserve payment`);
+    console.warn(`[processPayment] tasksManagement/${bookingId} not found � creating minimal doc to preserve payment`);
     const isWA = bookingId.startsWith('WA-');
     // Pull critical fields from futureBookings so the doc isn't orphaned
     let fbFields = {};
@@ -9586,35 +9652,35 @@ async function processSuccessfulPayment(bookingId, { amountGross, pfPaymentId, i
         if (autoIsDeposit && !autoDepositAlreadyPaid) {
           autoDisplayAmt = parseFloat(fbPayData.deposit_amount || '0') || Math.round(autoTotalCost * 0.35 * 100) / 100;
           const autoBalAmt = parseFloat(fbPayData.balance_amount || '0') || Math.round((autoTotalCost - autoDisplayAmt) * 100) / 100;
-          waMessage = `ðŸ’° *Deposit received!* R${autoDisplayAmt.toFixed(2)} for booking #${orderLabel}.
+          waMessage = `💰 *Deposit received!* R${autoDisplayAmt.toFixed(2)} for booking #${orderLabel}.
 
-âœ… Your booking is confirmed. The remaining balance of R${autoBalAmt.toFixed(2)} will be due after job completion.
+✅ Your booking is confirmed. The remaining balance of R${autoBalAmt.toFixed(2)} will be due after job completion.
 
-Your artisan will contact you to arrange the visit. ðŸ› ï¸
+Your artisan will contact you to arrange the visit. 🛠️
 
-ðŸ“² *What's next?*
-â€¢ You'll receive your artisan's photo & details for safety verification
-â€¢ Reply *"track"* to see when they're on the way
-â€¢ Reply *"help"* anytime if you have questions`;
+📲 *What's next?*
+• You'll receive your artisan's photo & details for safety verification
+• Reply *"track"* to see when they're on the way
+• Reply *"help"* anytime if you have questions`;
           // Update the minimal doc with deposit fields
           await taskRef.update({ payment_type: 'deposit', deposit_paid: true, deposit_paid_at: now, deposit_amount: autoDisplayAmt.toFixed(2), balance_amount: autoBalAmt.toFixed(2), balance_remaining: autoBalAmt.toFixed(2), payment_status: 'deposit_paid', paymentStatus: 'deposit_paid' });
         } else if (autoIsDeposit && autoDepositAlreadyPaid) {
           autoDisplayAmt = parseFloat(fbPayData.balance_remaining || fbPayData.balance_amount || '0') || Math.round(autoTotalCost * 0.65 * 100) / 100;
-          waMessage = `ðŸ’° *Balance payment received!* R${autoDisplayAmt.toFixed(2)} for booking #${orderLabel}.
+          waMessage = `💰 *Balance payment received!* R${autoDisplayAmt.toFixed(2)} for booking #${orderLabel}.
 
-âœ… Your booking is now fully paid. You can now rate your artisan.
+✅ Your booking is now fully paid. You can now rate your artisan.
 
-Thank you for choosing Square 15! â­
+Thank you for choosing Square 15! ⭐
 
-ðŸ“ Reply *"rate"* to leave a review for your artisan.`;
+📝 Reply *"rate"* to leave a review for your artisan.`;
           await taskRef.update({ balance_paid: true, balance_paid_at: now, payment_status: 'paid', paymentStatus: 'paid' });
         } else {
           autoDisplayAmt = autoTotalCost;
-          waMessage = `ðŸ’° *Payment received!* R${autoDisplayAmt > 0 ? autoDisplayAmt.toFixed(2) : '0.00'} for booking #${orderLabel}.
+          waMessage = `💰 *Payment received!* R${autoDisplayAmt > 0 ? autoDisplayAmt.toFixed(2) : '0.00'} for booking #${orderLabel}.
 
-âœ… Your booking is confirmed. Your artisan will contact you to arrange the visit.
+✅ Your booking is confirmed. Your artisan will contact you to arrange the visit.
 
-Thank you for choosing Square 15! ðŸ› ï¸`;
+Thank you for choosing Square 15! 🛠️`;
         }
         await fetch(`${waBot}/api/booking-status-update`, {
           method: 'POST',
@@ -9672,7 +9738,7 @@ Thank you for choosing Square 15! ðŸ› ï¸`;
           const fdDepPaidAt = fd.deposit_paid_at ? new Date(fd.deposit_paid_at).getTime() : 0;
           const fdTimeSinceDep = fdDepPaidAt ? (Date.now() - fdDepPaidAt) : Infinity;
           if (fd.payment_type === 'deposit' && fd.deposit_paid === true && fd.balance_paid !== true && fd.payment_status !== 'paid' && fdTimeSinceDep > 120000) {
-            // Balance payment ï¿½ proceed (genuine second payment, not ITN duplicate)
+            // Balance payment � proceed (genuine second payment, not ITN duplicate)
             return;
           }
           throw new Error('ALREADY_VERIFIED');
@@ -9687,7 +9753,7 @@ Thank you for choosing Square 15! ðŸ› ï¸`;
       console.warn(`[processPayment] Idempotency transaction error: ${txErr.message}`);
     }
   } else {
-    console.log(`[processPayment] Balance payment for deposit booking ${bookingId} (${Math.round(timeSinceDeposit/1000)}s after deposit) ï¿½ bypassing idempotency`);
+    console.log(`[processPayment] Balance payment for deposit booking ${bookingId} (${Math.round(timeSinceDeposit/1000)}s after deposit) � bypassing idempotency`);
   }
 
   // -- Read deposit/balance info from futureBookings if missing on tasksManagement --
@@ -9760,7 +9826,7 @@ Thank you for choosing Square 15! ðŸ› ï¸`;
   // -- PAYMENT AMOUNT VERIFICATION (financial-integrity guard) --
   // The amount actually paid via PayFast (amountGross) MUST match the
   // amount we recorded as expected (deposit_amount / balance_remaining / cost)
-  // within a small tolerance. Mismatches must NOT auto-confirm ï¿½ they
+  // within a small tolerance. Mismatches must NOT auto-confirm � they
   // indicate a tampered/stale link, manual override, or quote change after
   // payment was initiated. Such cases are flagged for admin review.
   // --------------------------------------------------------------------
@@ -9787,13 +9853,13 @@ Thank you for choosing Square 15! ðŸ› ï¸`;
     }
 
     if (expectedAmount > 0) {
-      // Tolerance: max(R1.00 absolute, 1% relative) ï¿½ covers gateway rounding
+      // Tolerance: max(R1.00 absolute, 1% relative) � covers gateway rounding
       const diff = Math.abs(paidAmount - expectedAmount);
       const tolerance = Math.max(1.00, expectedAmount * 0.01);
       if (diff > tolerance) {
         console.error(`?? [processPayment] AMOUNT MISMATCH for ${bookingId}: expected ${expectedLabel} R${expectedAmount.toFixed(2)} but PayFast received R${paidAmount.toFixed(2)} (diff R${diff.toFixed(2)}, tolerance R${tolerance.toFixed(2)})`);
 
-          // Flag the booking for admin review ï¿½ DO NOT mark as paid
+          // Flag the booking for admin review � DO NOT mark as paid
           const mismatchFields = {
             payment_amount_mismatch: true,
             payment_amount_mismatch_at: now,
@@ -9858,7 +9924,7 @@ Thank you for choosing Square 15! ðŸ› ï¸`;
           // Notify admin (in-app + FCM)
           try {
             await admin.firestore().collection('notifications').add({
-              title: '?? Payment amount mismatch ï¿½ manual review required',
+              title: '?? Payment amount mismatch � manual review required',
               body: `Booking ${taskData.order_no || bookingId}: expected ${expectedLabel} R${expectedAmount.toFixed(2)} but received R${paidAmount.toFixed(2)} (diff R${diff.toFixed(2)}). PayFast ID: ${pfPaymentId || 'unknown'}. Booking is on hold pending admin action.`,
               type: 'payment_mismatch',
               user_type: 'admin',
@@ -9884,7 +9950,7 @@ Thank you for choosing Square 15! ðŸ› ï¸`;
                   body: JSON.stringify({
                     bookingId: taskData.future_booking_id || bookingId,
                     status: 'payment_under_review',
-                    message: `âš ï¸ *Payment received but on hold*\n\nWe received R${paidAmount.toFixed(2)} for booking #${taskData.order_no || bookingId}, but our records show the expected ${expectedLabel} amount is R${expectedAmount.toFixed(2)}.\n\nOur team has been notified and will review this within 1 business hour. Your funds are safe â€” no further action is needed from you right now. We'll message you once it's resolved. ðŸ™`,
+                    message: `⚠️ *Payment received but on hold*\n\nWe received R${paidAmount.toFixed(2)} for booking #${taskData.order_no || bookingId}, but our records show the expected ${expectedLabel} amount is R${expectedAmount.toFixed(2)}.\n\nOur team has been notified and will review this within 1 business hour. Your funds are safe — no further action is needed from you right now. We'll message you once it's resolved. 🙏`,
                   }),
                   signal: AbortSignal.timeout(10000),
                 });
@@ -9898,10 +9964,10 @@ Thank you for choosing Square 15! ðŸ› ï¸`;
       }
       console.log(`[processPayment] Amount verified for ${bookingId}: ${expectedLabel} expected R${expectedAmount.toFixed(2)}, paid R${paidAmount.toFixed(2)} (within tolerance R${tolerance.toFixed(2)})`);
     } else {
-      console.warn(`[processPayment] Could not determine expected amount for ${bookingId} (${expectedLabel}) ï¿½ proceeding without verification`);
+      console.warn(`[processPayment] Could not determine expected amount for ${bookingId} (${expectedLabel}) � proceeding without verification`);
     }
   } else {
-    console.warn(`[processPayment] amountGross missing/invalid for ${bookingId}: "${amountGross}" ï¿½ proceeding without verification`);
+    console.warn(`[processPayment] amountGross missing/invalid for ${bookingId}: "${amountGross}" � proceeding without verification`);
   }
 
   const updateData = {
@@ -10069,31 +10135,31 @@ Thank you for choosing Square 15! ðŸ› ï¸`;
         const displayAmount = rawPayAmt > 0 ? rawPayAmt.toFixed(2) : '0.00';
         let waMessage;
         if (isBalancePayment) {
-          waMessage = `ðŸ’° *Balance payment received!* R${displayAmount} for booking #${taskData.order_no || fbId}.
+          waMessage = `💰 *Balance payment received!* R${displayAmount} for booking #${taskData.order_no || fbId}.
 
-âœ… Your booking is now fully paid. You can now rate your artisan.
+✅ Your booking is now fully paid. You can now rate your artisan.
 
-Thank you for choosing Square 15! â­
+Thank you for choosing Square 15! ⭐
 
-ðŸ“ Reply *"rate"* to leave a review for your artisan.`;
+📝 Reply *"rate"* to leave a review for your artisan.`;
         } else if (isDepositPayment) {
           const balAmount = parseFloat(taskData.balance_amount || 0).toFixed(2);
-          waMessage = `ðŸ’° *Deposit received!* R${displayAmount} for booking #${taskData.order_no || fbId}.
+          waMessage = `💰 *Deposit received!* R${displayAmount} for booking #${taskData.order_no || fbId}.
 
-âœ… Your booking is confirmed. The remaining balance of R${balAmount} will be due after job completion.
+✅ Your booking is confirmed. The remaining balance of R${balAmount} will be due after job completion.
 
-Your artisan will contact you to arrange the visit. ðŸ› ï¸
+Your artisan will contact you to arrange the visit. 🛠️
 
-ðŸ“² *What's next?*
-â€¢ You'll receive your artisan's photo & details for safety verification
-â€¢ Reply *"track"* to see when they're on the way
-â€¢ Reply *"help"* anytime if you have questions`;
+📲 *What's next?*
+• You'll receive your artisan's photo & details for safety verification
+• Reply *"track"* to see when they're on the way
+• Reply *"help"* anytime if you have questions`;
         } else {
-          waMessage = `ðŸ’° *Payment received!* R${displayAmount} for booking #${taskData.order_no || fbId}.
+          waMessage = `💰 *Payment received!* R${displayAmount} for booking #${taskData.order_no || fbId}.
 
-âœ… Your booking is confirmed. Your artisan will contact you to arrange the visit.
+✅ Your booking is confirmed. Your artisan will contact you to arrange the visit.
 
-Thank you for choosing Square 15! ðŸ› ï¸`;
+Thank you for choosing Square 15! 🛠️`;
         }
         await fetch(`${waBot}/api/booking-status-update`, {
           method: 'POST',
@@ -10134,7 +10200,7 @@ Thank you for choosing Square 15! ðŸ› ï¸`;
         }
         const orderLabel = taskData.order_no || fbId;
         const totalForArtisan = parseFloat(taskData.total_cost) || parseFloat(taskData.cost) || 0;
-        // SAFETY: same priority ï¿½ prefer recorded expected amount over amountGross
+        // SAFETY: same priority � prefer recorded expected amount over amountGross
         let artisanPayAmt;
         if (isDepositPayment) {
           artisanPayAmt = parseFloat(updateData.deposit_amount) || parseFloat(taskData.deposit_amount)
@@ -10311,16 +10377,16 @@ h1{color:${color};margin:0 0 16px}p{color:#555;line-height:1.6;margin:0}</style>
 
   // -- FALLBACK: Process payment directly since ITN may not reach Render (free tier sleep) --
   // processSuccessfulPayment has idempotency (ALREADY_VERIFIED transaction), so calling from
-  // both ozow-result AND ITN is safe ï¿½ only the first one processes.
+  // both ozow-result AND ITN is safe � only the first one processes.
   //
   // LK-3 (May 2026): we MUST verify the signed callback token before processing
   // payment, otherwise an attacker can hit this URL with any booking_id and
   // mark it paid. Fail-closed: invalid/missing token ? render the page (above)
   // but DO NOT call processSuccessfulPayment.
   if (isSuccess && booking_id) {
-    // Skip admin card-save synthetic id (no payment to process ï¿½ PayFast handles tokenisation server-side)
+    // Skip admin card-save synthetic id (no payment to process � PayFast handles tokenisation server-side)
     if (booking_id === 'admin_card_save') {
-      console.log('[ozow-result] admin_card_save callback ï¿½ no booking processing needed');
+      console.log('[ozow-result] admin_card_save callback � no booking processing needed');
       return;
     }
     const sigCheck = verifyPaymentCallback(booking_id, t, exp);
@@ -10339,7 +10405,7 @@ h1{color:${color};margin:0 0 16px}p{color:#555;line-height:1.6;margin:0}</style>
           read: false,
         });
       } catch (_) {}
-      return; // page already sent ï¿½ do NOT process payment
+      return; // page already sent � do NOT process payment
     }
     try {
       const preCheck = await admin.firestore().collection('tasksManagement').doc(booking_id).get();
@@ -10349,8 +10415,8 @@ h1{color:${color};margin:0 0 16px}p{color:#555;line-height:1.6;margin:0}</style>
         console.log(`[ozow-result] Booking ${booking_id} already in state '${preData.payment_status}', skipping`);
         return;
       }
-      console.log(`[ozow-result] Processing payment for ${booking_id} (fallback ï¿½ ITN may or may not arrive)`);
-      // Resolve amount based on payment_type ï¿½ DO NOT default to total cost,
+      console.log(`[ozow-result] Processing payment for ${booking_id} (fallback � ITN may or may not arrive)`);
+      // Resolve amount based on payment_type � DO NOT default to total cost,
       // or a deposit payment will be recorded as the full amount (financial bug).
       let fallbackItem = preData.description || preData.item_name || '';
       let preDoc = preData;
@@ -10393,7 +10459,7 @@ h1{color:${color};margin:0 0 16px}p{color:#555;line-height:1.6;margin:0}</style>
 });
 
 // -- PayFast ITN (Instant Transaction Notification) Webhook --
-// Server-side payment verification ï¿½ PayFast posts here after payment
+// Server-side payment verification � PayFast posts here after payment
 app.post('/api/payment/itn', async (req, res) => {
   try {
     const data = req.body;
@@ -10512,7 +10578,7 @@ app.post('/api/payment/itn', async (req, res) => {
           });
         } catch (replayErr) {
           if (replayErr && replayErr.message === 'ITN_ALREADY_PROCESSED') {
-            console.warn(`[ITN] replay detected for pf_payment_id=${pfPaymentId} task=${customStr1} ï¿½ skipping`);
+            console.warn(`[ITN] replay detected for pf_payment_id=${pfPaymentId} task=${customStr1} � skipping`);
             return res.status(200).send('OK');
           }
           throw replayErr;
@@ -10632,7 +10698,7 @@ app.post('/api/token', authMiddleware, rateLimitBy('livekit_token', 30, 5 * 60 *
  * POST /api/chat-bot
  * Body: { question: string }
  * Auth: Firebase ID token required.
- * Rate limit: 60/uid/5min (interactive chat ï¿½ generous but not abusable).
+ * Rate limit: 60/uid/5min (interactive chat � generous but not abusable).
  */
 // Debug endpoint: proxy arbitrary OpenAI Chat Completions for internal testing
 // of the AITextChatService (Lizzy Text) routing. Gated by INTERNAL_API_SECRET.
@@ -10712,11 +10778,11 @@ app.post('/api/chat-bot', authMiddleware, rateLimitBy('chat_bot', 60, 5 * 60 * 1
               'You help clients with information about plumbing, electrical, painting, carpentry, roofing, tiling, locksmith, and other maintenance services. ' +
               'Be helpful, friendly, and concise. Amounts are in South African Rand (R). ' +
               "For booking or account actions, suggest the user use the full AI Chat or the app's booking flow. " +
-              '\n\nTRUST & SAFETY FACTS â€” use ONLY these wordings, never invent warranties, insurance, criminal-background checks, or licence claims:\n' +
+              '\n\nTRUST & SAFETY FACTS — use ONLY these wordings, never invent warranties, insurance, criminal-background checks, or licence claims:\n' +
               '- ESCROW: every payment is held by Square 15 and only released to the artisan after the customer confirms the work is done right.\n' +
               '- VETTING: every active artisan is registered with Square 15, has submitted government ID, and is rated by past customers.\n' +
               '- IDENTITY CHECK: when the artisan is on the way, the customer is sent the artisan\'s profile photo on WhatsApp so they can match the face at the door.\n' +
-              '- REFUND POLICY: full refund if cancelled before work starts; partial refund (less materials already bought + time worked) if cancelled mid-job; if work is finished but the customer is not satisfied, escrow stays locked until admin investigates. Wallet refunds are instant; card refunds 3â€“5 business days.\n' +
+              '- REFUND POLICY: full refund if cancelled before work starts; partial refund (less materials already bought + time worked) if cancelled mid-job; if work is finished but the customer is not satisfied, escrow stays locked until admin investigates. Wallet refunds are instant; card refunds 3–5 business days.\n' +
               '- PERSONAL SAFETY: tell the user that if they ever feel unsafe they can reply "help" or "emergency" to alert support; for life-threatening emergencies remind them to call 10111 / 10177 first.\n' +
               '- DO NOT promise workmanship warranties, free reworks, insurance cover, or licence numbers. If asked, say our standard protection is the escrow + refund policy and offer to connect them with admin.',
           },
@@ -10865,7 +10931,7 @@ app.get('/debug/voice-breadcrumb', (req, res) => {
  *   - Dispatches the voice agent into a fresh room
  *   - Publishes credentials (firebase_token) via LiveKit data channel
  *   - Publishes a square15_app text_input action so the agent's LLM processes the
- *     message AS IF the user spoke it â€” agent tools fire, real Firestore artifacts created.
+ *     message AS IF the user spoke it — agent tools fire, real Firestore artifacts created.
  * Returns the room name + dispatch info so the caller can poll Firestore.
  */
 app.post('/debug/voice-e2e', async (req, res) => {
@@ -10932,7 +10998,7 @@ app.post('/debug/voice-e2e', async (req, res) => {
     }
 
     // Wait for the agent's session to be fully started (session.start() returned)
-    // â€” only then can generate_reply produce assistant turns. The agent posts
+    // — only then can generate_reply produce assistant turns. The agent posts
     // a `session_started` event in the `agent-ready-{roomName}` breadcrumb.
     const readyKey = `agent-ready-${roomName}`;
     const readyDeadline = Date.now() + 60000;
@@ -10969,7 +11035,7 @@ app.post('/debug/voice-e2e', async (req, res) => {
     // Give the agent a moment to ingest credentials before sending the user turn.
     await new Promise(r => setTimeout(r, 1500));
 
-    // 3) Push the text_input action â€” agent will process it as user speech
+    // 3) Push the text_input action — agent will process it as user speech
     const textInput = {
       type: 'square15_app',
       action: 'text_input',
@@ -10996,7 +11062,7 @@ app.post('/debug/voice-e2e', async (req, res) => {
     // 4) Wait for the agent to run its LLM + tools
     await new Promise(r => setTimeout(r, waitMs));
 
-    // 5) Diff Firestore â€” return newly-created futureBookings for this uid
+    // 5) Diff Firestore — return newly-created futureBookings for this uid
     let newBookings = [];
     try {
       const cutoffMs = Date.now() - waitMs - 30000;
@@ -11272,7 +11338,7 @@ async function logErrorToAdmin(errorType, description, source, errorDetails, boo
           _cleanStaleFcmTokens(stale).catch(() => {});
         }
       } else {
-        console.warn('[errorReport] No admin FCM tokens found ï¿½ push not sent (error_log still written).');
+        console.warn('[errorReport] No admin FCM tokens found � push not sent (error_log still written).');
       }
     } catch (fanoutErr) {
       console.warn('[errorReport] admin fanout failed:', fanoutErr && fanoutErr.message);
@@ -11339,7 +11405,7 @@ async function _cleanStaleFcmTokens(staleTokens) {
         'auto_healed',
         `Auto-cleaned ${cleaned} stale FCM push tokens (user devices reinstalled app or uninstalled).`,
         'livekit_backend',
-        `Affected: ${affectedUsers.slice(0, 10).join(', ')}${affectedUsers.length > 10 ? 'ï¿½' : ''}`,
+        `Affected: ${affectedUsers.slice(0, 10).join(', ')}${affectedUsers.length > 10 ? '�' : ''}`,
         '',
         'low'
       ).then((id) => {
@@ -11471,11 +11537,11 @@ function _startRefundReconciliationSweeper() {
   }, INTERVAL_MS).unref?.();
 }
 
-// â”€â”€â”€ Weekly Ozow Payout Batch sweeper â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─── Weekly Ozow Payout Batch sweeper ─────────────────────────────────────
 // Every Monday at ~09:00 SAST (07:00 UTC) we build a draft payout batch that
 // the admin must review/edit/approve via /api/admin/payout-batches/:id/approve.
 // Source: corporate_partners.pending_payout + users (artisans) balance.
-// Idempotent â€” won't create a second draft if one already exists for the week.
+// Idempotent — won't create a second draft if one already exists for the week.
 function _startWeeklyPayoutBatchSweep() {
   const CHECK_INTERVAL_MS = 60 * 60 * 1000; // re-check every hour
   // Run once shortly after boot, then hourly.
@@ -11571,7 +11637,7 @@ async function _maybeBuildWeeklyBatch(force = false) {
     // Send an INFO-level admin notification once per batch. Not an error.
     if (!prevNotifiedAt) {
       try {
-        const message = `Weekly payout batch ${weekKey} ready for review: ${items.length} items, R${totalAmount.toFixed(2)}. Open admin app â†’ Payouts to approve.`;
+        const message = `Weekly payout batch ${weekKey} ready for review: ${items.length} items, R${totalAmount.toFixed(2)}. Open admin app → Payouts to approve.`;
         await firestore.collection('notifications').add({
           title: 'Weekly Payout Batch Ready',
           message,
@@ -11624,9 +11690,9 @@ function _plainEnglishFromError(err) {
   if (s.includes('ozow')) return 'Ozow payment gateway call failed.';
   if (s.includes('timeout')) return 'An operation timed out. Backend still running.';
   if (s.includes('cannot read') || s.includes('undefined is not')) {
-    return 'Code error ï¿½ a variable was missing or wrong shape. Auto-recovered.';
+    return 'Code error � a variable was missing or wrong shape. Auto-recovered.';
   }
-  return 'Unexpected backend error. Auto-recovered ï¿½ server still running. See stack for details.';
+  return 'Unexpected backend error. Auto-recovered � server still running. See stack for details.';
 }
 
 async function _captureBackendError(kind, err, reqInfo) {
@@ -11690,7 +11756,7 @@ async function _captureBackendError(kind, err, reqInfo) {
   }
 }
 
-// Error handling middleware ï¿½ also forwards to admin dashboard
+// Error handling middleware � also forwards to admin dashboard
 app.use((err, req, res, next) => {
   console.error('? Server error:', err);
   const reqInfo = `${req.method} ${req.originalUrl}`;
@@ -11808,7 +11874,7 @@ app.post('/api/admin/self-bootstrap-claims', adminLimiter, async (req, res) => {
     const existing = (decoded && decoded.claims) || {};
     const grantRole = tierGrants ? tier : 'admin';
     await admin.auth().setCustomUserClaims(uid, { ...existing, role: grantRole, admin: true });
-    console.log(`âœ… self-bootstrap-claims: granted ${grantRole} to ${uid} (${u.email || ''})`);
+    console.log(`✅ self-bootstrap-claims: granted ${grantRole} to ${uid} (${u.email || ''})`);
     return res.json({
       success: true,
       uid,
@@ -11831,13 +11897,13 @@ app.post('/api/admin/self-bootstrap-claims', adminLimiter, async (req, res) => {
  * }
  *
  * Anti-fraud (May-2026): the admin's Android Storage SDK has been
- * returning a generic [unknown] error during direct putFile() ï¿½ likely a
+ * returning a generic [unknown] error during direct putFile() � likely a
  * regional/SDK quirk. We bypass the client SDK entirely: backend uses
  * the Firebase Admin SDK (bypasses Storage rules), uploads to
  * `service_providers/{artisanId}.jpg`, generates a download URL, and
  * mirrors `imageUrl`/`image` onto `serviceProvider/{artisanId}` in
  * Firestore so the artisan app + admin app + WA bot all see the new
- * picture immediately. Artisans cannot call this endpoint ï¿½ we verify
+ * picture immediately. Artisans cannot call this endpoint � we verify
  * the caller is an admin via Firestore (Admin SDK can read it bypassing
  * rules; we don't rely on custom claims here).
  */
@@ -11942,7 +12008,7 @@ app.post(
 );
 
 // -------------------------------------------------------------------------------
-// PHASE 5.2 ï¿½ Secure Finance Approval Pipeline (Tier C)
+// PHASE 5.2 � Secure Finance Approval Pipeline (Tier C)
 // Money NEVER moves without: auth ? fraud check ? request doc ? admin approval
 // -------------------------------------------------------------------------------
 
@@ -11958,7 +12024,7 @@ async function runFraudChecks({ firestore, type, amount, targetUserId, requested
     alerts.push({ rule: 'amount_exceeds_daily_limit', severity: 'high', detail: `R${amountNum} exceeds R${dailyLimit} limit for ${type}` });
   }
 
-  // Rule 2: Velocity check ï¿½ max 5 finance requests per user per hour
+  // Rule 2: Velocity check � max 5 finance requests per user per hour
   try {
     const oneHourAgo = new Date(Date.now() - 3600000).toISOString();
     const recentSnap = await firestore.collection('finance_requests')
@@ -11971,12 +12037,12 @@ async function runFraudChecks({ firestore, type, amount, targetUserId, requested
     }
   } catch (e) { console.warn('\u26a0\ufe0f fraud velocity check:', e.message); }
 
-  // Rule 3: Self-dealing ï¿½ admin requesting funds to themselves
+  // Rule 3: Self-dealing � admin requesting funds to themselves
   if (targetUserId === requestedBy) {
     alerts.push({ rule: 'self_dealing', severity: 'critical', detail: 'Admin requesting financial action to own account' });
   }
 
-  // Rule 4: Duplicate refund ï¿½ same booking refunded within 24 hours
+  // Rule 4: Duplicate refund � same booking refunded within 24 hours
   if (type === 'refund' && bookingId) {
     try {
       const oneDayAgo = new Date(Date.now() - 86400000).toISOString();
@@ -12080,7 +12146,7 @@ app.post('/api/admin/ops/fix', adminLimiter, async (req, res) => {
 
   try {
     if (action === 'clean_fcm_tokens') {
-      // target = token string OR user/artisan docId ï¿½ we scrub by token string;
+      // target = token string OR user/artisan docId � we scrub by token string;
       // if a docId is given, pull tokens off that doc first.
       let tokens = [];
       if (target) {
@@ -12342,7 +12408,7 @@ app.post('/api/finance/approve', adminLimiter, async (req, res) => {
     });
   }
 
-  // Check status ï¿½ only pending or flagged can be approved
+  // Check status � only pending or flagged can be approved
   if (!['pending_approval', 'flagged_for_review'].includes(finReq.status)) {
     return res.status(409).json({
       error: 'invalid_status',
@@ -12633,7 +12699,7 @@ app.get('/api/finance/fraud-alerts', adminLimiter, async (req, res) => {
         .limit(limit)
         .get();
     } catch (indexErr) {
-      // Composite index may not exist yet ï¿½ fall back to status-only query
+      // Composite index may not exist yet � fall back to status-only query
       console.warn('[fraud-alerts] Index query failed, falling back:', indexErr.message);
       snap = await firestore.collection('fraud_alerts')
         .where('status', '==', status)
@@ -12677,23 +12743,23 @@ app.post('/api/finance/fraud-alerts/dismiss', adminLimiter, async (req, res) => 
 });
 
 // 404 handler
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-// PayJustNow direct integration (scaffolding â€” keys arrive later).
+// ─────────────────────────────────────────────────────────────────────────────
+// PayJustNow direct integration (scaffolding — keys arrive later).
 //
 // Flow when live:
 //   1. Client POSTs /api/bnpl/payjustnow/create-order with { amount, taskId, ... }
-//   2. Backend reads app_config/bnpl_payJustNow â†’ api_key, sandbox/prod flag.
+//   2. Backend reads app_config/bnpl_payJustNow → api_key, sandbox/prod flag.
 //   3. Backend POSTs to PayJustNow /order endpoint, receives token + redirectUrl.
 //   4. Backend stores bnpl_orders/{orderId} with status='pending'.
 //   5. Returns { redirect_url, token, order_id } to client.
-//   6. Client opens WebView â†’ on confirm redirect, client posts /api/bnpl/payjustnow/capture.
+//   6. Client opens WebView → on confirm redirect, client posts /api/bnpl/payjustnow/capture.
 //   7. Backend posts to PayJustNow /order/{token}/capture, marks bnpl_orders captured.
-//   8. PayJustNow webhook â†’ /api/bnpl/payjustnow/webhook (signed; we verify).
+//   8. PayJustNow webhook → /api/bnpl/payjustnow/webhook (signed; we verify).
 //
 // Right now every endpoint returns 503 because we have no API key.
 // When PayJustNow sends us their keys, fill PAYJUSTNOW_* config values and
-// flip the COMING_SOON guard at the top â€” no client changes needed.
-// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// flip the COMING_SOON guard at the top — no client changes needed.
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function getPayJustNowConfig() {
   try {
@@ -12825,7 +12891,7 @@ app.post('/api/bnpl/payjustnow/capture', authMiddleware, async (req, res) => {
   }
 });
 
-// PayJustNow webhook (signature verification â€” exact header name TBD by PJN docs).
+// PayJustNow webhook (signature verification — exact header name TBD by PJN docs).
 app.post('/api/bnpl/payjustnow/webhook', express.raw({ type: '*/*' }), async (req, res) => {
   const cfg = await getPayJustNowConfig();
   if (!cfg) return res.status(503).send('not_configured');
@@ -12868,7 +12934,7 @@ if (require.main === module) {
     console.error('\u274c Unhandled Rejection:', reason);
     const err = reason instanceof Error ? reason : new Error(String(reason));
     _captureBackendError('unhandled_rejection', err);
-    // DO NOT exit ï¿½ keep serving other requests
+    // DO NOT exit � keep serving other requests
   });
   process.on('uncaughtException', (error) => {
     console.error('\u274c Uncaught Exception:', error);
@@ -12883,11 +12949,11 @@ if (require.main === module) {
     console.log(`?? Token endpoint: http://localhost:${PORT}/api/token`);
     console.log(`?? Voice start endpoint: http://localhost:${PORT}/api/voice/start`);
     console.log(`?? Environment: ${process.env.NODE_ENV}`);
-    // â”€â”€â”€ Gap #14: Ozow prod safety at startup â”€â”€â”€
+    // ─── Gap #14: Ozow prod safety at startup ───
     try {
       const ozowErrs = assertOzowProdSafety();
       if (ozowErrs.length > 0) {
-        console.error('ðŸš¨ OZOW PROD SAFETY WARNING AT STARTUP:', ozowErrs);
+        console.error('🚨 OZOW PROD SAFETY WARNING AT STARTUP:', ozowErrs);
         try {
           admin.firestore().collection('error_logs').add({
             error_type: 'ozow_prod_safety_warning_startup',
@@ -12898,13 +12964,13 @@ if (require.main === module) {
           });
         } catch (_) {}
       } else if (env('OZOW_IS_TEST') === 'true') {
-        console.log('âœ… Ozow: SANDBOX mode (no money will move).');
+        console.log('✅ Ozow: SANDBOX mode (no money will move).');
       } else {
-        console.log('âœ… Ozow: LIVE mode â€” credentials passed safety check.');
+        console.log('✅ Ozow: LIVE mode — credentials passed safety check.');
       }
     } catch (e) { console.warn('Ozow safety assertion threw:', e.message); }
 
-    // â”€â”€â”€ Owner bootstrap â”€â”€â”€
+    // ─── Owner bootstrap ───
     // If OWNER_UID is set in env, ensure that uid has the `owner` custom
     // claim. Idempotent and safe to run on every startup.
     try {
@@ -12929,25 +12995,25 @@ if (require.main === module) {
               changed_by: 'system_bootstrap',
               created_at: new Date().toISOString(),
             });
-            console.log(`ðŸ‘‘ Owner role granted to ${ownerUid} (${user.email || '?'})`);
+            console.log(`👑 Owner role granted to ${ownerUid} (${user.email || '?'})`);
           } else {
-            console.log(`ðŸ‘‘ Owner already configured: ${ownerUid} (${user.email || '?'})`);
+            console.log(`👑 Owner already configured: ${ownerUid} (${user.email || '?'})`);
           }
         } else {
-          console.warn(`âš ï¸ OWNER_UID=${ownerUid} not found in Firebase Auth`);
+          console.warn(`⚠️ OWNER_UID=${ownerUid} not found in Firebase Auth`);
         }
       } else {
-        console.warn('âš ï¸ No OWNER_UID env var set. No admin can grant roles or bypass daily caps until one is configured.');
+        console.warn('⚠️ No OWNER_UID env var set. No admin can grant roles or bypass daily caps until one is configured.');
       }
     } catch (e) { console.warn('Owner bootstrap error:', e.message); }
-    // LK-13: hard refusal ï¿½ if anyone leaves the no-auth voice flag enabled in
+    // LK-13: hard refusal � if anyone leaves the no-auth voice flag enabled in
     // production, log loudly to error_logs and ALSO refuse to enable it (the
     // flag is read again at request time; we set NODE_ENV-dependent override).
     try {
       const dangerFlag = String(process.env.ALLOW_VOICE_START_WITHOUT_AUTH || '').toLowerCase();
       const isProd = String(process.env.NODE_ENV || '').toLowerCase() === 'production';
       if (isProd && (dangerFlag === '1' || dangerFlag === 'true' || dangerFlag === 'yes' || dangerFlag === 'on')) {
-        console.error('?? SECURITY: ALLOW_VOICE_START_WITHOUT_AUTH is enabled in production. This lets anyone start a voice session without Firebase auth. The flag is being IGNORED ï¿½ set it to false in Render env vars to silence this warning.');
+        console.error('?? SECURITY: ALLOW_VOICE_START_WITHOUT_AUTH is enabled in production. This lets anyone start a voice session without Firebase auth. The flag is being IGNORED � set it to false in Render env vars to silence this warning.');
         // Forcibly clear so downstream isEnvTruthy() reads false
         process.env.ALLOW_VOICE_START_WITHOUT_AUTH = 'false';
         try {
