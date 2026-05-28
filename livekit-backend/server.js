@@ -742,7 +742,14 @@ async function resolveRole({ firestore, uid, decodedToken }) {
     (decodedToken && (decodedToken.role || decodedToken.user_role || decodedToken.user_type)) ||
     '';
   const claimRole = String(fromClaims).trim().toLowerCase();
+  // Owner is a super-admin tier. Normalize to 'admin' so all downstream
+  // `role === 'admin'` checks pass (otherwise the Owner gets 403
+  // "Admin access required" on payouts, refunds, etc — May 28 2026 bug).
+  // Also treat the admin boolean claim as 'admin' role for the same
+  // reason (some users have admin:true but no role string).
+  if (claimRole === 'owner') return 'admin';
   if (claimRole === 'admin' || claimRole === 'artisan' || claimRole === 'client') return claimRole;
+  if (decodedToken && decodedToken.admin === true) return 'admin';
 
   try {
     const userSnap = await firestore.collection('users').doc(uid).get();
