@@ -9045,11 +9045,11 @@ app.post('/api/ozow-payout-verify', async (req, res) => {
     } catch (_) {}
 
     console.log(`[ozow-payout-verify] APPROVED payoutId=${payoutId} ref=${bankReference} - returning encryption key`);
-    // Ozow's verification webhook spec requires `IsAccountVerified: true` as
-    // the primary boolean. Returning any other field name causes Ozow to
-    // mark the payout "Verification Failed / Not verified response" and
-    // cancel it. We send every reasonable casing variation so we are
-    // resilient to spec changes.
+    // Ozow's verification webhook spec requires two specific fields:
+    //   - `IsAccountVerified: true`          (boolean approval)
+    //   - `AccountNumberDecryptionKey`       (the AES key used to encrypt the account number)
+    // Missing either causes the payout to be cancelled. We send every
+    // reasonable casing variation so we are resilient to spec changes.
     return res.status(200).json({
       IsAccountVerified: true,
       isAccountVerified: true,
@@ -9057,6 +9057,10 @@ app.post('/api/ozow-payout-verify', async (req, res) => {
       isVerified: true,
       Verified: true,
       verified: true,
+      AccountNumberDecryptionKey: encryptionKey,
+      accountNumberDecryptionKey: encryptionKey,
+      DecryptionKey: encryptionKey,
+      decryptionKey: encryptionKey,
       EncryptionKey: encryptionKey,
       encryptionKey: encryptionKey,
       PayoutId: payoutId || rec.ozow_payout_id || null,
