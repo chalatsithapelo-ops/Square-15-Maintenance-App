@@ -9026,14 +9026,14 @@ app.post('/api/ozow-payout-verify', async (req, res) => {
 
     if (!foundDoc) {
       console.warn(`[ozow-payout-verify] payoutId=${payoutId} ref=${bankReference} not found in payout_records`);
-      return res.status(404).json({ verified: false, error: 'Payout not found' });
+      return res.status(404).json({ IsAccountVerified: false, isAccountVerified: false, verified: false, error: 'Payout not found' });
     }
 
     const rec = foundDoc.data() || {};
     const encryptionKey = rec.encryption_key || rec.encryptionKey || null;
     if (!encryptionKey) {
       console.warn(`[ozow-payout-verify] payout ${foundDoc.id} has no encryption_key (legacy record?)`);
-      return res.status(409).json({ verified: false, error: 'Encryption key missing on payout record' });
+      return res.status(409).json({ IsAccountVerified: false, isAccountVerified: false, verified: false, error: 'Encryption key missing on payout record' });
     }
 
     // Mark record as verified for audit
@@ -9045,15 +9045,26 @@ app.post('/api/ozow-payout-verify', async (req, res) => {
     } catch (_) {}
 
     console.log(`[ozow-payout-verify] APPROVED payoutId=${payoutId} ref=${bankReference} - returning encryption key`);
-    // Ozow expects the encryption key in the response so it can decrypt the
-    // accountNumber field. Field names tried by Ozow: encryptionKey / EncryptionKey.
+    // Ozow's verification webhook spec requires `IsAccountVerified: true` as
+    // the primary boolean. Returning any other field name causes Ozow to
+    // mark the payout "Verification Failed / Not verified response" and
+    // cancel it. We send every reasonable casing variation so we are
+    // resilient to spec changes.
     return res.status(200).json({
+      IsAccountVerified: true,
+      isAccountVerified: true,
+      IsVerified: true,
+      isVerified: true,
+      Verified: true,
       verified: true,
-      payoutId: payoutId || rec.ozow_payout_id || null,
-      bankReference: bankReference || rec.merchant_reference || null,
-      merchantReference: rec.merchant_reference || null,
-      encryptionKey: encryptionKey,
       EncryptionKey: encryptionKey,
+      encryptionKey: encryptionKey,
+      PayoutId: payoutId || rec.ozow_payout_id || null,
+      payoutId: payoutId || rec.ozow_payout_id || null,
+      MerchantReference: rec.merchant_reference || null,
+      merchantReference: rec.merchant_reference || null,
+      BankReference: bankReference || rec.merchant_reference || null,
+      bankReference: bankReference || rec.merchant_reference || null,
     });
   } catch (e) {
     console.error('[ozow-payout-verify] error:', e && e.message);
