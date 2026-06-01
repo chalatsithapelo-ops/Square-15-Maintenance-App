@@ -9228,6 +9228,97 @@ app.post('/api/ozow-payout-notify', async (req, res) => {
     }
 
     console.log(`? Payout ${payoutId} updated to ${finalStatus}`);
+
+    // ── Admin FCM push on settlement ─────────────────────────────────
+    // Notify every admin when a payout reaches a terminal state so they
+    // get a phone alert without having to refresh the dashboard.
+    try {
+      const amountStr = `R${parseFloat(payoutData.amount || 0).toFixed(2)}`;
+      const refLabel = payoutData.recipient_name || payoutData.recipient_id || payoutData.merchant_reference || '';
+      const title = finalStatus === 'completed'
+        ? `Payout SUCCESS: ${amountStr}`
+        : (finalStatus === 'failed' ? `Payout FAILED: ${amountStr}` : `Payout update: ${amountStr}`);
+      const body = finalStatus === 'completed'
+        ? `${amountStr} EFT to ${refLabel} cleared.`
+        : (finalStatus === 'failed'
+            ? `${amountStr} EFT to ${refLabel} failed (${statusMessage || status}). Funds reversed.`
+            : `${amountStr} EFT to ${refLabel} - status: ${status}`);
+      const dataPayload = {
+        type: 'admin_payout_settled',
+        payout_id: String(payoutId || ''),
+        merchant_reference: String(payoutData.merchant_reference || ''),
+        recipient_type: String(payoutData.recipient_type || ''),
+        recipient_id: String(payoutData.recipient_id || ''),
+        amount: parseFloat(payoutData.amount || 0).toFixed(2),
+        final_status: finalStatus,
+        ozow_status: String(status || ''),
+      };
+
+      const _collectTokens = (d) => {
+        const out = []; const seen = new Set();
+        const push = (v) => { const t = String(v || '').trim(); if (t && !seen.has(t)) { seen.add(t); out.push(t); } };
+        push(d.deviceToken); push(d.device_token); push(d.fcm_token);
+        push(d.fcmToken); push(d.token); push(d.push_token); push(d.pushToken);
+        for (const list of [d.tokens, d.fcm_tokens, d.deviceTokens]) {
+          if (Array.isArray(list)) for (const item of list) push(item);
+        }
+        return out;
+      };
+
+      let adminSnap;
+      try {
+        adminSnap = await db.collection('users').where('isAdmin', '==', true).get();
+      } catch (qe) {
+        console.warn('[ozow-payout-notify] admin lookup failed:', qe && qe.message);
+        adminSnap = { docs: [] };
+      }
+
+      const tokens = [];
+      const seenTokens = new Set();
+      const nowIso = new Date().toISOString();
+      for (const adminDoc of (adminSnap.docs || [])) {
+        const adminUid = adminDoc.id;
+        try {
+          const nref = db.collection('notifications').doc();
+          await nref.set({
+            id: nref.id,
+            user_id: adminUid,
+            user_type: 'admin',
+            title,
+            message: body,
+            type: 'admin_payout_settled',
+            read: false,
+            view: false,
+            time: nowIso,
+            created_at: nowIso,
+            recipient_uid: adminUid,
+            data: dataPayload,
+          });
+        } catch (we) { console.warn('[ozow-payout-notify] admin notif doc failed:', we && we.message); }
+        for (const t of _collectTokens(adminDoc.data() || {})) {
+          if (!seenTokens.has(t)) { seenTokens.add(t); tokens.push(t); }
+        }
+      }
+
+      if (tokens.length > 0) {
+        try {
+          const resp = await admin.messaging().sendEachForMulticast({
+            tokens,
+            notification: { title, body },
+            data: Object.fromEntries(Object.entries(dataPayload).map(([k, v]) => [k, String(v)])),
+            android: { priority: 'high', notification: { channelId: 'high_importance_channel' } },
+          });
+          console.log(`[ozow-payout-notify] FCM sent: attempted=${tokens.length} success=${resp.successCount} fail=${resp.failureCount}`);
+        } catch (e) {
+          console.warn('[ozow-payout-notify] FCM send failed:', e && e.message);
+        }
+      } else {
+        console.warn('[ozow-payout-notify] No admin FCM tokens found - admins will not receive push.');
+      }
+    } catch (notifErr) {
+      console.warn('[ozow-payout-notify] settlement notification block failed (non-fatal):', notifErr && notifErr.message);
+    }
+
     res.json({ ok: true, status: finalStatus });
   } catch (error) {
     console.error('? Ozow payout notify error:', error);
