@@ -9138,11 +9138,15 @@ app.post('/api/ozow-payout-notify', async (req, res) => {
     const okInternal = !!expectedInternal && !!providedInternal
       && crypto.timingSafeEqual(_sha(providedInternal), _sha(expectedInternal));
 
-    const { payoutId, status, statusMessage, bankReference } = req.body || {};
-    // Ozow may send merchantReference under several casings.
+    const _b = req.body || {};
+    // Ozow may send any of these field names depending on the notification
+    // type (Verification vs PayoutComplete) and SDK version. Accept all.
+    const payoutId = _b.payoutId || _b.PayoutId || _b.payoutID || _b.PayoutID || null;
+    const status = _b.status || _b.Status || '';
+    const statusMessage = _b.statusMessage || _b.StatusMessage || '';
+    const bankReference = _b.bankReference || _b.BankReference || _b.customerBankReference || _b.CustomerBankReference || '';
     const merchantRefIncoming = String(
-      (req.body && (req.body.merchantReference || req.body.MerchantReference)) ||
-      bankReference || ''
+      _b.merchantReference || _b.MerchantReference || bankReference || ''
     );
 
     // Fallback auth: Ozow's NotifyUrl spec does NOT carry our token, so
@@ -9171,6 +9175,12 @@ app.post('/api/ozow-payout-notify', async (req, res) => {
             .limit(1).get();
           okPayoutMatch = !probe.empty;
         }
+        if (!okPayoutMatch && bankReference) {
+          const probe = await db0.collection('payout_records')
+            .where('customer_bank_reference', '==', String(bankReference))
+            .limit(1).get();
+          okPayoutMatch = !probe.empty;
+        }
       } catch (_) { /* best-effort */ }
     }
 
@@ -9195,7 +9205,9 @@ app.post('/api/ozow-payout-notify', async (req, res) => {
 
     const db = admin.firestore();
 
-    // Find the payout record by ozow_payout_id, falling back to merchant_reference.
+    // Find the payout record by ozow_payout_id, falling back to
+    // merchant_reference, then customer_bank_reference (Ozow sends
+    // VerificationSuccessful with bankReference = our customerBankReference).
     let payoutSnap = await db.collection('payout_records')
       .where('ozow_payout_id', '==', payoutId)
       .limit(1)
@@ -9205,7 +9217,15 @@ app.post('/api/ozow-payout-notify', async (req, res) => {
         .where('merchant_reference', '==', merchantRefIncoming)
         .limit(1)
         .get();
-      // If found via merchantRef, back-fill the ozow_payout_id for next time.
+      if (!payoutSnap.empty) {
+        try { await payoutSnap.docs[0].ref.update({ ozow_payout_id: payoutId }); } catch (_) {}
+      }
+    }
+    if (payoutSnap.empty && bankReference) {
+      payoutSnap = await db.collection('payout_records')
+        .where('customer_bank_reference', '==', String(bankReference))
+        .limit(1)
+        .get();
       if (!payoutSnap.empty) {
         try { await payoutSnap.docs[0].ref.update({ ozow_payout_id: payoutId }); } catch (_) {}
       }
