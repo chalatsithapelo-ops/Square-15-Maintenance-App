@@ -12835,31 +12835,75 @@ app.get('/api/finance/requests', adminLimiter, async (req, res) => {
   const limitRaw = Number.parseInt(String(req.query.limit || '50'), 10);
   const limit = Math.max(1, Math.min(200, limitRaw));
 
-  let q = firestore.collection('finance_requests').orderBy('created_at', 'desc').limit(limit);
-  if (status) {
-    q = firestore.collection('finance_requests').where('status', '==', status).orderBy('created_at', 'desc').limit(limit);
-  }
-  if (type) {
-    q = q.where('type', '==', type);
-  }
+  // Composite indexes may not exist on every deployment. Build the ideal
+  // query, but fall back to a simpler query + in-memory sort if Firestore
+  // returns FAILED_PRECONDITION (missing-index).
+  const buildIdealQuery = () => {
+    let q = firestore.collection('finance_requests')
+      .orderBy('created_at', 'desc')
+      .limit(limit);
+    if (status) {
+      q = firestore.collection('finance_requests')
+        .where('status', '==', status)
+        .orderBy('created_at', 'desc')
+        .limit(limit);
+    }
+    if (type) {
+      q = q.where('type', '==', type);
+    }
+    return q;
+  };
+
+  const buildFallbackQuery = () => {
+    let q = firestore.collection('finance_requests');
+    if (status) q = q.where('status', '==', status);
+    if (type) q = q.where('type', '==', type);
+    // Pull a larger window so we can sort + trim in memory.
+    return q.limit(Math.max(limit * 4, 200));
+  };
 
   try {
-    const snap = await q.get();
-    const items = snap.docs.map(d => {
+    let snap;
+    let usedFallback = false;
+    try {
+      snap = await buildIdealQuery().get();
+    } catch (indexErr) {
+      console.warn('[finance/requests] index query failed, falling back:', indexErr && indexErr.message);
+      usedFallback = true;
+      snap = await buildFallbackQuery().get();
+    }
+
+    let items = snap.docs.map(d => {
       const r = d.data() || {};
       return {
         id: d.id, type: r.type, amount: r.amount, status: r.status,
         target_user_id: r.target_user_id, booking_id: r.booking_id,
-        reason: r.reason, requested_by: r.requested_by, method: r.method,
+        reason: r.reason, requested_by: r.requested_by,
+        requested_by_email: r.requested_by_email, method: r.method,
         fraud_score: r.fraud_score, fraud_alerts: r.fraud_alerts,
         requires_secondary_approval: r.requires_secondary_approval,
         approvals: r.approvals, created_at: r.created_at,
         executed_at: r.executed_at, resolved_at: r.resolved_at,
       };
     });
-    return res.json({ success: true, count: items.length, items });
+
+    if (usedFallback) {
+      const toMs = (v) => {
+        if (!v) return 0;
+        if (typeof v.toMillis === 'function') return v.toMillis();
+        if (typeof v === 'number') return v;
+        if (typeof v === 'string') { const t = Date.parse(v); return isNaN(t) ? 0 : t; }
+        if (v._seconds) return v._seconds * 1000 + Math.floor((v._nanoseconds || 0) / 1e6);
+        return 0;
+      };
+      items.sort((a, b) => toMs(b.created_at) - toMs(a.created_at));
+      items = items.slice(0, limit);
+    }
+
+    return res.json({ success: true, count: items.length, items, fallback: usedFallback || undefined });
   } catch (e) {
-    return res.status(500).json({ error: 'internal_error' });
+    console.error('[finance/requests] failed:', e);
+    return res.status(500).json({ error: 'internal_error', message: e && e.message });
   }
 });
 
