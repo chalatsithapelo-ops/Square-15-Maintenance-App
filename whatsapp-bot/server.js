@@ -8024,7 +8024,21 @@ app.post('/webhook', async (req, res) => {
     const changes = entry?.changes?.[0];
     const value = changes?.value;
 
-    if (!value?.messages) return; // status update, not a message
+    if (!value?.messages) {
+      // Capture delivery / read / failed status callbacks so we can debug
+      // when Meta returns 200 from /messages but silently drops the send
+      // (e.g. outside 24h customer-care window).
+      if (Array.isArray(value?.statuses)) {
+        for (const st of value.statuses) {
+          if (st.status === 'failed' || st.errors) {
+            console.error('[wa-status]', JSON.stringify({ id: st.id, recipient: st.recipient_id, status: st.status, errors: st.errors }).slice(0, 800));
+          } else {
+            console.log(`[wa-status] id=${st.id} → ${st.status} (recipient=${st.recipient_id})`);
+          }
+        }
+      }
+      return;
+    }
 
     // Grab WhatsApp profile name for chat logs
     const _contactName = value?.contacts?.[0]?.profile?.name || null;
@@ -8384,14 +8398,36 @@ app.post('/debug/wa-identity', requireInternalSecret, async (req, res) => {
     if (req.body && req.body.testTo) {
       let to = String(req.body.testTo).replace(/[^0-9]/g, '');
       if (to.length === 10 && to.startsWith('0')) to = '27' + to.slice(1);
-      const msg = (req.body.text || '[wa-identity probe] ' + new Date().toISOString()).slice(0, 1000);
+      const useTemplate = !!req.body.useTemplate;
+      const tplName = req.body.templateName || 'hello_world';
+      const tplLang = req.body.templateLang || 'en_US';
+      const payload = useTemplate
+        ? { messaging_product: 'whatsapp', to, type: 'template', template: { name: tplName, language: { code: tplLang } } }
+        : { messaging_product: 'whatsapp', to, type: 'text', text: { body: (req.body.text || '[probe] ' + new Date().toISOString()).slice(0, 1000) } };
       const sendRes = await fetch(`${WA_API}/${phoneId}/messages`, {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messaging_product: 'whatsapp', to, type: 'text', text: { body: msg } }),
+        body: JSON.stringify(payload),
         signal: AbortSignal.timeout(15000),
       });
-      sendBody = { status: sendRes.status, body: await sendRes.json().catch(() => ({})) };
+      sendBody = { status: sendRes.status, body: await sendRes.json().catch(() => ({})), used: useTemplate ? `template:${tplName}` : 'text' };
+    }
+
+    // 3. Optional: list approved templates on the linked WABA so we know what to fall back to.
+    let templates = null;
+    if (req.body && req.body.listTemplates) {
+      try {
+        const wabaId = process.env.WHATSAPP_WABA_ID || process.env.WHATSAPP_BUSINESS_ACCOUNT_ID || '';
+        if (wabaId) {
+          const tr = await fetch(`${WA_API}/${wabaId}/message_templates?fields=name,language,status,category&limit=50`, {
+            headers: { 'Authorization': `Bearer ${token}` },
+            signal: AbortSignal.timeout(15000),
+          });
+          templates = { status: tr.status, body: await tr.json().catch(() => ({})) };
+        } else {
+          templates = { error: 'WHATSAPP_WABA_ID env not set' };
+        }
+      } catch (e) { templates = { error: e.message }; }
     }
 
     return res.json({
@@ -8401,6 +8437,7 @@ app.post('/debug/wa-identity', requireInternalSecret, async (req, res) => {
       identityStatus: idRes.status,
       identity: idBody,
       sendProbe: sendBody,
+      templates,
     });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e.message });
