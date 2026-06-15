@@ -7873,6 +7873,13 @@ setInterval(() => {
 // writes. Keep ids for 10 minutes; that's well beyond Meta's retry window.
 const _seenMessageIds = new Map();
 const MSG_ID_TTL_MS = 10 * 60 * 1000;
+// Ring buffer of last 100 delivery-status callbacks from Meta so /debug/wa-statuses
+// can reveal whether outbound sends are being delivered, read, or failed.
+const _waStatuses = [];
+function pushWaStatus(s) {
+  _waStatuses.push({ ts: Date.now(), ...s });
+  while (_waStatuses.length > 100) _waStatuses.shift();
+}
 setInterval(() => {
   const now = Date.now();
   for (const [id, ts] of _seenMessageIds) {
@@ -8030,8 +8037,10 @@ app.post('/webhook', async (req, res) => {
       // (e.g. outside 24h customer-care window).
       if (Array.isArray(value?.statuses)) {
         for (const st of value.statuses) {
+          const entry = { id: st.id, recipient: st.recipient_id, status: st.status, errors: st.errors || null, conversation: st.conversation || null, pricing: st.pricing || null };
+          pushWaStatus(entry);
           if (st.status === 'failed' || st.errors) {
-            console.error('[wa-status]', JSON.stringify({ id: st.id, recipient: st.recipient_id, status: st.status, errors: st.errors }).slice(0, 800));
+            console.error('[wa-status]', JSON.stringify(entry).slice(0, 800));
           } else {
             console.log(`[wa-status] id=${st.id} → ${st.status} (recipient=${st.recipient_id})`);
           }
@@ -8377,7 +8386,7 @@ app.post('/debug/inject-message', requireInternalSecret, async (req, res) => {
   }
 });
 
-// 1c) WA identity + raw test-send — exposes which Meta WABA / phone number ID
+// 1b) Mint a Firebase ID token for any uid (E2E auth for livekit-backend endpoints).
 //     the deployed bot is actually using, plus the full Meta API response so
 //     we can diagnose template-required / 24h window / not-allowlisted errors.
 app.post('/debug/wa-identity', requireInternalSecret, async (req, res) => {
@@ -8442,6 +8451,16 @@ app.post('/debug/wa-identity', requireInternalSecret, async (req, res) => {
   } catch (e) {
     return res.status(500).json({ ok: false, error: e.message });
   }
+});
+
+// 1d) Return last N delivery-status callbacks from Meta. Lets us confirm
+//     whether messages we sent were actually delivered or silently dropped.
+app.get('/debug/wa-statuses', requireInternalSecret, (req, res) => {
+  const limit = Math.max(1, Math.min(100, parseInt(req.query.limit || '50', 10)));
+  const recipient = String(req.query.recipient || '').replace(/[^\d]/g, '');
+  let list = _waStatuses.slice(-limit);
+  if (recipient) list = list.filter(s => String(s.recipient || '') === recipient);
+  res.json({ count: list.length, total: _waStatuses.length, statuses: list });
 });
 
 // 1b) Mint a Firebase ID token for any uid (E2E auth for livekit-backend endpoints).
