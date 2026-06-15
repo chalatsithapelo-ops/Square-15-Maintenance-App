@@ -3842,7 +3842,10 @@ async function executeWaTool(name, args, session) {
       const userDoc = await firestore.collection('users').doc(session.linkedUserId).get();
       if (!userDoc.exists) return { error: 'Account not found.' };
       const balance = parseFloat(userDoc.data().balance || '0');
-      return { balance: `R${balance.toFixed(2)}`, userId: session.linkedUserId };
+      // Format with thousands separator so the hallucination guard's PRICE_RE
+      // recognises the amount as legitimately tool-sourced.
+      const formatted = balance.toLocaleString('en-ZA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      return { balance: `R${formatted}`, balance_numeric: balance, userId: session.linkedUserId };
     }
 
     // ═══════════════════════════════════════════
@@ -7731,8 +7734,11 @@ async function handleMessage(session, userMessage, imageDataUrl) {
           if (m.role !== 'tool') continue;
           const txt = typeof m.content === 'string' ? m.content : '';
           if (_hg.PRICE_RE.test(txt)) { toolReturnedPrice = true; break; }
-          // Numeric grand_total / fixedPrice fields.
-          if (/"(grand_total|fixedPrice|cost|total|quoted_price|amount)"\s*:\s*("?R?\s*\d|[1-9]\d*)/i.test(txt)) {
+          // Also accept an unformatted R<digits> (no thousands separator) — wallet
+          // balance tool used to return R443664.00 which PRICE_RE rejects.
+          if (/\bR\s*\d+(?:\.\d{1,2})?\b/i.test(txt)) { toolReturnedPrice = true; break; }
+          // Numeric grand_total / fixedPrice / balance fields.
+          if (/"(grand_total|fixedPrice|cost|total|quoted_price|amount|balance|balance_numeric|wallet|refund_amount)"\s*:\s*("?R?\s*\d|[1-9]\d*)/i.test(txt)) {
             toolReturnedPrice = true; break;
           }
         }
