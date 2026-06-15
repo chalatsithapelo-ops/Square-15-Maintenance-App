@@ -7630,6 +7630,9 @@ async function handleMessage(session, userMessage, imageDataUrl) {
 
     // Handle tool calls (support multiple rounds)
     let toolRounds = 0;
+    // Dedupe identical tool calls within the same user-turn — guards against
+    // GPT calling submit_rfq / create_booking twice with same args.
+    const _turnToolCallSigs = new Set();
     while (assistantMessage.tool_calls && assistantMessage.tool_calls.length > 0 && toolRounds < 3) {
       toolRounds++;
       session.messages.push(assistantMessage);
@@ -7637,6 +7640,13 @@ async function handleMessage(session, userMessage, imageDataUrl) {
       for (const tc of assistantMessage.tool_calls) {
         let toolArgs = {};
         try { toolArgs = JSON.parse(tc.function.arguments); } catch (_) {}
+        const sig = tc.function.name + ':' + JSON.stringify(toolArgs);
+        if (_turnToolCallSigs.has(sig) && /^(submit_rfq|create_booking|accept_rfq_quote|request_payment_link|pay_with_wallet|cancel_booking|rate_booking|request_refund)$/.test(tc.function.name)) {
+          console.warn(`[tool] DEDUP duplicate ${tc.function.name} this turn — returning cached "already_invoked"`);
+          session.messages.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify({ error: 'already_invoked_this_turn', note: 'This action was already performed in this same response — do not call it again.' }) });
+          continue;
+        }
+        _turnToolCallSigs.add(sig);
         console.log(`[tool] ${tc.function.name}(${JSON.stringify(toolArgs).substring(0, 100)})`);
         session._lastToolsCalled.push(tc.function.name);
         let result;
@@ -7697,7 +7707,21 @@ async function handleMessage(session, userMessage, imageDataUrl) {
       assistantMessage = followUp.choices[0].message;
     }
 
-    const reply = assistantMessage.content || "I'm sorry, I couldn't process that. Please try again.";
+    let reply = assistantMessage.content || '';
+    if (!reply || !reply.trim()) {
+      // Empty content despite tool round(s) — try to surface something useful
+      // from the most recent tool result instead of the generic apology.
+      const lastToolMsg = [...session.messages].reverse().find(m => m.role === 'tool');
+      try {
+        const parsed = lastToolMsg ? JSON.parse(lastToolMsg.content) : null;
+        if (parsed) {
+          if (parsed.message && String(parsed.message).trim()) reply = String(parsed.message);
+          else if (parsed.success && parsed.bookingId) reply = `✓ Booking ${parsed.bookingId} created${parsed.cost ? ` (cost ${parsed.cost})` : ''}. I'll keep you posted.`;
+          else if (parsed.error) reply = String(parsed.error);
+        }
+      } catch (_) {}
+      if (!reply || !reply.trim()) reply = "I'm sorry, I couldn't process that. Please try again.";
+    }
 
     // ─────────────────────────────────────────────────────────────────────
     // HALLUCINATED-PRICE GUARD (Apr 28 2026)
