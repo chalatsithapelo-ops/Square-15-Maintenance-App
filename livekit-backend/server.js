@@ -11163,7 +11163,7 @@ app.post('/debug/voice-e2e', async (req, res) => {
 
     // 1) Dispatch agent into the room (creates the room if it doesn't exist)
     const dispatchClient = new AgentDispatchClient(httpUrl, apiKey, apiSecret);
-    const dispatch = await dispatchClient.createDispatch(roomName, agentName, {
+    let dispatch = await dispatchClient.createDispatch(roomName, agentName, {
       metadata: JSON.stringify({ source: 'debug-voice-e2e', uid, sessionId }),
     });
 
@@ -11180,15 +11180,27 @@ app.post('/debug/voice-e2e', async (req, res) => {
     // Wait for the agent worker to actually join the room before publishing.
     // Without this, sendData will fail because the room has no participants.
     // Allow up to 45s for cold-start (worker spin-up on Render free tier can
-    // exceed 15s after idle periods).
-    const joinDeadline = Date.now() + 45000;
-    let agentReady = false;
-    while (Date.now() < joinDeadline) {
+    // exceed 15s after idle periods). One re-dispatch retry if the first
+    // dispatch is silently dropped after long idle gaps.
+    async function waitForAgent(deadlineMs) {
+      while (Date.now() < deadlineMs) {
+        try {
+          const parts = await roomSvc.listParticipants(roomName);
+          if (parts && parts.length > 0) return true;
+        } catch (_) { /* room may not exist yet */ }
+        await new Promise(r => setTimeout(r, 500));
+      }
+      return false;
+    }
+    let agentReady = await waitForAgent(Date.now() + 45000);
+    if (!agentReady) {
+      // Retry once: re-dispatch (worker may have missed the first job after idle).
       try {
-        const parts = await roomSvc.listParticipants(roomName);
-        if (parts && parts.length > 0) { agentReady = true; break; }
-      } catch (_) { /* room may not exist yet */ }
-      await new Promise(r => setTimeout(r, 500));
+        dispatch = await dispatchClient.createDispatch(roomName, agentName, {
+          metadata: JSON.stringify({ source: 'debug-voice-e2e-retry', uid, sessionId }),
+        });
+      } catch (_) { /* retry-dispatch errors are non-fatal — continue waiting */ }
+      agentReady = await waitForAgent(Date.now() + 30000);
     }
     if (!agentReady) {
       return res.status(504).json({ error: 'agent_did_not_join', roomName, dispatch });
