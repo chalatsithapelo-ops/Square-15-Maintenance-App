@@ -8310,6 +8310,7 @@ app.post('/debug/inject-message', requireInternalSecret, async (req, res) => {
     let reply = '';
     let toolsCalled = [];
     let sentChunks = 0;
+    let sendResults = [];
     let lastBookingId = null, lastRfqId = null;
     await withPhoneLock(from, async () => {
       if (reset) {
@@ -8343,14 +8344,66 @@ app.post('/debug/inject-message', requireInternalSecret, async (req, res) => {
       session._lastReplyText = reply; session._lastReplyAt = Date.now();
       logChatMessage(from, 'outgoing', reply, { linkedUserId: session.linkedUserId, displayName: contactName || 'E2ETest', toolsCalled, source: 'inject' });
       const chunks = reply.match(/.{1,4000}/gs) || [reply];
+      sendResults = [];
       for (const chunk of chunks) {
-        try { await sendWhatsAppMessage(from, chunk); sentChunks++; } catch (e) { console.error('[inject] send failed:', e.message); }
+        try {
+          const r = await sendWhatsAppMessage(from, chunk);
+          sendResults.push(r || { ok: true });
+          if (r && r.ok) sentChunks++;
+        } catch (e) {
+          console.error('[inject] send failed:', e.message);
+          sendResults.push({ ok: false, error: e.message });
+        }
       }
     });
-    return res.json({ ok: true, reply, toolsCalled, sentChunks, lastBookingId, lastRfqId, phone: from });
+    return res.json({ ok: true, reply, toolsCalled, sentChunks, sendResults, lastBookingId, lastRfqId, phone: from });
   } catch (e) {
     console.error('[inject] error:', e.stack || e.message);
     return res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+// 1c) WA identity + raw test-send — exposes which Meta WABA / phone number ID
+//     the deployed bot is actually using, plus the full Meta API response so
+//     we can diagnose template-required / 24h window / not-allowlisted errors.
+app.post('/debug/wa-identity', requireInternalSecret, async (req, res) => {
+  try {
+    const phoneId = process.env.WHATSAPP_PHONE_NUMBER_ID;
+    const token   = process.env.WHATSAPP_ACCESS_TOKEN;
+    if (!phoneId || !token) return res.status(500).json({ ok: false, error: 'no_credentials', phoneIdSet: !!phoneId, tokenSet: !!token });
+
+    // 1. Identity (which number is the bot using?)
+    const idRes = await fetch(`${WA_API}/${phoneId}?fields=display_phone_number,verified_name,quality_rating,messaging_limit_tier,name_status`, {
+      headers: { 'Authorization': `Bearer ${token}` },
+      signal: AbortSignal.timeout(15000),
+    });
+    const idBody = await idRes.json().catch(() => ({}));
+
+    // 2. Optional raw test send to a given phone with the *exact* full response from Meta
+    let sendBody = null;
+    if (req.body && req.body.testTo) {
+      let to = String(req.body.testTo).replace(/[^0-9]/g, '');
+      if (to.length === 10 && to.startsWith('0')) to = '27' + to.slice(1);
+      const msg = (req.body.text || '[wa-identity probe] ' + new Date().toISOString()).slice(0, 1000);
+      const sendRes = await fetch(`${WA_API}/${phoneId}/messages`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messaging_product: 'whatsapp', to, type: 'text', text: { body: msg } }),
+        signal: AbortSignal.timeout(15000),
+      });
+      sendBody = { status: sendRes.status, body: await sendRes.json().catch(() => ({})) };
+    }
+
+    return res.json({
+      ok: idRes.ok,
+      phoneNumberId: phoneId,
+      tokenLastFour: String(token).slice(-4),
+      identityStatus: idRes.status,
+      identity: idBody,
+      sendProbe: sendBody,
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
   }
 });
 
