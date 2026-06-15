@@ -11132,7 +11132,9 @@ app.post('/debug/voice-e2e', async (req, res) => {
     const message = String((req.body && req.body.message) || '').trim();
     if (!idToken) return res.status(400).json({ error: 'idToken required' });
     if (!message) return res.status(400).json({ error: 'message required' });
-    const waitMs = Math.min(20000, Math.max(500, Number(req.body && req.body.waitMs) || 6000));
+    // Wait long enough for generate_reply + tool calls + Firestore write.
+    // The agent's LLM round-trip + create_booking tool can take 30-45s.
+    const waitMs = Math.min(90000, Math.max(500, Number(req.body && req.body.waitMs) || 6000));
 
     // Verify the ID token so we can return uid in the response
     let uid = null;
