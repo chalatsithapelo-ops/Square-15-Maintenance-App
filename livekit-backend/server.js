@@ -11054,7 +11054,12 @@ app.post('/debug/mint-id-token', async (req, res) => {
     if (req.headers['x-internal-secret'] !== expected) {
       return res.status(403).json({ error: 'forbidden' });
     }
-    const webKey = process.env.FIREBASE_WEB_API_KEY || process.env.FIREBASE_API_KEY;
+    // Fall back to the public Firebase Web API key used by all client apps.
+    // Setting it here means /debug/mint-id-token works even when the env var
+    // is missing on Render. It is NOT a secret — it ships in every client APK.
+    const webKey = process.env.FIREBASE_WEB_API_KEY
+      || process.env.FIREBASE_API_KEY
+      || 'AIzaSyA2GPzutbQqSdLioBgiCrzAQF171Wdd2gE';
     if (!webKey) return res.status(503).json({ error: 'FIREBASE_WEB_API_KEY not set' });
     const uid = String((req.body && req.body.uid) || '').trim();
     if (!uid) return res.status(400).json({ error: 'uid required' });
@@ -11174,7 +11179,9 @@ app.post('/debug/voice-e2e', async (req, res) => {
 
     // Wait for the agent worker to actually join the room before publishing.
     // Without this, sendData will fail because the room has no participants.
-    const joinDeadline = Date.now() + 15000;
+    // Allow up to 45s for cold-start (worker spin-up on Render free tier can
+    // exceed 15s after idle periods).
+    const joinDeadline = Date.now() + 45000;
     let agentReady = false;
     while (Date.now() < joinDeadline) {
       try {

@@ -1296,8 +1296,10 @@ async def entrypoint(ctx: JobContext):
 
     @llm.function_tool(
         description=(
-            "Check the payment status for a booking. "
-            "Use this when user asks 'Did I pay?' or 'What's the payment status?'"
+            "READ-ONLY payment status check. Use ONLY when the user asks 'Did I pay?', "
+            "'What is my payment status?', 'Has payment been received?'. "
+            "DO NOT call this when the user wants to pay or wants a payment link \u2014 "
+            "for that, call request_payment_link instead."
         )
     )
     async def check_payment(booking_id: str) -> str:
@@ -1336,12 +1338,16 @@ async def entrypoint(ctx: JobContext):
 
     @llm.function_tool(
         description=(
-            "Request a payment link for a booking. This generates a PayFast card payment link "
-            "and sends it to the customer's phone via notification. IMPORTANT: Only call this "
-            "AFTER an artisan has accepted the job. NEVER offer payment immediately after booking "
-            "creation. Always ask the customer 'Would you like to pay the full amount or a 35 percent deposit?' "
-            "before calling this. Use payment_type='deposit' for 35% deposit, or payment_type='full' for "
-            "full payment."
+            "GENERATE a PayFast card payment link and send it to the customer's phone. "
+            "Call this whenever the user wants to pay, asks for a payment link, says "
+            "'send me a link to pay', 'I want to pay', 'pay now', 'pay the full amount', "
+            "'pay deposit', 'send payment link'. Do NOT call check_payment for these \u2014 "
+            "that one only reads payment status. "
+            "IMPORTANT: Only call AFTER an artisan has accepted the job. NEVER offer "
+            "payment immediately after booking creation. If unclear, ask 'Would you like "
+            "to pay the full amount or a 35 percent deposit?' \u2014 but if the user "
+            "already said 'full' or 'deposit', call immediately without re-asking. "
+            "Use payment_type='deposit' for 35% deposit, payment_type='full' for full payment."
         )
     )
     async def request_payment_link(booking_id: str, payment_type: str = "full") -> str:
@@ -2864,27 +2870,48 @@ async def entrypoint(ctx: JobContext):
                                     user_input=text,
                                     tool_choice="auto",
                                     instructions=(
-                                        "The user just spoke. If they described a maintenance problem "
-                                        "with enough detail (category + location + description), "
-                                        "IMMEDIATELY call the create_booking function tool. "
-                                        "If they explicitly mention 'RFQ' or 'quote request', pass is_rfq='yes'. "
-                                        "Do NOT ask for confirmation — they have already confirmed by speaking. "
+                                        "The user just sent a text message (debug/E2E channel). "
+                                        "Pick the SINGLE most appropriate tool and call it immediately. "
+                                        "Rules:\n"
+                                        "- If user describes a maintenance problem with category+location+description, "
+                                        "call create_booking. If they say 'RFQ' or 'quote request', pass is_rfq='yes'.\n"
+                                        "- If user asks for a price/cost lookup BEFORE booking, call lookup_service_pricing "
+                                        "then in your NEXT step (after the tool result) call create_booking with the returned job_ids.\n"
+                                        "- If user says 'send payment link', 'pay', 'I want to pay', 'send me a link to pay' — "
+                                        "call request_payment_link (NOT check_payment). check_payment is only for 'did I pay?' / "
+                                        "'what is my payment status?'.\n"
+                                        "- If user says 'accept the quote', 'I accept', 'go ahead' for an RFQ — call accept_rfq with the booking_id.\n"
+                                        "- If user asks 'status', 'where is my booking' — call get_booking_status.\n"
+                                        "- If user gives a rating ('rate 5 stars', 'X stars') — call submit_rating.\n"
+                                        "Do NOT ask for confirmation — the user already confirmed by sending the message. "
                                         "Use the address they provided as service_address."
                                     ),
                                 )
-                                # Await the SpeechHandle so we know when the LLM is fully done
+                                # Don't block on TTS playout — debug channel has no audio
+                                # consumer so wait_for_playout never resolves before timeout.
+                                # Just await the handle itself (which resolves once the LLM
+                                # response + first tool round completes); tools may continue
+                                # to fire in the background after this returns.
                                 try:
-                                    if hasattr(handle, 'wait_for_playout'):
-                                        await asyncio.wait_for(handle.wait_for_playout(), timeout=40.0)
-                                    elif hasattr(handle, '__await__'):
-                                        await asyncio.wait_for(handle, timeout=40.0)
+                                    if hasattr(handle, '__await__'):
+                                        await asyncio.wait_for(handle, timeout=75.0)
+                                except asyncio.TimeoutError:
+                                    await _post_breadcrumb(
+                                        f"{backend_url.rstrip('/')}/debug/voice-breadcrumb",
+                                        {'session_id': session_id or 'unknown',
+                                         'event': 'handle_wait_timeout',
+                                         'text': 'handle did not resolve within 75s'}
+                                    )
                                 except Exception as wfe:
                                     await _post_breadcrumb(
                                         f"{backend_url.rstrip('/')}/debug/voice-breadcrumb",
                                         {'session_id': session_id or 'unknown',
                                          'event': 'handle_wait_err',
-                                         'text': str(wfe)[:200]}
+                                         'text': (str(wfe) or type(wfe).__name__)[:200]}
                                     )
+                                # Give the agent loop a beat to fire any follow-up tool call
+                                # after the first response (multi-step chains).
+                                await asyncio.sleep(3.0)
                                 hist = session.history if hasattr(session, 'history') else None
                                 items = getattr(hist, 'items', None) if hist else None
                                 dump = []
