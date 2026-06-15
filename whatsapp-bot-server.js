@@ -4324,7 +4324,7 @@ app.post('/webhook', async (req, res) => {
 });
 
 // Health check
-app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'cc31c07-apr13-v2' }));
+app.get('/health', (req, res) => res.json({ status: 'ok', service: 'square15-whatsapp-bot', version: 'jun15-2026-inject-debug' }));
 
 // ─── Diagnostic: test Firebase read/write (auth-protected) ───
 app.get('/debug/firebase-test', requireInternalSecret, async (req, res) => {
@@ -4620,6 +4620,59 @@ app.post('/api/payment-confirmed', requireInternalSecret, async (req, res) => {
   } catch (err) {
     console.error('[api/payment-confirmed] error:', err.message);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Debug: inject a user message exactly like the webhook would, optionally resetting session.
+//          The bot still sends its reply to the user's real WhatsApp via Meta Cloud API.
+//          Returns the assistant reply text and any tools called so tests can assert on them. ───
+app.post('/debug/inject-message', requireInternalSecret, async (req, res) => {
+  try {
+    const { phone, text, reset, contactName } = req.body || {};
+    if (!phone || !text) return res.status(400).json({ error: 'phone and text required' });
+
+    let to = String(phone).replace(/[^0-9]/g, '');
+    if (to.startsWith('0')) to = '27' + to.slice(1);
+    if (to.length < 10 || to.length > 15) return res.status(400).json({ error: 'invalid phone' });
+
+    if (reset) {
+      sessions.delete(to);
+      try { const f = db(); if (f) await f.collection('wa_sessions').doc(to).delete().catch(() => {}); } catch (_) {}
+    }
+
+    const session = getSession(to);
+    if (contactName && !session.contactName) session.contactName = contactName;
+    await restoreSessionFromFirestore(session).catch(() => {});
+
+    if (!session.linkedUserId) {
+      try { const u = await findUserByPhone(to); if (u) session.linkedUserId = u.id; } catch (_) {}
+    }
+
+    const beforeLen = (session.messages || []).length;
+    const reply = await handleMessage(session, text);
+    const afterMsgs = session.messages || [];
+    const toolsCalled = afterMsgs.slice(beforeLen).flatMap(m =>
+      (m.tool_calls || []).map(tc => tc.function?.name).filter(Boolean)
+    );
+
+    if (reply && reply.trim()) {
+      const chunks = reply.match(/.{1,4000}/gs) || [reply];
+      for (const c of chunks) await sendWhatsAppMessage(to, c);
+    }
+
+    res.json({
+      ok: true,
+      to,
+      reply: reply || '',
+      toolsCalled,
+      sessionLinkedUserId: session.linkedUserId || null,
+      sessionLastBookingId: session.lastBookingId || null,
+      sessionLastRfqId: session.lastRfqId || null,
+      messagesInSession: (session.messages || []).length,
+    });
+  } catch (err) {
+    console.error('[debug/inject-message] error:', err.message);
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
