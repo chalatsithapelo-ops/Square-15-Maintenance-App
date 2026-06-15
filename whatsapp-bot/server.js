@@ -7661,11 +7661,27 @@ async function handleMessage(session, userMessage, imageDataUrl) {
           continue;
         }
         _turnToolCallSigs.add(sig);
-        console.log(`[tool] ${tc.function.name}(${JSON.stringify(toolArgs).substring(0, 100)})`);
-        session._lastToolsCalled.push(tc.function.name);
+
+        // Wallet-intent override: if the customer explicitly said "wallet"
+        // and the model still tried to mint a CARD payment link, swap to
+        // pay_with_wallet. This catches the lingering bug where GPT picks
+        // request_payment_link after the user said "pay from my wallet".
+        let _toolName = tc.function.name;
+        try {
+          if (_toolName === 'request_payment_link') {
+            const _userTxt = (typeof userMessage === 'string' ? userMessage : '').toLowerCase();
+            if (/\b(from\s+(?:my\s+)?wallet|use\s+(?:my\s+)?wallet|pay\s+(?:with\s+|from\s+|using\s+)?(?:my\s+)?wallet|wallet\s+pay|deduct\s+(?:from\s+)?(?:my\s+)?wallet)\b/.test(_userTxt)) {
+              console.warn('[tool] wallet-intent override: swapping request_payment_link → pay_with_wallet');
+              _toolName = 'pay_with_wallet';
+            }
+          }
+        } catch (_) {}
+
+        console.log(`[tool] ${_toolName}(${JSON.stringify(toolArgs).substring(0, 100)})`);
+        session._lastToolsCalled.push(_toolName);
         let result;
         try {
-          result = await executeWaTool(tc.function.name, toolArgs, session);
+          result = await executeWaTool(_toolName, toolArgs, session);
         } catch (toolErr) {
           console.error(`[tool] ${tc.function.name} THREW:`, toolErr.message, toolErr.stack);
           result = { error: `Tool ${tc.function.name} failed: ${toolErr.message}` };
