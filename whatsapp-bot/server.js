@@ -4953,6 +4953,20 @@ async function executeWaTool(name, args, session) {
         }
       } catch (e) { console.warn('[wa-tool] cancel photo-cleanup setup failed:', e.message); }
 
+      // Clear session pointers so a follow-up "check my wallet" / "book again"
+      // turn doesn't keep referencing this dead booking. Only clear if the
+      // cancelled booking matches the pinned id (don't wipe other contexts).
+      try {
+        if (session.lastBookingId === bid) {
+          session.lastBookingId = null;
+          session.lastBookingCost = null;
+        }
+        if (session.lastRfqId === bid) {
+          session.lastRfqId = null;
+          session.lastRfqAt = 0;
+        }
+      } catch (_) {}
+
       return {
         success: true,
         message: `Booking ${bid} has been cancelled.${refundMsg}`,
