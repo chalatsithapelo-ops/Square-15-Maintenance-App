@@ -1,7 +1,7 @@
 node_modules/
 .env
-.env.local
-.env.production
+.env.*
+!.env.example
 *.log
 npm-debug.log*
 yarn-debug.log*
@@ -18,6 +18,12 @@ build/
 check_*.js
 cleanup_images.js
 migrate_images.js
+
+# Service account keys / secrets — never commit
+**/secrets/
+**/firebase-adminsdk*.json
+**/service-account*.json
+*-credentials.json
 
 # Python
 __pycache__/

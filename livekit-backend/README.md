@@ -16,15 +16,15 @@ npm install
 Edit the `.env` file and add your Livekit credentials:
 
 ```env
-LIVEKIT_API_KEY=APIfA2HcvgKpuuV
-LIVEKIT_API_SECRET=your-actual-secret-here
-LIVEKIT_WS_URL=wss://square-15-maintenance-app-n6ijx3po.livekit.cloud
+LIVEKIT_API_KEY=your-livekit-api-key
+LIVEKIT_API_SECRET=your-livekit-api-secret
+LIVEKIT_WS_URL=wss://your-project.livekit.cloud
 LIVEKIT_AGENT_NAME=square15-voice-assistant
 ```
 
-**To get your API Secret:**
+**To get your API Key and Secret:**
 1. Go to https://cloud.livekit.io/projects
-2. Select your project: "square-15-maintenance-app-n6ijx3po"
+2. Select your project
 3. Go to Settings → API Keys
 4. Copy your API Secret
 
