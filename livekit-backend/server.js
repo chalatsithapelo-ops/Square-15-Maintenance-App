@@ -6708,6 +6708,104 @@ app.post('/api/notifications/send', authMiddleware, assistantLimiter, async (req
   }
 });
 
+// -- Google Places + Geocoding proxy --
+// Android-restricted Google API keys silently reject raw HTTPS REST calls
+// from Dart's package:http (no Play Services attestation header). The Maps
+// SDK works because it attaches attestation natively. To keep the key safely
+// behind app restrictions we proxy Places/Geocoding REST calls through the
+// backend, which holds an unrestricted server key (GOOGLE_API_TOKEN).
+// All endpoints require a valid Firebase ID token + are rate limited.
+
+function getServerGoogleKey() {
+  return (process.env.GOOGLE_API_TOKEN || process.env.GOOGLE_MAPS_API_KEY || '').trim();
+}
+
+// POST /api/places/autocomplete  body: { input: string, languageCode?: string }
+app.post('/api/places/autocomplete', authMiddleware, assistantLimiter, async (req, res) => {
+  try {
+    const key = getServerGoogleKey();
+    if (!key) return res.status(503).json({ error: 'GOOGLE_API_TOKEN not configured on server' });
+    const input = sanitizeForPrompt(String(req.body?.input || ''), 200);
+    if (!input) return res.status(400).json({ error: 'input is required' });
+    const languageCode = sanitizeForPrompt(String(req.body?.languageCode || 'en'), 10);
+
+    const resp = await fetchWithTimeout('https://places.googleapis.com/v1/places:autocomplete', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Goog-Api-Key': key,
+      },
+      body: JSON.stringify({ input, languageCode }),
+      timeoutMs: 15000,
+    });
+    const text = await resp.text();
+    if (!resp.ok) {
+      console.warn('[places.autocomplete] upstream status=' + resp.status + ' body=' + text.slice(0, 300));
+      return res.status(resp.status).json({ error: 'upstream_error', status: resp.status, message: text.slice(0, 500) });
+    }
+    let json; try { json = JSON.parse(text); } catch { json = {}; }
+    return res.json(json);
+  } catch (err) {
+    console.error('[places.autocomplete] error:', err.message || err);
+    return res.status(500).json({ error: 'autocomplete_failed', message: String(err.message || err) });
+  }
+});
+
+// GET /api/places/:placeId  -> formattedAddress + location + displayName
+app.get('/api/places/:placeId', authMiddleware, assistantLimiter, async (req, res) => {
+  try {
+    const key = getServerGoogleKey();
+    if (!key) return res.status(503).json({ error: 'GOOGLE_API_TOKEN not configured on server' });
+    const placeId = sanitizeForPrompt(String(req.params.placeId || ''), 200);
+    if (!placeId) return res.status(400).json({ error: 'placeId is required' });
+
+    const url = `https://places.googleapis.com/v1/places/${encodeURIComponent(placeId)}`;
+    const resp = await fetchWithTimeout(url, {
+      method: 'GET',
+      headers: {
+        'X-Goog-Api-Key': key,
+        'X-Goog-FieldMask': 'formattedAddress,location,displayName',
+      },
+      timeoutMs: 15000,
+    });
+    const text = await resp.text();
+    if (!resp.ok) {
+      console.warn('[places.details] upstream status=' + resp.status + ' body=' + text.slice(0, 300));
+      return res.status(resp.status).json({ error: 'upstream_error', status: resp.status, message: text.slice(0, 500) });
+    }
+    let json; try { json = JSON.parse(text); } catch { json = {}; }
+    return res.json(json);
+  } catch (err) {
+    console.error('[places.details] error:', err.message || err);
+    return res.status(500).json({ error: 'place_details_failed', message: String(err.message || err) });
+  }
+});
+
+// GET /api/geocode/reverse?lat=&lng=  -> formatted_address
+app.get('/api/geocode/reverse', authMiddleware, assistantLimiter, async (req, res) => {
+  try {
+    const key = getServerGoogleKey();
+    if (!key) return res.status(503).json({ error: 'GOOGLE_API_TOKEN not configured on server' });
+    const lat = parseFloat(String(req.query.lat || ''));
+    const lng = parseFloat(String(req.query.lng || ''));
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+      return res.status(400).json({ error: 'lat and lng are required numbers' });
+    }
+    const url = `https://maps.googleapis.com/maps/api/geocode/json?latlng=${lat},${lng}&key=${encodeURIComponent(key)}`;
+    const resp = await fetchWithTimeout(url, { method: 'GET', timeoutMs: 15000 });
+    const text = await resp.text();
+    if (!resp.ok) {
+      console.warn('[geocode.reverse] upstream status=' + resp.status + ' body=' + text.slice(0, 300));
+      return res.status(resp.status).json({ error: 'upstream_error', status: resp.status, message: text.slice(0, 500) });
+    }
+    let json; try { json = JSON.parse(text); } catch { json = {}; }
+    return res.json(json);
+  } catch (err) {
+    console.error('[geocode.reverse] error:', err.message || err);
+    return res.status(500).json({ error: 'reverse_geocode_failed', message: String(err.message || err) });
+  }
+});
+
 // -- AI Photo Diagnosis (GPT-4o Vision) --
 // Used by client app + Lizzy Voice photo enrichment.
 app.post('/api/photo/diagnose', assistantLimiter, async (req, res) => {
