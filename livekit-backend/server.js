@@ -5204,6 +5204,7 @@ app.get('/health', (req, res) => {
     status: 'ok', 
     message: 'Livekit Token Server is running',
     timestamp: new Date().toISOString(),
+    buildMarker: 'diag-2026-06-16-v3',
     sdkVersion: getSdkVersion(),
     firebase: {
       configured: (() => {
