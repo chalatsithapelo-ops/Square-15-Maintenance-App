@@ -2672,6 +2672,8 @@ async def entrypoint(ctx: JobContext):
             artisan_cancel_and_reassign,
             submit_rating,
             submit_complaint,
+            # Payment action tools
+            request_payment_link,
             # RFQ quote tools
             generate_rfq_quote,
             accept_rfq,
