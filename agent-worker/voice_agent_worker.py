@@ -1414,6 +1414,18 @@ async def entrypoint(ctx: JobContext):
         if not search_q:
             search_q = "all"
 
+        # Guard against wrong-tool selection: if the LLM passes payment-related
+        # terms, this should be request_payment_link instead. Return a hint.
+        lowered = (search_q or "").lower().strip()
+        if lowered in ("payment", "pay", "payment link", "payment_link",
+                       "request_payment_link", "check_payment", "pay now"):
+            return (
+                "PRICING_LOOKUP_REJECTED: That request looks like a payment action, "
+                "not a price lookup. Call request_payment_link(booking_id=...) instead "
+                "if the user wants to pay, or check_payment(booking_id=...) if they "
+                "want to check payment status."
+            )
+
         logger.info(f"🔍 lookup_service_pricing called: category={category_name}, task={task_name}, query={search_q}")
 
         try:
@@ -2889,9 +2901,11 @@ async def entrypoint(ctx: JobContext):
                                         "call create_booking. If they say 'RFQ' or 'quote request', pass is_rfq='yes'.\n"
                                         "- If user asks for a price/cost lookup BEFORE booking, call lookup_service_pricing "
                                         "then in your NEXT step (after the tool result) call create_booking with the returned job_ids.\n"
-                                        "- If user says 'send payment link', 'pay', 'I want to pay', 'send me a link to pay' — "
-                                        "call request_payment_link (NOT check_payment). check_payment is only for 'did I pay?' / "
-                                        "'what is my payment status?'.\n"
+                                        "- If user says 'send payment link', 'pay', 'I want to pay', 'send me a link to pay', "
+                                        "'request_payment_link' (verbatim), 'pay the full amount', 'pay deposit' — "
+                                        "call request_payment_link(booking_id=..., payment_type='full' or 'deposit'). "
+                                        "NEVER call lookup_service_pricing with query='payment' — that is the WRONG tool. "
+                                        "check_payment is only for 'did I pay?' / 'what is my payment status?'.\n"
                                         "- If user says 'accept the quote', 'I accept', 'go ahead' for an RFQ — call accept_rfq with the booking_id.\n"
                                         "- If user asks 'status', 'where is my booking' — call get_booking_status.\n"
                                         "- If user gives a rating ('rate 5 stars', 'X stars') — call submit_rating.\n"
