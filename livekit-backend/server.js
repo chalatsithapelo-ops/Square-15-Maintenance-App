@@ -11006,7 +11006,9 @@ app.post('/api/chat-bot', authMiddleware, rateLimitBy('chat_bot', 60, 5 * 60 * 1
  * POST /debug/lizzy-text-e2e   body: { question }
  */
 app.post('/debug/lizzy-text-e2e', async (req, res) => {
+  let step = 'init';
   try {
+    step = 'check-secret';
     const expected = process.env.INTERNAL_API_SECRET;
     if (!expected) {
       return res.status(503).json({ error: 'misconfigured', message: 'INTERNAL_API_SECRET not set on server' });
@@ -11014,36 +11016,52 @@ app.post('/debug/lizzy-text-e2e', async (req, res) => {
     if (req.headers['x-internal-secret'] !== expected) {
       return res.status(403).json({ error: 'forbidden' });
     }
+    step = 'check-openai-key';
     const openaiKey = process.env.OPENAI_API_KEY;
     if (!openaiKey) return res.status(503).json({ error: 'OPENAI_API_KEY not set' });
+    step = 'parse-question';
     const question = String((req.body && req.body.question) || '').trim();
     if (!question) return res.status(400).json({ error: 'question required' });
     if (question.length > 2000) return res.status(400).json({ error: 'question too long' });
+    step = 'resolve-fetch';
     const fetchFn = (typeof fetch === 'function') ? fetch : require('node-fetch');
+    step = 'build-body';
+    const requestBody = JSON.stringify({
+      model: process.env.LIZZY_MODEL || 'gpt-4o-mini',
+      messages: [
+        { role: 'system', content: 'You are Lizzy, the AI assistant for Square 15 Facility Solutions, a property maintenance company in South Africa. You help clients with information about plumbing, electrical, painting, carpentry, roofing, tiling, locksmith, and other maintenance services. Be helpful, friendly, and concise. Amounts are in South African Rand (R). For booking or account actions, suggest the user use the full AI Chat or the app\u2019s booking flow.\n\nTRUST & SAFETY FACTS \u2014 use ONLY these wordings, never invent warranties, insurance, criminal-background checks, or licence claims:\n- ESCROW: every payment is held by Square 15 and only released to the artisan after the customer confirms the work is done right.\n- VETTING: every active artisan is registered with Square 15, has submitted government ID, and is rated by past customers.\n- IDENTITY CHECK: when the artisan is on the way, the customer is sent the artisan\'s profile photo on WhatsApp so they can match the face at the door.\n- REFUND POLICY: full refund if cancelled before work starts; partial refund (less materials already bought + time worked) if cancelled mid-job; if work is finished but the customer is not satisfied, escrow stays locked until admin investigates. Wallet refunds are instant; card refunds 3\u20135 business days.\n- PERSONAL SAFETY: tell the user that if they ever feel unsafe they can reply "help" or "emergency" to alert support; for life-threatening emergencies remind them to call 10111 / 10177 first.\n- DO NOT promise workmanship warranties, free reworks, insurance cover, or licence numbers. If asked, say our standard protection is the escrow + refund policy and offer to connect them with admin.' },
+        { role: 'user', content: question },
+      ],
+      max_tokens: 1000,
+      temperature: 0.7,
+    });
+    step = 'fetch';
     const t0 = Date.now();
     const upstream = await fetchFn('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${openaiKey}` },
-      body: JSON.stringify({
-        model: process.env.LIZZY_MODEL || 'gpt-4o-mini',
-        messages: [
-          { role: 'system', content: 'You are Lizzy, the AI assistant for Square 15 Facility Solutions, a property maintenance company in South Africa. You help clients with information about plumbing, electrical, painting, carpentry, roofing, tiling, locksmith, and other maintenance services. Be helpful, friendly, and concise. Amounts are in South African Rand (R). For booking or account actions, suggest the user use the full AI Chat or the app\u2019s booking flow.\n\nTRUST & SAFETY FACTS \u2014 use ONLY these wordings, never invent warranties, insurance, criminal-background checks, or licence claims:\n- ESCROW: every payment is held by Square 15 and only released to the artisan after the customer confirms the work is done right.\n- VETTING: every active artisan is registered with Square 15, has submitted government ID, and is rated by past customers.\n- IDENTITY CHECK: when the artisan is on the way, the customer is sent the artisan\'s profile photo on WhatsApp so they can match the face at the door.\n- REFUND POLICY: full refund if cancelled before work starts; partial refund (less materials already bought + time worked) if cancelled mid-job; if work is finished but the customer is not satisfied, escrow stays locked until admin investigates. Wallet refunds are instant; card refunds 3\u20135 business days.\n- PERSONAL SAFETY: tell the user that if they ever feel unsafe they can reply "help" or "emergency" to alert support; for life-threatening emergencies remind them to call 10111 / 10177 first.\n- DO NOT promise workmanship warranties, free reworks, insurance cover, or licence numbers. If asked, say our standard protection is the escrow + refund policy and offer to connect them with admin.' },
-          { role: 'user', content: question },
-        ],
-        max_tokens: 1000,
-        temperature: 0.7,
-      }),
+      body: requestBody,
     });
     const ms = Date.now() - t0;
+    step = 'parse-response';
     if (!upstream.ok) {
       const txt = await upstream.text().catch(() => '');
       return res.status(502).json({ error: 'upstream_error', status: upstream.status, body: txt.slice(0, 500), ms });
     }
     const data = await upstream.json();
+    step = 'extract-answer';
     const answer = ((data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '').trim();
+    step = 'send-response';
     return res.json({ answer, ms, tokens: data && data.usage });
   } catch (e) {
-    return res.status(500).json({ error: 'lizzy_text_e2e_error', message: e && e.message });
+    console.error(`[lizzy-text-e2e] FAIL step=${step}:`, e && e.message, e && e.stack);
+    return res.status(500).json({
+      error: 'lizzy_text_e2e_error',
+      step,
+      errName: e && e.name,
+      message: e && e.message,
+      stack: e && e.stack ? e.stack.split('\n').slice(0, 6).join(' | ') : null,
+    });
   }
 });
 
