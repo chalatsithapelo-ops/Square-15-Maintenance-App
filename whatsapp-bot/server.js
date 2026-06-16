@@ -10068,7 +10068,7 @@ async function getArtisanProfile(firestore, artisanId) {
     const candidates = [d.imageUrl, d.image, d.profile_image, d.profileImage, d.photo_url, d.photoURL, d.profile_picture, d.profilePicture];
     for (const c of candidates) {
       const u = String(c || '').trim();
-      if (u && /^https?:\/\//i.test(u) && !u.includes('maintenance-app-d320b.appspot.com')) {
+      if (u && /^https?:\/\//i.test(u)) {
         out.imageUrl = u;
         break;
       }
