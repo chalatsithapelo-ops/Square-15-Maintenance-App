@@ -6,7 +6,11 @@
  */
 const WA_BOT = process.env.WA_BOT_URL || 'https://square15-whatsapp-bot.onrender.com';
 const LK = process.env.LK_URL || 'https://square15-livekit-backend.onrender.com';
-const SECRET = process.env.INTERNAL_API_SECRET || 'sq15_internal_2026_xK9mP3';
+const SECRET = process.env.INTERNAL_API_SECRET;
+if (!SECRET) {
+  console.error('FATAL: INTERNAL_API_SECRET env var not set. Export it before running this test.');
+  process.exit(1);
+}
 const UID = process.env.TEST_UID || 'ANulx1ZGL4gskDZzK64VwdR8B3a2';
 
 function decodeJwtPayload(jwt) {
