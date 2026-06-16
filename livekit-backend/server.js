@@ -11114,6 +11114,56 @@ app.post('/debug/voice-breadcrumb', express.json(), (req, res) => {
   }
 });
 
+// TEMP DIAGNOSTIC: inspect OpenAI env state + raw OpenAI ping (no DB writes).
+// Remove after rotation verified.
+app.get('/debug/openai-diag', async (req, res) => {
+  try {
+    const expected = process.env.INTERNAL_API_SECRET;
+    if (!expected) return res.status(503).json({ error: 'misconfigured' });
+    if (req.headers['x-internal-secret'] !== expected) return res.status(403).json({ error: 'forbidden' });
+    const key = process.env.OPENAI_API_KEY;
+    const info = {
+      hasKey: Boolean(key),
+      keyLen: key ? key.length : 0,
+      keyPrefix: key ? key.slice(0, 14) : null,
+      keyTrailing: key ? key.slice(-4) : null,
+      hasWhitespace: key ? (key !== key.trim()) : false,
+      nodeVersion: process.version,
+      hasGlobalFetch: typeof fetch === 'function',
+    };
+    if (!key) return res.json({ ok: false, reason: 'no_key', info });
+    const t0 = Date.now();
+    try {
+      const fetchFn = (typeof fetch === 'function') ? fetch : require('node-fetch');
+      const r = await fetchFn('https://api.openai.com/v1/models', {
+        method: 'GET',
+        headers: { 'Authorization': `Bearer ${key.trim()}` },
+      });
+      const status = r.status;
+      const body = await r.text();
+      return res.json({
+        ok: r.ok,
+        status,
+        ms: Date.now() - t0,
+        bodySample: body.slice(0, 300),
+        info,
+      });
+    } catch (fetchErr) {
+      return res.json({
+        ok: false,
+        reason: 'fetch_threw',
+        errName: fetchErr && fetchErr.name,
+        errMessage: fetchErr && fetchErr.message,
+        errStack: fetchErr && fetchErr.stack ? fetchErr.stack.split('\n').slice(0, 5).join(' | ') : null,
+        ms: Date.now() - t0,
+        info,
+      });
+    }
+  } catch (e) {
+    return res.status(500).json({ error: 'diag_error', message: e && e.message, stack: e && e.stack ? e.stack.split('\n').slice(0, 5).join(' | ') : null });
+  }
+});
+
 // GET helper to inspect all breadcrumbs (or filter by prefix)
 app.get('/debug/voice-breadcrumb', (req, res) => {
   const expected = process.env.INTERNAL_API_SECRET;
