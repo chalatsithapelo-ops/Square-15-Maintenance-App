@@ -10895,7 +10895,10 @@ app.post('/api/token', authMiddleware, rateLimitBy('livekit_token', 30, 5 * 60 *
 app.post('/api/openai-debug', async (req, res) => {
   try {
     const internalSecret = req.headers['x-internal-secret'];
-    const expected = process.env.INTERNAL_API_SECRET || 'sq15_internal_2026_xK9mP3';
+    const expected = process.env.INTERNAL_API_SECRET;
+    if (!expected) {
+      return res.status(503).json({ error: 'misconfigured', message: 'INTERNAL_API_SECRET not set on server' });
+    }
     if (internalSecret !== expected) {
       return res.status(403).json({ error: 'forbidden', message: 'Invalid internal secret' });
     }
@@ -11004,7 +11007,10 @@ app.post('/api/chat-bot', authMiddleware, rateLimitBy('chat_bot', 60, 5 * 60 * 1
  */
 app.post('/debug/lizzy-text-e2e', async (req, res) => {
   try {
-    const expected = process.env.INTERNAL_API_SECRET || 'sq15_internal_2026_xK9mP3';
+    const expected = process.env.INTERNAL_API_SECRET;
+    if (!expected) {
+      return res.status(503).json({ error: 'misconfigured', message: 'INTERNAL_API_SECRET not set on server' });
+    }
     if (req.headers['x-internal-secret'] !== expected) {
       return res.status(403).json({ error: 'forbidden' });
     }
@@ -11050,7 +11056,10 @@ app.post('/debug/lizzy-text-e2e', async (req, res) => {
  */
 app.post('/debug/mint-id-token', async (req, res) => {
   try {
-    const expected = process.env.INTERNAL_API_SECRET || 'sq15_internal_2026_xK9mP3';
+    const expected = process.env.INTERNAL_API_SECRET;
+    if (!expected) {
+      return res.status(503).json({ error: 'misconfigured', message: 'INTERNAL_API_SECRET not set on server' });
+    }
     if (req.headers['x-internal-secret'] !== expected) {
       return res.status(403).json({ error: 'forbidden' });
     }
@@ -11107,7 +11116,8 @@ app.post('/debug/voice-breadcrumb', express.json(), (req, res) => {
 
 // GET helper to inspect all breadcrumbs (or filter by prefix)
 app.get('/debug/voice-breadcrumb', (req, res) => {
-  const expected = process.env.INTERNAL_API_SECRET || 'sq15_internal_2026_xK9mP3';
+  const expected = process.env.INTERNAL_API_SECRET;
+  if (!expected) return res.status(503).json({ error: 'misconfigured', message: 'INTERNAL_API_SECRET not set on server' });
   if (req.headers['x-internal-secret'] !== expected) return res.status(403).json({ error: 'forbidden' });
   const prefix = String(req.query.prefix || '').trim();
   const out = {};
@@ -11129,7 +11139,10 @@ app.get('/debug/voice-breadcrumb', (req, res) => {
  */
 app.post('/debug/voice-e2e', async (req, res) => {
   try {
-    const expected = process.env.INTERNAL_API_SECRET || 'sq15_internal_2026_xK9mP3';
+    const expected = process.env.INTERNAL_API_SECRET;
+    if (!expected) {
+      return res.status(503).json({ error: 'misconfigured', message: 'INTERNAL_API_SECRET not set on server' });
+    }
     if (req.headers['x-internal-secret'] !== expected) {
       return res.status(403).json({ error: 'forbidden' });
     }
