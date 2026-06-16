@@ -733,6 +733,18 @@ async def entrypoint(ctx: JobContext):
             # ── Redirect action calls to dedicated backend tools ──
             # If the LLM accidentally calls ui_navigate for actions that should use
             # the dedicated backend tools, redirect to those tools instead.
+            if action in ("create_order_booking", "dispatch_artisan") and (category_name or problem_description):
+                logger.info(f"↪ Redirecting ui_navigate({action}) → create_booking tool")
+                # Determine is_rfq: explicit 'rfq' hint OR caller passed accept='rfq'
+                is_rfq_val = "yes" if (accept or "").lower() == "rfq" else "no"
+                return await create_booking(
+                    category_name=category_name or "",
+                    problem_description=problem_description or additional_notes or "",
+                    scheduled_date=scheduled_date or "",
+                    scheduled_time=scheduled_time or "",
+                    service_address=service_address or "",
+                    is_rfq=is_rfq_val,
+                )
             if action in ("cancel_booking",) and booking_id:
                 logger.info(f"↪ Redirecting ui_navigate({action}) → cancel_booking tool")
                 return await cancel_booking(booking_id=booking_id, reason=additional_notes or "User requested cancellation")
