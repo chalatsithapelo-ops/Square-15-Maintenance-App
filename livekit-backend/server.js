@@ -11122,6 +11122,7 @@ app.get('/debug/openai-diag', async (req, res) => {
     if (!expected) return res.status(503).json({ error: 'misconfigured' });
     if (req.headers['x-internal-secret'] !== expected) return res.status(403).json({ error: 'forbidden' });
     const key = process.env.OPENAI_API_KEY;
+    const mode = String(req.query.mode || 'models');
     const info = {
       hasKey: Boolean(key),
       keyLen: key ? key.length : 0,
@@ -11130,22 +11131,37 @@ app.get('/debug/openai-diag', async (req, res) => {
       hasWhitespace: key ? (key !== key.trim()) : false,
       nodeVersion: process.version,
       hasGlobalFetch: typeof fetch === 'function',
+      mode,
     };
     if (!key) return res.json({ ok: false, reason: 'no_key', info });
     const t0 = Date.now();
     try {
       const fetchFn = (typeof fetch === 'function') ? fetch : require('node-fetch');
-      const r = await fetchFn('https://api.openai.com/v1/models', {
-        method: 'GET',
-        headers: { 'Authorization': `Bearer ${key.trim()}` },
-      });
+      let r;
+      if (mode === 'chat') {
+        r = await fetchFn('https://api.openai.com/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key.trim()}` },
+          body: JSON.stringify({
+            model: 'gpt-4o-mini',
+            messages: [{ role: 'user', content: 'Reply with the single word OK' }],
+            max_tokens: 5,
+            temperature: 0.0,
+          }),
+        });
+      } else {
+        r = await fetchFn('https://api.openai.com/v1/models', {
+          method: 'GET',
+          headers: { 'Authorization': `Bearer ${key.trim()}` },
+        });
+      }
       const status = r.status;
       const body = await r.text();
       return res.json({
         ok: r.ok,
         status,
         ms: Date.now() - t0,
-        bodySample: body.slice(0, 300),
+        bodySample: body.slice(0, 500),
         info,
       });
     } catch (fetchErr) {
