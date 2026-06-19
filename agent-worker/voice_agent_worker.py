@@ -7,9 +7,10 @@ upload/deploy a minimal set of files to GitHub/Render.
 
 # ── Version tag — bump this on every deploy so we can verify Render runs the
 # latest code.  Check Render logs for the startup banner.
-WORKER_VERSION = "2026-02-26-v5"
+WORKER_VERSION = "2026-06-19-v6"
 
 import os
+import sys
 import asyncio
 import logging
 from pathlib import Path
@@ -25,6 +26,15 @@ import json
 import aiohttp
 from typing import Optional, Dict, Any
 
+
+# Ensure log streams can encode the emoji used in log messages. On Windows the
+# default console encoding (cp1252) raises UnicodeEncodeError on every emoji,
+# spamming tracebacks; reconfiguring to UTF-8 is a no-op on Linux (Render).
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
 
 logging.basicConfig(
     level=logging.INFO,
