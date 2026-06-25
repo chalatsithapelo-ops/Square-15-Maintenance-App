@@ -11098,6 +11098,85 @@ app.post('/api/chat-bot', authMiddleware, rateLimitBy('chat_bot', 60, 5 * 60 * 1
 });
 
 /**
+ * Full Lizzy text-chat proxy (with OpenAI function/tool calling).
+ *
+ * The Flutter client builds the entire conversation (system prompt + history)
+ * and the tool definitions, then posts them here. We forward to OpenAI
+ * chat-completions using the SERVER-side OPENAI_API_KEY and return OpenAI's raw
+ * response so the client can run its existing tool-execution loop unchanged.
+ *
+ * This replaces the old client design that shipped the OpenAI key to the device
+ * (read from Firestore app_config/ai_keys) — that key is now never exposed.
+ *
+ * POST /api/lizzy-chat
+ *   body: { messages: [...], tools?: [...], tool_choice?: 'auto'|..., model?, max_tokens?, temperature? }
+ *   returns: raw OpenAI chat-completions JSON ({ choices: [...] , ... })
+ */
+app.post('/api/lizzy-chat', authMiddleware, rateLimitBy('lizzy_chat', 80, 5 * 60 * 1000), async (req, res) => {
+  try {
+    const openaiKey = process.env.OPENAI_API_KEY;
+    if (!openaiKey) {
+      return res.status(503).json({ error: 'lizzy_unconfigured', message: 'OPENAI_API_KEY not set in server env' });
+    }
+
+    const body = req.body || {};
+    const messages = body.messages;
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return res.status(400).json({ error: 'missing_messages', message: 'messages array is required' });
+    }
+    // Bound the payload so a malicious/buggy client cannot run up huge token bills.
+    if (messages.length > 60) {
+      return res.status(400).json({ error: 'too_many_messages', message: 'Maximum 60 messages per request' });
+    }
+    const approxChars = JSON.stringify(messages).length;
+    if (approxChars > 120000) {
+      return res.status(400).json({ error: 'payload_too_large', message: 'Conversation payload too large' });
+    }
+
+    // Only pass through a safe, known set of fields to OpenAI. Model + token
+    // ceiling are pinned server-side so the client cannot select an expensive
+    // model or raise the token cap.
+    const payload = {
+      model: process.env.LIZZY_MODEL || 'gpt-4o-mini',
+      messages,
+      max_tokens: 700,
+      temperature: typeof body.temperature === 'number'
+        ? Math.max(0, Math.min(1, body.temperature))
+        : 0.3,
+    };
+    if (Array.isArray(body.tools) && body.tools.length > 0) {
+      if (body.tools.length > 60) {
+        return res.status(400).json({ error: 'too_many_tools', message: 'Maximum 60 tools' });
+      }
+      payload.tools = body.tools;
+      payload.tool_choice = body.tool_choice || 'auto';
+    }
+
+    const fetchFn = (typeof fetch === 'function') ? fetch : require('node-fetch');
+    const upstream = await fetchFn('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${openaiKey}`,
+      },
+      body: JSON.stringify(payload),
+    });
+
+    if (!upstream.ok) {
+      const txt = await upstream.text().catch(() => '');
+      console.warn('[lizzy_chat] OpenAI upstream error', upstream.status, txt.slice(0, 300));
+      return res.status(502).json({ error: 'upstream_error', status: upstream.status });
+    }
+
+    const data = await upstream.json();
+    return res.json(data);
+  } catch (e) {
+    console.error('[lizzy_chat] error:', e && e.message);
+    return res.status(500).json({ error: 'lizzy_chat_error', message: e && e.message });
+  }
+});
+
+/**
  * Debug-only end-to-end test of Lizzy text. Same OpenAI pipeline as /api/chat-bot
  * but gated by INTERNAL_API_SECRET so automated E2E suites can exercise the
  * real OpenAI response without minting Firebase ID tokens.
