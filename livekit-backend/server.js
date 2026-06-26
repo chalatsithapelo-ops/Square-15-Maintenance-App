@@ -3854,7 +3854,30 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     }
   }
 
-  if (!bookingId) {
+  // Actions defined BELOW this point that do NOT operate on a single booking id.
+  // Without this exemption the blanket guard would make them unreachable
+  // (they would all return missing_booking_id even though they need no booking).
+  const BOOKINGLESS_ACTIONS = new Set([
+    'get_transaction_history',
+    'get_deposit_requests',
+    'get_service_categories',
+    'get_notifications',
+    'get_scheduled_bookings',
+    'get_artisan_info',
+    'submit_complaint',
+    'admin_bulk_reassign',
+    'admin_close_stale_cases',
+    'admin_broadcast_notification',
+    'admin_flag_user',
+    'get_finance_summary',
+    'get_daily_revenue',
+    'get_failed_payments',
+    'get_refund_history',
+    'get_payout_status',
+    'get_fraud_alerts',
+  ]);
+
+  if (!bookingId && !BOOKINGLESS_ACTIONS.has(action)) {
     return { ok: false, status: 400, error: 'missing_booking_id' };
   }
 
