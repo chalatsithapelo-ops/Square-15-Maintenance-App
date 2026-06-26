@@ -7084,7 +7084,11 @@ app.post('/api/payment/initiate', authMiddleware, assistantLimiter, async (req, 
     paymentData.cancel_url = cancel_url || defaultCancel;
     paymentData.notify_url = notify_url || defaultNotify;
     if (buyerName) paymentData.name_first = buyerName;
-    if (buyerEmail) paymentData.email_address = buyerEmail;
+    // NOTE: Do NOT send email_address. This PayFast merchant account returns a
+    // branded HTTP 500 "Server Error" page whenever a valid email_address is
+    // posted to /eng/process (an invalid email gives 400, none works fine). This
+    // broke ALL in-app card/EFT/BNPL payments. The WhatsApp flow never sent email
+    // which is why it worked. PayFast collects the buyer's email on its own page.
     paymentData.amount = String(parseFloat(amount).toFixed(2));
     paymentData.item_name = String(item_name);
     if (custom_str1) paymentData.custom_str1 = custom_str1;
