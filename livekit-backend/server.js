@@ -3312,7 +3312,17 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
 
     // Admin can see all; users see only their own
     if (actorRole === 'artisan') {
-      query = query.where('service_provider_id', '==', actorUid);
+      // Bookings store service_provider_id = the serviceProvider DOC id, not the
+      // artisan's auth uid. Resolve the doc id from the auth uid so artisans
+      // actually see their dispatched jobs.
+      let artisanQueryId = actorUid;
+      try {
+        const spDoc = await getServiceProviderDocByAnyId(actorUid);
+        if (spDoc && spDoc.exists) artisanQueryId = spDoc.id;
+      } catch (e) {
+        console.warn('[list_bookings] artisan doc resolve failed:', e.message);
+      }
+      query = query.where('service_provider_id', '==', artisanQueryId);
     } else if (actorRole !== 'admin') {
       query = query.where('user_id', '==', actorUid);
     }
