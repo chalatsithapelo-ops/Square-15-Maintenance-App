@@ -3655,7 +3655,14 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       if (!bid) return { ok: false, status: 400, error: 'missing_booking_id' };
       if (!actorUid) return { ok: false, status: 401, error: 'unauthorized' };
 
-      const bData = await loadBooking();
+      let bData = await loadBooking();
+      if (!bData) {
+        // In-app regular bookings live in tasksManagement (not futureBookings).
+        // loadBooking() only checks futureBookings, so fall back to tasksManagement
+        // for app-initiated wallet payments (e.g. order paid from Booking > Current).
+        const tmSnap = await firestore.collection('tasksManagement').doc(bid).get();
+        if (tmSnap.exists) bData = tmSnap.data() || {};
+      }
       if (!bData) return { ok: false, status: 404, error: 'booking_not_found' };
 
       const artisanAccepted = bData.accept === '1' || bData.accept === 1 || bData.artisan_confirmed === 'yes';
@@ -3689,6 +3696,64 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       } else {
         payAmount = cost;
       }
+
+      // ── Promo code support (validated SERVER-SIDE; never trust a client discount) ──
+      // The client may pass payload.promo_id (preferred) or payload.promo_code. We
+      // independently re-validate against promo_codes/promo_redemptions and compute
+      // the discount here so the customer cannot forge a cheaper price.
+      let promoDiscount = 0;
+      let appliedPromoId = null;
+      const promoIdIn = String(payload.promo_id || payload.promoId || '').trim();
+      const promoCodeIn = String(payload.promo_code || payload.promoCode || '').trim().toUpperCase();
+      try {
+        let promoDoc = null;
+        if (promoIdIn) {
+          const d = await firestore.collection('promo_codes').doc(promoIdIn).get();
+          if (d.exists) promoDoc = d;
+        } else if (promoCodeIn) {
+          const qs = await firestore.collection('promo_codes')
+            .where('code', '==', promoCodeIn)
+            .where('status', '==', 'active')
+            .limit(1).get();
+          if (!qs.empty) promoDoc = qs.docs[0];
+        }
+        if (promoDoc && promoDoc.exists) {
+          const pd = promoDoc.data() || {};
+          const nowMs = Date.now();
+          const statusOk = (pd.status || 'active') === 'active';
+          const startMs = pd.start_date ? Date.parse(pd.start_date) : NaN;
+          const endMs = pd.end_date ? Date.parse(pd.end_date) : NaN;
+          const startOk = Number.isNaN(startMs) || nowMs >= startMs;
+          const endOk = Number.isNaN(endMs) || nowMs <= endMs;
+          const maxUses = Number(pd.max_uses || 0);
+          const usedCount = Number(pd.used_count || 0);
+          const maxOk = maxUses <= 0 || usedCount < maxUses;
+          const minJob = Number(pd.min_job_value || 0);
+          const minOk = minJob <= 0 || payAmount >= minJob;
+          let perUserOk = true;
+          const perUserLimit = Number(pd.per_user_limit || 1);
+          if (perUserLimit > 0) {
+            const uses = await firestore.collection('promo_redemptions')
+              .where('promo_id', '==', promoDoc.id)
+              .where('user_id', '==', actorUid)
+              .get();
+            perUserOk = uses.size < perUserLimit;
+          }
+          if (statusOk && startOk && endOk && maxOk && minOk && perUserOk) {
+            const dtype = String(pd.discount_type || 'percentage');
+            const dval = Number(pd.discount_value || 0);
+            let disc = dtype === 'fixed_amount' ? dval : (payAmount * dval / 100);
+            if (!Number.isFinite(disc) || disc < 0) disc = 0;
+            if (disc > payAmount) disc = payAmount;
+            promoDiscount = Math.round(disc * 100) / 100;
+            appliedPromoId = promoDoc.id;
+          }
+        }
+      } catch (e) {
+        console.warn('[pay_with_wallet] promo validation failed (ignored):', e.message);
+        promoDiscount = 0; appliedPromoId = null;
+      }
+      payAmount = Math.max(0, Math.round((payAmount - promoDiscount) * 100) / 100);
 
       // Check wallet balance
       const userSnap = await firestore.collection('users').doc(actorUid).get();
@@ -3753,12 +3818,36 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         status: 'success',
         wallet_balance_before: walletBalance.toFixed(2),
         wallet_balance_after: newBalance.toFixed(2),
+        promo_id: appliedPromoId || null,
+        discount_amount: promoDiscount.toFixed(2),
         created_at: admin.firestore.FieldValue.serverTimestamp(),
       });
+
+      // Record promo redemption (only after the wallet deduction succeeded).
+      if (appliedPromoId && promoDiscount > 0) {
+        try {
+          const redemptionId = crypto.randomUUID();
+          await firestore.collection('promo_redemptions').doc(redemptionId).set({
+            id: redemptionId,
+            promo_id: appliedPromoId,
+            user_id: actorUid,
+            task_management_id: bid,
+            job_amount: cost,
+            discount_amount: promoDiscount,
+            created_at: new Date().toISOString(),
+          });
+          await firestore.collection('promo_codes').doc(appliedPromoId).update({
+            used_count: admin.firestore.FieldValue.increment(1),
+          });
+        } catch (e) {
+          console.warn('[pay_with_wallet] promo redemption record failed (non-fatal):', e.message);
+        }
+      }
 
       return { ok: true, status: 200, data: {
         message: `Payment of R${payAmount.toFixed(2)} completed from your wallet. Remaining balance: R${newBalance.toFixed(2)}.`,
         bookingId: bid, amount: payAmount, new_balance: newBalance,
+        discount_amount: promoDiscount, promo_id: appliedPromoId,
       }};
     } catch (err) {
       return { ok: false, status: 500, error: `wallet_payment_error: ${err.message}` };
