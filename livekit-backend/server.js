@@ -7155,9 +7155,19 @@ app.post('/api/payment/initiate', authMiddleware, assistantLimiter, async (req, 
 
     console.log(`[payment] Initiated ${payment_method || 'eft'} payment, amount=R${amount}, save_card=${!!save_card}, task=${taskId}`);
 
+    // PayFast's /eng/process endpoint requires a POST form submission. Returning
+    // the raw GET query-string URL (payfast.co.za/eng/process?...) makes PayFast
+    // respond with its branded 500 "Server Error" page. Store the signed params
+    // in a session and hand back the GET-friendly checkout page (same mechanism
+    // as the WhatsApp flow) which auto-submits a POST form to PayFast. Fixes
+    // card, instant-EFT and BNPL in-app payments alike.
+    const sessionId = crypto.randomUUID();
+    paymentSessions.set(sessionId, { paymentData, created: Date.now() });
+    const checkoutUrl = `${backendUrl}/api/payment/checkout/${sessionId}`;
+
     res.json({
       ok: true,
-      payment_url: fullPaymentUrl,
+      payment_url: checkoutUrl,
       payment_form_html: formHtml,
       payfast_url: payfastUrl,
       payment_data: paymentData,
