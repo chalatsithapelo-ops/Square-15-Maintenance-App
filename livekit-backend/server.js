@@ -4374,12 +4374,16 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     return { ok: true, status: 200, data: { negotiation: true, rfq_no: String(data.rfq_no || '').trim() } };
   }
 
-  const bookingData = await loadBooking();
-  if (!bookingData) return { ok: false, status: 404, error: 'booking_not_found' };
+  // Bookingless actions (see BOOKINGLESS_ACTIONS above) are defined further down
+  // and must not be forced through this booking load / booking_not_found guard.
+  const bookingData = BOOKINGLESS_ACTIONS.has(action) ? null : await loadBooking();
+  if (!bookingData && !BOOKINGLESS_ACTIONS.has(action)) {
+    return { ok: false, status: 404, error: 'booking_not_found' };
+  }
 
-  const userId = String(bookingData.user_id || '').trim();
-  const artisanId = String(bookingData.service_provider_id || '').trim();
-  const tmId = String(bookingData.tasks_management_id || '').trim();
+  const userId = String((bookingData || {}).user_id || '').trim();
+  const artisanId = String((bookingData || {}).service_provider_id || '').trim();
+  const tmId = String((bookingData || {}).tasks_management_id || '').trim();
 
   if (action === 'cancel_booking') {
     if (!(actorRole === 'client' && userId === actorUid)) {
