@@ -1063,7 +1063,198 @@ setInterval(async () => {
   }
 }, 15 * 60 * 1000); // check every 15 minutes
 
-/** Restore session context from Firestore when server restarts (best-effort). */
+// ── In-app instant-order auto-dispatch escalation ────────────────────────
+// Client-app instant orders are first assigned to the SINGLE nearest online
+// artisan (service_provider_id). If that artisan doesn't accept within
+// IN_APP_BROADCAST_AFTER_MS, we rebroadcast the order to ALL approved artisans
+// for the order's task categories (first-to-accept wins). If still nobody
+// accepts within IN_APP_ESCALATE_AFTER_MS of the broadcast, we escalate to
+// admin for manual assignment. Mirrors the WhatsApp/RFQ timeout flow above
+// but for the `tasksManagement` instant-order path (dispatch_stage driven).
+const IN_APP_BROADCAST_AFTER_MS = 5 * 60 * 1000;   // nearest gets a 5-min head start
+const IN_APP_ESCALATE_AFTER_MS = 15 * 60 * 1000;   // then 15 min of open broadcast
+
+// Resolve approved artisans (auth uid + email + fcm token) for a set of task
+// ids via the userTasks(task_id -> serviceProvider) mapping the rest of the
+// app uses to record which artisans perform which tasks.
+async function resolveEligibleArtisansForTasks(firestore, taskIds) {
+  const out = { uids: new Set(), emails: new Set(), tokens: new Set(), spDocIds: new Set() };
+  const wanted = new Set((Array.isArray(taskIds) ? taskIds : [])
+    .map((t) => String(t || '').trim()).filter(Boolean));
+  if (wanted.size === 0) return out;
+
+  // 1. userTasks rows for the order's tasks → candidate serviceProvider ids.
+  const candidateIds = new Set();
+  const utSnap = await firestore.collection('userTasks').get();
+  for (const ud of utSnap.docs) {
+    const udd = ud.data() || {};
+    const tid = String(udd.task_id || udd.taskId || '').trim();
+    if (!wanted.has(tid)) continue;
+    const aid = String(udd.user_id || udd.userId || udd.artisan_id || '').trim();
+    if (aid) candidateIds.add(aid);
+  }
+  if (candidateIds.size === 0) return out;
+
+  // 2. resolve each candidate to a live, eligible serviceProvider doc.
+  const REJECT = new Set(['pending', 'rejected', 'reject', 'suspended', 'inactive', 'disabled']);
+  for (const cid of candidateIds) {
+    let spDoc = null;
+    try {
+      const direct = await firestore.collection('serviceProvider').doc(cid).get();
+      if (direct.exists) spDoc = direct;
+    } catch (_) { /* fall through to field lookup */ }
+    if (!spDoc) {
+      for (const f of ['user_id', 'uid', 'userId', 'docId']) {
+        try {
+          const q = await firestore.collection('serviceProvider').where(f, '==', cid).limit(1).get();
+          if (!q.empty) { spDoc = q.docs[0]; break; }
+        } catch (_) { /* try next field */ }
+      }
+    }
+    if (!spDoc || !spDoc.exists) continue;
+    const ad = spDoc.data() || {};
+    if (ad.is_suspended === true) continue;
+    if (ad.active != null && !isTruthyValue(ad.active)) continue;
+    const st = ad.status == null ? '' : String(ad.status).toLowerCase();
+    if (st && REJECT.has(st)) continue;
+    out.spDocIds.add(spDoc.id);
+    const email = String(ad.email || ad.userEmail || '').trim().toLowerCase();
+    if (email) out.emails.add(email);
+    const authUid = String(ad.uid || ad.userId || '').trim();
+    if (authUid) out.uids.add(authUid);
+    const token = String(ad.fcm_token || ad.deviceToken || ad.fcmToken || '').trim();
+    if (token) out.tokens.add(token);
+  }
+  return out;
+}
+
+async function escalateInAppOrderToAdmin(firestore, docRef, data, reason) {
+  await docRef.update({
+    status: 'pending_admin_review',
+    rfq_status: 'timeout_escalated',
+    dispatch_stage: 'escalated',
+    dispatch_escalated_at: new Date().toISOString(),
+    dispatch_escalation_reason: reason,
+    updated_at: new Date().toISOString(),
+  });
+  try {
+    await pushAdminNotification({
+      title: '⏰ Order needs manual assignment',
+      body: `Order #${data.order_no || docRef.id} had no artisan accept (${reason}). Please assign manually.`,
+      type: 'artisan_timeout',
+      bookingId: docRef.id,
+    });
+  } catch (_) { /* best-effort */ }
+  // Reassure the customer in-app.
+  try {
+    const customerId = String(data.user_id || data.userId || '').trim();
+    if (customerId) {
+      await firestore.collection('notifications').add({
+        user_id: customerId,
+        title: 'Matching you with an artisan',
+        body: "We're still finding an available artisan for your order and will update you shortly.",
+        type: 'order_update',
+        booking_id: docRef.id,
+        read: false,
+        created_at: admin.firestore.FieldValue.serverTimestamp(),
+        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    }
+  } catch (_) { /* best-effort */ }
+  console.log(`[dispatch] Escalated in-app order ${docRef.id} to admin (${reason})`);
+}
+
+setInterval(async () => {
+  const firestore = db();
+  if (!firestore) return;
+  try {
+    const snap = await firestore.collection('tasksManagement')
+      .where('dispatch_stage', 'in', ['nearest', 'broadcast'])
+      .limit(30)
+      .get();
+    if (snap.empty) return;
+    const now = Date.now();
+    const CLOSED_STATUSES = new Set([
+      'pending_payment', 'progress', 'paid', 'deposit_paid', 'completed',
+      'closed', 'cancelled', 'canceled', 'rejected', 'accepted', 'pending_admin_review',
+    ]);
+    const parseTs = (v) => {
+      if (!v) return null;
+      if (typeof v.toDate === 'function') return v.toDate().getTime();
+      const t = new Date(v).getTime();
+      return Number.isNaN(t) ? null : t;
+    };
+
+    for (const doc of snap.docs) {
+      const data = doc.data() || {};
+      const stage = String(data.dispatch_stage || '').trim();
+      const accept = String(data.accept || '').trim();
+      const status = String(data.status || '').trim().toLowerCase();
+
+      // Already accepted / closed / escalated → stop tracking this order.
+      if (accept === '1' || CLOSED_STATUSES.has(status)) {
+        try {
+          await doc.ref.update({ dispatch_stage: accept === '1' ? 'accepted' : 'closed' });
+        } catch (_) { /* best-effort */ }
+        continue;
+      }
+
+      if (stage === 'nearest') {
+        const since = parseTs(data.dispatched_at) || parseTs(data.creation_date) || parseTs(data.updated_at);
+        if (since == null || (now - since) < IN_APP_BROADCAST_AFTER_MS) continue;
+
+        const elig = await resolveEligibleArtisansForTasks(firestore, data.dispatch_task_ids);
+        const uids = [...elig.uids];
+        const emails = [...elig.emails];
+        const tokens = [...elig.tokens];
+
+        if (uids.length === 0 && emails.length === 0) {
+          await escalateInAppOrderToAdmin(firestore, doc.ref, data, 'no_eligible_artisans');
+          continue;
+        }
+
+        const update = {
+          dispatch_stage: 'broadcast',
+          dispatch_broadcast_at: new Date().toISOString(),
+          dispatch_candidate_count: elig.spDocIds.size,
+          updated_at: new Date().toISOString(),
+        };
+        if (uids.length) update.dispatched_artisan_uids = admin.firestore.FieldValue.arrayUnion(...uids);
+        if (emails.length) update.dispatched_artisan_emails = admin.firestore.FieldValue.arrayUnion(...emails);
+        await doc.ref.update(update);
+
+        if (tokens.length) {
+          try {
+            await admin.messaging().sendEachForMulticast({
+              tokens,
+              notification: {
+                title: 'New job available',
+                body: `Order #${data.order_no || doc.id} is open for acceptance — first to accept wins.`,
+              },
+              data: { type: 'rfq_broadcast', booking_id: String(doc.id), task_id: String(doc.id) },
+              android: { priority: 'high', notification: { channelId: 'high_importance_channel' } },
+              apns: { payload: { aps: { sound: 'default' } } },
+            });
+          } catch (fcmErr) {
+            console.warn(`[dispatch] broadcast FCM failed for ${doc.id}:`, fcmErr && fcmErr.message);
+          }
+        }
+        console.log(`[dispatch] Broadcast in-app order ${doc.id} to ${elig.spDocIds.size} artisan(s) (uids=${uids.length} emails=${emails.length} tokens=${tokens.length})`);
+        continue;
+      }
+
+      if (stage === 'broadcast') {
+        const since = parseTs(data.dispatch_broadcast_at) || parseTs(data.updated_at);
+        if (since == null || (now - since) < IN_APP_ESCALATE_AFTER_MS) continue;
+        await escalateInAppOrderToAdmin(firestore, doc.ref, data, 'no_artisan_accepted_after_broadcast');
+      }
+    }
+  } catch (e) {
+    console.warn('[dispatch] In-app order escalation check failed:', e.message);
+  }
+}, 2 * 60 * 1000); // check every 2 minutes
+
+
 async function restoreSessionFromFirestore(session) {
   if (session._restored) return;
   session._restored = true;
@@ -3842,10 +4033,7 @@ async function executeWaTool(name, args, session) {
       const userDoc = await firestore.collection('users').doc(session.linkedUserId).get();
       if (!userDoc.exists) return { error: 'Account not found.' };
       const balance = parseFloat(userDoc.data().balance || '0');
-      // Format with thousands separator so the hallucination guard's PRICE_RE
-      // recognises the amount as legitimately tool-sourced.
-      const formatted = balance.toLocaleString('en-ZA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-      return { balance: `R${formatted}`, balance_numeric: balance, userId: session.linkedUserId };
+      return { balance: `R${balance.toFixed(2)}`, userId: session.linkedUserId };
     }
 
     // ═══════════════════════════════════════════
@@ -4952,20 +5140,6 @@ async function executeWaTool(name, args, session) {
           deleteStoragePhotos(allUrls, `cancel_booking ${bid}`).catch(() => {});
         }
       } catch (e) { console.warn('[wa-tool] cancel photo-cleanup setup failed:', e.message); }
-
-      // Clear session pointers so a follow-up "check my wallet" / "book again"
-      // turn doesn't keep referencing this dead booking. Only clear if the
-      // cancelled booking matches the pinned id (don't wipe other contexts).
-      try {
-        if (session.lastBookingId === bid) {
-          session.lastBookingId = null;
-          session.lastBookingCost = null;
-        }
-        if (session.lastRfqId === bid) {
-          session.lastRfqId = null;
-          session.lastRfqAt = 0;
-        }
-      } catch (_) {}
 
       return {
         success: true,
@@ -7102,7 +7276,7 @@ PAYMENT FLOW (CRITICAL):
 - Pass the customer's choice as the paymentType parameter ("full" or "deposit").
 - Do NOT call request_payment_link without first asking and getting the customer's payment type choice.
 - WALLET PAYMENT: If the customer EXPLICITLY says "from my wallet", "use my wallet", "pay from wallet", or any clear wallet intent, call pay_with_wallet with the bookingId — do NOT call request_payment_link in that case. The wallet tool handles deposit/balance automatically based on booking state.
-- If the customer asks about wallet balance, money in wallet, account balance, or any phrasing about how much money they have, you MUST call check_wallet_balance and then state the exact balance back to them (e.g. "Your current wallet balance is R443,664.00."). NEVER ask for an address or any other detail before answering — the tool only needs the linked phone number which is already attached to the session. If the tool returns an error, relay the error to the user (e.g. "Your number isn't linked yet").
+- If the customer asks about wallet balance only (no payment intent), call check_wallet_balance.
 - Do NOT refuse or block payment based on conversation history alone. The function checks real-time booking status in the database.
 - If an artisan hasn't accepted yet, the function itself will return an appropriate message.
 - NEVER tell the customer "the artisan hasn't accepted yet" without first calling request_payment_link to verify.
@@ -7118,10 +7292,10 @@ DEPOSIT vs BALANCE PAYMENTS (CRITICAL):
 - If you see a [SYSTEM STATUS UPDATE] message with status "completed" or "after_photo", check if balance is due by calling check_booking_status.
 
 PHOTO REQUIREMENT (CRITICAL):
-- ASK the customer once for a photo of the issue before creating a booking or RFQ: "Could you please send me a photo of the issue? This helps our artisans understand the problem and come prepared."
-- If the customer has already sent a photo during this conversation, do NOT ask again.
-- If the customer declines, can't send, says "no photo", "proceed without", "don't have one", "skip the photo", or anything similar — you MUST proceed without a photo. Do NOT ask a second time. Do NOT block the booking. Continue to the next step (price lookup, address, materials, etc.).
-- Pricing questions like "how much for X" do NOT require a photo first — call lookup_pricing immediately and give the price.
+- ALWAYS ask the customer to send a photo of the issue BEFORE creating a booking or RFQ.
+- Say something like: "Could you please send me a photo of the issue? This helps our artisans understand the problem and come prepared."
+- If the customer has already sent a photo during this conversation, you do NOT need to ask again.
+- If the customer says they cannot send a photo (e.g. "I can't right now"), proceed without one — don't block the booking.
 - Photos are automatically attached to the booking and sent to artisans when they receive the job request.
 - The artisan will see the photos alongside the job description, address, and pricing.
 - Customers often send multiple photos in one go. Treat them as ONE set and respond ONCE — do NOT send the same reply multiple times.
@@ -7546,11 +7720,8 @@ async function handleMessage(session, userMessage, imageDataUrl) {
       const wantsFull = /\b(pay\s+(?:in\s+)?full|full\s+payment|pay\s+everything|pay\s+all|^full$|pay\s+the\s+full|pay\s+balance|pay\s+the\s+balance|balance\s+please|^balance$)\b/i.test(userTextRaw)
         || /^full\b/i.test(userTextLower);
       const wantsPayGeneric = /^(pay|pay\s+now|payment\s+link|send\s+(?:me\s+)?(?:the\s+)?(?:payment|link)|i\s+want\s+to\s+pay|ready\s+to\s+pay)\b/i.test(userTextLower);
-      // Wallet intent — must intercept to pay_with_wallet so we don't accidentally
-      // mint a CARD link when the customer asked for wallet payment.
-      const wantsWallet = /\b(from\s+(?:my\s+)?wallet|use\s+(?:my\s+)?wallet|pay\s+(?:with\s+|from\s+|using\s+)?(?:my\s+)?wallet|wallet\s+pay(?:ment)?|deduct\s+(?:from\s+)?(?:my\s+)?wallet)\b/i.test(userTextRaw);
 
-      if ((wantsDeposit || wantsFull || wantsPayGeneric || wantsWallet) && (session.lastBookingId || session.lastRfqId)) {
+      if ((wantsDeposit || wantsFull || wantsPayGeneric) && (session.lastBookingId || session.lastRfqId)) {
         const bid = session.lastBookingId || session.lastRfqId;
         // If generic, look back at the last assistant message for default
         let paymentType = wantsDeposit ? 'deposit' : (wantsFull ? 'full' : 'full');
@@ -7567,34 +7738,25 @@ async function handleMessage(session, userMessage, imageDataUrl) {
             }
           }
           if (!priorChoice) {
-            // Don't intercept — let GPT ask the question. Force paymentType
-            // to '' so shouldIntercept below evaluates false for the generic
-            // case (without losing the explicit deposit/full intercept).
-            paymentType = '';
+            // Don't intercept — let GPT ask the question.
           } else {
             paymentType = priorChoice;
           }
         }
-        // wantsWallet always intercepts — regardless of full/deposit choice.
-        // pay_with_wallet handles deposit vs full via paymentType (default full).
-        const shouldIntercept = wantsWallet || wantsDeposit || wantsFull || (wantsPayGeneric && (paymentType === 'deposit' || paymentType === 'full'));
+        const shouldIntercept = wantsDeposit || wantsFull || (wantsPayGeneric && (paymentType === 'deposit' || paymentType === 'full'));
         if (shouldIntercept) {
-          const _tool = wantsWallet ? 'pay_with_wallet' : 'request_payment_link';
-          const _pt = paymentType || 'full';
-          console.log(`[payment-intercept] ${maskPhone(session.phone)}: "${userTextRaw}" → ${_tool}(${bid}, ${_pt})`);
-          const argsObj = { bookingId: bid, paymentType: _pt };
-          session._lastToolsCalled.push(_tool);
+          console.log(`[payment-intercept] ${maskPhone(session.phone)}: "${userTextRaw}" → request_payment_link(${bid}, ${paymentType})`);
+          const argsObj = { bookingId: bid, paymentType };
+          session._lastToolsCalled.push('request_payment_link');
           let reply = '';
           try {
-            const toolResult = await executeWaTool(_tool, argsObj, session);
+            const toolResult = await executeWaTool('request_payment_link', argsObj, session);
             reply = (toolResult && (toolResult.message || toolResult.error)) || '';
           } catch (toolErr) {
-            console.error(`[payment-intercept] ${_tool} threw:`, toolErr && toolErr.stack || toolErr);
+            console.error(`[payment-intercept] request_payment_link threw:`, toolErr && toolErr.stack || toolErr);
           }
           if (!reply) {
-            reply = wantsWallet
-              ? 'I had trouble processing your wallet payment. Please try again, or open the Square 15 app to pay.'
-              : 'I had trouble generating your payment link. Please try again in a moment, or open the Square 15 app to pay.';
+            reply = 'I had trouble generating your payment link. Please try again in a moment, or open the Square 15 app to pay.';
           }
           session.messages.push({ role: 'assistant', content: reply });
           return reply;
@@ -7656,9 +7818,6 @@ async function handleMessage(session, userMessage, imageDataUrl) {
 
     // Handle tool calls (support multiple rounds)
     let toolRounds = 0;
-    // Dedupe identical tool calls within the same user-turn — guards against
-    // GPT calling submit_rfq / create_booking twice with same args.
-    const _turnToolCallSigs = new Set();
     while (assistantMessage.tool_calls && assistantMessage.tool_calls.length > 0 && toolRounds < 3) {
       toolRounds++;
       session.messages.push(assistantMessage);
@@ -7666,34 +7825,11 @@ async function handleMessage(session, userMessage, imageDataUrl) {
       for (const tc of assistantMessage.tool_calls) {
         let toolArgs = {};
         try { toolArgs = JSON.parse(tc.function.arguments); } catch (_) {}
-        const sig = tc.function.name + ':' + JSON.stringify(toolArgs);
-        if (_turnToolCallSigs.has(sig) && /^(submit_rfq|create_booking|accept_rfq_quote|request_payment_link|pay_with_wallet|cancel_booking|rate_booking|request_refund)$/.test(tc.function.name)) {
-          console.warn(`[tool] DEDUP duplicate ${tc.function.name} this turn — returning cached "already_invoked"`);
-          session.messages.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify({ error: 'already_invoked_this_turn', note: 'This action was already performed in this same response — do not call it again.' }) });
-          continue;
-        }
-        _turnToolCallSigs.add(sig);
-
-        // Wallet-intent override: if the customer explicitly said "wallet"
-        // and the model still tried to mint a CARD payment link, swap to
-        // pay_with_wallet. This catches the lingering bug where GPT picks
-        // request_payment_link after the user said "pay from my wallet".
-        let _toolName = tc.function.name;
-        try {
-          if (_toolName === 'request_payment_link') {
-            const _userTxt = (typeof userMessage === 'string' ? userMessage : '').toLowerCase();
-            if (/\b(from\s+(?:my\s+)?wallet|use\s+(?:my\s+)?wallet|pay\s+(?:with\s+|from\s+|using\s+)?(?:my\s+)?wallet|wallet\s+pay|deduct\s+(?:from\s+)?(?:my\s+)?wallet)\b/.test(_userTxt)) {
-              console.warn('[tool] wallet-intent override: swapping request_payment_link → pay_with_wallet');
-              _toolName = 'pay_with_wallet';
-            }
-          }
-        } catch (_) {}
-
-        console.log(`[tool] ${_toolName}(${JSON.stringify(toolArgs).substring(0, 100)})`);
-        session._lastToolsCalled.push(_toolName);
+        console.log(`[tool] ${tc.function.name}(${JSON.stringify(toolArgs).substring(0, 100)})`);
+        session._lastToolsCalled.push(tc.function.name);
         let result;
         try {
-          result = await executeWaTool(_toolName, toolArgs, session);
+          result = await executeWaTool(tc.function.name, toolArgs, session);
         } catch (toolErr) {
           console.error(`[tool] ${tc.function.name} THREW:`, toolErr.message, toolErr.stack);
           result = { error: `Tool ${tc.function.name} failed: ${toolErr.message}` };
@@ -7749,21 +7885,7 @@ async function handleMessage(session, userMessage, imageDataUrl) {
       assistantMessage = followUp.choices[0].message;
     }
 
-    let reply = assistantMessage.content || '';
-    if (!reply || !reply.trim()) {
-      // Empty content despite tool round(s) — try to surface something useful
-      // from the most recent tool result instead of the generic apology.
-      const lastToolMsg = [...session.messages].reverse().find(m => m.role === 'tool');
-      try {
-        const parsed = lastToolMsg ? JSON.parse(lastToolMsg.content) : null;
-        if (parsed) {
-          if (parsed.message && String(parsed.message).trim()) reply = String(parsed.message);
-          else if (parsed.success && parsed.bookingId) reply = `✓ Booking ${parsed.bookingId} created${parsed.cost ? ` (cost ${parsed.cost})` : ''}. I'll keep you posted.`;
-          else if (parsed.error) reply = String(parsed.error);
-        }
-      } catch (_) {}
-      if (!reply || !reply.trim()) reply = "I'm sorry, I couldn't process that. Please try again.";
-    }
+    const reply = assistantMessage.content || "I'm sorry, I couldn't process that. Please try again.";
 
     // ─────────────────────────────────────────────────────────────────────
     // HALLUCINATED-PRICE GUARD (Apr 28 2026)
@@ -7800,11 +7922,8 @@ async function handleMessage(session, userMessage, imageDataUrl) {
           if (m.role !== 'tool') continue;
           const txt = typeof m.content === 'string' ? m.content : '';
           if (_hg.PRICE_RE.test(txt)) { toolReturnedPrice = true; break; }
-          // Also accept an unformatted R<digits> (no thousands separator) — wallet
-          // balance tool used to return R443664.00 which PRICE_RE rejects.
-          if (/\bR\s*\d+(?:\.\d{1,2})?\b/i.test(txt)) { toolReturnedPrice = true; break; }
-          // Numeric grand_total / fixedPrice / balance fields.
-          if (/"(grand_total|fixedPrice|cost|total|quoted_price|amount|balance|balance_numeric|wallet|refund_amount)"\s*:\s*("?R?\s*\d|[1-9]\d*)/i.test(txt)) {
+          // Numeric grand_total / fixedPrice fields.
+          if (/"(grand_total|fixedPrice|cost|total|quoted_price|amount)"\s*:\s*("?R?\s*\d|[1-9]\d*)/i.test(txt)) {
             toolReturnedPrice = true; break;
           }
         }
@@ -7945,13 +8064,6 @@ setInterval(() => {
 // writes. Keep ids for 10 minutes; that's well beyond Meta's retry window.
 const _seenMessageIds = new Map();
 const MSG_ID_TTL_MS = 10 * 60 * 1000;
-// Ring buffer of last 100 delivery-status callbacks from Meta so /debug/wa-statuses
-// can reveal whether outbound sends are being delivered, read, or failed.
-const _waStatuses = [];
-function pushWaStatus(s) {
-  _waStatuses.push({ ts: Date.now(), ...s });
-  while (_waStatuses.length > 100) _waStatuses.shift();
-}
 setInterval(() => {
   const now = Date.now();
   for (const [id, ts] of _seenMessageIds) {
@@ -8103,23 +8215,7 @@ app.post('/webhook', async (req, res) => {
     const changes = entry?.changes?.[0];
     const value = changes?.value;
 
-    if (!value?.messages) {
-      // Capture delivery / read / failed status callbacks so we can debug
-      // when Meta returns 200 from /messages but silently drops the send
-      // (e.g. outside 24h customer-care window).
-      if (Array.isArray(value?.statuses)) {
-        for (const st of value.statuses) {
-          const entry = { id: st.id, recipient: st.recipient_id, status: st.status, errors: st.errors || null, conversation: st.conversation || null, pricing: st.pricing || null };
-          pushWaStatus(entry);
-          if (st.status === 'failed' || st.errors) {
-            console.error('[wa-status]', JSON.stringify(entry).slice(0, 800));
-          } else {
-            console.log(`[wa-status] id=${st.id} → ${st.status} (recipient=${st.recipient_id})`);
-          }
-        }
-      }
-      return;
-    }
+    if (!value?.messages) return; // status update, not a message
 
     // Grab WhatsApp profile name for chat logs
     const _contactName = value?.contacts?.[0]?.profile?.name || null;
@@ -8405,7 +8501,6 @@ app.post('/debug/inject-message', requireInternalSecret, async (req, res) => {
     let reply = '';
     let toolsCalled = [];
     let sentChunks = 0;
-    let sendResults = [];
     let lastBookingId = null, lastRfqId = null;
     await withPhoneLock(from, async () => {
       if (reset) {
@@ -8439,100 +8534,15 @@ app.post('/debug/inject-message', requireInternalSecret, async (req, res) => {
       session._lastReplyText = reply; session._lastReplyAt = Date.now();
       logChatMessage(from, 'outgoing', reply, { linkedUserId: session.linkedUserId, displayName: contactName || 'E2ETest', toolsCalled, source: 'inject' });
       const chunks = reply.match(/.{1,4000}/gs) || [reply];
-      sendResults = [];
       for (const chunk of chunks) {
-        try {
-          const r = await sendWhatsAppMessage(from, chunk);
-          sendResults.push(r || { ok: true });
-          if (r && r.ok) sentChunks++;
-        } catch (e) {
-          console.error('[inject] send failed:', e.message);
-          sendResults.push({ ok: false, error: e.message });
-        }
+        try { await sendWhatsAppMessage(from, chunk); sentChunks++; } catch (e) { console.error('[inject] send failed:', e.message); }
       }
     });
-    return res.json({ ok: true, reply, toolsCalled, sentChunks, sendResults, lastBookingId, lastRfqId, phone: from });
+    return res.json({ ok: true, reply, toolsCalled, sentChunks, lastBookingId, lastRfqId, phone: from });
   } catch (e) {
     console.error('[inject] error:', e.stack || e.message);
     return res.status(500).json({ error: String(e.message || e) });
   }
-});
-
-// 1b) Mint a Firebase ID token for any uid (E2E auth for livekit-backend endpoints).
-//     the deployed bot is actually using, plus the full Meta API response so
-//     we can diagnose template-required / 24h window / not-allowlisted errors.
-app.post('/debug/wa-identity', requireInternalSecret, async (req, res) => {
-  try {
-    const phoneId = process.env.WHATSAPP_PHONE_NUMBER_ID;
-    const token   = process.env.WHATSAPP_ACCESS_TOKEN;
-    if (!phoneId || !token) return res.status(500).json({ ok: false, error: 'no_credentials', phoneIdSet: !!phoneId, tokenSet: !!token });
-
-    // 1. Identity (which number is the bot using?)
-    const idRes = await fetch(`${WA_API}/${phoneId}?fields=display_phone_number,verified_name,quality_rating,messaging_limit_tier,name_status`, {
-      headers: { 'Authorization': `Bearer ${token}` },
-      signal: AbortSignal.timeout(15000),
-    });
-    const idBody = await idRes.json().catch(() => ({}));
-
-    // 2. Optional raw test send to a given phone with the *exact* full response from Meta
-    let sendBody = null;
-    if (req.body && req.body.testTo) {
-      let to = String(req.body.testTo).replace(/[^0-9]/g, '');
-      if (to.length === 10 && to.startsWith('0')) to = '27' + to.slice(1);
-      const useTemplate = !!req.body.useTemplate;
-      const tplName = req.body.templateName || 'hello_world';
-      const tplLang = req.body.templateLang || 'en_US';
-      const payload = useTemplate
-        ? { messaging_product: 'whatsapp', to, type: 'template', template: { name: tplName, language: { code: tplLang } } }
-        : { messaging_product: 'whatsapp', to, type: 'text', text: { body: (req.body.text || '[probe] ' + new Date().toISOString()).slice(0, 1000) } };
-      const sendRes = await fetch(`${WA_API}/${phoneId}/messages`, {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(15000),
-      });
-      sendBody = { status: sendRes.status, body: await sendRes.json().catch(() => ({})), used: useTemplate ? `template:${tplName}` : 'text' };
-    }
-
-    // 3. Optional: list approved templates on the linked WABA so we know what to fall back to.
-    let templates = null;
-    if (req.body && req.body.listTemplates) {
-      try {
-        const wabaId = process.env.WHATSAPP_WABA_ID || process.env.WHATSAPP_BUSINESS_ACCOUNT_ID || '';
-        if (wabaId) {
-          const tr = await fetch(`${WA_API}/${wabaId}/message_templates?fields=name,language,status,category&limit=50`, {
-            headers: { 'Authorization': `Bearer ${token}` },
-            signal: AbortSignal.timeout(15000),
-          });
-          templates = { status: tr.status, body: await tr.json().catch(() => ({})) };
-        } else {
-          templates = { error: 'WHATSAPP_WABA_ID env not set' };
-        }
-      } catch (e) { templates = { error: e.message }; }
-    }
-
-    return res.json({
-      ok: idRes.ok,
-      phoneNumberId: phoneId,
-      tokenLastFour: String(token).slice(-4),
-      identityStatus: idRes.status,
-      identity: idBody,
-      sendProbe: sendBody,
-      templates,
-    });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// 1d) Return last N delivery-status callbacks from Meta. Lets us confirm
-//     whether messages we sent were actually delivered or silently dropped.
-app.get('/debug/wa-statuses', requireInternalSecret, (req, res) => {
-  const limit = Math.max(1, Math.min(100, parseInt(req.query.limit || '50', 10)));
-  const recipient = String(req.query.recipient || '').replace(/[^\d]/g, '');
-  let list = _waStatuses.slice(-limit);
-  if (recipient) list = list.filter(s => String(s.recipient || '') === recipient);
-  res.json({ count: list.length, total: _waStatuses.length, statuses: list });
 });
 
 // 1b) Mint a Firebase ID token for any uid (E2E auth for livekit-backend endpoints).
