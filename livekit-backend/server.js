@@ -5777,16 +5777,52 @@ app.post('/api/action/execute', assistantLimiter, async (req, res) => {
   if (existing.exists) {
     const data = existing.data() || {};
     if (data.status === 'success') {
-      return res.json({
-        success: true,
-        idempotencyKey,
-        action,
-        reused: true,
-        result: data.result || null,
-        request_id: req.requestId || null,
-      });
-    }
-    if (data.status === 'started') {
+      // Defensive re-validation for wallet payments. The client uses a stable
+      // idempotency key (wallet_<taskId>), so a success audit left over from an
+      // EARLIER payment that was later reset/refunded would otherwise make every
+      // future tap a phantom no-op ("Payment Successful" with no actual charge).
+      // If the payment isn't actually recorded on the booking anymore, treat the
+      // cached success as stale and re-execute. (No double-charge risk: the
+      // pay_with_wallet handler no-ops when the task is already paid.)
+      let staleSuccess = false;
+      if (action === 'pay_with_wallet') {
+        try {
+          const bid = normalizeBookingId(payload);
+          const ptype = String(payload.payment_type || payload.paymentType || 'full').toLowerCase();
+          if (bid) {
+            let bd = null;
+            const fb = await firestore.collection('futureBookings').doc(bid).get();
+            if (fb.exists) bd = fb.data() || {};
+            if (!bd) {
+              const tm = await firestore.collection('tasksManagement').doc(bid).get();
+              if (tm.exists) bd = tm.data() || {};
+            }
+            if (bd) {
+              const ps = String(bd.payment_status || '').toLowerCase();
+              if (ptype === 'deposit') {
+                staleSuccess = bd.deposit_paid !== true && ps !== 'deposit_paid' && ps !== 'paid';
+              } else {
+                staleSuccess = ps !== 'paid';
+              }
+            }
+          }
+        } catch (e) {
+          console.warn('[idempotency] stale-check failed (treating as fresh):', e.message);
+          staleSuccess = false;
+        }
+      }
+      if (!staleSuccess) {
+        return res.json({
+          success: true,
+          idempotencyKey,
+          action,
+          reused: true,
+          result: data.result || null,
+          request_id: req.requestId || null,
+        });
+      }
+      // else: fall through and re-execute; the audit doc is overwritten below.
+    } else if (data.status === 'started') {
       return res.status(409).json({
         error: 'duplicate_in_flight',
         message: 'This action is already being processed',
