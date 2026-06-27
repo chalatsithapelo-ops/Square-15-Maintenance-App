@@ -7720,8 +7720,11 @@ async function handleMessage(session, userMessage, imageDataUrl) {
       const wantsFull = /\b(pay\s+(?:in\s+)?full|full\s+payment|pay\s+everything|pay\s+all|^full$|pay\s+the\s+full|pay\s+balance|pay\s+the\s+balance|balance\s+please|^balance$)\b/i.test(userTextRaw)
         || /^full\b/i.test(userTextLower);
       const wantsPayGeneric = /^(pay|pay\s+now|payment\s+link|send\s+(?:me\s+)?(?:the\s+)?(?:payment|link)|i\s+want\s+to\s+pay|ready\s+to\s+pay)\b/i.test(userTextLower);
+      // Wallet intent — must intercept to pay_with_wallet so we don't accidentally
+      // mint a CARD link when the customer asked for wallet payment.
+      const wantsWallet = /\b(from\s+(?:my\s+)?wallet|use\s+(?:my\s+)?wallet|pay\s+(?:with\s+|from\s+|using\s+)?(?:my\s+)?wallet|wallet\s+pay(?:ment)?|deduct\s+(?:from\s+)?(?:my\s+)?wallet)\b/i.test(userTextRaw);
 
-      if ((wantsDeposit || wantsFull || wantsPayGeneric) && (session.lastBookingId || session.lastRfqId)) {
+      if ((wantsDeposit || wantsFull || wantsPayGeneric || wantsWallet) && (session.lastBookingId || session.lastRfqId)) {
         const bid = session.lastBookingId || session.lastRfqId;
         // If generic, look back at the last assistant message for default
         let paymentType = wantsDeposit ? 'deposit' : (wantsFull ? 'full' : 'full');
@@ -7738,25 +7741,34 @@ async function handleMessage(session, userMessage, imageDataUrl) {
             }
           }
           if (!priorChoice) {
-            // Don't intercept — let GPT ask the question.
+            // Don't intercept — let GPT ask the question. Force paymentType
+            // to '' so shouldIntercept below evaluates false for the generic
+            // case (without losing the explicit deposit/full intercept).
+            paymentType = '';
           } else {
             paymentType = priorChoice;
           }
         }
-        const shouldIntercept = wantsDeposit || wantsFull || (wantsPayGeneric && (paymentType === 'deposit' || paymentType === 'full'));
+        // wantsWallet always intercepts — regardless of full/deposit choice.
+        // pay_with_wallet handles deposit vs full via paymentType (default full).
+        const shouldIntercept = wantsWallet || wantsDeposit || wantsFull || (wantsPayGeneric && (paymentType === 'deposit' || paymentType === 'full'));
         if (shouldIntercept) {
-          console.log(`[payment-intercept] ${maskPhone(session.phone)}: "${userTextRaw}" → request_payment_link(${bid}, ${paymentType})`);
-          const argsObj = { bookingId: bid, paymentType };
-          session._lastToolsCalled.push('request_payment_link');
+          const _tool = wantsWallet ? 'pay_with_wallet' : 'request_payment_link';
+          const _pt = paymentType || 'full';
+          console.log(`[payment-intercept] ${maskPhone(session.phone)}: "${userTextRaw}" → ${_tool}(${bid}, ${_pt})`);
+          const argsObj = { bookingId: bid, paymentType: _pt };
+          session._lastToolsCalled.push(_tool);
           let reply = '';
           try {
-            const toolResult = await executeWaTool('request_payment_link', argsObj, session);
+            const toolResult = await executeWaTool(_tool, argsObj, session);
             reply = (toolResult && (toolResult.message || toolResult.error)) || '';
           } catch (toolErr) {
-            console.error(`[payment-intercept] request_payment_link threw:`, toolErr && toolErr.stack || toolErr);
+            console.error(`[payment-intercept] ${_tool} threw:`, toolErr && toolErr.stack || toolErr);
           }
           if (!reply) {
-            reply = 'I had trouble generating your payment link. Please try again in a moment, or open the Square 15 app to pay.';
+            reply = wantsWallet
+              ? 'I had trouble processing your wallet payment. Please try again, or open the Square 15 app to pay.'
+              : 'I had trouble generating your payment link. Please try again in a moment, or open the Square 15 app to pay.';
           }
           session.messages.push({ role: 'assistant', content: reply });
           return reply;
@@ -7818,6 +7830,9 @@ async function handleMessage(session, userMessage, imageDataUrl) {
 
     // Handle tool calls (support multiple rounds)
     let toolRounds = 0;
+    // Dedupe identical tool calls within the same user-turn — guards against
+    // GPT calling submit_rfq / create_booking / accept_rfq_quote twice with same args.
+    const _turnToolCallSigs = new Set();
     while (assistantMessage.tool_calls && assistantMessage.tool_calls.length > 0 && toolRounds < 3) {
       toolRounds++;
       session.messages.push(assistantMessage);
@@ -7825,11 +7840,33 @@ async function handleMessage(session, userMessage, imageDataUrl) {
       for (const tc of assistantMessage.tool_calls) {
         let toolArgs = {};
         try { toolArgs = JSON.parse(tc.function.arguments); } catch (_) {}
-        console.log(`[tool] ${tc.function.name}(${JSON.stringify(toolArgs).substring(0, 100)})`);
-        session._lastToolsCalled.push(tc.function.name);
+        const sig = tc.function.name + ':' + JSON.stringify(toolArgs);
+        if (_turnToolCallSigs.has(sig) && /^(submit_rfq|create_booking|accept_rfq_quote|request_payment_link|pay_with_wallet|cancel_booking|rate_booking|request_refund)$/.test(tc.function.name)) {
+          console.warn(`[tool] DEDUP duplicate ${tc.function.name} this turn — returning cached "already_invoked"`);
+          session.messages.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify({ error: 'already_invoked_this_turn', note: 'This action was already performed in this same response — do not call it again.' }) });
+          continue;
+        }
+        _turnToolCallSigs.add(sig);
+
+        // Wallet-intent override: if the customer explicitly said "wallet"
+        // and the model still tried to mint a CARD payment link, swap to
+        // pay_with_wallet. Belt-and-braces for the payment-intercept above.
+        let _toolName = tc.function.name;
+        try {
+          if (_toolName === 'request_payment_link') {
+            const _userTxt = (typeof userMessage === 'string' ? userMessage : '').toLowerCase();
+            if (/\b(from\s+(?:my\s+)?wallet|use\s+(?:my\s+)?wallet|pay\s+(?:with\s+|from\s+|using\s+)?(?:my\s+)?wallet|wallet\s+pay|deduct\s+(?:from\s+)?(?:my\s+)?wallet)\b/.test(_userTxt)) {
+              console.warn('[tool] wallet-intent override: swapping request_payment_link → pay_with_wallet');
+              _toolName = 'pay_with_wallet';
+            }
+          }
+        } catch (_) {}
+
+        console.log(`[tool] ${_toolName}(${JSON.stringify(toolArgs).substring(0, 100)})`);
+        session._lastToolsCalled.push(_toolName);
         let result;
         try {
-          result = await executeWaTool(tc.function.name, toolArgs, session);
+          result = await executeWaTool(_toolName, toolArgs, session);
         } catch (toolErr) {
           console.error(`[tool] ${tc.function.name} THREW:`, toolErr.message, toolErr.stack);
           result = { error: `Tool ${tc.function.name} failed: ${toolErr.message}` };
