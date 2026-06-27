@@ -6813,6 +6813,8 @@ app.post('/api/notifications/send', authMiddleware, assistantLimiter, async (req
             for (const d of snap.docs) {
               await d.ref.update({
                 deviceToken: admin.firestore.FieldValue.delete(),
+                fcm_token: admin.firestore.FieldValue.delete(),
+                fcmToken: admin.firestore.FieldValue.delete(),
                 deviceTokenInvalidatedAt: new Date().toISOString(),
               });
               pruned++;
