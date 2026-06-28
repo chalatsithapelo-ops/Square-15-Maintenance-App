@@ -7,7 +7,7 @@ upload/deploy a minimal set of files to GitHub/Render.
 
 # ── Version tag — bump this on every deploy so we can verify Render runs the
 # latest code.  Check Render logs for the startup banner.
-WORKER_VERSION = "2026-06-19-v6"
+WORKER_VERSION = "2026-06-28-dedup-v1"
 
 import os
 import sys
@@ -414,6 +414,16 @@ async def entrypoint(ctx: JobContext):
     app_context_bookings = []
     app_context_user_id = ""
 
+    # Idempotency guard for create_booking. The LLM frequently emits two parallel
+    # create_booking calls for a single user request (often one direct + one via
+    # ui_navigate(create_order_booking) redirect), and the backend create flow is
+    # NOT idempotent — each call produced a separate booking doc (duplicate
+    # dispatch + duplicate charge). Serialize identical creates and return the
+    # first result for any duplicate within the dedup window.
+    _create_booking_lock = asyncio.Lock()
+    _recent_booking_creates = {}  # sig -> {'ts': monotonic, 'result': str}
+    _CREATE_DEDUP_WINDOW_S = 120
+
     logger.info(f"📡 Connecting to room: {room_name}")
 
     # Build version breadcrumb so /debug/voice-e2e can confirm deployment.
@@ -423,7 +433,7 @@ async def entrypoint(ctx: JobContext):
             {
                 'session_id': f'agent-startup-{room_name}',
                 'event': 'agent_entrypoint',
-                'text': f'room={room_name} build=voice-e2e-v2',
+                'text': f'room={room_name} build=create-booking-dedup-v1',
             }
         ))
     except Exception:
@@ -1539,9 +1549,16 @@ async def entrypoint(ctx: JobContext):
         is_rfq: str = "no",
         job_ids: str = ""
     ) -> str:
-        """Create a booking using backend propose/confirm workflow."""
-        nonlocal backend_client
-        # E2E breadcrumb so /debug/voice-e2e can see when the LLM picked this tool.
+        """Idempotent wrapper around the propose/confirm booking flow.
+
+        The LLM commonly emits two create_booking calls for one request (e.g. one
+        direct call plus one via ui_navigate(create_order_booking) redirect). The
+        backend create flow is NOT idempotent, so each call produced a separate
+        booking (duplicate dispatch + duplicate charge). Serialize identical
+        creates and return the first result for any duplicate within the window.
+        """
+        import time as _time
+        # Breadcrumb on EVERY call so duplicate calls remain observable.
         try:
             asyncio.create_task(_post_breadcrumb(
                 f"{backend_url.rstrip('/')}/debug/voice-breadcrumb",
@@ -1553,6 +1570,45 @@ async def entrypoint(ctx: JobContext):
             ))
         except Exception:
             pass
+        _sig = "|".join([
+            (category_name or '').strip().lower(),
+            (problem_description or '').strip().lower()[:120],
+            (is_rfq or 'no').strip().lower(),
+        ])
+        async with _create_booking_lock:
+            _prev = _recent_booking_creates.get(_sig)
+            if _prev and (_time.monotonic() - _prev['ts']) < _CREATE_DEDUP_WINDOW_S:
+                logger.info(
+                    f"♻️ create_booking dedup: identical request within {_CREATE_DEDUP_WINDOW_S}s — returning prior booking result"
+                )
+                return _prev['result']
+            _result = await _create_booking_impl(
+                category_name=category_name,
+                problem_description=problem_description,
+                scheduled_date=scheduled_date,
+                scheduled_time=scheduled_time,
+                service_address=service_address,
+                is_rfq=is_rfq,
+                job_ids=job_ids,
+            )
+            # Cache only successful creations so transient errors stay retryable.
+            if isinstance(_result, str) and (
+                'successfully' in _result.lower() or 'has been submitted' in _result.lower()
+            ):
+                _recent_booking_creates[_sig] = {'ts': _time.monotonic(), 'result': _result}
+            return _result
+
+    async def _create_booking_impl(
+        category_name: str,
+        problem_description: str,
+        scheduled_date: str = "",
+        scheduled_time: str = "",
+        service_address: str = "",
+        is_rfq: str = "no",
+        job_ids: str = ""
+    ) -> str:
+        """Create a booking using backend propose/confirm workflow."""
+        nonlocal backend_client
         if not backend_client:
             if not await _ensure_backend_or_retry():
                 return _CONNECTION_RETRY_MSG
