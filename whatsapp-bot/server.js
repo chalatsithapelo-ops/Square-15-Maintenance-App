@@ -388,6 +388,22 @@ async function sendWhatsAppList(to, header, body, buttonText, sections) {
 
 // ─── Chat logging (Firestore wa_chat_logs) ───
 
+// Per-conversation cooldown for admin push on incoming WhatsApp messages.
+// We alert admins when a customer starts messaging so nothing is missed, but
+// collapse an ongoing back-and-forth into a single push per session so the
+// admin phone isn't flooded. Keyed by phone -> last-push epoch ms (in-memory;
+// resets on restart, which is fine — a fresh push then just re-alerts).
+const _lastWaAdminPushAt = new Map();
+const WA_ADMIN_PUSH_COOLDOWN_MS = 10 * 60 * 1000; // 10 minutes
+
+function _formatWaPhone(phone) {
+  const p = String(phone || '').replace(/[^0-9]/g, '');
+  if (p.startsWith('27') && p.length === 11) {
+    return `+27 ${p.slice(2, 4)} ${p.slice(4, 7)} ${p.slice(7)}`;
+  }
+  return p ? `+${p}` : 'Unknown';
+}
+
 async function logChatMessage(phone, direction, text, opts = {}) {
   const firestore = db();
   if (!firestore) return;
@@ -420,6 +436,34 @@ async function logChatMessage(phone, direction, text, opts = {}) {
       console.warn('[chatLog] summary set failed:', err.message);
       logErrorToAdmin('chat_log_write_failure', `wa_chat_logs summary set failed for ${phone}: ${err.message}`, 'whatsapp_bot.logChatMessage', err.message, opts.bookingRef || '', 'medium').catch(() => {});
     });
+
+    // ── Real-time admin push on INCOMING customer messages ──
+    // Admins were missing WhatsApp texts because the monitor had no push
+    // notifications. Fire an FCM push (subject to a per-conversation cooldown)
+    // so an admin's phone lights up when a customer messages the bot.
+    if (direction === 'incoming') {
+      try {
+        const now = Date.now();
+        const last = _lastWaAdminPushAt.get(phone) || 0;
+        if (now - last >= WA_ADMIN_PUSH_COOLDOWN_MS) {
+          _lastWaAdminPushAt.set(phone, now);
+          const who = (opts.displayName && String(opts.displayName).trim())
+            ? String(opts.displayName).trim()
+            : _formatWaPhone(phone);
+          const preview = (text || '').toString().trim().slice(0, 120)
+            || (opts.messageType && opts.messageType !== 'text'
+                ? `[${opts.messageType}]`
+                : '[message]');
+          // Fire-and-forget: never let notification latency block chat logging.
+          pushAdminNotification({
+            title: `WhatsApp: ${who}`,
+            body: preview,
+            type: 'wa_incoming',
+            extraData: { phone: String(phone || ''), display_name: who },
+          }).catch(() => {});
+        }
+      } catch (_) { /* never break logging for a notification */ }
+    }
   } catch (e) {
     console.error('[chatLog] Error:', e.message);
   }
@@ -1485,6 +1529,33 @@ function _matcherScore(qNorm, sNorm) {
 }
 
 /**
+ * True when the customer's request is a DIAGNOSTIC / INVESTIGATION job rather
+ * than a known fixed-scope task. Such requests must NOT be given a fixed price
+ * (the real scope is unknown until an artisan inspects) — they should become an
+ * RFQ / inspection booking instead.
+ *
+ * Logic:
+ *  1. Explicit investigation intent ("investigate", "not sure what's wrong",
+ *     "find out what's causing", "come and check", "diagnose") -> diagnostic.
+ *  2. A smell / odour complaint with NO concrete repair verb (unblock, replace,
+ *     install, fix, repair, clear, clean, change, fit, service) -> diagnostic.
+ *     If a concrete verb IS present (e.g. "unblock the toilet, it smells") the
+ *     smell is just context and the fixed job stands.
+ */
+function _isDiagnosticQuery(text) {
+  const q = String(text || '').toLowerCase();
+  if (!q) return false;
+  const investigate = /(investigat|diagnos|assess\b|inspect|figure out|find out|find the (cause|source|leak|problem|issue)|check (what|why|where|the cause)|what('?s| is) (causing|wrong)|why (is|it|there)|not sure (what|why|where)|unsure|don'?t know (what|why|where)|do not know (what|why|where)|can'?t tell|cant tell|come (and )?(see|check|look)|have a look|look into|get it checked|need(s)? (to be )?(checked|investigated|looked at))/i;
+  if (investigate.test(q)) return true;
+  const smell = /(bad smell|smell|smelly|odou?r|stench|foul (smell|odou?r)?|sewer(age)? smell)/i;
+  if (smell.test(q)) {
+    const concreteAction = /\b(unblock|unclog|replace|install|fix|repair|clear|clean|change|fit|service|paint|seal|tile)\b/i;
+    if (!concreteAction.test(q)) return true;
+  }
+  return false;
+}
+
+/**
  * Find a fixed-price task matching the customer's request.
  * Returns { matched, name, cost, ... } or { matched: false, rejected: [...] }.
  *
@@ -1500,6 +1571,19 @@ function _matcherScore(qNorm, sNorm) {
 function findFixedPriceMatch({ subcategory, description, taskResults }) {
   const subQuery = String(subcategory || description || '').toLowerCase();
   if (!subQuery) return { matched: false, rejected: [] };
+
+  // ── Diagnostic / investigation guard ──
+  // A customer describing an unexplained SYMPTOM that needs to be investigated
+  // ("there's a bad smell, please find out what's causing it", "not sure where
+  // the leak is", "strange noise") has NO honest fixed price — the true scope
+  // is unknown until an artisan inspects. Quoting a guessed fixed job (e.g.
+  // pricing "unblock a toilet" for a "bad smell, please investigate" request)
+  // is exactly the failure we must avoid. Force an RFQ/inspection instead.
+  const diagText = `${subcategory || ''} ${description || ''}`.toLowerCase();
+  if (_isDiagnosticQuery(diagText)) {
+    return { matched: false, rejected: [{ name: '', reason: 'diagnostic-investigation' }] };
+  }
+
   const askedLabourOnly = /\b(lab[ou]r)\s*only\b/i.test(subQuery);
 
   // Normalize: strip parentheticals, lowercase, alphanumeric only
@@ -1689,6 +1773,7 @@ const waTools = [
         properties: {
           category:    { type: 'string', description: 'Service category (e.g. plumbing, electrical, painting)' },
           subcategory: { type: 'string', description: 'Specific service needed (e.g. toilet unblocking, leak repair, light installation)' },
+          description: { type: 'string', description: "The customer's own words describing the problem. Include this verbatim so diagnostic/investigation requests (e.g. 'bad smell, please investigate') are not mispriced as a fixed job." },
         },
         required: ['category'],
       },
@@ -2877,7 +2962,7 @@ async function executeWaTool(name, args, session) {
               taskResults.push({ name, cost, category_id: d.categoryId || d.category_id || '', category_name: d.category_name || d.categoryName || '' });
             }
           }
-          const result = findFixedPriceMatch({ subcategory: subQuery, taskResults });
+          const result = findFixedPriceMatch({ subcategory: subQuery, description: args.description, taskResults });
           if (result.matched) {
             estimatedCost = result.cost.toString();
             pricingSource = 'fixed';
@@ -3477,6 +3562,7 @@ async function executeWaTool(name, args, session) {
         let matchedService = null;
         let matchedPrice = null;
         let categoryName = args.category || '';
+        let isDiagnostic = false;
 
         // ── SOLE SOURCE: tasks collection (admin-managed fixed prices) ──
         const taskResults = [];
@@ -3500,12 +3586,13 @@ async function executeWaTool(name, args, session) {
         // live there. Any future tweak applies to BOTH lookup_pricing and
         // create_booking automatically.
         if (subQuery) {
-          const result = findFixedPriceMatch({ subcategory: subQuery, taskResults });
+          const result = findFixedPriceMatch({ subcategory: subQuery, description: args.description, taskResults });
           if (result.matched) {
             matchedService = result.name;
             matchedPrice = result.cost;
             categoryName = result.category_name || categoryName;
           } else if (result.rejected && result.rejected.length) {
+            if (result.rejected.some(r => r.reason === 'diagnostic-investigation')) isDiagnostic = true;
             console.log(`[lookup_pricing] rejected ${result.rejected.length} candidate(s) for "${subQuery}":`, result.rejected.map(r => `${r.name}[${r.reason || r.sAction || ''}]`).join(', '));
           }
         }
@@ -3542,6 +3629,14 @@ async function executeWaTool(name, args, session) {
         // The bot must call submit_rfq instead. Returning availableServices
         // here causes hallucinated quotes (e.g. "shower door = R480" picked
         // from "varnish door frame Labour only").
+        if (isDiagnostic) {
+          return {
+            matched: false,
+            diagnostic: true,
+            category: categoryName,
+            note: "This is a DIAGNOSTIC / INVESTIGATION request — the customer described a symptom (e.g. a bad smell, an unknown leak, a strange noise) whose cause is NOT yet known. There is NO fixed price because the actual work is unknown until an artisan inspects. You MUST NOT quote a price and MUST NOT assume a specific fixed job (e.g. do NOT price 'unblock a toilet' for a 'bad smell' complaint). Explain to the customer that an artisan needs to inspect and diagnose the problem first, then call submit_rfq so admin/artisan can assess and provide an accurate quote.",
+          };
+        }
         return {
           matched: false,
           category: categoryName,
@@ -7260,6 +7355,12 @@ CRITICAL PRICING RULES:
 - ⛔ "Labour only" / "Labor only" priced services in the catalog are NOT all-in prices. Never present a "Labour only" price as the cost of a job that includes materials.
 - ⛔ A reply that contains a "R{number}" amount that did NOT come from a tool result on this turn is a BUG. The only way you may state a Rand amount is if (a) lookup_pricing returned matched=true on this turn, or (b) submit_rfq / accept_rfq_quote / check_rfq_status returned a quote on this turn.
 - If create_booking returns an estimated cost of R0.00, it means no fixed price was found — DO NOT quote a price; tell the customer the job needs an RFQ and call submit_rfq.
+
+DIAGNOSTIC / INVESTIGATION REQUESTS (CRITICAL — NEVER MISPRICE A SYMPTOM):
+- When a customer describes a SYMPTOM whose cause is not yet known — e.g. 'there is a bad smell, please investigate', 'water is coming from somewhere', 'a strange noise', 'damp on the wall, not sure why', 'something is wrong but I do not know what' — this is a DIAGNOSTIC job. The real work is UNKNOWN until an artisan inspects.
+- NEVER assume a specific fixed service from a symptom. Example of the exact mistake to avoid: the customer says 'there is a bad smell in the bathroom, please investigate' and you price 'unblock a toilet'. That is WRONG — the smell could be a blocked drain, a broken seal, a sewer vent, a dead pest in the ceiling, or something else entirely.
+- For diagnostic requests do NOT call lookup_pricing with a guessed service and do NOT quote any price. Instead: acknowledge the problem warmly, explain that an artisan needs to inspect and diagnose it first, then follow the CUSTOM JOB / AI RFQ FLOW and call submit_rfq so it can be properly assessed and quoted.
+- Only treat a request as a fixed job when the customer clearly names the concrete task (e.g. 'please UNBLOCK my toilet', 'REPLACE my kitchen tap'). A concrete action verb plus a fixture means a fixed job; a symptom on its own means investigation and an RFQ.
 
 PRICE CONFIRMATION (CRITICAL — NEVER SKIP):
 - After calling lookup_pricing, you MUST present the price to the customer and WAIT for their explicit confirmation BEFORE calling create_booking.
