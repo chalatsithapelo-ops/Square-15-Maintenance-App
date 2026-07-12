@@ -9418,7 +9418,22 @@ app.post('/api/ozow-payout-notify', async (req, res) => {
     // Ozow may send any of these field names depending on the notification
     // type (Verification vs PayoutComplete) and SDK version. Accept all.
     const payoutId = _b.payoutId || _b.PayoutId || _b.payoutID || _b.PayoutID || null;
-    const status = _b.status || _b.Status || '';
+    // Ozow's PAYOUT notifications carry the outcome in `notificationType`
+    // (e.g. "PayoutCompleted", "VerificationSuccessful", "PayoutFailed"),
+    // NOT in a `status` field (which is often empty for payouts — unlike the
+    // collections callback). We therefore read the type AND any numeric
+    // status code and treat all of them as completion/failure signals.
+    const notificationType = String(
+      _b.notificationType || _b.NotificationType || _b.notification_type ||
+      _b.eventType || _b.EventType || _b.type || _b.Type || ''
+    ).trim();
+    const numericStatus = Number(
+      _b.statusCode != null ? _b.statusCode
+        : (_b.StatusCode != null ? _b.StatusCode
+          : (_b.subStatus != null ? _b.subStatus
+            : (_b.SubStatus != null ? _b.SubStatus : NaN)))
+    );
+    const status = _b.status || _b.Status || notificationType || '';
     const statusMessage = _b.statusMessage || _b.StatusMessage || '';
     const bankReference = _b.bankReference || _b.BankReference || _b.customerBankReference || _b.CustomerBankReference || '';
     const merchantRefIncoming = String(
@@ -9524,18 +9539,40 @@ app.post('/api/ozow-payout-notify', async (req, res) => {
     }
 
     const normalizedStatus = (status || '').toLowerCase();
+    const typeHay = `${notificationType} ${status}`.toLowerCase();
     let finalStatus = 'pending';
-    if (normalizedStatus === 'complete' || normalizedStatus === 'completed' || normalizedStatus === 'success') {
+    // ── Completion signals (any one is authoritative) ──
+    // 1. notificationType === "PayoutCompleted"
+    // 2. status string complete/completed/success
+    // 3. numeric Ozow payout status 5 (Complete)
+    if (
+      typeHay.includes('payoutcompleted') ||
+      normalizedStatus === 'complete' || normalizedStatus === 'completed' || normalizedStatus === 'success' ||
+      numericStatus === 5
+    ) {
       finalStatus = 'completed';
-    } else if (normalizedStatus === 'failed' || normalizedStatus === 'error' || normalizedStatus === 'cancelled') {
+    // ── Failure signals ──
+    // notificationType PayoutFailed/Cancelled/Returned/Error or VerificationFailed,
+    // status failed/error/cancelled, or numeric 4 (ProcessingError)/90 (Returned)/99 (Cancelled).
+    } else if (
+      typeHay.includes('payoutfailed') || typeHay.includes('payoutcancelled') ||
+      typeHay.includes('payoutreturned') || typeHay.includes('payouterror') ||
+      typeHay.includes('verificationfailed') ||
+      normalizedStatus === 'failed' || normalizedStatus === 'error' || normalizedStatus === 'cancelled' ||
+      [4, 90, 99].includes(numericStatus)
+    ) {
       finalStatus = 'failed';
     }
+    // Note: "VerificationSuccessful" is an intermediate step → stays 'pending'
+    // until the subsequent "PayoutCompleted" notify arrives.
 
     // Update payout record
     await payoutDoc.ref.update({
       status: finalStatus,
       ozow_status: status,
+      ozow_notification_type: notificationType || '',
       ozow_status_message: statusMessage || '',
+      ozow_notify_body: (() => { try { return JSON.stringify(_b).slice(0, 700); } catch (_) { return ''; } })(),
       updated_at: now,
     });
 
