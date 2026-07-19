@@ -10959,9 +10959,225 @@ h1{color:${color};margin:0 0 16px}p{color:#555;line-height:1.6;margin:0}</style>
   }
 });
 
+// ============================================================================
+// REMOTE JOB-CARD SIGN-OFF (admin-issued commercial jobs)
+// ----------------------------------------------------------------------------
+// When the on-site client is NOT present, the artisan/admin sends a single-use
+// link. The client opens it in a browser, signs, and the job is completed.
+// Security: the link carries a random unguessable token stored in Firestore
+// (collection `jobcard_signoff_tokens`) that is single-use and time-limited.
+// No secret is shared with the mobile apps — the admin app writes the token
+// doc directly, and only the token (not any HMAC secret) travels in the URL.
+// ============================================================================
+function _escHtml(s) {
+  return String(s || '').replace(/[<>"'&]/g, (c) => (
+    { '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;', '&': '&amp;' }[c]
+  ));
+}
+
+app.get('/jobcard/sign/:token', async (req, res) => {
+  const token = String(req.params.token || '').trim();
+  const renderPage = (bodyHtml) => res.type('html').send(`<!DOCTYPE html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Square 15 — Job Card Sign-Off</title>
+<style>
+:root{--gold:#C49A1E;--green:#2E3D0F;--ink:#1d1d1f;--muted:#6b6b70;--line:#e6e6ea}
+*{box-sizing:border-box}body{font-family:-apple-system,"Segoe UI",Roboto,Arial,sans-serif;margin:0;background:#f2f2f5;color:var(--ink)}
+.wrap{max-width:520px;margin:0 auto;padding:18px}
+.card{background:#fff;border-radius:16px;box-shadow:0 6px 24px rgba(0,0,0,.08);padding:20px;margin-top:16px}
+.brand{display:flex;align-items:center;gap:10px;color:#fff;background:linear-gradient(160deg,#2E3D0F,#3f5314);border-radius:16px;padding:16px 18px}
+.brand b{font-size:18px;letter-spacing:.02em}
+h2{margin:0 0 4px;font-size:20px}.muted{color:var(--muted);font-size:14px;margin:0 0 14px}
+label{display:block;font-weight:600;font-size:14px;margin:14px 0 6px}
+input,textarea{width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;font-size:15px;font-family:inherit}
+canvas{width:100%;height:200px;border:1px dashed #bbb;border-radius:10px;background:#fff;touch-action:none}
+.row{display:flex;justify-content:space-between;align-items:center;margin-top:6px}
+.stars{font-size:30px;color:#f5b301;cursor:pointer;user-select:none}
+.btn{width:100%;padding:15px;border:0;border-radius:12px;font-size:16px;font-weight:700;color:#fff;background:#2E7D32;margin-top:20px}
+.btn.sec{background:#eee;color:#333;margin-top:8px}
+.ok{text-align:center;padding:40px 20px}.ok .big{font-size:60px}
+</style></head><body><div class="wrap">
+<div class="brand"><b>Square&nbsp;15</b><span style="opacity:.85">Job Card Sign-Off</span></div>
+${bodyHtml}
+</div></body></html>`);
+
+  try {
+    if (!/^[A-Za-z0-9_-]{8,128}$/.test(token)) {
+      return renderPage(`<div class="card"><h2>Invalid link</h2><p class="muted">This sign-off link is not valid.</p></div>`);
+    }
+    const db = admin.firestore();
+    const tokRef = db.collection('jobcard_signoff_tokens').doc(token);
+    const tokSnap = await tokRef.get();
+    if (!tokSnap.exists) {
+      return renderPage(`<div class="card"><h2>Link not found</h2><p class="muted">This sign-off link has expired or is no longer available.</p></div>`);
+    }
+    const tok = tokSnap.data() || {};
+    if (tok.used === true) {
+      return renderPage(`<div class="card"><div class="ok"><div class="big">✅</div><h2>Already signed</h2><p class="muted">This job card has already been signed off. Thank you.</p></div></div>`);
+    }
+    const expMs = Number(tok.expires_at_ms || 0);
+    if (expMs && expMs < Date.now()) {
+      return renderPage(`<div class="card"><h2>Link expired</h2><p class="muted">Please ask Square 15 to send a new sign-off link.</p></div>`);
+    }
+
+    const jobTitle = _escHtml(tok.category_name || 'Maintenance job');
+    const jobDesc = _escHtml(tok.description || '');
+    const clientName = _escHtml(tok.client_contact_name || tok.commercial_client_name || '');
+
+    return renderPage(`<div class="card">
+<h2>${jobTitle}</h2>
+<p class="muted">${jobDesc || 'Please confirm the work has been completed to your satisfaction.'}</p>
+<form id="f">
+  <label>Your full name</label>
+  <input id="signer" value="${clientName}" placeholder="Name of person signing" required>
+  <label>Signature</label>
+  <canvas id="pad"></canvas>
+  <div class="row"><span class="muted">Sign with your finger or mouse</span><a href="#" id="clr" class="muted">Clear</a></div>
+  <label>Your rating</label>
+  <div class="stars" id="stars" data-v="5">★★★★★</div>
+  <label>Notes (optional)</label>
+  <textarea id="notes" rows="3" placeholder="Any comments about the work"></textarea>
+  <button class="btn" type="submit" id="sub">Confirm &amp; Complete</button>
+</form>
+</div>
+<script>
+var cv=document.getElementById('pad'),ctx=cv.getContext('2d'),drawing=false,has=false;
+function resize(){var r=cv.getBoundingClientRect();cv.width=r.width*2;cv.height=r.height*2;ctx.scale(2,2);ctx.lineWidth=2.2;ctx.lineCap='round';ctx.strokeStyle='#111';}
+setTimeout(resize,50);
+function pos(e){var r=cv.getBoundingClientRect();var t=e.touches?e.touches[0]:e;return{x:t.clientX-r.left,y:t.clientY-r.top};}
+function down(e){drawing=true;has=true;var p=pos(e);ctx.beginPath();ctx.moveTo(p.x,p.y);e.preventDefault();}
+function move(e){if(!drawing)return;var p=pos(e);ctx.lineTo(p.x,p.y);ctx.stroke();e.preventDefault();}
+function up(){drawing=false;}
+cv.addEventListener('mousedown',down);cv.addEventListener('mousemove',move);window.addEventListener('mouseup',up);
+cv.addEventListener('touchstart',down);cv.addEventListener('touchmove',move);cv.addEventListener('touchend',up);
+document.getElementById('clr').onclick=function(e){e.preventDefault();ctx.clearRect(0,0,cv.width,cv.height);has=false;};
+var stars=document.getElementById('stars');
+stars.onclick=function(e){var r=stars.getBoundingClientRect();var v=Math.ceil((e.clientX-r.left)/(r.width/5));v=Math.max(1,Math.min(5,v));stars.dataset.v=v;stars.textContent='★★★★★'.slice(0,v)+'☆☆☆☆☆'.slice(0,5-v);};
+document.getElementById('f').onsubmit=function(e){e.preventDefault();
+  var signer=document.getElementById('signer').value.trim();
+  if(!signer){alert('Please enter your name');return;}
+  if(!has){alert('Please sign in the box');return;}
+  var sub=document.getElementById('sub');sub.disabled=true;sub.textContent='Saving…';
+  fetch('/api/jobcard/sign/${token}',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({signerName:signer,rating:Number(stars.dataset.v||5),notes:document.getElementById('notes').value.trim(),signatureDataUrl:cv.toDataURL('image/png')})})
+  .then(function(r){return r.json();}).then(function(j){
+    if(j&&j.success){document.querySelector('.wrap').innerHTML='<div class="card"><div class="ok"><div class="big">✅</div><h2>Thank you!</h2><p class="muted">Your sign-off has been recorded and the job is now complete.</p></div></div>';}
+    else{sub.disabled=false;sub.textContent='Confirm & Complete';alert((j&&j.error)||'Could not save. Please try again.');}
+  }).catch(function(){sub.disabled=false;sub.textContent='Confirm & Complete';alert('Network error. Please try again.');});
+};
+</script>`);
+  } catch (e) {
+    console.error('[jobcard sign GET] error:', e.message);
+    return res.status(500).type('html').send('<h2>Something went wrong. Please try again later.</h2>');
+  }
+});
+
+app.post('/api/jobcard/sign/:token', async (req, res) => {
+  const token = String(req.params.token || '').trim();
+  try {
+    if (!/^[A-Za-z0-9_-]{8,128}$/.test(token)) {
+      return res.status(400).json({ error: 'Invalid link' });
+    }
+    const { signerName, rating, notes, signatureDataUrl } = req.body || {};
+    if (!signerName || !String(signerName).trim()) {
+      return res.status(400).json({ error: 'Name is required' });
+    }
+    const db = admin.firestore();
+    const tokRef = db.collection('jobcard_signoff_tokens').doc(token);
+
+    // Atomically claim the token (single-use) inside a transaction.
+    let claim;
+    try {
+      claim = await db.runTransaction(async (txn) => {
+        const snap = await txn.get(tokRef);
+        if (!snap.exists) throw new Error('NOT_FOUND');
+        const t = snap.data() || {};
+        if (t.used === true) throw new Error('USED');
+        const expMs = Number(t.expires_at_ms || 0);
+        if (expMs && expMs < Date.now()) throw new Error('EXPIRED');
+        txn.update(tokRef, { used: true, used_at: new Date().toISOString() });
+        return t;
+      });
+    } catch (te) {
+      const msg = te.message === 'USED' ? 'This link has already been used'
+        : te.message === 'EXPIRED' ? 'This link has expired'
+        : 'Link not found';
+      return res.status(410).json({ error: msg });
+    }
+
+    const taskId = String(claim.task_id || '').trim();
+    const futureBookingId = String(claim.future_booking_id || '').trim();
+
+    // Upload signature PNG to Storage (best-effort).
+    let signatureUrl = '';
+    try {
+      const raw = String(signatureDataUrl || '');
+      const b64 = raw.replace(/^data:image\/\w+;base64,/, '');
+      if (b64) {
+        const buf = Buffer.from(b64, 'base64');
+        if (buf.length > 0 && buf.length <= 5 * 1024 * 1024) {
+          const downloadToken = crypto.randomUUID();
+          const storagePath = `job_cards/${token}.png`;
+          const bucketName = process.env.FIREBASE_STORAGE_BUCKET || 'promaintapp-b618a.firebasestorage.app';
+          const bucket = admin.storage().bucket(bucketName);
+          await bucket.file(storagePath).save(buf, {
+            contentType: 'image/png',
+            metadata: { cacheControl: 'public, max-age=3600', metadata: { firebaseStorageDownloadTokens: downloadToken } },
+            resumable: false,
+            validation: false,
+          });
+          signatureUrl = `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/${encodeURIComponent(storagePath)}?alt=media&token=${downloadToken}`;
+        }
+      }
+    } catch (upErr) {
+      console.warn('[jobcard sign] signature upload failed:', upErr.message);
+    }
+
+    const jobCard = {
+      signed: true,
+      signer_name: String(signerName).trim(),
+      signature_url: signatureUrl,
+      rating: Math.max(1, Math.min(5, Number(rating) || 5)),
+      notes: String(notes || '').trim(),
+      method: 'remote_link',
+      signed_at: new Date().toISOString(),
+    };
+
+    const patch = { job_card: jobCard, status: 'completed', client_signed_off: true, updated_at: new Date().toString() };
+    if (taskId) {
+      try { await db.collection('tasksManagement').doc(taskId).set(patch, { merge: true }); } catch (_) {}
+    }
+    if (futureBookingId) {
+      try { await db.collection('futureBookings').doc(futureBookingId).set(patch, { merge: true }); } catch (_) {}
+    }
+
+    // Notify admins that a remote sign-off completed.
+    try {
+      const admins = await db.collection('users').where('isAdmin', '==', true).limit(10).get();
+      const batch = db.batch();
+      admins.docs.forEach((d) => {
+        const nref = db.collection('notifications').doc();
+        batch.set(nref, {
+          user_id: d.id, user_type: 'user', title: 'Job signed off (remote)',
+          message: `${jobCard.signer_name} signed off job ${futureBookingId || taskId} (${jobCard.rating}★).`,
+          booking_id: futureBookingId || taskId, type: 'admin_job', read: false, view: false,
+          created_at: new Date().toString(),
+        });
+      });
+      await batch.commit();
+    } catch (_) {}
+
+    return res.json({ success: true });
+  } catch (e) {
+    console.error('[jobcard sign POST] error:', e.message);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // -- PayFast ITN (Instant Transaction Notification) Webhook --
 // Server-side payment verification � PayFast posts here after payment
 app.post('/api/payment/itn', async (req, res) => {
+
   try {
     const data = req.body;
     console.log('?? PayFast ITN received:', JSON.stringify(data));
