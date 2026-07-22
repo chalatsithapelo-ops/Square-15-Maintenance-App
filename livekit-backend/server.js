@@ -12716,6 +12716,201 @@ app.post('/api/admin/self-bootstrap-claims', adminLimiter, async (req, res) => {
   }
 });
 
+// ─── Admin user management (Admin SDK powered) ───────────────────────────
+// The Flutter admin app CANNOT create/delete other users' Firebase Auth
+// accounts or set their passwords from the client SDK (and Firestore rules
+// only allow a user to create their OWN users doc). These endpoints let a
+// signed-in admin do all of that server-side. Caller must present a valid
+// Firebase ID token that resolves to a recognised admin tier. Owner-tier
+// targets are protected: only an owner may modify/delete another owner.
+async function _requireCallerAdmin(req, res) {
+  const decoded = await verifyFirebaseAuth(req, res);
+  if (!decoded) return null; // 401 already sent
+  const tier = resolveAdminTier(decoded);
+  if (!tier) {
+    res.status(403).json({ error: 'forbidden', message: 'Admin only' });
+    return null;
+  }
+  return { decoded, tier };
+}
+
+// Resolve a target user by uid or email → { uid, userRecord }.
+async function _resolveTargetUser({ uid, email }) {
+  if (uid && String(uid).trim()) {
+    const rec = await admin.auth().getUser(String(uid).trim());
+    return { uid: rec.uid, userRecord: rec };
+  }
+  if (email && String(email).trim()) {
+    const rec = await admin.auth().getUserByEmail(String(email).trim());
+    return { uid: rec.uid, userRecord: rec };
+  }
+  return null;
+}
+
+/**
+ * Create OR promote an admin user (idempotent).
+ * POST /api/admin/manage/upsert-user
+ * Body: { email, password?, name, contact?, admin_tier? }
+ * - If the email is new → creates the Auth account with the given password.
+ * - If the email already exists → reuses that account (and updates the
+ *   password if one was supplied). This is exactly the "already registered
+ *   as a client first" case.
+ * Always writes the users doc as an admin and sets the custom claim.
+ */
+app.post('/api/admin/manage/upsert-user', adminLimiter, async (req, res) => {
+  const firestore = requireFirebase(res);
+  if (!firestore) return;
+  const caller = await _requireCallerAdmin(req, res);
+  if (!caller) return;
+  try {
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const password = req.body?.password != null ? String(req.body.password) : '';
+    const name = String(req.body?.name || '').trim();
+    const contactRaw = req.body?.contact;
+    const tierReq = String(req.body?.admin_tier || 'support').trim().toLowerCase();
+    const adminTier = ADMIN_TIERS.includes(tierReq) ? tierReq : 'support';
+    if (!email || !email.includes('@')) {
+      return res.status(400).json({ error: 'bad_request', message: 'Valid email required' });
+    }
+    // Only an owner may mint another owner.
+    if (adminTier === 'owner' && caller.tier !== 'owner') {
+      return res.status(403).json({ error: 'forbidden', message: 'Only an owner can create an owner-tier admin.' });
+    }
+    if (password && password.length < 6) {
+      return res.status(400).json({ error: 'bad_request', message: 'Password must be at least 6 characters' });
+    }
+
+    let uid;
+    let created = false;
+    try {
+      const existing = await admin.auth().getUserByEmail(email);
+      uid = existing.uid;
+      // Update password / display name if supplied.
+      const upd = {};
+      if (password) upd.password = password;
+      if (name) upd.displayName = name;
+      if (Object.keys(upd).length) await admin.auth().updateUser(uid, upd);
+    } catch (e) {
+      if (e.code === 'auth/user-not-found') {
+        if (!password) {
+          return res.status(400).json({ error: 'bad_request', message: 'Password required to create a new account' });
+        }
+        const rec = await admin.auth().createUser({
+          email,
+          password,
+          displayName: name || undefined,
+        });
+        uid = rec.uid;
+        created = true;
+      } else {
+        throw e;
+      }
+    }
+
+    let contact = contactRaw;
+    if (typeof contactRaw === 'string') {
+      const n = parseInt(contactRaw.replace(/[^0-9]/g, ''), 10);
+      contact = Number.isFinite(n) ? n : contactRaw;
+    }
+
+    await firestore.collection('users').doc(uid).set({
+      uid,
+      email,
+      name: name || null,
+      contact: contact ?? null,
+      isAdmin: true,
+      isUser: false,
+      isServiceProvider: false,
+      isVerified: true,
+      admin_tier: adminTier,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      managedBy: caller.decoded.email || caller.decoded.uid,
+    }, { merge: true });
+
+    await admin.auth().setCustomUserClaims(uid, { role: adminTier, admin: true });
+
+    console.log(`✅ manage/upsert-user: ${created ? 'created' : 'promoted'} ${email} (${uid}) tier=${adminTier} by ${caller.decoded.email || caller.decoded.uid}`);
+    return res.json({ success: true, uid, created, admin_tier: adminTier });
+  } catch (e) {
+    console.error('manage/upsert-user error:', e);
+    return res.status(500).json({ error: 'internal', message: e.message });
+  }
+});
+
+/**
+ * Set a new password for an existing admin user.
+ * POST /api/admin/manage/set-password
+ * Body: { uid?, email?, password }
+ */
+app.post('/api/admin/manage/set-password', adminLimiter, async (req, res) => {
+  const caller = await _requireCallerAdmin(req, res);
+  if (!caller) return;
+  try {
+    const password = String(req.body?.password || '');
+    if (password.length < 6) {
+      return res.status(400).json({ error: 'bad_request', message: 'Password must be at least 6 characters' });
+    }
+    const target = await _resolveTargetUser({ uid: req.body?.uid, email: req.body?.email }).catch((e) => {
+      if (e.code === 'auth/user-not-found') return null;
+      throw e;
+    });
+    if (!target) {
+      return res.status(404).json({ error: 'not_found', message: 'No account found for that user' });
+    }
+    // Protect owner accounts from non-owners.
+    const targetClaims = target.userRecord.customClaims || {};
+    if (String(targetClaims.role || '').toLowerCase() === 'owner' && caller.tier !== 'owner') {
+      return res.status(403).json({ error: 'forbidden', message: 'Only an owner can reset an owner\'s password.' });
+    }
+    await admin.auth().updateUser(target.uid, { password });
+    console.log(`✅ manage/set-password: reset for ${target.userRecord.email || target.uid} by ${caller.decoded.email || caller.decoded.uid}`);
+    return res.json({ success: true, uid: target.uid });
+  } catch (e) {
+    console.error('manage/set-password error:', e);
+    return res.status(500).json({ error: 'internal', message: e.message });
+  }
+});
+
+/**
+ * Fully delete an admin user (Auth account + Firestore users doc).
+ * POST /api/admin/manage/delete-user
+ * Body: { uid?, email? }
+ */
+app.post('/api/admin/manage/delete-user', adminLimiter, async (req, res) => {
+  const firestore = requireFirebase(res);
+  if (!firestore) return;
+  const caller = await _requireCallerAdmin(req, res);
+  if (!caller) return;
+  try {
+    const target = await _resolveTargetUser({ uid: req.body?.uid, email: req.body?.email }).catch((e) => {
+      if (e.code === 'auth/user-not-found') return null;
+      throw e;
+    });
+    if (!target) {
+      // Auth account already gone — still try to clean up any stray doc by uid.
+      const strayUid = String(req.body?.uid || '').trim();
+      if (strayUid) {
+        await firestore.collection('users').doc(strayUid).delete().catch(() => {});
+      }
+      return res.json({ success: true, message: 'No Auth account found; cleaned up any Firestore doc.' });
+    }
+    if (target.uid === caller.decoded.uid) {
+      return res.status(400).json({ error: 'bad_request', message: 'You cannot delete your own account.' });
+    }
+    const targetClaims = target.userRecord.customClaims || {};
+    if (String(targetClaims.role || '').toLowerCase() === 'owner' && caller.tier !== 'owner') {
+      return res.status(403).json({ error: 'forbidden', message: 'Only an owner can delete an owner.' });
+    }
+    await firestore.collection('users').doc(target.uid).delete().catch(() => {});
+    await admin.auth().deleteUser(target.uid);
+    console.log(`✅ manage/delete-user: deleted ${target.userRecord.email || target.uid} by ${caller.decoded.email || caller.decoded.uid}`);
+    return res.json({ success: true, uid: target.uid });
+  } catch (e) {
+    console.error('manage/delete-user error:', e);
+    return res.status(500).json({ error: 'internal', message: e.message });
+  }
+});
+
 /**
  * Upload an artisan profile image (admin-only).
  * POST /api/admin/upload-artisan-image
