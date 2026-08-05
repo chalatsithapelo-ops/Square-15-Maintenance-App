@@ -4399,31 +4399,52 @@ async function executeWaTool(name, args, session) {
       // repeat call as an UPDATE (e.g. client just supplied budget or material choice
       // after the first attempt). This prevents duplicate RFQs from being created
       // when the LLM calls submit_rfq twice in the same conversation.
+      //
+      // BUGFIX (Aug 2026): previously the guard fired blindly on any
+      // session.lastRfqId. If the persisted session pointer was stale (e.g.
+      // an earlier submit_rfq wrote the pointer but the futureBookings write
+      // rolled back, or the RFQ was hard-deleted from Firestore), the guard
+      // short-circuited with duplicate_prevented=true — the LLM then told the
+      // client "RFQ submission was already initiated" while no RFQ actually
+      // existed. Now we require the doc to REALLY be there before reusing it.
       const REUSE_WINDOW_MS = 10 * 60 * 1000;
       if (session.lastRfqId && session.lastRfqAt && (Date.now() - session.lastRfqAt) < REUSE_WINDOW_MS) {
         const existingId = session.lastRfqId;
         const existingNo = session.lastRfqNo || existingId;
-        console.log(`[submit_rfq] Idempotency: reusing existing ${existingNo} (${Math.round((Date.now()-session.lastRfqAt)/1000)}s ago)`);
+        let existingSnap = null;
         try {
-          const updatePatch = {
-            description: args.description || '',
-            problem_description: args.description || '',
-            materials_responsibility: args.materialsResponsibility || 'artisan',
-            user_budget: Number(args.clientBudget) > 0 ? Number(args.clientBudget) : 0,
-            material_choice: String(args.materialChoice || '').trim(),
-            updated_at: new Date().toISOString(),
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          existingSnap = await firestore.collection('futureBookings').doc(existingId).get();
+        } catch (e) {
+          console.warn('[submit_rfq] Idempotency existence check failed:', e.message);
+        }
+        if (!existingSnap || !existingSnap.exists) {
+          console.warn(`[submit_rfq] Stale session pointer ${existingId} — doc missing in Firestore. Clearing and creating a fresh RFQ.`);
+          session.lastRfqId = null;
+          session.lastRfqNo = null;
+          session.lastRfqAt = 0;
+        } else {
+          console.log(`[submit_rfq] Idempotency: reusing existing ${existingNo} (${Math.round((Date.now()-session.lastRfqAt)/1000)}s ago)`);
+          try {
+            const updatePatch = {
+              description: args.description || '',
+              problem_description: args.description || '',
+              materials_responsibility: args.materialsResponsibility || 'artisan',
+              user_budget: Number(args.clientBudget) > 0 ? Number(args.clientBudget) : 0,
+              material_choice: String(args.materialChoice || '').trim(),
+              updated_at: new Date().toISOString(),
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            };
+            await firestore.collection('futureBookings').doc(existingId).update(updatePatch);
+          } catch (e) { console.error('[submit_rfq] idempotent update failed:', e.message); }
+          return {
+            success: true,
+            rfqId: existingId,
+            rfqNo: existingNo,
+            hasQuote: false,
+            duplicate_prevented: true,
+            message: `RFQ ${existingNo} is already on file. I've refreshed it with your latest details. Reply to me here — do not resubmit — our admin is reviewing the quote and will send it through shortly.`,
           };
-          await firestore.collection('futureBookings').doc(existingId).update(updatePatch);
-        } catch (e) { console.error('[submit_rfq] idempotent update failed:', e.message); }
-        return {
-          success: true,
-          rfqId: existingId,
-          rfqNo: existingNo,
-          hasQuote: false,
-          duplicate_prevented: true,
-          message: `RFQ ${existingNo} already received — I've updated it with your latest info. Our admin is reviewing the quote and we'll send it through here shortly.`,
-        };
+        }
       }
 
       const rfqId = `RFQ-${Date.now().toString(36).toUpperCase()}`;
