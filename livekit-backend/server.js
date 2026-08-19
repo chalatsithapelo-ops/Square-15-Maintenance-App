@@ -12952,14 +12952,25 @@ app.post(
         return res.status(401).json({ error: 'Invalid ID token', detail: e.message });
       }
 
-      // 2) Verify caller is an admin in Firestore
+      // 2) Verify caller is an admin. The ID token's custom claims are the
+      //    authoritative, cryptographically-signed admin signal — prefer
+      //    them. Fall back to the Firestore users doc for older admins whose
+      //    claims were never minted. (Aug 2026: previously we required BOTH
+      //    users.isAdmin===true AND users.isVerified===true, but many valid
+      //    admin/owner accounts have isVerified unset, so uploads 403'd even
+      //    with correct custom claims. That broke Add-Artisan entirely.)
       const callerUid = decoded.uid;
-      const userDoc = await firestore.collection('users').doc(callerUid).get();
-      if (!userDoc.exists) return res.status(403).json({ error: 'User not found' });
-      const u = userDoc.data() || {};
-      if (u.isAdmin !== true || u.isVerified !== true) {
-        console.warn(`[upload-artisan-image] DENIED for ${callerUid}: isAdmin=${u.isAdmin} isVerified=${u.isVerified}`);
-        return res.status(403).json({ error: 'Admin privileges required' });
+      const claimRole = String(decoded.role || '').toLowerCase();
+      const claimIsAdmin = decoded.admin === true || claimRole === 'admin' || claimRole === 'owner';
+      let allowed = claimIsAdmin;
+      if (!allowed) {
+        const userDoc = await firestore.collection('users').doc(callerUid).get();
+        const u = userDoc.exists ? (userDoc.data() || {}) : {};
+        allowed = u.isAdmin === true;
+        if (!allowed) {
+          console.warn(`[upload-artisan-image] DENIED for ${callerUid}: claims admin=${decoded.admin} role=${decoded.role} | users.isAdmin=${u.isAdmin}`);
+          return res.status(403).json({ error: 'Admin privileges required' });
+        }
       }
 
       // 3) Validate body
