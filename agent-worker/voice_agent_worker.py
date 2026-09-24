@@ -55,12 +55,11 @@ _FORBIDDEN_SPEECH_PATTERNS = [
     re.compile(r"\bsquare15_ui\b", re.IGNORECASE),
     re.compile(r"\bsquare15_app\b", re.IGNORECASE),
     re.compile(r"\bSQUARE15_UI\b", re.IGNORECASE),
-    # Prevent agent from saying "loading/opening/opened" phrases when it cannot actually load/see anything
+    # Prevent agent from CLAIMING it can see/analyse an image itself (the app does the analysis).
+    # NOTE: "opening the photo upload screen" is now a REAL feature (ui_navigate open_rfq_upload),
+    # so those phrases are intentionally NOT blocked — the app opens the screen and Lizzy announces it.
     re.compile(r"\b(?:i\s+am\s+)?loading\s+(?:the\s+)?(?:picture|photo|image)s?\b", re.IGNORECASE),
     re.compile(r"\b(?:let\s+me\s+)?(?:load|check)\s+(?:the\s+)?(?:picture|photo|image)s?\b", re.IGNORECASE),
-    re.compile(r"\bopening\s+(?:the\s+)?(?:picture|photo|image)s?\b", re.IGNORECASE),
-    re.compile(r"\b(?:i\s+have\s+)?opened\s+(?:the\s+)?(?:picture|photo|image)\s+(?:upload|screen)\b", re.IGNORECASE),
-    re.compile(r"\bopening\s+(?:picture|photo|image)\s+upload\b", re.IGNORECASE),
 ]
 
 
@@ -555,10 +554,10 @@ async def entrypoint(ctx: JobContext):
             "- RFQ QUOTE tools: generate_rfq_quote (trigger AI quote), accept_rfq (accept quote → payment), reject_rfq (negotiate quote). Use when handling RFQ requests.\n"
             "- lookup_service_pricing for pricing: when user asks 'how much is...', 'what's the price for...', call lookup_service_pricing.\n"
             "- FINANCE tools (admin-only, read-only): get_finance_overview, get_daily_revenue_report, get_failed_payments_report, get_fraud_alerts_report. Use when admin asks 'What's the revenue today?', 'Any failed payments?', 'Show financial summary', 'Any fraud alerts?'. These are READ-ONLY and safe. NEVER process refunds, payouts, or wallet adjustments via voice — those require the admin app approval workflow.\n"
-            "- ui_navigate ONLY for opening screens/navigation: open_bookings_tab, open_future_bookings, open_wallet, open_profile, open_settings, open_notifications, open_calendar, open_help, open_support, go_home, go_back, close_window, create_order_booking, call_assigned_artisan.\n"
+            "- ui_navigate ONLY for opening screens/navigation: open_bookings_tab, open_future_bookings, open_wallet, open_profile, open_settings, open_notifications, open_calendar, open_help, open_support, go_home, go_back, close_window, create_order_booking, open_rfq_upload, call_assigned_artisan.\n"
             "- NEVER use ui_navigate for cancel_booking, reschedule_booking, send_message_to_artisan, send_message_to_client, send_message_to_admin, mark_booking_in_progress, artisan_cancel_and_reassign. Use the dedicated tools instead.\n"
             "- NEVER narrate tool calls. Never say JSON, function names, or metadata.\n"
-            "- NEVER claim you opened/loaded pictures or images.\n"
+            "- You CAN open the photo upload screen for the customer with ui_navigate(action='open_rfq_upload'). Do NOT claim you can personally SEE or analyse a photo — the app analyses uploaded photos and gives you the findings.\n"
             "- NEVER claim you opened a map or showed a location. There is no map feature.\n"
             "- Speak naturally, 1-3 short sentences. Be concise.\n"
             "- CURRENCY: When speaking amounts, say the full words. Say 'one million rand' NOT 'R1000000'. "
@@ -647,11 +646,9 @@ async def entrypoint(ctx: JobContext):
             "- If the quote is not ready yet, say: 'The quote is still being prepared. Check back in a moment.'\n"
             "\n"
             "BOOKING CREATION (IMPORTANT):\n"
-            "- To create a new booking, ALWAYS use ui_navigate with action='create_order_booking'.\n"
-            "- Provide: category_name, problem_description (enriched with diagnostic details), and optionally scheduled_date, scheduled_time, service_address.\n"
-            "- Do NOT use create_booking tool. ONLY use ui_navigate(action='create_order_booking').\n"
-            "- After calling ui_navigate, say 'I am processing your booking now, please keep the app open.' Do NOT say an artisan has been dispatched until confirmed.\n"
-            "- NEVER open photo upload, map, or any other screen during booking creation. The app handles everything.\n"
+            "- For a repair or issue booking (something is broken, leaking, blocked, or not working), a photo helps the artisan come prepared. AFTER you have confirmed the price and the customer agreed, OPEN the photo screen for them by calling ui_navigate(action='open_rfq_upload') with category_name, problem_description (enriched with diagnostic details), and service_address. This opens the photo screen on their phone; once they add a photo the app AUTOMATICALLY creates the booking and dispatches an artisan. Do NOT also call create_order_booking afterwards — the photo flow books it for you.\n"
+            "- If the customer says they cannot or do not want to add a photo, do NOT block them: create the booking directly with ui_navigate(action='create_order_booking') using category_name, problem_description, and optionally scheduled_date, scheduled_time, service_address.\n"
+            "- After calling either action, say 'I am processing your booking now, please keep the app open.' Do NOT say an artisan has been dispatched until confirmed.\n"
             "- Do NOT use open_map or show_location actions. They do not exist.\n"
             "\n"
             "PRICE CONFIRMATION (CRITICAL — NEVER SKIP):\n"
@@ -694,11 +691,11 @@ async def entrypoint(ctx: JobContext):
         else:
             base += (
                 "\nCLIENT ACTIONS:\n"
-                "- Create booking: First run the DIAGNOSIS flow (ask 2-3 questions about scope, urgency, and sub-category). "
-                "Then REMIND the customer to upload photos: 'Before I create the booking, could you please upload photos of the issue? "
-                "Tap the camera icon or send photos in the app — this helps our artisans understand the problem and come prepared.' "
-                "If they say they will or already have, proceed. If they say they can't right now, proceed without blocking. "
-                "Then call ui_navigate(action='create_order_booking') with category_name and the enriched problem_description. "
+                "- Create booking: First run the DIAGNOSIS flow (ask 2-3 questions about scope, urgency, and sub-category), then confirm the price and wait for the customer to agree. "
+                "Then, for a repair/issue booking, tell them 'I'll open the photo screen so you can add a quick photo of the issue,' and call "
+                "ui_navigate(action='open_rfq_upload') with category_name, the enriched problem_description, and service_address. "
+                "The app opens the photo screen on their phone; once they add a photo it creates the booking and dispatches an artisan automatically — do NOT also call create_order_booking. "
+                "If the customer says they can't add a photo, don't block them: call ui_navigate(action='create_order_booking') with category_name and the enriched problem_description instead. "
                 "The app handles pricing, RFQ creation, AI quoting, and artisan dispatch automatically.\n"
                 "- For complex jobs (renovations, full installs, geyser replacement): use create_booking with is_rfq='yes'. "
                 "This creates an RFQ and auto-generates an AI quote with labour, materials, and contingency breakdown.\n"
@@ -719,7 +716,7 @@ async def entrypoint(ctx: JobContext):
         description=(
             "Send a UI navigation command to the Square 15 mobile app. "
             "Use ONLY for navigation and screen-opening actions. "
-            "Supported actions: create_order_booking, dispatch_artisan, "
+            "Supported actions: create_order_booking, dispatch_artisan, open_rfq_upload, "
             "open_bookings_tab, open_future_bookings, open_artisan_requests, open_artisan_appointments, "
             "open_artisan_wallet, accept_latest_request, reject_latest_request, respond_to_request, "
             "call_assigned_artisan, "
@@ -806,7 +803,7 @@ async def entrypoint(ctx: JobContext):
                 )
             elif action == "open_rfq_upload":
                 text = (
-                    "Please upload 3 clear photos of the work needed in the photo upload screen."
+                    "Opening the photo screen now — please add a photo of the issue so I can send it to the artisan."
                 )
             elif action == "open_bookings_tab":
                 text = "Opening your bookings now."
