@@ -7,7 +7,7 @@ upload/deploy a minimal set of files to GitHub/Render.
 
 # ── Version tag — bump this on every deploy so we can verify Render runs the
 # latest code.  Check Render logs for the startup banner.
-WORKER_VERSION = "2026-06-28-dedup-v1"
+WORKER_VERSION = "2026-09-24-connpool-v1"
 
 import os
 import sys
@@ -45,6 +45,30 @@ logger = logging.getLogger(__name__)
 # Module-level pricing cache — updated on every successful pricing lookup.
 # Used as fallback when the backend is unreachable.
 _pricing_cache: Optional[str] = None
+
+
+# Module-level shared HTTP session for backend calls. Reusing one session (with a
+# keep-alive connector) across every tool call avoids a fresh TCP+TLS handshake
+# per request (~200ms each) and keeps connections warm across conversations,
+# which is the main cause of Lizzy feeling laggy between turns.
+_shared_http_session: Optional["aiohttp.ClientSession"] = None
+_shared_session_lock = asyncio.Lock()
+
+
+async def _get_shared_session() -> "aiohttp.ClientSession":
+    """Return a process-wide pooled aiohttp session, creating it on first use."""
+    global _shared_http_session
+    if _shared_http_session is None or _shared_http_session.closed:
+        async with _shared_session_lock:
+            if _shared_http_session is None or _shared_http_session.closed:
+                connector = aiohttp.TCPConnector(
+                    limit=20,
+                    ttl_dns_cache=300,
+                    keepalive_timeout=60,
+                    enable_cleanup_closed=True,
+                )
+                _shared_http_session = aiohttp.ClientSession(connector=connector)
+    return _shared_http_session
 
 
 _FORBIDDEN_SPEECH_PATTERNS = [
@@ -236,149 +260,159 @@ class BackendAPIClient:
 
     async def get_booking_status(self, booking_id: str) -> Dict[str, Any]:
         """Get booking status from backend."""
-        async with aiohttp.ClientSession(timeout=self.timeout) as session:
-            payload = {
-                'action': 'get_booking_status',
-                'payload': {'booking_id': booking_id},
-                'context': self._get_context(),
-            }
-            async with session.post(
-                f'{self.base_url}/api/action/execute',
-                json=payload,
-                headers=self._get_headers()
-            ) as resp:
-                return await resp.json()
+        session = await _get_shared_session()
+        payload = {
+            'action': 'get_booking_status',
+            'payload': {'booking_id': booking_id},
+            'context': self._get_context(),
+        }
+        async with session.post(
+            f'{self.base_url}/api/action/execute',
+            json=payload,
+            headers=self._get_headers(),
+            timeout=self.timeout,
+        ) as resp:
+            return await resp.json()
 
     async def list_user_bookings(self, status: Optional[str] = None, limit: int = 10) -> Dict[str, Any]:
         """List user's bookings."""
-        async with aiohttp.ClientSession(timeout=self.timeout) as session:
-            payload = {
-                'action': 'list_user_bookings',
-                'payload': {'status': status or '', 'limit': limit},
-                'context': self._get_context(),
-            }
-            async with session.post(
-                f'{self.base_url}/api/action/execute',
-                json=payload,
-                headers=self._get_headers()
-            ) as resp:
-                return await resp.json()
+        session = await _get_shared_session()
+        payload = {
+            'action': 'list_user_bookings',
+            'payload': {'status': status or '', 'limit': limit},
+            'context': self._get_context(),
+        }
+        async with session.post(
+            f'{self.base_url}/api/action/execute',
+            json=payload,
+            headers=self._get_headers(),
+            timeout=self.timeout,
+        ) as resp:
+            return await resp.json()
 
     async def explain_rfq_quote(self, booking_id: str) -> Dict[str, Any]:
         """Explain RFQ quote details."""
-        async with aiohttp.ClientSession(timeout=self.timeout) as session:
-            payload = {
-                'action': 'explain_rfq_quote',
-                'payload': {'booking_id': booking_id},
-                'context': self._get_context(),
-            }
-            async with session.post(
-                f'{self.base_url}/api/action/execute',
-                json=payload,
-                headers=self._get_headers()
-            ) as resp:
-                return await resp.json()
+        session = await _get_shared_session()
+        payload = {
+            'action': 'explain_rfq_quote',
+            'payload': {'booking_id': booking_id},
+            'context': self._get_context(),
+        }
+        async with session.post(
+            f'{self.base_url}/api/action/execute',
+            json=payload,
+            headers=self._get_headers(),
+            timeout=self.timeout,
+        ) as resp:
+            return await resp.json()
 
     async def generate_rfq_quote(self, booking_id: str) -> Dict[str, Any]:
         """Generate AI quote for an RFQ booking."""
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
-            payload = {
-                'action': 'generate_rfq_quote',
-                'payload': {'booking_id': booking_id},
-                'context': self._get_context(),
-            }
-            async with session.post(
-                f'{self.base_url}/api/action/execute',
-                json=payload,
-                headers=self._get_headers()
-            ) as resp:
-                return await resp.json()
+        session = await _get_shared_session()
+        payload = {
+            'action': 'generate_rfq_quote',
+            'payload': {'booking_id': booking_id},
+            'context': self._get_context(),
+        }
+        async with session.post(
+            f'{self.base_url}/api/action/execute',
+            json=payload,
+            headers=self._get_headers(),
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as resp:
+            return await resp.json()
 
     async def accept_rfq_quote(self, booking_id: str) -> Dict[str, Any]:
         """Accept an RFQ quote."""
-        async with aiohttp.ClientSession(timeout=self.timeout) as session:
-            payload = {
-                'action': 'accept_rfq_quote',
-                'payload': {'booking_id': booking_id, 'source': 'voice'},
-                'context': self._get_context(),
-            }
-            async with session.post(
-                f'{self.base_url}/api/action/execute',
-                json=payload,
-                headers=self._get_headers()
-            ) as resp:
-                return await resp.json()
+        session = await _get_shared_session()
+        payload = {
+            'action': 'accept_rfq_quote',
+            'payload': {'booking_id': booking_id, 'source': 'voice'},
+            'context': self._get_context(),
+        }
+        async with session.post(
+            f'{self.base_url}/api/action/execute',
+            json=payload,
+            headers=self._get_headers(),
+            timeout=self.timeout,
+        ) as resp:
+            return await resp.json()
 
     async def reject_rfq_quote(self, booking_id: str, reason: str = '') -> Dict[str, Any]:
         """Reject/negotiate an RFQ quote."""
-        async with aiohttp.ClientSession(timeout=self.timeout) as session:
-            payload = {
-                'action': 'reject_rfq_quote',
-                'payload': {'booking_id': booking_id, 'reason': reason, 'source': 'voice'},
-                'context': self._get_context(),
-            }
-            async with session.post(
-                f'{self.base_url}/api/action/execute',
-                json=payload,
-                headers=self._get_headers()
-            ) as resp:
-                return await resp.json()
+        session = await _get_shared_session()
+        payload = {
+            'action': 'reject_rfq_quote',
+            'payload': {'booking_id': booking_id, 'reason': reason, 'source': 'voice'},
+            'context': self._get_context(),
+        }
+        async with session.post(
+            f'{self.base_url}/api/action/execute',
+            json=payload,
+            headers=self._get_headers(),
+            timeout=self.timeout,
+        ) as resp:
+            return await resp.json()
 
     async def get_payment_status(self, booking_id: str) -> Dict[str, Any]:
         """Get payment status."""
-        async with aiohttp.ClientSession(timeout=self.timeout) as session:
-            payload = {
-                'action': 'get_payment_status',
-                'payload': {'tasks_management_id': booking_id},
-                'context': self._get_context(),
-            }
-            async with session.post(
-                f'{self.base_url}/api/action/execute',
-                json=payload,
-                headers=self._get_headers()
-            ) as resp:
-                return await resp.json()
+        session = await _get_shared_session()
+        payload = {
+            'action': 'get_payment_status',
+            'payload': {'tasks_management_id': booking_id},
+            'context': self._get_context(),
+        }
+        async with session.post(
+            f'{self.base_url}/api/action/execute',
+            json=payload,
+            headers=self._get_headers(),
+            timeout=self.timeout,
+        ) as resp:
+            return await resp.json()
 
     async def call_backend_action(self, action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Generic action executor via /api/action/execute."""
-        async with aiohttp.ClientSession(timeout=self.timeout) as session:
-            body = {
-                'action': action,
-                'payload': payload,
-                'context': self._get_context(),
-            }
-            async with session.post(
-                f'{self.base_url}/api/action/execute',
-                json=body,
-                headers=self._get_headers()
-            ) as resp:
-                return await resp.json()
+        session = await _get_shared_session()
+        body = {
+            'action': action,
+            'payload': payload,
+            'context': self._get_context(),
+        }
+        async with session.post(
+            f'{self.base_url}/api/action/execute',
+            json=body,
+            headers=self._get_headers(),
+            timeout=self.timeout,
+        ) as resp:
+            return await resp.json()
 
     async def propose_action(self, action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Propose an action (Phase 1 proposal)."""
-        async with aiohttp.ClientSession(timeout=self.timeout) as session:
-            body = {
-                'action': action,
-                'payload': payload,
-                'context': self._get_context(),
-            }
-            async with session.post(
-                f'{self.base_url}/api/action/propose',
-                json=body,
-                headers=self._get_headers()
-            ) as resp:
-                return await resp.json()
+        session = await _get_shared_session()
+        body = {
+            'action': action,
+            'payload': payload,
+            'context': self._get_context(),
+        }
+        async with session.post(
+            f'{self.base_url}/api/action/propose',
+            json=body,
+            headers=self._get_headers(),
+            timeout=self.timeout,
+        ) as resp:
+            return await resp.json()
 
     async def confirm_action(self, proposal_id: str) -> Dict[str, Any]:
         """Confirm a proposed action (Phase 1 confirmation)."""
-        async with aiohttp.ClientSession(timeout=self.timeout) as session:
-            body = {'proposalId': proposal_id}
-            async with session.post(
-                f'{self.base_url}/api/action/confirm',
-                json=body,
-                headers=self._get_headers()
-            ) as resp:
-                return await resp.json()
+        session = await _get_shared_session()
+        body = {'proposalId': proposal_id}
+        async with session.post(
+            f'{self.base_url}/api/action/confirm',
+            json=body,
+            headers=self._get_headers(),
+            timeout=self.timeout,
+        ) as resp:
+            return await resp.json()
 
     async def lookup_service_pricing(self, category_name: str = "", task_name: str = "", query: str = "") -> Dict[str, Any]:
         """Look up service pricing from the backend."""
@@ -1453,14 +1487,14 @@ async def entrypoint(ctx: JobContext):
             url = f"{backend_url}/api/test-pricing?q={encoded_q}"
             logger.info(f"🔍 Calling public pricing endpoint: {url}")
 
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=25)) as http_session:
-                async with http_session.get(url) as resp:
-                    logger.info(f"🔍 Pricing response status: {resp.status}")
-                    if resp.status != 200:
-                        body_text = await resp.text()
-                        logger.warning(f"🔍 Pricing endpoint returned {resp.status}: {body_text[:200]}")
-                        return f"Sorry, I couldn't look up pricing right now. The service returned an error. Please try again."
-                    result = await resp.json()
+            http_session = await _get_shared_session()
+            async with http_session.get(url, timeout=aiohttp.ClientTimeout(total=25)) as resp:
+                logger.info(f"🔍 Pricing response status: {resp.status}")
+                if resp.status != 200:
+                    body_text = await resp.text()
+                    logger.warning(f"🔍 Pricing endpoint returned {resp.status}: {body_text[:200]}")
+                    return f"Sorry, I couldn't look up pricing right now. The service returned an error. Please try again."
+                result = await resp.json()
 
             logger.info(f"🔍 Pricing result ok={result.get('ok')}, matched={result.get('matched')}")
 
