@@ -412,6 +412,8 @@ async def entrypoint(ctx: JobContext):
     # Bookings sent from the app context (fallback when backend_client is not yet initialized)
     app_context_bookings = []
     app_context_user_id = ""
+    # Photos staged by the app's manual "Add Photos" button; attached to the next booking.
+    staged_work_image_urls: list = []
 
     # Idempotency guard for create_booking. The LLM frequently emits two parallel
     # create_booking calls for a single user request (often one direct + one via
@@ -1623,6 +1625,10 @@ async def entrypoint(ctx: JobContext):
                 'is_rfq': is_rfq,
                 'job_ids': job_ids_list,
             }
+            # Attach any photos the customer added via the app's "Add Photos" button.
+            if staged_work_image_urls:
+                payload['work_image_urls'] = list(staged_work_image_urls)
+                payload['require_photos'] = False
             proposal_result = await backend_client.propose_action('create_order_booking', payload)
 
             if not proposal_result.get('success'):
@@ -1645,6 +1651,9 @@ async def entrypoint(ctx: JobContext):
             if not confirm_result.get('success'):
                 error = confirm_result.get('error', 'unknown_error')
                 return f"Booking proposed but confirmation failed: {error}"
+
+            # Photos were consumed by this booking; clear them so the next booking starts fresh.
+            staged_work_image_urls.clear()
 
             result_data = confirm_result.get('result', {})
             booking_id = result_data.get('booking_id') or result_data.get('bookingId')
@@ -2864,6 +2873,16 @@ async def entrypoint(ctx: JobContext):
                 if not text:
                     return
                 session.say(text, allow_interruptions=True)
+            elif action == "stage_photos":
+                urls = payload.get("urls")
+                if isinstance(urls, list):
+                    staged_work_image_urls.clear()
+                    staged_work_image_urls.extend(
+                        [u for u in urls if isinstance(u, str) and u.strip()]
+                    )
+                    logger.info(
+                        f"📸 Staged {len(staged_work_image_urls)} photo(s) from app for the next booking"
+                    )
             elif action == "context":
                 # Store app context data (active bookings, user_id) for tool fallback
                 bookings = payload.get("active_bookings")
