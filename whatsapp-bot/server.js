@@ -4448,7 +4448,9 @@ async function executeWaTool(name, args, session) {
       }
 
       const rfqId = `RFQ-${Date.now().toString(36).toUpperCase()}`;
-      const rfqNo = `SQ15-RFQ-${rfqId}`;
+      // rfqId already carries the "RFQ-" prefix — don't add it again or the
+      // customer-facing number becomes "SQ15-RFQ-RFQ-XXXX" (double prefix).
+      const rfqNo = `SQ15-${rfqId}`;
       const now = new Date().toISOString();
 
       const rfqDoc = {
