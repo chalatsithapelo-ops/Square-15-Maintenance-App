@@ -5518,6 +5518,7 @@ app.post('/api/voice/start', assistantLimiter, async (req, res) => {
     // If session binding is required, we must have auth + Firestore so we can validate actions.
     let participantName = req.body.participantName || `user-${Date.now()}`;
     let sessionId = randomId('vs-');
+    let resolvedUserName = '';
 
     const sessionNonce = crypto.randomBytes(24).toString('hex');
     const expiresAt = new Date(Date.now() + voiceSessionTtlMinutes * 60_000).toISOString();
@@ -5590,6 +5591,16 @@ app.post('/api/voice/start', assistantLimiter, async (req, res) => {
           const safeRole = role === 'admin' || role === 'artisan' ? role : 'client';
           participantName = `${safeRole}-${uid}-${Date.now()}`;
 
+          // Resolve the caller's name so the voice agent can greet them by name.
+          try {
+            const uSnap = await firestore.collection('users').doc(uid).get();
+            if (uSnap.exists) {
+              const ud = uSnap.data() || {};
+              resolvedUserName = (ud.name || ud.userName || ud.full_name || ud.displayName || '').toString().trim();
+            }
+            if (!resolvedUserName && decoded.name) resolvedUserName = String(decoded.name).trim();
+          } catch (_nameErr) { /* best-effort; greet generically if unavailable */ }
+
           await firestore.collection('assistant_voice_sessions').doc(sessionId).set({
             id: sessionId,
             uid,
@@ -5626,12 +5637,14 @@ app.post('/api/voice/start', assistantLimiter, async (req, res) => {
       // Do NOT embed the raw Firebase ID token � it would leak to all room participants.
       parsed.voice_session_id = sessionId;
       parsed.voice_session_nonce = sessionNonce;
+      if (resolvedUserName) parsed.user_name = resolvedUserName;
       enrichedMetadata = JSON.stringify(parsed);
     } catch (e) { console.warn('\u26a0\ufe0f metadata JSON parse:', e.message);
       // If metadata isn't valid JSON, create a fresh object
       enrichedMetadata = JSON.stringify({
         voice_session_id: sessionId,
         voice_session_nonce: sessionNonce,
+        ...(resolvedUserName ? { user_name: resolvedUserName } : {}),
       });
     }
 

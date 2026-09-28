@@ -7,7 +7,7 @@ upload/deploy a minimal set of files to GitHub/Render.
 
 # ── Version tag — bump this on every deploy so we can verify Render runs the
 # latest code.  Check Render logs for the startup banner.
-WORKER_VERSION = "2026-09-28-personalize-v1"
+WORKER_VERSION = "2026-09-28-personalize-v2"
 
 import os
 import sys
@@ -3223,11 +3223,10 @@ async def entrypoint(ctx: JobContext):
         if backend_client:
             logger.info("✅ Backend client initialized from post-start scan")
 
-    # Give app-context metadata a brief chance to arrive so we can greet by name.
-    for _ in range(6):
-        if caller_name:
-            break
-        await asyncio.sleep(0.25)
+    # The caller's name now arrives in the participant token metadata and is
+    # captured by the scans above. Do one final no-wait scan, then greet
+    # immediately — no artificial delay, so startup stays fast.
+    if not caller_name:
         _scan_participants_for_credentials()
 
     try:
