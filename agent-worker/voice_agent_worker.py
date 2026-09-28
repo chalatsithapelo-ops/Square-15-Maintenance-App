@@ -7,7 +7,7 @@ upload/deploy a minimal set of files to GitHub/Render.
 
 # ── Version tag — bump this on every deploy so we can verify Render runs the
 # latest code.  Check Render logs for the startup banner.
-WORKER_VERSION = "2026-09-24-connpool-v1"
+WORKER_VERSION = "2026-09-28-personalize-v1"
 
 import os
 import sys
@@ -98,6 +98,26 @@ def _sanitize_spoken_text(text: str) -> str:
     # Convert currency amounts to TTS-friendly spoken text
     t = _format_currency_for_speech(t)
     return t
+
+
+def _first_name(full_name: str) -> str:
+    """Return a clean, capitalized first name from a full name, or '' if junk.
+
+    Guards against empty values, overly long tokens, and tokens containing
+    digits (which are usually IDs, not names).
+    """
+    try:
+        raw = (full_name or "").strip()
+        if not raw:
+            return ""
+        first = raw.split()[0]
+        if not first or len(first) > 20:
+            return ""
+        if any(ch.isdigit() for ch in first):
+            return ""
+        return first[:1].upper() + first[1:]
+    except Exception:
+        return ""
 
 
 def _format_currency_for_speech(text: str) -> str:
@@ -446,6 +466,8 @@ async def entrypoint(ctx: JobContext):
     # Bookings sent from the app context (fallback when backend_client is not yet initialized)
     app_context_bookings = []
     app_context_user_id = ""
+    # The caller's first name (from app context) so Lizzy can greet them by name.
+    caller_name = ""
     # Photos staged by the app's manual "Add Photos" button; attached to the next booking.
     staged_work_image_urls: list = []
 
@@ -580,6 +602,7 @@ async def entrypoint(ctx: JobContext):
             "- When confirming a new booking, briefly reassure the user about escrow and the artisan-photo identity check (one short sentence).\n\n"
             "RULES:\n"
             "- Greet once, then just help. Never repeat your introduction.\n"
+            "- If you are given the user's first name, use it: greet them by name and address them by their first name at least once more during the conversation so it feels personal and warm. Never overuse it.\n"
             "- When user asks to DO something, CALL the right tool immediately. Do NOT describe what you would do — just do it.\n"
             "- NEVER say 'I cannot access', 'I am unable to', 'I don't have access to', or 'I need you to be authenticated'. ALWAYS try calling the relevant tool.\n"
             "- BACKEND tools for data: get_booking_status, list_my_bookings, explain_quote, check_payment, get_wallet_balance, get_messages, get_case_status.\n"
@@ -2846,7 +2869,7 @@ async def entrypoint(ctx: JobContext):
         return True
 
     def on_participant_metadata_changed(participant, old_metadata, new_metadata):
-        nonlocal backend_client, firebase_token, session_id, session_nonce, app_context_bookings, app_context_user_id
+        nonlocal backend_client, firebase_token, session_id, session_nonce, app_context_bookings, app_context_user_id, caller_name
         try:
             if not new_metadata or not str(new_metadata).strip():
                 return
@@ -2926,6 +2949,11 @@ async def entrypoint(ctx: JobContext):
                 uid = (payload.get("user_id") or "").strip()
                 if uid:
                     app_context_user_id = uid
+                if not caller_name:
+                    nm = _first_name(payload.get("user_name") or "")
+                    if nm:
+                        caller_name = nm
+                        logger.info(f"👤 Caller first name from app context: {caller_name}")
                 # Store screen context for OpenClaw-like screen awareness
                 screen_ctx = payload.get("screen_context")
                 if isinstance(screen_ctx, dict):
@@ -3121,7 +3149,7 @@ async def entrypoint(ctx: JobContext):
     # so we can read it directly from any remote participant's metadata JSON.
     def _scan_participants_for_credentials():
         """Scan all remote participants for firebase_token in metadata."""
-        nonlocal backend_client, app_context_bookings, app_context_user_id
+        nonlocal backend_client, app_context_bookings, app_context_user_id, caller_name
         try:
             participants = ctx.room.remote_participants
             # Handle both dict.values() and direct iteration
@@ -3160,6 +3188,11 @@ async def entrypoint(ctx: JobContext):
                     uid = (msg.get('user_id') or '').strip()
                     if uid:
                         app_context_user_id = uid
+                    if not caller_name:
+                        _pl = msg.get('payload') if isinstance(msg.get('payload'), dict) else {}
+                        nm = _first_name(msg.get('user_name') or _pl.get('user_name') or '')
+                        if nm:
+                            caller_name = nm
                 except Exception:
                     pass
             logger.info(f"🔍 Scan complete: {participant_count} participants scanned, backend_client={'SET' if backend_client else 'NONE'}, app_bookings={len(app_context_bookings)}")
@@ -3190,15 +3223,38 @@ async def entrypoint(ctx: JobContext):
         if backend_client:
             logger.info("✅ Backend client initialized from post-start scan")
 
+    # Give app-context metadata a brief chance to arrive so we can greet by name.
+    for _ in range(6):
+        if caller_name:
+            break
+        await asyncio.sleep(0.25)
+        _scan_participants_for_credentials()
+
     try:
-        _greeting_handle = session.say(
-            "Hi, I am Lizzy, how can I help you today?",
-            allow_interruptions=True,
+        greeting = (
+            f"Hi {caller_name}, I am Lizzy, how can I help you today?"
+            if caller_name
+            else "Hi, I am Lizzy, how can I help you today?"
         )
-        logger.info("✅ Greeting sent")
+        _greeting_handle = session.say(greeting, allow_interruptions=True)
+        logger.info(f"✅ Greeting sent (name={'yes' if caller_name else 'no'})")
     except Exception as e:
         _greeting_handle = None
         logger.warning(f"⚠️ Could not send greeting: {e}")
+
+    # If we learned the caller's name, remind the LLM to use it naturally once more.
+    if caller_name:
+        try:
+            extra = (
+                f"\n\nThe user's first name is {caller_name}. Address them by their "
+                "first name naturally at least once more during this conversation. "
+                "Never overuse it."
+            )
+            _res = agent.update_instructions(_instructions_for_role(caller_role) + extra)
+            if inspect.isawaitable(_res):
+                await _res
+        except Exception as _e:
+            logger.info(f"update_instructions with name skipped: {_e}")
 
     # ── Background: periodically retry credential scan until backend_client is set ──
     async def _credential_retry_loop():

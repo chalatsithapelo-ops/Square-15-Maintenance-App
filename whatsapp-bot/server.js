@@ -7643,6 +7643,43 @@ async function handleMessage(session, userMessage, imageDataUrl) {
 
     // Inject pending-rating hint so the AI knows to prompt the customer
     const sysMessages = [{ role: 'system', content: SYSTEM_PROMPT }];
+
+    // Personalize: tell Lizzy the customer's first name so she greets them by
+    // name and uses it once more during the chat (feels human, not robotic).
+    try {
+      let profileName = (session.linkedUserName || session.customerName || '').toString().trim();
+      if (!profileName) {
+        const firestore = db();
+        if (firestore) {
+          if (session.linkedUserId && !String(session.linkedUserId).startsWith('wa_')) {
+            const uref = await firestore.collection('users').doc(session.linkedUserId).get();
+            if (uref.exists) {
+              const ud = uref.data() || {};
+              profileName = (ud.name || ud.userName || ud.full_name || '').toString().trim();
+            }
+          }
+          if (!profileName) {
+            const u = await findUserByPhone(session.phone);
+            if (u) {
+              if (!session.linkedUserId) session.linkedUserId = u.id;
+              profileName = (u.name || u.userName || u.full_name || '').toString().trim();
+            }
+          }
+          if (profileName) session.linkedUserName = profileName; // cache on session
+        }
+      }
+      const rawFirst = profileName ? profileName.split(/\s+/)[0].replace(/[^A-Za-z'\-]/g, '') : '';
+      if (rawFirst && rawFirst.length <= 20) {
+        const fn = rawFirst.charAt(0).toUpperCase() + rawFirst.slice(1);
+        sysMessages.push({
+          role: 'system',
+          content: `[USER PROFILE] The customer's first name is ${fn}. Greet them by their first name and naturally address them by their first name at least once more during the conversation so it feels warm and personal. Never overuse it.`,
+        });
+      }
+    } catch (e) {
+      console.warn('[personalize] name inject failed:', e.message);
+    }
+
     if (session.pendingRatingBookingId) {
       sysMessages.push({
         role: 'system',
