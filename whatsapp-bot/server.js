@@ -762,6 +762,7 @@ async function logErrorToAdmin(errorType, description, source, errorDetails, boo
 // Use this for non-error events (new RFQ, quote accepted, escalation etc) where we want
 // the admin phone to light up even when the app is closed.
 async function pushAdminNotification({ title, body, type, bookingId = '', extraData = {} }) {
+  const firestore = db();
   if (!firestore) return;
   try {
     const notifPayload = {
