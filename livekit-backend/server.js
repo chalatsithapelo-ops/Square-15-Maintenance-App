@@ -966,6 +966,7 @@ const ACTION_TIERS = Object.freeze({
   submit_complaint: 'B',
   request_payment_link: 'B',
   pay_with_wallet: 'B',
+  request_bnpl_link: 'B',
   // Phase 4: Admin automation tools (Tier B � admin role required)
   admin_bulk_reassign: 'B',
   admin_close_stale_cases: 'B',
@@ -3578,6 +3579,12 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       const cancelUrl = `${backendUrl}/api/payment/ozow-result?status=cancel&booking_id=${encodeURIComponent(bid)}${_sig}`;
       const notifyUrl = `${backendUrl}/api/payment/itn`;
 
+      // Payment method: 'card' (PayFast card) or 'eft' (PayFast instant EFT).
+      // Voice/app may pass payment_method; default to card for backwards-compat.
+      const pmIn = String(payload.payment_method || 'card').toLowerCase();
+      const pfMethod = (pmIn === 'eft' || pmIn === 'instant_eft' || pmIn === 'instanteft') ? 'eft' : 'cc';
+      const methodLabel = pfMethod === 'eft' ? 'instant EFT' : 'card';
+
       const paymentData = {
         merchant_id: merchantId,
         merchant_key: merchantKey,
@@ -3587,8 +3594,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         cancel_url: cancelUrl,
         notify_url: notifyUrl,
         custom_str1: bid,
-        // Force card-only checkout
-        payment_method: 'cc',
+        payment_method: pfMethod,
       };
 
       // Also update booking with payment_type for ITN deposit/balance detection
@@ -3650,8 +3656,8 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       }
 
       return { ok: true, status: 200, data: {
-        message: `Payment link generated for R${payAmount.toFixed(2)} ${itemSuffix}. A notification with the link has been sent to your phone.`,
-        paymentUrl, reference: payRef, bookingId: bid, amount: payAmount, payment_type: paymentType,
+        message: `A ${methodLabel} payment link for R${payAmount.toFixed(2)} ${itemSuffix} has been sent to your phone. Tap the notification to complete payment.`,
+        paymentUrl, reference: payRef, bookingId: bid, amount: payAmount, payment_type: paymentType, payment_method: pfMethod,
       }};
     } catch (err) {
       return { ok: false, status: 500, error: `payment_link_error: ${err.message}` };
@@ -3861,6 +3867,108 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       }};
     } catch (err) {
       return { ok: false, status: 500, error: `wallet_payment_error: ${err.message}` };
+    }
+  }
+
+  // -- Buy Now, Pay Later (BNPL via PayJustNow) --
+  // Server-side wrapper so the voice/text assistant can offer BNPL as a payment
+  // choice. Mirrors the booking guards used by pay_with_wallet. When the
+  // provider isn't configured yet it returns ok:true with available:false and a
+  // spoken fallback message (so the agent gracefully offers another method).
+  if (action === 'request_bnpl_link') {
+    try {
+      const bid = bookingId || String(payload.tasks_management_id || '').trim();
+      if (!bid) return { ok: false, status: 400, error: 'missing_booking_id' };
+      if (!actorUid) return { ok: false, status: 401, error: 'unauthorized' };
+
+      let bData = await loadBooking();
+      if (!bData) {
+        const tmSnap = await firestore.collection('tasksManagement').doc(bid).get();
+        if (tmSnap.exists) bData = tmSnap.data() || {};
+      }
+      if (!bData) return { ok: false, status: 404, error: 'booking_not_found' };
+
+      const artisanAccepted = bData.accept === '1' || bData.accept === 1 || bData.artisan_confirmed === 'yes';
+      if (!artisanAccepted) {
+        return { ok: false, status: 400, error: 'An artisan hasn\'t accepted this job yet. Payment is only available after an artisan accepts.' };
+      }
+      if ((bData.payment_status || bData.paymentStatus) === 'paid') {
+        return { ok: true, status: 200, data: { message: 'This booking is already paid.', bookingId: bid } };
+      }
+      const cost = parseFloat(bData.cost || bData.total_cost || bData.quoted_price || '0');
+      if (cost <= 0) return { ok: false, status: 400, error: 'no_confirmed_price' };
+
+      const paymentType = payload.payment_type || 'full';
+      if (paymentType === 'balance' && bData.deposit_paid !== true) {
+        return { ok: false, status: 400, error: 'cannot_pay_balance_before_deposit' };
+      }
+      let payAmount;
+      if (bData.deposit_paid === true && bData.balance_paid !== true) {
+        payAmount = parseFloat(bData.balance_amount || (cost * 0.65));
+      } else if (paymentType === 'deposit') {
+        payAmount = Math.round(cost * 0.35 * 100) / 100;
+      } else {
+        payAmount = cost;
+      }
+
+      const cfg = await getPayJustNowConfig();
+      const base = cfg ? (cfg.useSandbox ? cfg.sandboxBase : cfg.productionBase) : '';
+      if (!cfg || !base) {
+        return { ok: true, status: 200, data: {
+          available: false,
+          message: 'Buy now, pay later is not available yet \u2014 it is pending merchant approval. You can pay from your wallet, by instant EFT, or by card instead.',
+          bookingId: bid, amount: payAmount,
+        }};
+      }
+
+      const orderId = `SQ15-PJN-${Date.now()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+      const body = {
+        amount: payAmount.toFixed(2),
+        merchantReference: orderId,
+        merchant: { redirectConfirmUrl: cfg.confirmUrl, redirectCancelUrl: cfg.cancelUrl },
+        consumer: {},
+        description: `Square 15 Maintenance - Job ${bid}`,
+        taxAmount: '0.00',
+        shippingAmount: '0.00',
+      };
+      const fetch = (await import('node-fetch')).default;
+      const resp = await fetch(`${base}/order`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.apiKey}` },
+        body: JSON.stringify(body),
+      });
+      const text = await resp.text();
+      let pjnData = {};
+      try { pjnData = JSON.parse(text); } catch (_) {}
+      if (!resp.ok) {
+        console.warn(`[request_bnpl_link] provider ${resp.status}: ${text.slice(0, 200)}`);
+        return { ok: false, status: 502, error: 'bnpl_provider_error' };
+      }
+      const token = pjnData.token || pjnData.id || '';
+      const redirectUrl = pjnData.redirectCheckoutUrl || pjnData.redirect_url || pjnData.checkoutUrl || '';
+      if (!token || !redirectUrl) return { ok: false, status: 502, error: 'bnpl_response_missing_fields' };
+
+      await firestore.collection('bnpl_orders').doc(orderId).set({
+        order_id: orderId, provider: 'payJustNow', provider_name: 'PayJustNow', token,
+        amount: payAmount.toFixed(2), task_id: bid, booking_id: bid, uid: actorUid,
+        payment_type: paymentType, status: 'pending', sandbox: cfg.useSandbox, source: payload.source || 'voice',
+        created_at: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+
+      await firestore.collection('notifications').add({
+        title: 'Buy Now, Pay Later Ready',
+        body: `Tap to complete your buy-now-pay-later checkout for R${payAmount.toFixed(2)}`,
+        type: 'bnpl_link', booking_id: bid, amount: payAmount, payment_url: redirectUrl,
+        userId: actorUid, status: 'unread', created_at: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      return { ok: true, status: 200, data: {
+        available: true,
+        message: `A buy-now-pay-later checkout for R${payAmount.toFixed(2)} has been sent to your phone. Tap the notification to complete it.`,
+        redirect_url: redirectUrl, order_id: orderId, amount: payAmount, bookingId: bid, payment_type: paymentType,
+      }};
+    } catch (err) {
+      return { ok: false, status: 500, error: `bnpl_link_error: ${err.message}` };
     }
   }
 

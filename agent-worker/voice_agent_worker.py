@@ -7,7 +7,7 @@ upload/deploy a minimal set of files to GitHub/Render.
 
 # ── Version tag — bump this on every deploy so we can verify Render runs the
 # latest code.  Check Render logs for the startup banner.
-WORKER_VERSION = "2026-10-03-booking-flow-audit-v1"
+WORKER_VERSION = "2026-10-03-payment-chooser-v1"
 
 import os
 import sys
@@ -606,10 +606,17 @@ async def entrypoint(ctx: JobContext):
             "- NEVER say 'I cannot access', 'I am unable to', 'I don't have access to', or 'I need you to be authenticated'. ALWAYS try calling the relevant tool.\n"
             "- BACKEND tools for data: get_booking_status, list_my_bookings, explain_quote, check_payment, get_wallet_balance, get_messages, get_case_status.\n"
             "- BACKEND tools for ACTIONS: cancel_booking, reschedule_booking, send_message_to_artisan, send_message_to_client, send_message_to_admin, mark_booking_in_progress, artisan_cancel_and_reassign, submit_rating, submit_complaint. These tools EXECUTE real actions on the backend — use them, NOT ui_navigate.\n"
-            "- PAYMENT (after an artisan has accepted the job): the customer can pay from their Square 15 WALLET (instant) or by CARD. When they want to pay, FIRST ask 'Would you like to pay the full amount or a 35 percent deposit?'. Then: for CARD, call request_payment_link (sends a secure PayFast link to their phone); for WALLET, tell them they can confirm the payment on the in-app payment screen — open it with ui_navigate(action='open_wallet') if they need it — wallet charges are confirmed in-app for security. IMPORTANT: Only offer payment AFTER an artisan has accepted the job. NEVER offer payment immediately after booking creation.\n"
-            "- After a payment, CONFIRM it went through by calling check_payment(booking_id). Tell the customer the payment status, then continue — once payment is held in escrow the artisan proceeds with the job.\n"
-            "- If customer says 'deposit' or '35 percent' → call request_payment_link with payment_type='deposit'\n"
-            "- If customer says 'full' or 'pay everything' → call request_payment_link with payment_type='full'\n"
+            "- PAYMENT (only AFTER an artisan has accepted the job — NEVER offer payment right after booking creation):\n"
+            "  STEP 1: Ask 'Would you like to pay the full amount or a 35 percent deposit?' (payment_type='full' or 'deposit').\n"
+            "  STEP 2: Ask the customer to CHOOSE a method: 'How would you like to pay — from your Square 15 wallet, by instant EFT, by card, or buy-now-pay-later?' Let THEM choose; never pick for them.\n"
+            "  STEP 3: Route to the method they chose:\n"
+            "    - WALLET → this moves money instantly. Tell them the exact amount and get a clear 'yes' FIRST, then call pay_with_wallet(booking_id, payment_type).\n"
+            "    - INSTANT EFT → call request_payment_link(booking_id, payment_type, payment_method='eft') — sends a secure PayFast EFT link to their phone.\n"
+            "    - CARD → call request_payment_link(booking_id, payment_type, payment_method='card') — sends a secure PayFast card link to their phone.\n"
+            "    - BUY-NOW-PAY-LATER → call pay_with_bnpl(booking_id, payment_type) — sends a checkout link to their phone.\n"
+            "  STEP 4: After the payment, CONFIRM it went through by calling check_payment(booking_id). Tell the customer the status, then continue — once money is in escrow the artisan proceeds.\n"
+            "- WALLET SAFETY: NEVER charge the wallet without the customer explicitly choosing wallet AND confirming the amount out loud. If their balance is too low, offer EFT, card, or buy-now-pay-later instead.\n"
+            "- If customer says 'deposit' or '35 percent' → use payment_type='deposit'. If 'full' or 'pay everything' → use payment_type='full'.\n"
             "- RFQ QUOTE tools: generate_rfq_quote (trigger AI quote), accept_rfq (accept quote → payment), reject_rfq (negotiate quote). Use when handling RFQ requests.\n"
             "- lookup_service_pricing for pricing: when user asks 'how much is...', 'what's the price for...', call lookup_service_pricing.\n"
             "- FINANCE tools (admin-only, read-only): get_finance_overview, get_daily_revenue_report, get_failed_payments_report, get_fraud_alerts_report. Use when admin asks 'What's the revenue today?', 'Any failed payments?', 'Show financial summary', 'Any fraud alerts?'. These are READ-ONLY and safe. NEVER process refunds, payouts, or wallet adjustments via voice — those require the admin app approval workflow.\n"
@@ -1439,20 +1446,18 @@ async def entrypoint(ctx: JobContext):
 
     @llm.function_tool(
         description=(
-            "GENERATE a PayFast card payment link and send it to the customer's phone. "
-            "Call this whenever the user wants to pay, asks for a payment link, says "
-            "'send me a link to pay', 'I want to pay', 'pay now', 'pay the full amount', "
-            "'pay deposit', 'send payment link'. Do NOT call check_payment for these \u2014 "
-            "that one only reads payment status. "
+            "GENERATE a PayFast payment link (CARD or instant EFT) and send it to the "
+            "customer's phone. Call this when the customer chose to pay by CARD or by "
+            "INSTANT EFT. Pass payment_method='card' for card, or payment_method='eft' for "
+            "instant EFT. Do NOT call check_payment for these \u2014 that one only reads status. "
+            "Do NOT use this for wallet (use pay_with_wallet) or buy-now-pay-later (use pay_with_bnpl). "
             "IMPORTANT: Only call AFTER an artisan has accepted the job. NEVER offer "
-            "payment immediately after booking creation. If unclear, ask 'Would you like "
-            "to pay the full amount or a 35 percent deposit?' \u2014 but if the user "
-            "already said 'full' or 'deposit', call immediately without re-asking. "
+            "payment immediately after booking creation. "
             "Use payment_type='deposit' for 35% deposit, payment_type='full' for full payment."
         )
     )
-    async def request_payment_link(booking_id: str, payment_type: str = "full") -> str:
-        """Request a payment link via the backend."""
+    async def request_payment_link(booking_id: str, payment_type: str = "full", payment_method: str = "card") -> str:
+        """Request a PayFast card/EFT payment link via the backend."""
         nonlocal backend_client
         if not backend_client:
             if not await _ensure_backend_or_retry():
@@ -1461,7 +1466,7 @@ async def entrypoint(ctx: JobContext):
         try:
             result = await backend_client.call_backend_action(
                 'request_payment_link',
-                {'booking_id': booking_id, 'source': 'voice', 'payment_type': payment_type}
+                {'booking_id': booking_id, 'source': 'voice', 'payment_type': payment_type, 'payment_method': payment_method}
             )
             if not result.get('ok') and not result.get('success'):
                 error = result.get('error', 'unknown_error')
@@ -2104,6 +2109,81 @@ async def entrypoint(ctx: JobContext):
         except Exception as e:
             logger.error(f"get_wallet_balance error: {e}", exc_info=True)
             return "Sorry, I had trouble checking your wallet balance. Please try again."
+
+    @llm.function_tool(
+        description=(
+            "Charge the customer's Square 15 WALLET to pay for a booking (instant). "
+            "This MOVES REAL MONEY from their wallet into escrow. Call this ONLY after ALL of: "
+            "(1) an artisan has accepted the job, (2) the customer EXPLICITLY chose to pay from "
+            "their wallet, and (3) you told them the exact amount and they said yes. "
+            "Use payment_type='full' for full payment or 'deposit' for a 35 percent deposit. "
+            "Do NOT use this for card or EFT (use request_payment_link) or buy-now-pay-later (use pay_with_bnpl)."
+        )
+    )
+    async def pay_with_wallet(booking_id: str, payment_type: str = "full") -> str:
+        """Charge the user's wallet for a booking via the backend action."""
+        nonlocal backend_client
+        if not backend_client:
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
+
+        try:
+            result = await backend_client.call_backend_action(
+                'pay_with_wallet',
+                {'booking_id': booking_id, 'payment_type': payment_type, 'source': 'voice'}
+            )
+            if not result.get('ok') and not result.get('success'):
+                error = str(result.get('error', 'unknown_error'))
+                low = error.lower()
+                if 'insufficient' in low:
+                    return error + " Would you like to pay by card, instant EFT, or buy-now-pay-later instead?"
+                if 'artisan' in low:
+                    return "An artisan hasn't accepted this job yet. Payment is available once an artisan accepts."
+                if error == 'no_confirmed_price':
+                    return "This booking doesn't have a confirmed price yet."
+                return f"I couldn't complete the wallet payment: {error}"
+
+            data = result.get('data', result.get('result', {}))
+            message = data.get('message', '')
+            escrow_msg = " Your money is held securely in escrow until you confirm the work is done right."
+            if message:
+                return message + escrow_msg
+            return "Your wallet payment is complete." + escrow_msg
+        except Exception as e:
+            logger.error(f"pay_with_wallet error: {e}", exc_info=True)
+            return "Sorry, I had trouble processing the wallet payment. Please try again or use another method."
+
+    @llm.function_tool(
+        description=(
+            "Start a BUY-NOW-PAY-LATER checkout for a booking. Call this when the customer "
+            "chooses buy-now-pay-later, BNPL, 'pay later', or instalments. Sends a checkout "
+            "link to their phone. Only after an artisan has accepted the job. "
+            "Use payment_type='full' or 'deposit'."
+        )
+    )
+    async def pay_with_bnpl(booking_id: str, payment_type: str = "full") -> str:
+        """Start a buy-now-pay-later checkout via the backend action."""
+        nonlocal backend_client
+        if not backend_client:
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
+
+        try:
+            result = await backend_client.call_backend_action(
+                'request_bnpl_link',
+                {'booking_id': booking_id, 'payment_type': payment_type, 'source': 'voice'}
+            )
+            if not result.get('ok') and not result.get('success'):
+                error = str(result.get('error', 'unknown_error'))
+                if 'artisan' in error.lower():
+                    return "An artisan hasn't accepted this job yet. Payment is available once an artisan accepts."
+                return f"I couldn't start buy-now-pay-later: {error}"
+
+            data = result.get('data', result.get('result', {}))
+            return data.get('message', "A buy-now-pay-later checkout has been sent to your phone.")
+        except Exception as e:
+            logger.error(f"pay_with_bnpl error: {e}", exc_info=True)
+            return "Sorry, I had trouble starting buy-now-pay-later. Please try another method."
 
     @llm.function_tool(
         description=(
