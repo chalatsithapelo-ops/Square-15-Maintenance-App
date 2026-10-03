@@ -3411,13 +3411,21 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         return { ok: false, status: 400, error: 'missing_booking_id_or_tasks_management_id' };
       }
 
+      // Sort transactionLogs by recency in memory so the equality-only Firestore
+      // query needs no composite (booking_id + created_at) index.
+      const toMs = (v) => {
+        if (!v) return 0;
+        if (typeof v === 'object' && typeof v.toMillis === 'function') return v.toMillis();
+        if (typeof v === 'object' && v._seconds) return v._seconds * 1000;
+        const t = Date.parse(v); return Number.isNaN(t) ? 0 : t;
+      };
+
       // Try to find payment in transactionLogs by booking_id
       let qs = null;
       if (bookingId) {
         qs = await firestore.collection('transactionLogs')
           .where('booking_id', '==', bookingId)
-          .orderBy('created_at', 'desc')
-          .limit(5)
+          .limit(20)
           .get();
       }
 
@@ -3431,8 +3439,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         if (tmIdToSearch) {
           qs = await firestore.collection('transactionLogs')
             .where('tasks_management_id', '==', tmIdToSearch)
-            .orderBy('created_at', 'desc')
-            .limit(5)
+            .limit(20)
             .get();
         }
       }
@@ -3458,19 +3465,21 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         };
       }
 
-      const transactions = [];
+      const rows = [];
       for (const doc of qs.docs) {
         const tx = doc.data() || {};
         const txUserId = String(tx.user_id || tx.client_id || '').trim();
         if (actorRole !== 'admin' && txUserId !== actorUid) continue;
-        transactions.push({
-          transaction_id: doc.id,
-          type: String(tx.transaction_type || tx.type || '').trim(),
-          amount: String(tx.amount || '').trim(),
-          status: String(tx.status || tx.payment_status || '').trim(),
-          created_at: String(tx.created_at || '').trim(),
-        });
+        rows.push({ doc, tx, _ms: toMs(tx.created_at) });
       }
+      rows.sort((a, b) => b._ms - a._ms);
+      const transactions = rows.slice(0, 5).map(({ doc, tx }) => ({
+        transaction_id: doc.id,
+        type: String(tx.transaction_type || tx.type || '').trim(),
+        amount: String(tx.amount || '').trim(),
+        status: String(tx.status || tx.payment_status || '').trim(),
+        created_at: String(tx.created_at || '').trim(),
+      }));
 
       const latestTx = transactions[0] || null;
       return {
