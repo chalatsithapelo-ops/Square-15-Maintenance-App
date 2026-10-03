@@ -7,7 +7,7 @@ upload/deploy a minimal set of files to GitHub/Render.
 
 # ── Version tag — bump this on every deploy so we can verify Render runs the
 # latest code.  Check Render logs for the startup banner.
-WORKER_VERSION = "2026-10-03-payment-chooser-v1"
+WORKER_VERSION = "2026-10-03-payment-chooser-v2-payfast-bnpl"
 
 import os
 import sys
@@ -613,7 +613,7 @@ async def entrypoint(ctx: JobContext):
             "    - WALLET → this moves money instantly. Tell them the exact amount and get a clear 'yes' FIRST, then call pay_with_wallet(booking_id, payment_type).\n"
             "    - INSTANT EFT → call request_payment_link(booking_id, payment_type, payment_method='eft') — sends a secure PayFast EFT link to their phone.\n"
             "    - CARD → call request_payment_link(booking_id, payment_type, payment_method='card') — sends a secure PayFast card link to their phone.\n"
-            "    - BUY-NOW-PAY-LATER → call pay_with_bnpl(booking_id, payment_type) — sends a checkout link to their phone.\n"
+            "    - BUY-NOW-PAY-LATER → call pay_with_bnpl(booking_id, payment_type, provider) — PayFast buy-now-pay-later. provider is 'moretyme' (default), 'mobicred', or 'rcs'. If the customer names one, pass it; otherwise use moretyme. Sends a secure link to their phone.\n"
             "  STEP 4: After the payment, CONFIRM it went through by calling check_payment(booking_id). Tell the customer the status, then continue — once money is in escrow the artisan proceeds.\n"
             "- WALLET SAFETY: NEVER charge the wallet without the customer explicitly choosing wallet AND confirming the amount out loud. If their balance is too low, offer EFT, card, or buy-now-pay-later instead.\n"
             "- If customer says 'deposit' or '35 percent' → use payment_type='deposit'. If 'full' or 'pay everything' → use payment_type='full'.\n"
@@ -2155,32 +2155,43 @@ async def entrypoint(ctx: JobContext):
 
     @llm.function_tool(
         description=(
-            "Start a BUY-NOW-PAY-LATER checkout for a booking. Call this when the customer "
-            "chooses buy-now-pay-later, BNPL, 'pay later', or instalments. Sends a checkout "
-            "link to their phone. Only after an artisan has accepted the job. "
+            "Start a BUY-NOW-PAY-LATER checkout for a booking via PayFast. Call this when the "
+            "customer chooses buy-now-pay-later, BNPL, 'pay later', or instalments. Sends a "
+            "secure PayFast BNPL link to their phone. Only after an artisan has accepted the job. "
+            "provider options: 'moretyme' (default), 'mobicred', or 'rcs'. "
             "Use payment_type='full' or 'deposit'."
         )
     )
-    async def pay_with_bnpl(booking_id: str, payment_type: str = "full") -> str:
-        """Start a buy-now-pay-later checkout via the backend action."""
+    async def pay_with_bnpl(booking_id: str, payment_type: str = "full", provider: str = "moretyme") -> str:
+        """Start a PayFast buy-now-pay-later checkout via request_payment_link."""
         nonlocal backend_client
         if not backend_client:
             if not await _ensure_backend_or_retry():
                 return _CONNECTION_RETRY_MSG
 
+        # Map spoken provider name to a PayFast BNPL method code; backend also maps these.
+        prov = (provider or "moretyme").strip().lower()
+        method = {"moretyme": "mt", "more tyme": "mt", "mobicred": "mc", "rcs": "rc"}.get(prov, "mt")
+
         try:
             result = await backend_client.call_backend_action(
-                'request_bnpl_link',
-                {'booking_id': booking_id, 'payment_type': payment_type, 'source': 'voice'}
+                'request_payment_link',
+                {'booking_id': booking_id, 'payment_type': payment_type, 'payment_method': method, 'source': 'voice'}
             )
             if not result.get('ok') and not result.get('success'):
                 error = str(result.get('error', 'unknown_error'))
                 if 'artisan' in error.lower():
                     return "An artisan hasn't accepted this job yet. Payment is available once an artisan accepts."
+                if error == 'no_confirmed_price':
+                    return "This booking doesn't have a confirmed price yet."
                 return f"I couldn't start buy-now-pay-later: {error}"
 
             data = result.get('data', result.get('result', {}))
-            return data.get('message', "A buy-now-pay-later checkout has been sent to your phone.")
+            escrow_msg = " Your money is held securely in escrow until you confirm the work is done right."
+            message = data.get('message', '')
+            if message:
+                return message + escrow_msg
+            return "A buy-now-pay-later link has been sent to your phone." + escrow_msg
         except Exception as e:
             logger.error(f"pay_with_bnpl error: {e}", exc_info=True)
             return "Sorry, I had trouble starting buy-now-pay-later. Please try another method."
