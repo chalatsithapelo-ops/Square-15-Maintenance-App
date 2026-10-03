@@ -3656,7 +3656,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       }
 
       return { ok: true, status: 200, data: {
-        message: `A ${methodLabel} payment link for R${payAmount.toFixed(2)} ${itemSuffix} has been sent to your phone. Tap the notification to complete payment.`,
+        message: `Your ${methodLabel} payment link for R${payAmount.toFixed(2)} ${itemSuffix} has been sent to your phone. Tap the notification to complete payment.`,
         paymentUrl, reference: payRef, bookingId: bid, amount: payAmount, payment_type: paymentType, payment_method: pfMethod,
       }};
     } catch (err) {
