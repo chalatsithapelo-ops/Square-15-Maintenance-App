@@ -7,7 +7,7 @@ upload/deploy a minimal set of files to GitHub/Render.
 
 # ── Version tag — bump this on every deploy so we can verify Render runs the
 # latest code.  Check Render logs for the startup banner.
-WORKER_VERSION = "2026-09-28-personalize-v2"
+WORKER_VERSION = "2026-10-03-booking-flow-audit-v1"
 
 import os
 import sys
@@ -79,11 +79,10 @@ _FORBIDDEN_SPEECH_PATTERNS = [
     re.compile(r"\bsquare15_ui\b", re.IGNORECASE),
     re.compile(r"\bsquare15_app\b", re.IGNORECASE),
     re.compile(r"\bSQUARE15_UI\b", re.IGNORECASE),
-    # Prevent agent from CLAIMING it can see/analyse an image itself (the app does the analysis).
-    # NOTE: "opening the photo upload screen" is now a REAL feature (ui_navigate open_rfq_upload),
-    # so those phrases are intentionally NOT blocked — the app opens the screen and Lizzy announces it.
-    re.compile(r"\b(?:i\s+am\s+)?loading\s+(?:the\s+)?(?:picture|photo|image)s?\b", re.IGNORECASE),
-    re.compile(r"\b(?:let\s+me\s+)?(?:load|check)\s+(?:the\s+)?(?:picture|photo|image)s?\b", re.IGNORECASE),
+    # NOTE: photo-related phrases ("loading/checking the photo", "opening the photo upload")
+    # are intentionally NOT blocked. The app legitimately narrates photo upload/receipt via the
+    # speak channel, and Lizzy must be able to acknowledge photos. Blocking these previously
+    # nuked whole sentences to silence — the "kept quiet after photo upload" bug.
 ]
 
 
@@ -607,7 +606,8 @@ async def entrypoint(ctx: JobContext):
             "- NEVER say 'I cannot access', 'I am unable to', 'I don't have access to', or 'I need you to be authenticated'. ALWAYS try calling the relevant tool.\n"
             "- BACKEND tools for data: get_booking_status, list_my_bookings, explain_quote, check_payment, get_wallet_balance, get_messages, get_case_status.\n"
             "- BACKEND tools for ACTIONS: cancel_booking, reschedule_booking, send_message_to_artisan, send_message_to_client, send_message_to_admin, mark_booking_in_progress, artisan_cancel_and_reassign, submit_rating, submit_complaint. These tools EXECUTE real actions on the backend — use them, NOT ui_navigate.\n"
-            "- PAYMENT tools: request_payment_link (generates a PayFast payment link and sends it to the customer's phone). IMPORTANT: Only offer payment AFTER an artisan has accepted the job. NEVER offer payment immediately after booking creation. When customer wants to pay, ALWAYS ask 'Would you like to pay the full amount or a 35 percent deposit?' before calling request_payment_link.\n"
+            "- PAYMENT (after an artisan has accepted the job): the customer can pay from their Square 15 WALLET (instant) or by CARD. When they want to pay, FIRST ask 'Would you like to pay the full amount or a 35 percent deposit?'. Then: for CARD, call request_payment_link (sends a secure PayFast link to their phone); for WALLET, tell them they can confirm the payment on the in-app payment screen — open it with ui_navigate(action='open_wallet') if they need it — wallet charges are confirmed in-app for security. IMPORTANT: Only offer payment AFTER an artisan has accepted the job. NEVER offer payment immediately after booking creation.\n"
+            "- After a payment, CONFIRM it went through by calling check_payment(booking_id). Tell the customer the payment status, then continue — once payment is held in escrow the artisan proceeds with the job.\n"
             "- If customer says 'deposit' or '35 percent' → call request_payment_link with payment_type='deposit'\n"
             "- If customer says 'full' or 'pay everything' → call request_payment_link with payment_type='full'\n"
             "- RFQ QUOTE tools: generate_rfq_quote (trigger AI quote), accept_rfq (accept quote → payment), reject_rfq (negotiate quote). Use when handling RFQ requests.\n"
@@ -703,6 +703,19 @@ async def entrypoint(ctx: JobContext):
             "- QUOTE NEGOTIATION: When user says 'too expensive' or 'can you adjust' → call reject_rfq(booking_id, reason)\n"
             "- ALWAYS present the quote breakdown verbally: labour hours and rate, materials with markup, contingency, and grand total.\n"
             "- If the quote is not ready yet, say: 'The quote is still being prepared. Check back in a moment.'\n"
+            "\n"
+            "SERVICE LOCATION (CRITICAL — ALWAYS CONFIRM):\n"
+            "- Before creating ANY booking you MUST know where the artisan should go. If the customer has not told you, ASK: 'Where should I send the artisan — your current location, or a different address?'\n"
+            "- If they say their current location, pass service_address='current location'. If they give an address, pass it verbatim as service_address.\n"
+            "- NEVER create a booking without a location. Do not silently assume — always confirm it with the customer at least once.\n"
+            "\n"
+            "BOOKING COMPLETION (CRITICAL — ALWAYS FINISH THE JOB):\n"
+            "- Your job is NOT done until a booking is actually created. NEVER end with 'let me know if you need anything else', NEVER just say 'thank you', and NEVER go quiet BEFORE the booking has been created.\n"
+            "- Once you have a category, a problem description, a confirmed service location, and (for priced jobs) the customer's agreement to the price — CREATE THE BOOKING NOW by calling the booking action. Do not stall, do not keep asking questions, do not wait.\n"
+            "- After creating it, confirm to the customer that the booking is created and an artisan is being found. If a tool reports an error, tell the customer plainly and try again — do not pretend it worked and do not go silent.\n"
+            "\n"
+            "PHOTOS (ACKNOWLEDGE + CONTINUE):\n"
+            "- When the app tells you the customer uploaded or added photos, ACKNOWLEDGE it out loud (e.g. 'Thanks, I've got your photos') and CONTINUE the booking — do not go quiet. The app analyses the photos and gives you the findings; use them to enrich the problem description.\n"
             "\n"
             "BOOKING CREATION (IMPORTANT):\n"
             "- For a repair or issue booking (something is broken, leaking, blocked, or not working), a photo helps the artisan come prepared. AFTER you have confirmed the price and the customer agreed, OPEN the photo screen for them by calling ui_navigate(action='open_rfq_upload') with category_name, problem_description (enriched with diagnostic details), and service_address. This opens the photo screen on their phone; once they add a photo the app AUTOMATICALLY creates the booking and dispatches an artisan. Do NOT also call create_order_booking afterwards — the photo flow books it for you.\n"
@@ -2937,9 +2950,22 @@ async def entrypoint(ctx: JobContext):
                     staged_work_image_urls.extend(
                         [u for u in urls if isinstance(u, str) and u.strip()]
                     )
+                    n = len(staged_work_image_urls)
                     logger.info(
-                        f"📸 Staged {len(staged_work_image_urls)} photo(s) from app for the next booking"
+                        f"📸 Staged {n} photo(s) from app for the next booking"
                     )
+                    # Acknowledge receipt out loud so the customer knows the photo
+                    # landed and the booking will continue (fixes "stayed quiet after
+                    # I uploaded the picture").
+                    if n > 0:
+                        try:
+                            ack = (
+                                f"Got your {n} photo{'s' if n != 1 else ''} — thank you. "
+                                "I'll include them with your booking and continue."
+                            )
+                            session.say(ack, allow_interruptions=True)
+                        except Exception as _se:
+                            logger.debug(f"stage_photos ack say error: {_se}")
             elif action == "context":
                 # Store app context data (active bookings, user_id) for tool fallback
                 bookings = payload.get("active_bookings")
