@@ -7,7 +7,7 @@ upload/deploy a minimal set of files to GitHub/Render.
 
 # ── Version tag — bump this on every deploy so we can verify Render runs the
 # latest code.  Check Render logs for the startup banner.
-WORKER_VERSION = "2026-10-03-payment-chooser-v2-payfast-bnpl"
+WORKER_VERSION = "2026-10-11-debug-pay-route-wallet-bnpl"
 
 import os
 import sys
@@ -3164,9 +3164,14 @@ async def entrypoint(ctx: JobContext):
                                         "call create_booking. If they say 'RFQ' or 'quote request', pass is_rfq='yes'.\n"
                                         "- If user asks for a price/cost lookup BEFORE booking, call lookup_service_pricing "
                                         "then in your NEXT step (after the tool result) call create_booking with the returned job_ids.\n"
-                                        "- If user says 'send payment link', 'pay', 'I want to pay', 'send me a link to pay', "
-                                        "'request_payment_link' (verbatim), 'pay the full amount', 'pay deposit' — "
-                                        "call request_payment_link(booking_id=..., payment_type='full' or 'deposit'). "
+                                        "- PAYMENT — honor the method the user names:\n"
+                                        "    * 'from my wallet', 'use my wallet', 'charge my wallet', 'pay from wallet', 'wallet' — "
+                                        "call pay_with_wallet(booking_id=..., payment_type='full' or 'deposit').\n"
+                                        "    * 'buy now pay later', 'BNPL', 'pay later', 'instalments', 'moretyme', 'mobicred', 'rcs' — "
+                                        "call pay_with_bnpl(booking_id=..., payment_type='full' or 'deposit', provider='moretyme'|'mobicred'|'rcs').\n"
+                                        "    * Otherwise ('send payment link', 'pay', 'I want to pay', 'send me a link to pay', "
+                                        "'request_payment_link' (verbatim), 'pay the full amount', 'pay deposit', 'card', 'EFT') — "
+                                        "call request_payment_link(booking_id=..., payment_type='full' or 'deposit', payment_method='card' or 'eft'). "
                                         "NEVER call lookup_service_pricing with query='payment' — that is the WRONG tool. "
                                         "check_payment is only for 'did I pay?' / 'what is my payment status?'.\n"
                                         "- If user says 'accept the quote', 'I accept', 'go ahead' for an RFQ — call accept_rfq with the booking_id.\n"
