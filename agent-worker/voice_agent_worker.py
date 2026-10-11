@@ -1,13 +1,13 @@
-"""
+﻿"""
 LiveKit Voice Agent Worker - Cloud Deploy
 
 This file is a copy of the app worker script, placed in agent-worker/ so you can
 upload/deploy a minimal set of files to GitHub/Render.
 """
 
-# ── Version tag — bump this on every deploy so we can verify Render runs the
+# â”€â”€ Version tag â€” bump this on every deploy so we can verify Render runs the
 # latest code.  Check Render logs for the startup banner.
-WORKER_VERSION = "2026-10-11-debug-wallet-immediate-charge"
+WORKER_VERSION = "2026-10-11-debug-wallet-only-tool"
 
 import os
 import sys
@@ -42,7 +42,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Module-level pricing cache — updated on every successful pricing lookup.
+# Module-level pricing cache â€” updated on every successful pricing lookup.
 # Used as fallback when the backend is unreachable.
 _pricing_cache: Optional[str] = None
 
@@ -82,7 +82,7 @@ _FORBIDDEN_SPEECH_PATTERNS = [
     # NOTE: photo-related phrases ("loading/checking the photo", "opening the photo upload")
     # are intentionally NOT blocked. The app legitimately narrates photo upload/receipt via the
     # speak channel, and Lizzy must be able to acknowledge photos. Blocking these previously
-    # nuked whole sentences to silence — the "kept quiet after photo upload" bug.
+    # nuked whole sentences to silence â€” the "kept quiet after photo upload" bug.
 ]
 
 
@@ -123,12 +123,12 @@ def _format_currency_for_speech(text: str) -> str:
     """Convert South African Rand currency amounts to natural spoken language.
     
     Converts patterns like:
-      R1,000,000   → 1 million rand
-      R1000000     → 1 million rand
-      R1,000       → 1 thousand rand
-      R250.50      → 250 rand and 50 cents
-      R100         → 100 rand
-      R0.50        → 50 cents
+      R1,000,000   â†’ 1 million rand
+      R1000000     â†’ 1 million rand
+      R1,000       â†’ 1 thousand rand
+      R250.50      â†’ 250 rand and 50 cents
+      R100         â†’ 100 rand
+      R0.50        â†’ 50 cents
     """
     import re as _re
 
@@ -444,18 +444,18 @@ class BackendAPIClient:
 
 async def entrypoint(ctx: JobContext):
     room_name = ctx.room.name
-    logger.info(f"🎯 New job received for room: {room_name}  [worker v{WORKER_VERSION}]")
+    logger.info(f"ðŸŽ¯ New job received for room: {room_name}  [worker v{WORKER_VERSION}]")
 
     openai_key = os.getenv("OPENAI_API_KEY")
     if not openai_key:
-        logger.error("❌ OPENAI_API_KEY not set!")
+        logger.error("âŒ OPENAI_API_KEY not set!")
         return
 
     # Backend API configuration
     backend_url = os.getenv("BACKEND_API_URL", "https://square15-livekit-backend.onrender.com")
     if not os.getenv("BACKEND_API_URL"):
-        logger.warning("⚠️ BACKEND_API_URL not set — using hardcoded fallback. Set this env var in production.")
-    logger.info(f"📡 Backend API URL: {backend_url}")
+        logger.warning("âš ï¸ BACKEND_API_URL not set â€” using hardcoded fallback. Set this env var in production.")
+    logger.info(f"ðŸ“¡ Backend API URL: {backend_url}")
 
     # Initialize backend client (will be updated with token/session after voice start)
     backend_client = None
@@ -473,14 +473,14 @@ async def entrypoint(ctx: JobContext):
     # Idempotency guard for create_booking. The LLM frequently emits two parallel
     # create_booking calls for a single user request (often one direct + one via
     # ui_navigate(create_order_booking) redirect), and the backend create flow is
-    # NOT idempotent — each call produced a separate booking doc (duplicate
+    # NOT idempotent â€” each call produced a separate booking doc (duplicate
     # dispatch + duplicate charge). Serialize identical creates and return the
     # first result for any duplicate within the dedup window.
     _create_booking_lock = asyncio.Lock()
     _recent_booking_creates = {}  # sig -> {'ts': monotonic, 'result': str}
     _CREATE_DEDUP_WINDOW_S = 120
 
-    logger.info(f"📡 Connecting to room: {room_name}")
+    logger.info(f"ðŸ“¡ Connecting to room: {room_name}")
 
     # Build version breadcrumb so /debug/voice-e2e can confirm deployment.
     try:
@@ -499,34 +499,34 @@ async def entrypoint(ctx: JobContext):
     for attempt in range(max_retries):
         try:
             await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
-            logger.info(f"✅ Agent connected to room: {room_name}")
+            logger.info(f"âœ… Agent connected to room: {room_name}")
             break
         except Exception as e:
             if attempt < max_retries - 1:
                 logger.warning(
-                    f"⚠️ Connection attempt {attempt + 1} failed: {e}. Retrying..."
+                    f"âš ï¸ Connection attempt {attempt + 1} failed: {e}. Retrying..."
                 )
                 await asyncio.sleep(2**attempt)
             else:
-                logger.error(f"❌ Failed to connect after {max_retries} attempts: {e}")
+                logger.error(f"âŒ Failed to connect after {max_retries} attempts: {e}")
                 raise
 
-    logger.info("🎤 Loading Voice Activity Detection...")
+    logger.info("ðŸŽ¤ Loading Voice Activity Detection...")
     if not hasattr(silero, "VAD"):
         raise RuntimeError(
             "Silero plugin not available (silero.VAD missing). Install 'livekit-plugins-silero'."
         )
     # Tuned for low-latency conversational feel:
-    #   min_silence_duration: 0.25s (default 0.55) – detect end-of-speech faster
-    #   prefix_padding_duration: 0.3s (default 0.5) – less audio buffering
-    #   activation_threshold: 0.4 (default 0.5) – slightly more sensitive
+    #   min_silence_duration: 0.25s (default 0.55) â€“ detect end-of-speech faster
+    #   prefix_padding_duration: 0.3s (default 0.5) â€“ less audio buffering
+    #   activation_threshold: 0.4 (default 0.5) â€“ slightly more sensitive
     vad = silero.VAD.load(
         min_silence_duration=0.25,
         prefix_padding_duration=0.3,
         activation_threshold=0.4,
     )
 
-    logger.info("🤖 Creating voice agent...")
+    logger.info("ðŸ¤– Creating voice agent...")
 
     async def _detect_caller_role() -> str:
         """Best-effort role detection from the non-agent participant identity."""
@@ -553,7 +553,7 @@ async def entrypoint(ctx: JobContext):
         return "client"
 
     caller_role = await _detect_caller_role()
-    logger.info(f"🧭 Detected caller role: {caller_role}")
+    logger.info(f"ðŸ§­ Detected caller role: {caller_role}")
 
     async def _set_agent_metadata(meta: dict) -> None:
         """Set agent participant metadata in a way that works across SDK versions.
@@ -569,7 +569,7 @@ async def entrypoint(ctx: JobContext):
             if inspect.isawaitable(result):
                 await result
         except Exception as e:
-            logger.warning(f"⚠️ Failed to set agent metadata: {e}")
+            logger.warning(f"âš ï¸ Failed to set agent metadata: {e}")
 
     # Emit a handshake metadata packet so the mobile app can verify
     # it is receiving participant metadata updates from the agent.
@@ -582,16 +582,16 @@ async def entrypoint(ctx: JobContext):
                 "text": "Agent ready",
             }
         )
-        logger.info("✅ Sent agent_ready metadata")
+        logger.info("âœ… Sent agent_ready metadata")
     except Exception as e:
-        logger.warning(f"⚠️ Failed to send agent_ready metadata: {e}")
+        logger.warning(f"âš ï¸ Failed to send agent_ready metadata: {e}")
 
     def _instructions_for_role(role: str) -> str:
         role = (role or "client").strip().lower()
 
         base = (
             f"You are Lizzy, the Square 15 Voice AI Assistant, speaking to a {role.upper()} user.\n\n"
-            "TRUST & SAFETY FACTS (use ONLY these — never invent warranties, insurance, criminal-background checks, or licence claims):\n"
+            "TRUST & SAFETY FACTS (use ONLY these â€” never invent warranties, insurance, criminal-background checks, or licence claims):\n"
             "- Escrow: every payment is held by Square 15 and only released to the artisan after the customer confirms the job is done right.\n"
             "- Vetting: every active artisan is registered with Square 15, has submitted government ID, and is rated by past customers.\n"
             "- Identity check: when the artisan is on the way, the system sends the customer the artisan's profile photo via WhatsApp so they can match the face at the door.\n"
@@ -602,28 +602,28 @@ async def entrypoint(ctx: JobContext):
             "RULES:\n"
             "- Greet once, then just help. Never repeat your introduction.\n"
             "- If you are given the user's first name, use it: greet them by name and address them by their first name at least once more during the conversation so it feels personal and warm. Never overuse it.\n"
-            "- When user asks to DO something, CALL the right tool immediately. Do NOT describe what you would do — just do it.\n"
+            "- When user asks to DO something, CALL the right tool immediately. Do NOT describe what you would do â€” just do it.\n"
             "- NEVER say 'I cannot access', 'I am unable to', 'I don't have access to', or 'I need you to be authenticated'. ALWAYS try calling the relevant tool.\n"
             "- BACKEND tools for data: get_booking_status, list_my_bookings, explain_quote, check_payment, get_wallet_balance, get_messages, get_case_status.\n"
-            "- BACKEND tools for ACTIONS: cancel_booking, reschedule_booking, send_message_to_artisan, send_message_to_client, send_message_to_admin, mark_booking_in_progress, artisan_cancel_and_reassign, submit_rating, submit_complaint. These tools EXECUTE real actions on the backend — use them, NOT ui_navigate.\n"
-            "- PAYMENT (only AFTER an artisan has accepted the job — NEVER offer payment right after booking creation):\n"
+            "- BACKEND tools for ACTIONS: cancel_booking, reschedule_booking, send_message_to_artisan, send_message_to_client, send_message_to_admin, mark_booking_in_progress, artisan_cancel_and_reassign, submit_rating, submit_complaint. These tools EXECUTE real actions on the backend â€” use them, NOT ui_navigate.\n"
+            "- PAYMENT (only AFTER an artisan has accepted the job â€” NEVER offer payment right after booking creation):\n"
             "  STEP 1: Ask 'Would you like to pay the full amount or a 35 percent deposit?' (payment_type='full' or 'deposit').\n"
-            "  STEP 2: Ask the customer to CHOOSE a method: 'How would you like to pay — from your Square 15 wallet, by instant EFT, by card, or buy-now-pay-later?' Let THEM choose; never pick for them.\n"
+            "  STEP 2: Ask the customer to CHOOSE a method: 'How would you like to pay â€” from your Square 15 wallet, by instant EFT, by card, or buy-now-pay-later?' Let THEM choose; never pick for them.\n"
             "  STEP 3: Route to the method they chose:\n"
-            "    - WALLET → this moves money instantly. Tell them the exact amount and get a clear 'yes' FIRST, then call pay_with_wallet(booking_id, payment_type).\n"
-            "    - INSTANT EFT → call request_payment_link(booking_id, payment_type, payment_method='eft') — sends a secure PayFast EFT link to their phone.\n"
-            "    - CARD → call request_payment_link(booking_id, payment_type, payment_method='card') — sends a secure PayFast card link to their phone.\n"
-            "    - BUY-NOW-PAY-LATER → call pay_with_bnpl(booking_id, payment_type, provider) — PayFast buy-now-pay-later. provider is 'moretyme' (default), 'mobicred', or 'rcs'. If the customer names one, pass it; otherwise use moretyme. Sends a secure link to their phone.\n"
-            "  STEP 4: After the payment, CONFIRM it went through by calling check_payment(booking_id). Tell the customer the status, then continue — once money is in escrow the artisan proceeds.\n"
+            "    - WALLET â†’ this moves money instantly. Tell them the exact amount and get a clear 'yes' FIRST, then call pay_with_wallet(booking_id, payment_type).\n"
+            "    - INSTANT EFT â†’ call request_payment_link(booking_id, payment_type, payment_method='eft') â€” sends a secure PayFast EFT link to their phone.\n"
+            "    - CARD â†’ call request_payment_link(booking_id, payment_type, payment_method='card') â€” sends a secure PayFast card link to their phone.\n"
+            "    - BUY-NOW-PAY-LATER â†’ call pay_with_bnpl(booking_id, payment_type, provider) â€” PayFast buy-now-pay-later. provider is 'moretyme' (default), 'mobicred', or 'rcs'. If the customer names one, pass it; otherwise use moretyme. Sends a secure link to their phone.\n"
+            "  STEP 4: After the payment, CONFIRM it went through by calling check_payment(booking_id). Tell the customer the status, then continue â€” once money is in escrow the artisan proceeds.\n"
             "- WALLET SAFETY: NEVER charge the wallet without the customer explicitly choosing wallet AND confirming the amount out loud. If their balance is too low, offer EFT, card, or buy-now-pay-later instead.\n"
-            "- If customer says 'deposit' or '35 percent' → use payment_type='deposit'. If 'full' or 'pay everything' → use payment_type='full'.\n"
-            "- RFQ QUOTE tools: generate_rfq_quote (trigger AI quote), accept_rfq (accept quote → payment), reject_rfq (negotiate quote). Use when handling RFQ requests.\n"
+            "- If customer says 'deposit' or '35 percent' â†’ use payment_type='deposit'. If 'full' or 'pay everything' â†’ use payment_type='full'.\n"
+            "- RFQ QUOTE tools: generate_rfq_quote (trigger AI quote), accept_rfq (accept quote â†’ payment), reject_rfq (negotiate quote). Use when handling RFQ requests.\n"
             "- lookup_service_pricing for pricing: when user asks 'how much is...', 'what's the price for...', call lookup_service_pricing.\n"
-            "- FINANCE tools (admin-only, read-only): get_finance_overview, get_daily_revenue_report, get_failed_payments_report, get_fraud_alerts_report. Use when admin asks 'What's the revenue today?', 'Any failed payments?', 'Show financial summary', 'Any fraud alerts?'. These are READ-ONLY and safe. NEVER process refunds, payouts, or wallet adjustments via voice — those require the admin app approval workflow.\n"
+            "- FINANCE tools (admin-only, read-only): get_finance_overview, get_daily_revenue_report, get_failed_payments_report, get_fraud_alerts_report. Use when admin asks 'What's the revenue today?', 'Any failed payments?', 'Show financial summary', 'Any fraud alerts?'. These are READ-ONLY and safe. NEVER process refunds, payouts, or wallet adjustments via voice â€” those require the admin app approval workflow.\n"
             "- ui_navigate ONLY for opening screens/navigation: open_bookings_tab, open_future_bookings, open_wallet, open_profile, open_settings, open_notifications, open_calendar, open_help, open_support, go_home, go_back, close_window, create_order_booking, open_rfq_upload, call_assigned_artisan.\n"
             "- NEVER use ui_navigate for cancel_booking, reschedule_booking, send_message_to_artisan, send_message_to_client, send_message_to_admin, mark_booking_in_progress, artisan_cancel_and_reassign. Use the dedicated tools instead.\n"
             "- NEVER narrate tool calls. Never say JSON, function names, or metadata.\n"
-            "- You CAN open the photo upload screen for the customer with ui_navigate(action='open_rfq_upload'). Do NOT claim you can personally SEE or analyse a photo — the app analyses uploaded photos and gives you the findings.\n"
+            "- You CAN open the photo upload screen for the customer with ui_navigate(action='open_rfq_upload'). Do NOT claim you can personally SEE or analyse a photo â€” the app analyses uploaded photos and gives you the findings.\n"
             "- NEVER claim you opened a map or showed a location. There is no map feature.\n"
             "- Speak naturally, 1-3 short sentences. Be concise.\n"
             "- CURRENCY: When speaking amounts, say the full words. Say 'one million rand' NOT 'R1000000'. "
@@ -633,7 +633,7 @@ async def entrypoint(ctx: JobContext):
             "- Date format: YYYY-MM-DD. Time format: HH:MM.\n"
             "- If user refers to a booking by price, call list_my_bookings first to find it.\n"
             "\n"
-            "BOOKING LOOKUP (CRITICAL — MUST USE TOOLS):\n"
+            "BOOKING LOOKUP (CRITICAL â€” MUST USE TOOLS):\n"
             "- When user asks about a booking, 'where is my artisan/plumber?', 'what's the status of my booking?', or similar:\n"
             "  1. FIRST call list_my_bookings() to get their bookings.\n"
             "  2. Find the relevant booking from the results (match by category, artisan, date, or pick the most recent active one).\n"
@@ -641,54 +641,54 @@ async def entrypoint(ctx: JobContext):
             "  4. Tell the user the booking status, artisan name, and any relevant info.\n"
             "- NEVER say you 'can't access bookings' or 'unable to retrieve'. ALWAYS call list_my_bookings first. Even if there's an error, try the tool.\n"
             "\n"
-            "MESSAGING & CHAT (IMPORTANT — USE BACKEND TOOLS, NOT ui_navigate):\n"
-            "- 'Open chat' / 'open messages' / 'contact support' → call ui_navigate(action='open_support')\n"
-            "- 'Send message to artisan' / 'tell artisan ...' → call send_message_to_artisan(booking_id, message). Get booking_id from list_my_bookings if needed. This SENDS the message via the backend.\n"
-            "- 'Send message to client' / 'tell client ...' / 'message the client' → call send_message_to_client(booking_id, message). Get booking_id from list_my_bookings if needed. This SENDS the message via the backend.\n"
-            "- 'Contact admin' / 'send message to support' → call send_message_to_admin(message, subject). This SENDS the message via the backend.\n"
-            "- 'Show messages' / 'read messages for booking' → call get_messages(booking_id)\n"
+            "MESSAGING & CHAT (IMPORTANT â€” USE BACKEND TOOLS, NOT ui_navigate):\n"
+            "- 'Open chat' / 'open messages' / 'contact support' â†’ call ui_navigate(action='open_support')\n"
+            "- 'Send message to artisan' / 'tell artisan ...' â†’ call send_message_to_artisan(booking_id, message). Get booking_id from list_my_bookings if needed. This SENDS the message via the backend.\n"
+            "- 'Send message to client' / 'tell client ...' / 'message the client' â†’ call send_message_to_client(booking_id, message). Get booking_id from list_my_bookings if needed. This SENDS the message via the backend.\n"
+            "- 'Contact admin' / 'send message to support' â†’ call send_message_to_admin(message, subject). This SENDS the message via the backend.\n"
+            "- 'Show messages' / 'read messages for booking' â†’ call get_messages(booking_id)\n"
             "\n"
             "SUPPORT CASES:\n"
-            "- 'Show my cases' / 'do I have open tickets?' → call list_my_cases(state='open') or list_my_cases() for all\n"
-            "- 'Reply to case' / 'follow up on my ticket' → call reply_to_case(case_id, message)\n"
-            "- 'Check case status' → call get_case_status(case_id)\n"
+            "- 'Show my cases' / 'do I have open tickets?' â†’ call list_my_cases(state='open') or list_my_cases() for all\n"
+            "- 'Reply to case' / 'follow up on my ticket' â†’ call reply_to_case(case_id, message)\n"
+            "- 'Check case status' â†’ call get_case_status(case_id)\n"
             "- When a user has an issue and wants admin help, first create a case with send_message_to_admin(message, subject).\n"
             "- If they want to follow up, use reply_to_case with the case_id.\n"
             "\n"
-            "BOOKING MANAGEMENT (CRITICAL — USE DEDICATED TOOLS, NOT ui_navigate):\n"
+            "BOOKING MANAGEMENT (CRITICAL â€” USE DEDICATED TOOLS, NOT ui_navigate):\n"
             "- When user asks to cancel, reschedule, check status, or do anything with a booking:\n"
             "  1. If they don't give a booking ID, call list_my_bookings() first to find it.\n"
-            "  2. Then CALL the specific BACKEND tool — these EXECUTE the action:\n"
-            "- Cancel: cancel_booking(booking_id, reason) — actually cancels the booking on the server\n"
-            "- Reschedule: reschedule_booking(booking_id, scheduled_date, scheduled_time) — actually reschedules on the server\n"
+            "  2. Then CALL the specific BACKEND tool â€” these EXECUTE the action:\n"
+            "- Cancel: cancel_booking(booking_id, reason) â€” actually cancels the booking on the server\n"
+            "- Reschedule: reschedule_booking(booking_id, scheduled_date, scheduled_time) â€” actually reschedules on the server\n"
             "- Check status: get_booking_status(booking_id)\n"
             "- Call artisan: ui_navigate(action='call_assigned_artisan', booking_id=...)\n"
-            "- Send message to artisan: send_message_to_artisan(booking_id, message) — actually sends the message\n"
+            "- Send message to artisan: send_message_to_artisan(booking_id, message) â€” actually sends the message\n"
             "- IMPORTANT: NEVER use ui_navigate for cancel, reschedule, or messaging. Those only open screens. Use the dedicated tools to execute the action.\n"
             "\n"
-            "PRICING ENQUIRIES (CRITICAL — MUST USE TOOL):\n"
+            "PRICING ENQUIRIES (CRITICAL â€” MUST USE TOOL):\n"
             "- When user asks how much a service costs, MUST call lookup_service_pricing. Do NOT answer without calling this tool.\n"
             "- Pass query with the service name (e.g. query='plumbing', query='unblock toilet', query='painting').\n"
             "- The tool ALWAYS returns pricing data. Read back the prices from the results.\n"
             "- If cost is null for a service, say 'This service requires a quote from an artisan'.\n"
             "- NEVER guess or make up prices. ALWAYS call lookup_service_pricing.\n"
             "\n"
-            "DIAGNOSIS & QUOTING (IMPORTANT — ASK BEFORE BOOKING):\n"
+            "DIAGNOSIS & QUOTING (IMPORTANT â€” ASK BEFORE BOOKING):\n"
             "- When a user describes a maintenance problem, DO NOT immediately create a booking.\n"
             "- First, ask 2-3 diagnostic follow-up questions to understand scope and severity:\n"
             "  1. SCOPE: 'Is this affecting a small area or a large area?' / 'How many rooms or fixtures are affected?'\n"
             "  2. URGENCY: 'How long has this been happening?' / 'Is there active water flow, sparks, or danger right now?'\n"
-            "  3. DETAIL: 'Can you describe what you see — any cracks, leaks, discolouration, or damage?'\n"
+            "  3. DETAIL: 'Can you describe what you see â€” any cracks, leaks, discolouration, or damage?'\n"
             "- Use the answers to build a RICH problem_description. Combine the user's original description with the diagnostic details.\n"
-            "  Example: If user says 'my toilet is blocked' and answers 'just one toilet, been 2 days, water rises but drains slowly' →\n"
+            "  Example: If user says 'my toilet is blocked' and answers 'just one toilet, been 2 days, water rises but drains slowly' â†’\n"
             "  problem_description = 'Blocked toilet - single unit, issue for 2 days, water rises but drains slowly, no overflow yet'\n"
             "- For SUB-CATEGORY precision, ask: 'Is this a [option A], [option B], or something else?'\n"
             "  Examples by category:\n"
-            "    Plumbing → 'Is this a blocked drain, a leaking pipe, a geyser issue, or something else?'\n"
-            "    Electrical → 'Is this a tripping breaker, a faulty outlet, flickering lights, or something else?'\n"
-            "    Painting → 'Is this interior or exterior? Roughly how many square metres?'\n"
-            "    Roofing → 'Is this a leak, missing tiles, gutter damage, or waterproofing needed?'\n"
-            "    Carpentry → 'Is this a door, window frame, cabinet, or structural timber issue?'\n"
+            "    Plumbing â†’ 'Is this a blocked drain, a leaking pipe, a geyser issue, or something else?'\n"
+            "    Electrical â†’ 'Is this a tripping breaker, a faulty outlet, flickering lights, or something else?'\n"
+            "    Painting â†’ 'Is this interior or exterior? Roughly how many square metres?'\n"
+            "    Roofing â†’ 'Is this a leak, missing tiles, gutter damage, or waterproofing needed?'\n"
+            "    Carpentry â†’ 'Is this a door, window frame, cabinet, or structural timber issue?'\n"
             "- ONLY after gathering these details, proceed to create the booking.\n"
             "- If the user says 'just book it' or 'skip the questions', proceed immediately with what you have.\n"
             "\n"
@@ -706,45 +706,45 @@ async def entrypoint(ctx: JobContext):
             "  1. Call list_my_bookings() to find the RFQ booking.\n"
             "  2. Call explain_quote(booking_id) to get the AI-generated breakdown.\n"
             "  3. Read back: labour cost, materials list, equipment, contingency, and grand total.\n"
-            "- QUOTE ACCEPTANCE: When user says 'accept the quote' or 'go ahead' → call accept_rfq(booking_id)\n"
-            "- QUOTE NEGOTIATION: When user says 'too expensive' or 'can you adjust' → call reject_rfq(booking_id, reason)\n"
+            "- QUOTE ACCEPTANCE: When user says 'accept the quote' or 'go ahead' â†’ call accept_rfq(booking_id)\n"
+            "- QUOTE NEGOTIATION: When user says 'too expensive' or 'can you adjust' â†’ call reject_rfq(booking_id, reason)\n"
             "- ALWAYS present the quote breakdown verbally: labour hours and rate, materials with markup, contingency, and grand total.\n"
             "- If the quote is not ready yet, say: 'The quote is still being prepared. Check back in a moment.'\n"
             "\n"
-            "SERVICE LOCATION (CRITICAL — ALWAYS CONFIRM):\n"
-            "- Before creating ANY booking you MUST know where the artisan should go. If the customer has not told you, ASK: 'Where should I send the artisan — your current location, or a different address?'\n"
+            "SERVICE LOCATION (CRITICAL â€” ALWAYS CONFIRM):\n"
+            "- Before creating ANY booking you MUST know where the artisan should go. If the customer has not told you, ASK: 'Where should I send the artisan â€” your current location, or a different address?'\n"
             "- If they say their current location, pass service_address='current location'. If they give an address, pass it verbatim as service_address.\n"
-            "- NEVER create a booking without a location. Do not silently assume — always confirm it with the customer at least once.\n"
+            "- NEVER create a booking without a location. Do not silently assume â€” always confirm it with the customer at least once.\n"
             "\n"
-            "BOOKING COMPLETION (CRITICAL — ALWAYS FINISH THE JOB):\n"
+            "BOOKING COMPLETION (CRITICAL â€” ALWAYS FINISH THE JOB):\n"
             "- Your job is NOT done until a booking is actually created. NEVER end with 'let me know if you need anything else', NEVER just say 'thank you', and NEVER go quiet BEFORE the booking has been created.\n"
-            "- Once you have a category, a problem description, a confirmed service location, and (for priced jobs) the customer's agreement to the price — CREATE THE BOOKING NOW by calling the booking action. Do not stall, do not keep asking questions, do not wait.\n"
-            "- After creating it, confirm to the customer that the booking is created and an artisan is being found. If a tool reports an error, tell the customer plainly and try again — do not pretend it worked and do not go silent.\n"
+            "- Once you have a category, a problem description, a confirmed service location, and (for priced jobs) the customer's agreement to the price â€” CREATE THE BOOKING NOW by calling the booking action. Do not stall, do not keep asking questions, do not wait.\n"
+            "- After creating it, confirm to the customer that the booking is created and an artisan is being found. If a tool reports an error, tell the customer plainly and try again â€” do not pretend it worked and do not go silent.\n"
             "\n"
             "PHOTOS (ACKNOWLEDGE + CONTINUE):\n"
-            "- When the app tells you the customer uploaded or added photos, ACKNOWLEDGE it out loud (e.g. 'Thanks, I've got your photos') and CONTINUE the booking — do not go quiet. The app analyses the photos and gives you the findings; use them to enrich the problem description.\n"
+            "- When the app tells you the customer uploaded or added photos, ACKNOWLEDGE it out loud (e.g. 'Thanks, I've got your photos') and CONTINUE the booking â€” do not go quiet. The app analyses the photos and gives you the findings; use them to enrich the problem description.\n"
             "\n"
             "BOOKING CREATION (IMPORTANT):\n"
-            "- For a repair or issue booking (something is broken, leaking, blocked, or not working), a photo helps the artisan come prepared. AFTER you have confirmed the price and the customer agreed, OPEN the photo screen for them by calling ui_navigate(action='open_rfq_upload') with category_name, problem_description (enriched with diagnostic details), and service_address. This opens the photo screen on their phone; once they add a photo the app AUTOMATICALLY creates the booking and dispatches an artisan. Do NOT also call create_order_booking afterwards — the photo flow books it for you.\n"
+            "- For a repair or issue booking (something is broken, leaking, blocked, or not working), a photo helps the artisan come prepared. AFTER you have confirmed the price and the customer agreed, OPEN the photo screen for them by calling ui_navigate(action='open_rfq_upload') with category_name, problem_description (enriched with diagnostic details), and service_address. This opens the photo screen on their phone; once they add a photo the app AUTOMATICALLY creates the booking and dispatches an artisan. Do NOT also call create_order_booking afterwards â€” the photo flow books it for you.\n"
             "- If the customer says they cannot or do not want to add a photo, do NOT block them: create the booking directly with ui_navigate(action='create_order_booking') using category_name, problem_description, and optionally scheduled_date, scheduled_time, service_address.\n"
             "- After calling either action, say 'I am processing your booking now, please keep the app open.' Do NOT say an artisan has been dispatched until confirmed.\n"
             "- Do NOT use open_map or show_location actions. They do not exist.\n"
             "\n"
-            "PRICE CONFIRMATION (CRITICAL — NEVER SKIP):\n"
+            "PRICE CONFIRMATION (CRITICAL â€” NEVER SKIP):\n"
             "- After calling lookup_service_pricing, you MUST present the price to the customer and WAIT for their explicit confirmation BEFORE calling ui_navigate(action='create_order_booking').\n"
             "- Say something like: 'The cost for [service] is [amount] rand. Shall I go ahead and create the booking?'\n"
             "- Do NOT create a booking in the same turn as the pricing lookup. You must STOP and wait for the customer to say yes or confirm.\n"
             "- Only after the customer confirms (e.g. 'yes', 'ok', 'go ahead', 'book it') should you create the booking.\n"
-            "- If the customer questions the price or wants to negotiate, do NOT create the booking — explain the pricing and wait.\n"
+            "- If the customer questions the price or wants to negotiate, do NOT create the booking â€” explain the pricing and wait.\n"
             "- This applies even if you already have all other details (category, address, description). The price MUST be confirmed first.\n"
             "\n"
             "SCREEN AWARENESS & APP CONTROL (IMPORTANT):\n"
             "- You can see what screen the user is on and what actions are available.\n"
-            "- When user asks 'what's on my screen?', 'where am I?', 'what can I do here?' → call get_current_screen()\n"
-            "- When user asks 'analyze this', 'explain this page', 'what does this mean?' → call analyze_screen()\n"
-            "- When user asks 'what can you do?', 'what features are available?' → call list_app_features()\n"
+            "- When user asks 'what's on my screen?', 'where am I?', 'what can I do here?' â†’ call get_current_screen()\n"
+            "- When user asks 'analyze this', 'explain this page', 'what does this mean?' â†’ call analyze_screen()\n"
+            "- When user asks 'what can you do?', 'what features are available?' â†’ call list_app_features()\n"
             "- You control the app completely: navigate to any screen, execute any action, check any data.\n"
-            "- Think of yourself as the user's personal app assistant — they talk, you do.\n"
+            "- Think of yourself as the user's personal app assistant â€” they talk, you do.\n"
             "\n"
             "SERVICE AREA RESTRICTIONS:\n"
             "- Square 15 currently operates in specific service areas only (phased launch).\n"
@@ -757,10 +757,10 @@ async def entrypoint(ctx: JobContext):
         if role == "artisan":
             base += (
                 "\nARTISAN ACTIONS:\n"
-                "- Accept job → ui_navigate(action='accept_latest_request')\n"
-                "- Reject job → ui_navigate(action='reject_latest_request')\n"
-                "- Start job → mark_booking_in_progress(booking_id)\n"
-                "- Cancel+reassign → artisan_cancel_and_reassign(booking_id, reason)\n"
+                "- Accept job â†’ ui_navigate(action='accept_latest_request')\n"
+                "- Reject job â†’ ui_navigate(action='reject_latest_request')\n"
+                "- Start job â†’ mark_booking_in_progress(booking_id)\n"
+                "- Cancel+reassign â†’ artisan_cancel_and_reassign(booking_id, reason)\n"
                 "  IMPORTANT: Before calling artisan_cancel_and_reassign, you MUST ask the artisan to confirm. "
                 "Say something like 'Are you sure you want to cancel this job and have it reassigned to another artisan?' "
                 "Only proceed if the artisan explicitly says yes.\n"
@@ -773,7 +773,7 @@ async def entrypoint(ctx: JobContext):
                 "- Create booking: First run the DIAGNOSIS flow (ask 2-3 questions about scope, urgency, and sub-category), then confirm the price and wait for the customer to agree. "
                 "Then, for a repair/issue booking, tell them 'I'll open the photo screen so you can add a quick photo of the issue,' and call "
                 "ui_navigate(action='open_rfq_upload') with category_name, the enriched problem_description, and service_address. "
-                "The app opens the photo screen on their phone; once they add a photo it creates the booking and dispatches an artisan automatically — do NOT also call create_order_booking. "
+                "The app opens the photo screen on their phone; once they add a photo it creates the booking and dispatches an artisan automatically â€” do NOT also call create_order_booking. "
                 "If the customer says they can't add a photo, don't block them: call ui_navigate(action='create_order_booking') with category_name and the enriched problem_description instead. "
                 "The app handles pricing, RFQ creation, AI quoting, and artisan dispatch automatically.\n"
                 "- For complex jobs (renovations, full installs, geyser replacement): use create_booking with is_rfq='yes'. "
@@ -781,12 +781,12 @@ async def entrypoint(ctx: JobContext):
                 "- If the user explicitly says they want a diagnosis and quote WITHOUT booking, use lookup_service_pricing to give them a price range, "
                 "then ask if they want to proceed with a booking.\n"
                 "- Cancel: cancel_booking(booking_id, reason). Reschedule: reschedule_booking(booking_id, date, time).\n"
-                "- Call artisan → ui_navigate(action='call_assigned_artisan', booking_id)\n"
-                "- Future bookings → ui_navigate(action='open_future_bookings')\n"
-                "- Check RFQ quote → explain_quote(booking_id) — reads back the AI-generated cost breakdown\n"
-                "- Accept RFQ quote → accept_rfq(booking_id) — accepts quote and proceeds to payment\n"
-                "- Negotiate RFQ quote → reject_rfq(booking_id, reason) — sends negotiation to admin\n"
-                "- Generate quote manually → generate_rfq_quote(booking_id) — triggers AI quote if not auto-generated\n"
+                "- Call artisan â†’ ui_navigate(action='call_assigned_artisan', booking_id)\n"
+                "- Future bookings â†’ ui_navigate(action='open_future_bookings')\n"
+                "- Check RFQ quote â†’ explain_quote(booking_id) â€” reads back the AI-generated cost breakdown\n"
+                "- Accept RFQ quote â†’ accept_rfq(booking_id) â€” accepts quote and proceeds to payment\n"
+                "- Negotiate RFQ quote â†’ reject_rfq(booking_id, reason) â€” sends negotiation to admin\n"
+                "- Generate quote manually â†’ generate_rfq_quote(booking_id) â€” triggers AI quote if not auto-generated\n"
             )
 
         return base
@@ -802,7 +802,7 @@ async def entrypoint(ctx: JobContext):
             "open_notifications, open_profile, open_settings, open_support, open_wallet, "
             "open_calendar, open_help, go_home, go_back, close_window, close_dialog, dismiss. "
             "DO NOT use for cancel_booking, reschedule_booking, send_message_to_artisan, "
-            "send_message_to_admin, mark_booking_in_progress, artisan_cancel_and_reassign — "
+            "send_message_to_admin, mark_booking_in_progress, artisan_cancel_and_reassign â€” "
             "use the dedicated action tools instead."
         )
     )
@@ -826,11 +826,11 @@ async def entrypoint(ctx: JobContext):
     ) -> str:
         """Triggers an in-app navigation action."""
         try:
-            # ── Redirect action calls to dedicated backend tools ──
+            # â”€â”€ Redirect action calls to dedicated backend tools â”€â”€
             # If the LLM accidentally calls ui_navigate for actions that should use
             # the dedicated backend tools, redirect to those tools instead.
             if action in ("create_order_booking", "dispatch_artisan") and (category_name or problem_description):
-                logger.info(f"↪ Redirecting ui_navigate({action}) → create_booking tool")
+                logger.info(f"â†ª Redirecting ui_navigate({action}) â†’ create_booking tool")
                 # Determine is_rfq: explicit 'rfq' hint OR caller passed accept='rfq'
                 is_rfq_val = "yes" if (accept or "").lower() == "rfq" else "no"
                 return await create_booking(
@@ -842,16 +842,16 @@ async def entrypoint(ctx: JobContext):
                     is_rfq=is_rfq_val,
                 )
             if action in ("cancel_booking",) and booking_id:
-                logger.info(f"↪ Redirecting ui_navigate({action}) → cancel_booking tool")
+                logger.info(f"â†ª Redirecting ui_navigate({action}) â†’ cancel_booking tool")
                 return await cancel_booking(booking_id=booking_id, reason=additional_notes or "User requested cancellation")
             if action in ("reschedule_booking",) and booking_id:
-                logger.info(f"↪ Redirecting ui_navigate({action}) → reschedule_booking tool")
+                logger.info(f"â†ª Redirecting ui_navigate({action}) â†’ reschedule_booking tool")
                 return await reschedule_booking(booking_id=booking_id, scheduled_date=scheduled_date, scheduled_time=scheduled_time)
             if action in ("mark_booking_in_progress",) and booking_id:
-                logger.info(f"↪ Redirecting ui_navigate({action}) → mark_booking_in_progress tool")
+                logger.info(f"â†ª Redirecting ui_navigate({action}) â†’ mark_booking_in_progress tool")
                 return await mark_booking_in_progress(booking_id=booking_id)
             if action in ("artisan_cancel_and_reassign", "reassign_booking") and booking_id:
-                logger.info(f"↪ Redirecting ui_navigate({action}) → artisan_cancel_and_reassign tool")
+                logger.info(f"â†ª Redirecting ui_navigate({action}) â†’ artisan_cancel_and_reassign tool")
                 return await artisan_cancel_and_reassign(booking_id=booking_id, reason=additional_notes or "Reassignment requested")
 
             payload = {
@@ -882,7 +882,7 @@ async def entrypoint(ctx: JobContext):
                 )
             elif action == "open_rfq_upload":
                 text = (
-                    "Opening the photo screen now — please add a photo of the issue so I can send it to the artisan."
+                    "Opening the photo screen now â€” please add a photo of the issue so I can send it to the artisan."
                 )
             elif action == "open_bookings_tab":
                 text = "Opening your bookings now."
@@ -950,27 +950,27 @@ async def entrypoint(ctx: JobContext):
             logger.warning(f"ui_navigate failed: {e}")
             return "error"
 
-    # ── Helper: retry credential scan before giving up ──
+    # â”€â”€ Helper: retry credential scan before giving up â”€â”€
     async def _ensure_backend_or_retry() -> bool:
         """Last-ditch attempt to initialize backend_client if not set."""
         nonlocal backend_client
         if backend_client:
             return True
-        logger.info("🔄 _ensure_backend_or_retry: backend_client is None, scanning...")
+        logger.info("ðŸ”„ _ensure_backend_or_retry: backend_client is None, scanning...")
         # Try multiple scans with increasing waits
         for attempt in range(5):
             _scan_participants_for_credentials()
             if backend_client:
-                logger.info(f"✅ _ensure_backend_or_retry: got client on attempt {attempt + 1}")
+                logger.info(f"âœ… _ensure_backend_or_retry: got client on attempt {attempt + 1}")
                 return True
             wait_time = 1.0 + attempt * 0.5  # 1.0, 1.5, 2.0, 2.5, 3.0
-            logger.info(f"⏳ _ensure_backend_or_retry: attempt {attempt + 1}/5 failed, waiting {wait_time}s...")
+            logger.info(f"â³ _ensure_backend_or_retry: attempt {attempt + 1}/5 failed, waiting {wait_time}s...")
             await asyncio.sleep(wait_time)
         _scan_participants_for_credentials()
         if backend_client:
-            logger.info("✅ _ensure_backend_or_retry: got client on final scan")
+            logger.info("âœ… _ensure_backend_or_retry: got client on final scan")
             return True
-        logger.warning("❌ _ensure_backend_or_retry: FAILED after 5 attempts — no firebase_token found in any participant metadata")
+        logger.warning("âŒ _ensure_backend_or_retry: FAILED after 5 attempts â€” no firebase_token found in any participant metadata")
         return False
 
     _CONNECTION_RETRY_MSG = "I'm still connecting to your account. Please try again in a moment."
@@ -986,7 +986,7 @@ async def entrypoint(ctx: JobContext):
     async def get_booking_status(booking_id: str) -> str:
         """Get booking status from backend API."""
         nonlocal backend_client, app_context_bookings
-        logger.info(f"📋 get_booking_status called: booking_id={booking_id}, backend_client={'SET' if backend_client else 'NONE'}, app_bookings={len(app_context_bookings)}")
+        logger.info(f"ðŸ“‹ get_booking_status called: booking_id={booking_id}, backend_client={'SET' if backend_client else 'NONE'}, app_bookings={len(app_context_bookings)}")
         if not backend_client:
             # Fallback: check app context bookings if available
             if app_context_bookings:
@@ -1077,13 +1077,13 @@ async def entrypoint(ctx: JobContext):
             "List the user's recent bookings. Optionally filter by status (e.g., 'pending_assignment', 'in_progress', 'completed'). "
             "Returns booking IDs, categories, statuses, dates, prices, order numbers and RFQ numbers. "
             "Use this when user asks 'Show my bookings', 'What bookings do I have?', "
-            "'Find my R67000 booking', or 'Which booking costs...' — then match by price/amount from the results."
+            "'Find my R67000 booking', or 'Which booking costs...' â€” then match by price/amount from the results."
         )
     )
     async def list_my_bookings(status: str = "", limit: int = 10) -> str:
         """List user's bookings from backend API."""
         nonlocal backend_client, app_context_bookings
-        logger.info(f"📋 list_my_bookings called: status={status!r}, limit={limit}, backend_client={'SET' if backend_client else 'NONE'}, app_bookings={len(app_context_bookings)}")
+        logger.info(f"ðŸ“‹ list_my_bookings called: status={status!r}, limit={limit}, backend_client={'SET' if backend_client else 'NONE'}, app_bookings={len(app_context_bookings)}")
         if not backend_client:
             # Fallback: use app context bookings if available
             if app_context_bookings:
@@ -1117,12 +1117,12 @@ async def entrypoint(ctx: JobContext):
                 return _CONNECTION_RETRY_MSG
 
         try:
-            logger.info(f"📡 Calling backend list_user_bookings (status={status!r}, limit={min(limit, 10)})")
+            logger.info(f"ðŸ“¡ Calling backend list_user_bookings (status={status!r}, limit={min(limit, 10)})")
             result = await backend_client.list_user_bookings(status=status or None, limit=min(limit, 10))
-            logger.info(f"📡 Backend response: ok={result.get('ok')}, success={result.get('success')}, error={result.get('error', 'none')}")
+            logger.info(f"ðŸ“¡ Backend response: ok={result.get('ok')}, success={result.get('success')}, error={result.get('error', 'none')}")
             if not result.get('ok') and not result.get('success'):
                 error = result.get('error', 'unknown_error')
-                logger.warning(f"❌ list_my_bookings backend error: {error}")
+                logger.warning(f"âŒ list_my_bookings backend error: {error}")
                 return f"There was an issue getting your bookings: {error}"
 
             data = result.get('data', result.get('result', {}))
@@ -1147,7 +1147,7 @@ async def entrypoint(ctx: JobContext):
                 rfq_status = booking.get('rfq_status', '')
                 response += f"{i}. {category} booking {booking_id}: {booking_status}"
                 if problem:
-                    response += f" — {problem}"
+                    response += f" â€” {problem}"
                 if price:
                     response += f", price R{price}"
                 if rfq_no:
@@ -1520,24 +1520,24 @@ async def entrypoint(ctx: JobContext):
                 "want to check payment status."
             )
 
-        logger.info(f"🔍 lookup_service_pricing called: category={category_name}, task={task_name}, query={search_q}")
+        logger.info(f"ðŸ” lookup_service_pricing called: category={category_name}, task={task_name}, query={search_q}")
 
         try:
             import urllib.parse
             encoded_q = urllib.parse.quote(search_q)
             url = f"{backend_url}/api/test-pricing?q={encoded_q}"
-            logger.info(f"🔍 Calling public pricing endpoint: {url}")
+            logger.info(f"ðŸ” Calling public pricing endpoint: {url}")
 
             http_session = await _get_shared_session()
             async with http_session.get(url, timeout=aiohttp.ClientTimeout(total=25)) as resp:
-                logger.info(f"🔍 Pricing response status: {resp.status}")
+                logger.info(f"ðŸ” Pricing response status: {resp.status}")
                 if resp.status != 200:
                     body_text = await resp.text()
-                    logger.warning(f"🔍 Pricing endpoint returned {resp.status}: {body_text[:200]}")
+                    logger.warning(f"ðŸ” Pricing endpoint returned {resp.status}: {body_text[:200]}")
                     return f"Sorry, I couldn't look up pricing right now. The service returned an error. Please try again."
                 result = await resp.json()
 
-            logger.info(f"🔍 Pricing result ok={result.get('ok')}, matched={result.get('matched')}")
+            logger.info(f"ðŸ” Pricing result ok={result.get('ok')}, matched={result.get('matched')}")
 
             if not result.get('ok'):
                 return "Sorry, I couldn't look up pricing right now. Please try again in a moment."
@@ -1579,11 +1579,11 @@ async def entrypoint(ctx: JobContext):
                 # Hidden reference for the LLM only. Instructions tell it not to
                 # read these aloud, but to use them in create_booking(job_ids=...).
                 response += (
-                    "\n\n[INTERNAL_TASK_IDS — do NOT speak these aloud. "
+                    "\n\n[INTERNAL_TASK_IDS â€” do NOT speak these aloud. "
                     "When the user confirms a service, pass its ID to create_booking via job_ids.]\n"
                     + "\n".join(id_map)
                 )
-            logger.info(f"🔍 Returning pricing with {total} services to agent")
+            logger.info(f"ðŸ” Returning pricing with {total} services to agent")
             # Cache the successful response for fallback use
             global _pricing_cache
             _pricing_cache = response
@@ -1592,9 +1592,9 @@ async def entrypoint(ctx: JobContext):
             logger.error(f"lookup_service_pricing error: {e}", exc_info=True)
             # Use cached pricing from a previous successful call if available
             if _pricing_cache:
-                logger.info("🔍 Using cached pricing as fallback")
+                logger.info("ðŸ” Using cached pricing as fallback")
                 return "I'm having a brief connection issue, but here are our prices from my recent records:\n" + _pricing_cache
-            # Absolute last resort — generic message (should rarely happen)
+            # Absolute last resort â€” generic message (should rarely happen)
             return (
                 "I'm having a temporary connection issue retrieving our latest prices. "
                 "Please check the services section in the app for current pricing, or try asking me again in a moment."
@@ -1653,7 +1653,7 @@ async def entrypoint(ctx: JobContext):
             _prev = _recent_booking_creates.get(_sig)
             if _prev and (_time.monotonic() - _prev['ts']) < _CREATE_DEDUP_WINDOW_S:
                 logger.info(
-                    f"♻️ create_booking dedup: identical request within {_CREATE_DEDUP_WINDOW_S}s — returning prior booking result"
+                    f"â™»ï¸ create_booking dedup: identical request within {_CREATE_DEDUP_WINDOW_S}s â€” returning prior booking result"
                 )
                 return _prev['result']
             _result = await _create_booking_impl(
@@ -1800,7 +1800,7 @@ async def entrypoint(ctx: JobContext):
     ) -> str:
         """Send a message to the artisan assigned to a booking."""
         nonlocal backend_client
-        logger.info(f"📨 send_message_to_artisan called: booking_id={booking_id}, message={message!r}, backend_client={'SET' if backend_client else 'NONE'}")
+        logger.info(f"ðŸ“¨ send_message_to_artisan called: booking_id={booking_id}, message={message!r}, backend_client={'SET' if backend_client else 'NONE'}")
         if not backend_client:
             if not await _ensure_backend_or_retry():
                 return _CONNECTION_RETRY_MSG
@@ -1836,7 +1836,7 @@ async def entrypoint(ctx: JobContext):
     ) -> str:
         """Send a message to the client who made a booking."""
         nonlocal backend_client
-        logger.info(f"📨 send_message_to_client called: booking_id={booking_id}, message={message!r}, backend_client={'SET' if backend_client else 'NONE'}")
+        logger.info(f"ðŸ“¨ send_message_to_client called: booking_id={booking_id}, message={message!r}, backend_client={'SET' if backend_client else 'NONE'}")
         if not backend_client:
             if not await _ensure_backend_or_retry():
                 return _CONNECTION_RETRY_MSG
@@ -2071,7 +2071,7 @@ async def entrypoint(ctx: JobContext):
                 st = c.get('state', 'open')
                 pri = c.get('priority', 'normal')
                 replies = c.get('reply_count', 0)
-                lines.append(f"• Case {cid}: {subj} — {st} (priority: {pri}, {replies} messages)")
+                lines.append(f"â€¢ Case {cid}: {subj} â€” {st} (priority: {pri}, {replies} messages)")
 
             return "\n".join(lines)
         except Exception as e:
@@ -2314,7 +2314,7 @@ async def entrypoint(ctx: JobContext):
             logger.error(f"artisan_cancel_and_reassign error: {e}", exc_info=True)
             return "Sorry, I had trouble with the reassignment. Please try again."
 
-    # ── New tools ─────────────────────────────────────────────────
+    # â”€â”€ New tools â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     @llm.function_tool(
         description=(
@@ -2345,7 +2345,7 @@ async def entrypoint(ctx: JobContext):
                 status = t.get('status', '')
                 date = (t.get('transaction_at') or '')[:10]
                 arrow = "received" if direction == 'in' else "spent"
-                lines.append(f"R{amt} {typ.replace('_', ' ')} ({arrow}) on {date} — {status}")
+                lines.append(f"R{amt} {typ.replace('_', ' ')} ({arrow}) on {date} â€” {status}")
             summary = "; ".join(lines)
             return f"Here are your recent transactions: {summary}"
         except Exception as e:
@@ -2376,7 +2376,7 @@ async def entrypoint(ctx: JobContext):
                 amt = d.get('amount', '0')
                 status = d.get('status', 'pending')
                 date = (d.get('created_at') or '')[:10]
-                lines.append(f"R{amt} — {status} ({date})")
+                lines.append(f"R{amt} â€” {status} ({date})")
             return f"Your deposit requests: {'; '.join(lines)}"
         except Exception as e:
             logger.error(f"get_deposit_requests error: {e}", exc_info=True)
@@ -2637,7 +2637,7 @@ async def entrypoint(ctx: JobContext):
                 for b in app_context_bookings[:3]:
                     cat = b.get('category', 'service')
                     status = b.get('status', 'unknown')
-                    parts.append(f"• {cat}: {status}")
+                    parts.append(f"â€¢ {cat}: {status}")
                 parts.append("Would you like to check a specific booking, reschedule, cancel, or contact the artisan?")
             else:
                 parts.append("I can help you manage your bookings from here. Would you like to check a booking status or create a new one?")
@@ -2673,37 +2673,37 @@ async def entrypoint(ctx: JobContext):
         return (
             "Here are all the screens and features available in the Square 15 app:\n\n"
             "NAVIGATION:\n"
-            "• Home Dashboard — main screen with service categories and quick actions\n"
-            "• Future Bookings — view all your upcoming bookings\n"
-            "• Wallet — check balance, deposits, and transaction history\n"
-            "• Notifications — booking updates, payment alerts, system messages\n"
-            "• Profile — your personal information\n"
-            "• Settings — app preferences and account management\n"
-            "• Support Chat — contact admin team\n"
-            "• Calendar — scheduled services and appointments\n\n"
+            "â€¢ Home Dashboard â€” main screen with service categories and quick actions\n"
+            "â€¢ Future Bookings â€” view all your upcoming bookings\n"
+            "â€¢ Wallet â€” check balance, deposits, and transaction history\n"
+            "â€¢ Notifications â€” booking updates, payment alerts, system messages\n"
+            "â€¢ Profile â€” your personal information\n"
+            "â€¢ Settings â€” app preferences and account management\n"
+            "â€¢ Support Chat â€” contact admin team\n"
+            "â€¢ Calendar â€” scheduled services and appointments\n\n"
             "BOOKING ACTIONS:\n"
-            "• Create a new booking with any service category\n"
-            "• Cancel a booking\n"
-            "• Reschedule a booking to a new date/time\n"
-            "• Check booking status and details\n"
-            "• Call the assigned artisan\n"
-            "• Send a message to an artisan\n"
-            "• View RFQ quote details\n"
-            "• Submit a rating after service\n\n"
+            "â€¢ Create a new booking with any service category\n"
+            "â€¢ Cancel a booking\n"
+            "â€¢ Reschedule a booking to a new date/time\n"
+            "â€¢ Check booking status and details\n"
+            "â€¢ Call the assigned artisan\n"
+            "â€¢ Send a message to an artisan\n"
+            "â€¢ View RFQ quote details\n"
+            "â€¢ Submit a rating after service\n\n"
             "WALLET & PAYMENTS:\n"
-            "• Check wallet balance\n"
-            "• View transaction history\n"
-            "• Check deposit request status\n\n"
+            "â€¢ Check wallet balance\n"
+            "â€¢ View transaction history\n"
+            "â€¢ Check deposit request status\n\n"
             "COMMUNICATION:\n"
-            "• Send messages to artisans\n"
-            "• Contact admin support\n"
-            "• Submit complaints\n"
-            "• View chat messages\n\n"
+            "â€¢ Send messages to artisans\n"
+            "â€¢ Contact admin support\n"
+            "â€¢ Submit complaints\n"
+            "â€¢ View chat messages\n\n"
             "INFORMATION:\n"
-            "• Look up service pricing\n"
-            "• View service categories\n"
-            "• Check artisan information\n"
-            "• View notifications\n\n"
+            "â€¢ Look up service pricing\n"
+            "â€¢ View service categories\n"
+            "â€¢ Check artisan information\n"
+            "â€¢ View notifications\n\n"
             "Just tell me what you'd like to do and I'll help you."
         )
 
@@ -2815,14 +2815,14 @@ async def entrypoint(ctx: JobContext):
             failures = data.get('failures', [])
             count = data.get('count', len(failures))
             if count == 0:
-                return "Great news — there are no failed payments."
+                return "Great news â€” there are no failed payments."
             response = f"There {'is' if count == 1 else 'are'} {count} failed payment{'s' if count != 1 else ''}. "
             for f in failures[:5]:
                 amount = f.get('amount', 0)
                 reason = f.get('reason', 'unknown')
                 user = f.get('user_name', 'a user')
                 date = (f.get('created_at', '') or '')[:10]
-                response += f"{_fmt_currency(amount)} from {user} — {reason} ({date}). "
+                response += f"{_fmt_currency(amount)} from {user} â€” {reason} ({date}). "
             return response.strip()
         except Exception as e:
             logger.error(f"get_failed_payments_report error: {e}", exc_info=True)
@@ -2879,7 +2879,7 @@ async def entrypoint(ctx: JobContext):
         instructions=_instructions_for_role(caller_role),
     )
 
-    logger.info("🚀 Starting agent session...")
+    logger.info("ðŸš€ Starting agent session...")
     session = voice.AgentSession(
         tools=[
             ui_navigate,
@@ -2931,10 +2931,10 @@ async def entrypoint(ctx: JobContext):
             get_fraud_alerts_report,
         ],
         # --- Latency optimizations ---
-        min_endpointing_delay=0.25,       # default 0.5 — faster turn completion
-        max_endpointing_delay=1.5,        # default 3.0 — don't wait too long
+        min_endpointing_delay=0.25,       # default 0.5 â€” faster turn completion
+        max_endpointing_delay=1.5,        # default 3.0 â€” don't wait too long
         preemptive_generation=True,        # start LLM+TTS before turn confirmed
-        min_interruption_duration=0.4,     # default 0.5 — faster interruption
+        min_interruption_duration=0.4,     # default 0.5 â€” faster interruption
     )
 
     # Guardrail: never allow internal/tool narration to reach TTS.
@@ -2948,7 +2948,7 @@ async def entrypoint(ctx: JobContext):
 
     session.say = _say_sanitized
 
-    # ── CRITICAL: Register event handlers BEFORE session.start() ──
+    # â”€â”€ CRITICAL: Register event handlers BEFORE session.start() â”€â”€
     # The app sends credentials via publishData immediately after connecting.
     # If we register handlers after session.start(), we miss the data packet.
     last_metadata_by_identity: dict[str, str] = {}
@@ -2960,7 +2960,7 @@ async def entrypoint(ctx: JobContext):
         if not ft:
             logger.debug("_try_init_backend_from_msg: no firebase_token in msg")
             return False
-        logger.info(f"🔑 _try_init_backend_from_msg: got token (len={len(ft)}, starts={ft[:20]}...)")
+        logger.info(f"ðŸ”‘ _try_init_backend_from_msg: got token (len={len(ft)}, starts={ft[:20]}...)")
         firebase_token = ft
         session_id = msg.get("session_id")
         session_nonce = msg.get("session_nonce")
@@ -3003,7 +3003,7 @@ async def entrypoint(ctx: JobContext):
             # Handle voice session credentials from app
             if msg_type == "square15_voice_credentials":
                 if _try_init_backend_from_msg(msg):
-                    logger.info(f"✅ Backend client initialized with credentials (session: {session_id[:12] if session_id else 'none'}...)")
+                    logger.info(f"âœ… Backend client initialized with credentials (session: {session_id[:12] if session_id else 'none'}...)")
                 return
 
             # ALWAYS extract firebase_token from ANY metadata if backend_client not yet set.
@@ -3019,7 +3019,7 @@ async def entrypoint(ctx: JobContext):
                         'session_id': sid,
                         'session_nonce': snonce,
                     }):
-                        logger.info("✅ Backend client initialized from embedded metadata token")
+                        logger.info("âœ… Backend client initialized from embedded metadata token")
 
             if msg_type != "square15_app":
                 return
@@ -3043,7 +3043,7 @@ async def entrypoint(ctx: JobContext):
                     )
                     n = len(staged_work_image_urls)
                     logger.info(
-                        f"📸 Staged {n} photo(s) from app for the next booking"
+                        f"ðŸ“¸ Staged {n} photo(s) from app for the next booking"
                     )
                     # Acknowledge receipt out loud so the customer knows the photo
                     # landed and the booking will continue (fixes "stayed quiet after
@@ -3051,7 +3051,7 @@ async def entrypoint(ctx: JobContext):
                     if n > 0:
                         try:
                             ack = (
-                                f"Got your {n} photo{'s' if n != 1 else ''} — thank you. "
+                                f"Got your {n} photo{'s' if n != 1 else ''} â€” thank you. "
                                 "I'll include them with your booking and continue."
                             )
                             session.say(ack, allow_interruptions=True)
@@ -3062,7 +3062,7 @@ async def entrypoint(ctx: JobContext):
                 bookings = payload.get("active_bookings")
                 if isinstance(bookings, list) and bookings:
                     app_context_bookings = bookings
-                    logger.info(f"📋 Received {len(bookings)} active bookings from app context")
+                    logger.info(f"ðŸ“‹ Received {len(bookings)} active bookings from app context")
                 uid = (payload.get("user_id") or "").strip()
                 if uid:
                     app_context_user_id = uid
@@ -3070,18 +3070,18 @@ async def entrypoint(ctx: JobContext):
                     nm = _first_name(payload.get("user_name") or "")
                     if nm:
                         caller_name = nm
-                        logger.info(f"👤 Caller first name from app context: {caller_name}")
+                        logger.info(f"ðŸ‘¤ Caller first name from app context: {caller_name}")
                 # Store screen context for OpenClaw-like screen awareness
                 screen_ctx = payload.get("screen_context")
                 if isinstance(screen_ctx, dict):
                     _current_screen_context.clear()
                     _current_screen_context.update(screen_ctx)
-                    logger.info(f"📱 Screen context updated: {screen_ctx.get('screen_name', 'unknown')}")
+                    logger.info(f"ðŸ“± Screen context updated: {screen_ctx.get('screen_name', 'unknown')}")
         except Exception as e:
             logger.info(f"metadata handler error (ignored): {e}")
 
     def on_data_received(data_packet):
-        """Handle data channel messages — used for credentials delivery."""
+        """Handle data channel messages â€” used for credentials delivery."""
         nonlocal backend_client, firebase_token, session_id, session_nonce
         try:
             raw = None
@@ -3090,12 +3090,12 @@ async def entrypoint(ctx: JobContext):
             elif isinstance(data_packet, bytes):
                 raw = data_packet
             if raw is None:
-                logger.debug("📦 data_received: no data attribute")
+                logger.debug("ðŸ“¦ data_received: no data attribute")
                 return
             text = raw.decode('utf-8') if isinstance(raw, (bytes, bytearray)) else str(raw)
             if not text or not text.strip():
                 return
-            logger.info(f"📦 data_received: len={len(text)}, preview={text[:100]}...")
+            logger.info(f"ðŸ“¦ data_received: len={len(text)}, preview={text[:100]}...")
             # ALWAYS breadcrumb so we know the data channel reached the agent
             try:
                 crumb_url = f"{backend_url.rstrip('/')}/debug/voice-breadcrumb"
@@ -3119,7 +3119,7 @@ async def entrypoint(ctx: JobContext):
             msg_type = (msg.get('type') or '').strip()
             if msg_type == 'square15_voice_credentials':
                 if _try_init_backend_from_msg(msg):
-                    logger.info(f"✅ Backend client initialized via DATA CHANNEL (session: {session_id[:12] if session_id else 'none'}...)")
+                    logger.info(f"âœ… Backend client initialized via DATA CHANNEL (session: {session_id[:12] if session_id else 'none'}...)")
             elif msg_type == 'square15_app':
                 # DEBUG / E2E: allow injecting text as if the user spoke it.
                 # Used by /debug/voice-e2e to drive real RFQ/booking creation from a Node script.
@@ -3128,7 +3128,7 @@ async def entrypoint(ctx: JobContext):
                 if action == 'text_input':
                     text = (payload.get('text') or msg.get('text') or '').strip()
                     if text:
-                        logger.info(f"🧪 text_input via data channel: {text[:120]}")
+                        logger.info(f"ðŸ§ª text_input via data channel: {text[:120]}")
                         # Fire-and-forget breadcrumb so /debug/voice-e2e can prove the
                         # agent received the message even if the LLM doesn't call tools.
                         try:
@@ -3164,28 +3164,30 @@ async def entrypoint(ctx: JobContext):
                                         "call create_booking. If they say 'RFQ' or 'quote request', pass is_rfq='yes'.\n"
                                         "- If user asks for a price/cost lookup BEFORE booking, call lookup_service_pricing "
                                         "then in your NEXT step (after the tool result) call create_booking with the returned job_ids.\n"
-                                        "- PAYMENT — honor the method the user names:\n"
-                                        "    * 'from my wallet', 'use my wallet', 'charge my wallet', 'pay from wallet', 'wallet' — "
+                                        "- PAYMENT â€” honor the method the user names:\n"
+                                        "    * 'from my wallet', 'use my wallet', 'charge my wallet', 'pay from wallet', 'wallet' â€” "
                                         "call pay_with_wallet(booking_id=..., payment_type='full' or 'deposit'). "
                                         "In THIS debug/E2E channel the user has ALREADY been told the exact amount and has "
                                         "explicitly confirmed, so the pay_with_wallet safety preconditions are satisfied: call "
-                                        "pay_with_wallet IMMEDIATELY on the first turn — do NOT call check_payment or "
-                                        "get_wallet_balance first, and do NOT wait for another confirmation.\n"
-                                        "    * 'buy now pay later', 'BNPL', 'pay later', 'instalments', 'moretyme', 'mobicred', 'rcs' — "
+                                        "pay_with_wallet IMMEDIATELY on the first turn. For a wallet-payment request, "
+                                        "pay_with_wallet is the ONLY acceptable tool â€” do NOT call send_message_to_admin, "
+                                        "check_payment, get_wallet_balance, or request_payment_link, and do NOT wait for "
+                                        "another confirmation.\n"
+                                        "    * 'buy now pay later', 'BNPL', 'pay later', 'instalments', 'moretyme', 'mobicred', 'rcs' â€” "
                                         "call pay_with_bnpl(booking_id=..., payment_type='full' or 'deposit', provider='moretyme'|'mobicred'|'rcs').\n"
                                         "    * Otherwise ('send payment link', 'pay', 'I want to pay', 'send me a link to pay', "
-                                        "'request_payment_link' (verbatim), 'pay the full amount', 'pay deposit', 'card', 'EFT') — "
+                                        "'request_payment_link' (verbatim), 'pay the full amount', 'pay deposit', 'card', 'EFT') â€” "
                                         "call request_payment_link(booking_id=..., payment_type='full' or 'deposit', payment_method='card' or 'eft'). "
-                                        "NEVER call lookup_service_pricing with query='payment' — that is the WRONG tool. "
+                                        "NEVER call lookup_service_pricing with query='payment' â€” that is the WRONG tool. "
                                         "check_payment is only for 'did I pay?' / 'what is my payment status?'.\n"
-                                        "- If user says 'accept the quote', 'I accept', 'go ahead' for an RFQ — call accept_rfq with the booking_id.\n"
-                                        "- If user asks 'status', 'where is my booking' — call get_booking_status.\n"
-                                        "- If user gives a rating ('rate 5 stars', 'X stars') — call submit_rating.\n"
-                                        "Do NOT ask for confirmation — the user already confirmed by sending the message. "
+                                        "- If user says 'accept the quote', 'I accept', 'go ahead' for an RFQ â€” call accept_rfq with the booking_id.\n"
+                                        "- If user asks 'status', 'where is my booking' â€” call get_booking_status.\n"
+                                        "- If user gives a rating ('rate 5 stars', 'X stars') â€” call submit_rating.\n"
+                                        "Do NOT ask for confirmation â€” the user already confirmed by sending the message. "
                                         "Use the address they provided as service_address."
                                     ),
                                 )
-                                # Don't block on TTS playout — debug channel has no audio
+                                # Don't block on TTS playout â€” debug channel has no audio
                                 # consumer so wait_for_playout never resolves before timeout.
                                 # Just await the handle itself (which resolves once the LLM
                                 # response + first tool round completes); tools may continue
@@ -3252,7 +3254,7 @@ async def entrypoint(ctx: JobContext):
     try:
         ctx.room.on("participant_metadata_changed", on_participant_metadata_changed)
         ctx.room.on("data_received", on_data_received)
-        logger.info("✅ Listening for app metadata + data channel (square15_app)")
+        logger.info("âœ… Listening for app metadata + data channel (square15_app)")
         # Breadcrumb so /debug/voice-e2e can poll until the agent is actually
         # ready to receive data packets (handlers are registered ~5-10s after
         # ctx.connect because of LLM/STT/TTS bootstrap).
@@ -3268,9 +3270,9 @@ async def entrypoint(ctx: JobContext):
         except Exception:
             pass
     except Exception as e:
-        logger.warning(f"⚠️ Could not attach metadata listener: {e}")
+        logger.warning(f"âš ï¸ Could not attach metadata listener: {e}")
 
-    # ── Scan existing participants for credentials that arrived before we joined ──
+    # â”€â”€ Scan existing participants for credentials that arrived before we joined â”€â”€
     # The backend embeds firebase_token in the participant's access token metadata,
     # so we can read it directly from any remote participant's metadata JSON.
     def _scan_participants_for_credentials():
@@ -3288,14 +3290,14 @@ async def entrypoint(ctx: JobContext):
                 ident = getattr(p, 'identity', '???')
                 md = getattr(p, 'metadata', None)
                 if not md or not str(md).strip():
-                    logger.debug(f"🔍 Participant {ident}: no metadata")
+                    logger.debug(f"ðŸ” Participant {ident}: no metadata")
                     continue
-                logger.info(f"🔍 Participant {ident}: metadata len={len(md)}, preview={md[:120]}...")
+                logger.info(f"ðŸ” Participant {ident}: metadata len={len(md)}, preview={md[:120]}...")
                 try:
                     msg = json.loads(md)
                     if not isinstance(msg, dict):
                         continue
-                    # Check for firebase_token — either from access token metadata (backend-embedded)
+                    # Check for firebase_token â€” either from access token metadata (backend-embedded)
                     # or from square15_voice_credentials (app-sent)
                     ft = msg.get('firebase_token')
                     if ft and not backend_client:
@@ -3306,7 +3308,7 @@ async def entrypoint(ctx: JobContext):
                             'session_id': sid,
                             'session_nonce': snonce,
                         }):
-                            logger.info("✅ Backend client initialized from participant metadata")
+                            logger.info("âœ… Backend client initialized from participant metadata")
                     # Also extract app context data
                     bookings = msg.get('active_bookings')
                     if isinstance(bookings, list) and bookings:
@@ -3321,15 +3323,15 @@ async def entrypoint(ctx: JobContext):
                             caller_name = nm
                 except Exception:
                     pass
-            logger.info(f"🔍 Scan complete: {participant_count} participants scanned, backend_client={'SET' if backend_client else 'NONE'}, app_bookings={len(app_context_bookings)}")
+            logger.info(f"ðŸ” Scan complete: {participant_count} participants scanned, backend_client={'SET' if backend_client else 'NONE'}, app_bookings={len(app_context_bookings)}")
         except Exception as e:
-            logger.warning(f"⚠️ Participant scan error: {e}")
+            logger.warning(f"âš ï¸ Participant scan error: {e}")
 
     _scan_participants_for_credentials()
 
     await session.start(agent, room=ctx.room)
-    logger.info("✅ Agent session started and running!")
-    # E2E breadcrumb: agent fully ready (session.start() returned) — backend can now sendData
+    logger.info("âœ… Agent session started and running!")
+    # E2E breadcrumb: agent fully ready (session.start() returned) â€” backend can now sendData
     try:
         asyncio.create_task(_post_breadcrumb(
             f"{backend_url.rstrip('/')}/debug/voice-breadcrumb",
@@ -3342,16 +3344,16 @@ async def entrypoint(ctx: JobContext):
     except Exception:
         pass
 
-    # ── Post-start: re-scan in case metadata arrived during start ──
+    # â”€â”€ Post-start: re-scan in case metadata arrived during start â”€â”€
     if not backend_client:
         await asyncio.sleep(0.5)  # Brief wait for late-arriving metadata
         _scan_participants_for_credentials()
         if backend_client:
-            logger.info("✅ Backend client initialized from post-start scan")
+            logger.info("âœ… Backend client initialized from post-start scan")
 
     # The caller's name now arrives in the participant token metadata and is
     # captured by the scans above. Do one final no-wait scan, then greet
-    # immediately — no artificial delay, so startup stays fast.
+    # immediately â€” no artificial delay, so startup stays fast.
     if not caller_name:
         _scan_participants_for_credentials()
 
@@ -3362,10 +3364,10 @@ async def entrypoint(ctx: JobContext):
             else "Hi, I am Lizzy, how can I help you today?"
         )
         _greeting_handle = session.say(greeting, allow_interruptions=True)
-        logger.info(f"✅ Greeting sent (name={'yes' if caller_name else 'no'})")
+        logger.info(f"âœ… Greeting sent (name={'yes' if caller_name else 'no'})")
     except Exception as e:
         _greeting_handle = None
-        logger.warning(f"⚠️ Could not send greeting: {e}")
+        logger.warning(f"âš ï¸ Could not send greeting: {e}")
 
     # If we learned the caller's name, remind the LLM to use it naturally once more.
     if caller_name:
@@ -3381,21 +3383,21 @@ async def entrypoint(ctx: JobContext):
         except Exception as _e:
             logger.info(f"update_instructions with name skipped: {_e}")
 
-    # ── Background: periodically retry credential scan until backend_client is set ──
+    # â”€â”€ Background: periodically retry credential scan until backend_client is set â”€â”€
     async def _credential_retry_loop():
         for i in range(40):  # Try for ~60 seconds
             if backend_client:
-                logger.info(f"✅ Backend client confirmed initialized (retry loop check {i+1})")
+                logger.info(f"âœ… Backend client confirmed initialized (retry loop check {i+1})")
                 return
             await asyncio.sleep(1.5)
             _scan_participants_for_credentials()
             if backend_client:
-                logger.info(f"✅ Backend client initialized from retry loop (attempt {i+1})")
+                logger.info(f"âœ… Backend client initialized from retry loop (attempt {i+1})")
                 return
             if i % 5 == 4:
-                logger.info(f"⏳ Credential retry loop: {i+1}/40 attempts, still no backend_client")
+                logger.info(f"â³ Credential retry loop: {i+1}/40 attempts, still no backend_client")
         if not backend_client:
-            logger.warning("⚠️ Backend client never initialized after 60s — booking tools will use app context fallback only")
+            logger.warning("âš ï¸ Backend client never initialized after 60s â€” booking tools will use app context fallback only")
 
     asyncio.ensure_future(_credential_retry_loop())
 
@@ -3407,17 +3409,17 @@ async def request_handler(ctx: JobContext):
     try:
         await entrypoint(ctx)
     except Exception as e:
-        logger.error(f"❌ Fatal error in request handler: {e}", exc_info=True)
+        logger.error(f"âŒ Fatal error in request handler: {e}", exc_info=True)
 
 
 if __name__ == "__main__":
     logger.info("=" * 60)
-    logger.info(f"🚀 Square 15 Voice Agent Worker  v{WORKER_VERSION}")
+    logger.info(f"ðŸš€ Square 15 Voice Agent Worker  v{WORKER_VERSION}")
     logger.info("=" * 60)
-    logger.info("📡 Listening for room join events...")
+    logger.info("ðŸ“¡ Listening for room join events...")
 
     agent_name = os.getenv("LIVEKIT_AGENT_NAME", "square15-voice-assistant")
-    logger.info(f"🤝 Explicit dispatch agent_name: {agent_name}")
+    logger.info(f"ðŸ¤ Explicit dispatch agent_name: {agent_name}")
 
     cli.run_app(
         WorkerOptions(
@@ -3426,3 +3428,4 @@ if __name__ == "__main__":
             port=0,
         ),
     )
+
