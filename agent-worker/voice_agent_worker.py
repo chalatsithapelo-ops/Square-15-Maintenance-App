@@ -737,7 +737,8 @@ async def entrypoint(ctx: JobContext):
             "\n"
             "BOOKING CREATION (IMPORTANT):\n"
             "- For a repair or issue booking (something is broken, leaking, blocked, or not working), a photo helps the artisan come prepared. AFTER you have confirmed the price and the customer agreed, OPEN the photo screen for them by calling ui_navigate(action='open_rfq_upload') with category_name, problem_description (enriched with diagnostic details), and service_address. This opens the photo screen on their phone; once they add a photo the app AUTOMATICALLY creates the booking and dispatches an artisan. Do NOT also call create_order_booking afterwards â€” the photo flow books it for you.\n"
-            "- If the customer says they cannot or do not want to add a photo, do NOT block them: create the booking directly with ui_navigate(action='create_order_booking') using category_name, problem_description, and optionally scheduled_date, scheduled_time, service_address.\n"
+            "- A repair/issue booking ALWAYS prompts for a photo first: when you create the booking (create_order_booking or create_booking, non-RFQ) the app automatically opens the photo screen before booking. Just confirm the price, then create the booking - the photo screen opens on its own.\n"
+            "- Only if the customer EXPLICITLY says they cannot or do not want to add a photo, do NOT block them: call ui_navigate(action='create_order_booking', accept='no_photos') with category_name, problem_description, and optionally scheduled_date, scheduled_time, service_address to book without a photo.\n"
             "- After calling either action, say 'I am processing your booking now, please keep the app open.' Do NOT say an artisan has been dispatched until confirmed.\n"
             "- Do NOT use open_map or show_location actions. They do not exist.\n"
             "\n"
@@ -785,7 +786,7 @@ async def entrypoint(ctx: JobContext):
                 "Then, for a repair/issue booking, tell them 'I'll open the photo screen so you can add a quick photo of the issue,' and call "
                 "ui_navigate(action='open_rfq_upload') with category_name, the enriched problem_description, and service_address. "
                 "The app opens the photo screen on their phone; once they add a photo it creates the booking and dispatches an artisan automatically â€” do NOT also call create_order_booking. "
-                "If the customer says they can't add a photo, don't block them: call ui_navigate(action='create_order_booking') with category_name and the enriched problem_description instead. "
+                "If the customer EXPLICITLY can't or won't add a photo, don't block them: call ui_navigate(action='create_order_booking', accept='no_photos') with category_name and the enriched problem_description instead. "
                 "The app handles pricing, RFQ creation, AI quoting, and artisan dispatch automatically.\n"
                 "- For complex jobs (renovations, full installs, geyser replacement): use create_booking with is_rfq='yes'. "
                 "This creates an RFQ and auto-generates an AI quote with labour, materials, and contingency breakdown.\n"
@@ -844,6 +845,8 @@ async def entrypoint(ctx: JobContext):
                 logger.info(f"â†ª Redirecting ui_navigate({action}) â†’ create_booking tool")
                 # Determine is_rfq: explicit 'rfq' hint OR caller passed accept='rfq'
                 is_rfq_val = "yes" if (accept or "").lower() == "rfq" else "no"
+                # Explicit decline: customer cannot/will not add a photo -> book without one.
+                decline_photos = (accept or "").lower() in ("no_photos", "nophotos", "skip_photos")
                 return await create_booking(
                     category_name=category_name or "",
                     problem_description=problem_description or additional_notes or "",
@@ -851,6 +854,7 @@ async def entrypoint(ctx: JobContext):
                     scheduled_time=scheduled_time or "",
                     service_address=service_address or "",
                     is_rfq=is_rfq_val,
+                    skip_photos="yes" if decline_photos else "",
                 )
             if action in ("cancel_booking",) and booking_id:
                 logger.info(f"â†ª Redirecting ui_navigate({action}) â†’ cancel_booking tool")
@@ -1632,7 +1636,8 @@ async def entrypoint(ctx: JobContext):
         scheduled_time: str = "",
         service_address: str = "",
         is_rfq: str = "no",
-        job_ids: str = ""
+        job_ids: str = "",
+        skip_photos: str = ""
     ) -> str:
         """Idempotent wrapper around the propose/confirm booking flow.
 
@@ -1643,6 +1648,34 @@ async def entrypoint(ctx: JobContext):
         creates and return the first result for any duplicate within the window.
         """
         import time as _time
+        # Photo-first guard: a non-RFQ repair/issue booking must prompt the customer
+        # for photos BEFORE it is created. If no photos are staged and the customer has
+        # not explicitly declined, open the photo screen in the app; the app then creates
+        # the booking once photos are added. Prevents creating a booking with no pictures.
+        _skip_photos = (skip_photos or "").strip().lower() in ("yes", "true", "1", "skip")
+        if (is_rfq or "no").strip().lower() != "yes" and not staged_work_image_urls and not _skip_photos:
+            try:
+                await _set_agent_metadata({
+                    "type": "square15_ui",
+                    "action": "open_rfq_upload",
+                    "payload": {
+                        "category_name": category_name or "",
+                        "problem_description": problem_description or "",
+                        "additional_notes": "",
+                        "service_address": service_address or "",
+                        "scheduled_date": scheduled_date or "",
+                        "scheduled_time": scheduled_time or "",
+                    },
+                    "text": "Opening the photo screen now - please add a quick photo of the issue so I can send it to the artisan.",
+                })
+                return (
+                    "I've opened the photo screen on your phone. Please add a quick photo of the issue "
+                    "and I'll create the booking and dispatch an artisan right away. "
+                    "If you cannot add a photo, just tell me and I'll book it without one."
+                )
+            except Exception as _pe:
+                logger.warning(f"create_booking photo-first redirect failed: {_pe}")
+                # Could not open the photo screen; fall through to a direct create.
         # Breadcrumb on EVERY call so duplicate calls remain observable.
         try:
             asyncio.create_task(_post_breadcrumb(
