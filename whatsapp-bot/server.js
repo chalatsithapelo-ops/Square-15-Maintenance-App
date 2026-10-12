@@ -5603,13 +5603,21 @@ async function executeWaTool(name, args, session) {
 
       const now = new Date().toISOString();
 
-      // Update booking with rating
-      await firestore.collection('tasksManagement').doc(bid).update({
+      // Update booking with rating. RFQ bookings may live only in
+      // futureBookings/rfq_requests (no tasksManagement doc), so update the
+      // document where it was actually found (doc.ref) to avoid a NOT_FOUND
+      // throw, then best-effort mirror to the sibling collections.
+      const ratingUpdate = {
         rating,
         user_comment: args.comment || '',
         rated_at: now,
         status: 'closed',
-      });
+      };
+      await doc.ref.update(ratingUpdate);
+      for (const col of ['tasksManagement', 'futureBookings']) {
+        if (doc.ref.parent.id === col) continue;
+        try { await firestore.collection(col).doc(bid).update(ratingUpdate); } catch (_) {}
+      }
 
       // Store review on artisan profile
       const artisanId = d.service_provider_id;
@@ -7474,6 +7482,7 @@ GUIDELINES:
 - MULTI-ISSUE HANDLING (BHV-5): If the customer mentions MORE THAN ONE distinct problem in a single message (e.g. "my tap is leaking AND my light is broken", "I need painting and tiling"), do NOT collapse them into one booking. Each problem usually needs a different artisan trade and a different price. Reply: "I see two issues — (1) [issue A] and (2) [issue B]. Each needs a separate booking so the right artisan attends. Which one would you like to handle first?" Then create_booking ONE issue at a time. After the first is confirmed, ask: "Would you like me to book the second one ([issue B]) now too?"
 - When a customer sends a photo, ANALYSE the image using your vision capabilities. Identify the maintenance issue (e.g. leaking pipe, broken socket, cracked wall), suggest the correct service category, call lookup_pricing to get the price, and present the price to the customer for confirmation. Do NOT create a booking until the customer confirms the price.
 - VISION CONFIDENCE GUARD (BHV-8): If the photo is blurry, dark, partial, ambiguous, or you are NOT highly confident what product/issue it shows, DO NOT call lookup_pricing or create_booking. Instead reply: "I can see something in the photo but I'm not 100% sure what — could you describe it in a sentence (e.g. 'frameless shower door', 'kitchen mixer tap'), or send a clearer photo?" Hardware-install jobs (shower door, geyser, ceiling fan, gate, light fitting) have prices that vary 10-40× by product spec — never guess. When in doubt, route to submit_rfq so admin can confirm the actual product before quoting.
+- PHOTO RECEIPT & NEXT STEPS (CRITICAL — NEVER STAY SILENT): The moment a customer sends a photo, your reply MUST begin by confirming you received it (e.g. "Thanks, I've got your photo."). Never ignore a photo or leave the customer without a reply after they send one. Once you have everything needed and have created the booking or RFQ, ALWAYS tell the customer what happens next so they are never left waiting: for a fixed-price booking, explain that the nearest available artisan will be notified to accept, and once they accept the customer pays securely to confirm (payment held in escrow until the job is done); for an RFQ, explain that our team will review and send a detailed quote shortly, and once the customer accepts the quote and an artisan accepts the job they pay to confirm. Always end by inviting them to ask any questions.
 - For emergencies, emphasise urgency and prioritise booking creation (still ask for photo but don't delay)
 - When a booking is created, always mention the estimated cost and payment options
 - After job completion, encourage rating
