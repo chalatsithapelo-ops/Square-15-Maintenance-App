@@ -789,7 +789,8 @@ async def entrypoint(ctx: JobContext):
                 "If the customer EXPLICITLY can't or won't add a photo, don't block them: call ui_navigate(action='create_order_booking', accept='no_photos') with category_name and the enriched problem_description instead. "
                 "The app handles pricing, RFQ creation, AI quoting, and artisan dispatch automatically.\n"
                 "- For complex jobs (renovations, full installs, geyser replacement): use create_booking with is_rfq='yes'. "
-                "This creates an RFQ and auto-generates an AI quote with labour, materials, and contingency breakdown.\n"
+                "This opens the photo screen first (so the customer can add a quick photo of the scope), then creates an RFQ and auto-generates an AI quote with labour, materials, and contingency breakdown. "
+                "Tell the customer 'I'll open the photo screen so you can add a quick photo of the work' before it opens. If they explicitly cannot add a photo, call create_booking with is_rfq='yes' and skip_photos='yes'.\n"
                 "- If the user explicitly says they want a diagnosis and quote WITHOUT booking, use lookup_service_pricing to give them a price range, "
                 "then ask if they want to proceed with a booking.\n"
                 "- Cancel: cancel_booking(booking_id, reason). Reschedule: reschedule_booking(booking_id, date, time).\n"
@@ -1648,12 +1649,14 @@ async def entrypoint(ctx: JobContext):
         creates and return the first result for any duplicate within the window.
         """
         import time as _time
-        # Photo-first guard: a non-RFQ repair/issue booking must prompt the customer
-        # for photos BEFORE it is created. If no photos are staged and the customer has
-        # not explicitly declined, open the photo screen in the app; the app then creates
-        # the booking once photos are added. Prevents creating a booking with no pictures.
+        # Photo-first guard: EVERY booking (repair/issue order AND quote request/RFQ)
+        # must prompt the customer for photos BEFORE it is created. If no photos are
+        # staged and the customer has not explicitly declined, open the photo screen in
+        # the app; the app then creates the booking once photos are added. Prevents
+        # creating a booking (or an RFQ) with no pictures.
+        _is_rfq_booking = (is_rfq or "no").strip().lower() == "yes"
         _skip_photos = (skip_photos or "").strip().lower() in ("yes", "true", "1", "skip")
-        if (is_rfq or "no").strip().lower() != "yes" and not staged_work_image_urls and not _skip_photos:
+        if not staged_work_image_urls and not _skip_photos:
             try:
                 await _set_agent_metadata({
                     "type": "square15_ui",
@@ -1665,13 +1668,14 @@ async def entrypoint(ctx: JobContext):
                         "service_address": service_address or "",
                         "scheduled_date": scheduled_date or "",
                         "scheduled_time": scheduled_time or "",
+                        "is_rfq": "yes" if _is_rfq_booking else "no",
                     },
-                    "text": "Opening the photo screen now - please add a quick photo of the issue so I can send it to the artisan.",
+                    "text": "Opening the photo screen now - please add a quick photo of the issue so the artisan can see what needs doing.",
                 })
                 return (
                     "I've opened the photo screen on your phone. Please add a quick photo of the issue "
-                    "and I'll create the booking and dispatch an artisan right away. "
-                    "If you cannot add a photo, just tell me and I'll book it without one."
+                    "and I'll continue with your request right away. "
+                    "If you cannot add a photo, just tell me and I'll proceed without one."
                 )
             except Exception as _pe:
                 logger.warning(f"create_booking photo-first redirect failed: {_pe}")
