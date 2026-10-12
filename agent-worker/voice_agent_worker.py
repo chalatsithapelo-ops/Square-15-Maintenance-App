@@ -521,9 +521,9 @@ async def entrypoint(ctx: JobContext):
     #   prefix_padding_duration: 0.3s (default 0.5) â€“ less audio buffering
     #   activation_threshold: 0.4 (default 0.5) â€“ slightly more sensitive
     vad = silero.VAD.load(
-        min_silence_duration=0.25,
+        min_silence_duration=0.45,
         prefix_padding_duration=0.3,
-        activation_threshold=0.4,
+        activation_threshold=0.6,
     )
 
     logger.info("ðŸ¤– Creating voice agent...")
@@ -721,6 +721,10 @@ async def entrypoint(ctx: JobContext):
             "- Once you have a category, a problem description, a confirmed service location, and (for priced jobs) the customer's agreement to the price â€” CREATE THE BOOKING NOW by calling the booking action. Do not stall, do not keep asking questions, do not wait.\n"
             "- After creating it, confirm to the customer that the booking is created and an artisan is being found. If a tool reports an error, tell the customer plainly and try again â€” do not pretend it worked and do not go silent.\n"
             "\n"
+            "UNCLEAR OR NOISY INPUT (CRITICAL - NEVER HANG UP ON NOISE):\n"
+            "- If you cannot hear the customer clearly, the words are garbled, or what came through sounds like background noise rather than a real request, ASK THEM TO REPEAT: 'Sorry, I did not quite catch that, could you say it again?' Stay on the line and keep helping.\n"
+            "- NEVER end the conversation, say goodbye, say thank you, or say you will help another time just because the input was unclear, empty, or noisy. Only wrap up when the customer CLEARLY says they are done or asks you to stop.\n"
+            "- If there is a short silence, gently prompt once (for example 'I am still here whenever you are ready') instead of going quiet or ending.\n"
             "PHOTOS (ACKNOWLEDGE + CONTINUE):\n"
             "- When the app tells you the customer uploaded or added photos, ACKNOWLEDGE it out loud (e.g. 'Thanks, I've got your photos') and CONTINUE the booking â€” do not go quiet. The app analyses the photos and gives you the findings; use them to enrich the problem description.\n"
             "\n"
@@ -2931,10 +2935,10 @@ async def entrypoint(ctx: JobContext):
             get_fraud_alerts_report,
         ],
         # --- Latency optimizations ---
-        min_endpointing_delay=0.25,       # default 0.5 â€” faster turn completion
-        max_endpointing_delay=1.5,        # default 3.0 â€” don't wait too long
+        min_endpointing_delay=0.5,       # default 0.5 â€” faster turn completion
+        max_endpointing_delay=2.0,        # default 3.0 â€” don't wait too long
         preemptive_generation=True,        # start LLM+TTS before turn confirmed
-        min_interruption_duration=0.4,     # default 0.5 â€” faster interruption
+        min_interruption_duration=0.8,     # default 0.5 â€” faster interruption
     )
 
     # Guardrail: never allow internal/tool narration to reach TTS.
