@@ -1986,6 +1986,15 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     const providerListenerId = providerDoc && providerDoc.exists ? String(providerDoc.id).trim() : String(artisanIdLocal).trim();
     if (!providerListenerId) return null;
 
+    // Rules-provable dispatch arrays: the artisan app can only read a tasksManagement
+    // doc via dispatched_artisan_uids/emails (not the serviceProvider doc id), so
+    // populate them or the order stays invisible to the artisan.
+    const providerData = providerDoc && providerDoc.exists ? (providerDoc.data() || {}) : {};
+    const artisanAuthUid = String(providerData.uid || providerData.user_id || providerData.userId || '').trim();
+    const artisanEmailLower = String(providerData.email || '').trim().toLowerCase();
+    const dispatchedArtisanUids = artisanAuthUid ? [artisanAuthUid] : [];
+    const dispatchedArtisanEmails = artisanEmailLower ? [artisanEmailLower] : [];
+
     const workImages = stringList(bookingDataLocal.work_images ?? bookingDataLocal.workImages);
     const firstImage = workImages.length > 0 ? workImages[0] : '';
     const secondImage = workImages.length > 1 ? workImages[1] : '';
@@ -2079,6 +2088,8 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       status: 'pending',
       user_id: userIdLocal,
       service_provider_id: providerListenerId,
+      dispatched_artisan_uids: dispatchedArtisanUids,
+      dispatched_artisan_emails: dispatchedArtisanEmails,
       task_id: effectiveTaskId,
       cost: totalCost > 0 ? totalCost.toFixed(2) : String(bookingDataLocal.cost || 'TBD'),
       payment: '',
