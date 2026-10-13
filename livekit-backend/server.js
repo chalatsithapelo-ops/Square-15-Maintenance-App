@@ -939,12 +939,14 @@ const ACTION_TIERS = Object.freeze({
   get_notifications: 'A',
   get_scheduled_bookings: 'A',
   get_artisan_info: 'A',
+  get_job_summary: 'A',
   create_order_booking: 'B',
   create_order_booking_order: 'B',
   dispatch_artisan: 'B',
   cancel_booking: 'B',
   reschedule_booking: 'B',
   mark_booking_in_progress: 'B',
+  artisan_update_status: 'B',
   // RFQ quote lifecycle — handlers existed but were unreachable because they
   // weren't in the tier map. Tier B = normal state change (propose+confirm).
   generate_rfq_quote: 'B',
