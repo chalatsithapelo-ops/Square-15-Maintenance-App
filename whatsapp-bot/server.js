@@ -834,6 +834,77 @@ async function pushAdminNotification({ title, body, type, bookingId = '', extraD
   }
 }
 
+// ─── Artisan push helper: writes a notification doc AND fires FCM to the ───
+// artisan's device(s). Used for customer->artisan chat relays so the artisan
+// phone lights up (and can carry launch_lizzy to open Lizzy for them).
+async function pushArtisanNotification({ artisanId, title, body, type, bookingId = '', tmId = '', extraData = {} }) {
+  const firestore = db();
+  if (!firestore || !artisanId) return;
+  try {
+    const snap = await firestore.collection('serviceProvider').doc(String(artisanId)).get();
+    if (!snap.exists) return;
+    const ad = snap.data() || {};
+    const authUid = String(ad.uid || ad.user_id || ad.userId || '').trim();
+
+    const notifPayload = {
+      title: String(title || 'Square 15'),
+      body: String(body || '').slice(0, 500),
+      type: String(type || 'chat_message'),
+      user_type: 'artisan',
+      booking_id: String(bookingId || ''),
+      tasks_management_id: String(tmId || ''),
+      read: false,
+      view: false,
+      source: 'whatsapp_bot',
+      created_at: admin.firestore.FieldValue.serverTimestamp(),
+    };
+    const ids = new Set();
+    if (authUid) ids.add(authUid);
+    ids.add(String(artisanId));
+    await Promise.all(
+      [...ids].map((id) => firestore.collection('notifications').add({ ...notifPayload, user_id: id }))
+    ).catch(() => {});
+
+    const tokens = [];
+    const seen = new Set();
+    for (const k of ['fcm_token', 'deviceToken', 'fcmToken', 'device_token', 'push_token', 'pushToken', 'token']) {
+      const t = String(ad[k] || '').trim();
+      if (t.length > 20 && !seen.has(t)) { seen.add(t); tokens.push(t); }
+    }
+    for (const k of ['tokens', 'fcm_tokens', 'deviceTokens']) {
+      if (Array.isArray(ad[k])) {
+        for (const v of ad[k]) {
+          const t = String(v || '').trim();
+          if (t.length > 20 && !seen.has(t)) { seen.add(t); tokens.push(t); }
+        }
+      }
+    }
+    if (!tokens.length) { console.warn(`[artisanPush:${type}] no tokens on artisan ${artisanId}`); return; }
+
+    const data = {
+      type: notifPayload.type,
+      user_type: 'artisan',
+      booking_id: notifPayload.booking_id,
+      tasks_management_id: notifPayload.tasks_management_id,
+    };
+    for (const [k, v] of Object.entries(extraData || {})) data[k] = String(v == null ? '' : v).slice(0, 500);
+    try {
+      const resp = await admin.messaging().sendEachForMulticast({
+        tokens,
+        notification: { title: notifPayload.title, body: notifPayload.body },
+        data,
+        android: { priority: 'high', notification: { channelId: 'high_importance_channel' } },
+        apns: { payload: { aps: { sound: 'default', badge: 1 } } },
+      });
+      console.log(`[artisanPush:${type}] FCM ${resp.successCount}/${tokens.length} delivered`);
+    } catch (fcmErr) {
+      console.warn(`[artisanPush:${type}] FCM failed:`, fcmErr && fcmErr.message);
+    }
+  } catch (e) {
+    console.warn('[artisanPush] failed:', e && e.message);
+  }
+}
+
 async function notifyWebhookProcessingFailure(phone, err, userText = '') {
   const detail = err?.message || String(err || 'unknown_error');
   try {
@@ -1762,6 +1833,21 @@ const waTools = [
       name: 'get_my_bookings',
       description: 'List the customer\'s recent bookings (up to 5). Use this when a customer asks about their bookings.',
       parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'message_artisan',
+      description: 'Send a message from the customer to the artisan assigned to their booking. Use when the customer wants to tell, ask, or send something to their artisan (e.g. "tell my plumber I will be 10 minutes late", "ask the artisan to bring a ladder"). The artisan gets a push notification and can reply via their app.',
+      parameters: {
+        type: 'object',
+        properties: {
+          message: { type: 'string', description: 'The message the customer wants to send to the artisan' },
+          bookingId: { type: 'string', description: 'Optional booking ID. If omitted, the customer\'s most recent booking with an assigned artisan is used.' },
+        },
+        required: ['message'],
+      },
     },
   },
   {
@@ -3575,6 +3661,76 @@ async function executeWaTool(name, args, session) {
 
       if (bookings.length === 0) return { message: 'No bookings found for your number.' };
       return { bookings, count: bookings.length };
+    }
+
+    // ═══════════════════════════════════════════
+    // 4b) MESSAGE ARTISAN (customer -> assigned artisan)
+    // ═══════════════════════════════════════════
+    case 'message_artisan': {
+      if (!firestore) return { error: 'Database unavailable' };
+      const text = String(args.message || '').trim();
+      if (!text) return { error: 'What would you like to tell your artisan?' };
+      if (text.length > 1000) return { error: 'That message is too long. Please shorten it.' };
+
+      // Resolve the booking: explicit id, else the customer's most recent
+      // booking that actually has an artisan assigned.
+      let bookingDoc = null;
+      const bidArg = String(args.bookingId || '').trim();
+      if (bidArg) {
+        let d = await firestore.collection('futureBookings').doc(bidArg).get();
+        if (!d.exists) {
+          const q = await firestore.collection('futureBookings').where('order_no', '==', bidArg).limit(1).get();
+          if (!q.empty) d = q.docs[0];
+        }
+        if (d && d.exists) bookingDoc = d;
+      }
+      if (!bookingDoc && session.linkedUserId) {
+        const snap = await firestore.collection('futureBookings')
+          .where('user_id', '==', session.linkedUserId)
+          .orderBy('created_at', 'desc').limit(10).get();
+        for (const d of snap.docs) {
+          const dd = d.data() || {};
+          const spid = String(dd.service_provider_id || '').trim();
+          if (spid && spid !== 'admin') { bookingDoc = d; break; }
+        }
+      }
+      if (!bookingDoc) return { error: "I couldn't find a booking with an assigned artisan to message. Please give me the booking number." };
+
+      const bd = bookingDoc.data() || {};
+      const artisanId = String(bd.service_provider_id || '').trim();
+      const tmId = String(bd.tasks_management_id || '').trim() || bookingDoc.id;
+      if (!artisanId || artisanId === 'admin') return { error: "No artisan is assigned to that booking yet, so there is no one to message." };
+
+      const nowIso = new Date().toISOString();
+      try {
+        const chatRef = firestore.collection('tasksManagement').doc(tmId).collection('chat').doc();
+        await chatRef.set({
+          id: chatRef.id,
+          sender_id: session.linkedUserId || session.phone || 'whatsapp_client',
+          receiver_id: artisanId,
+          message: text,
+          source: 'whatsapp',
+          read: false, isRead: false,
+          timestamp: nowIso, created_at: nowIso,
+        });
+        await firestore.collection('tasksManagement').doc(tmId).set({
+          unread_artisan: admin.firestore.FieldValue.increment(1),
+          last_message: text.slice(0, 100),
+          last_message_at: nowIso,
+          last_message_by: 'client',
+        }, { merge: true });
+      } catch (e) { console.warn('[wa-tool] message_artisan chat write:', e.message); }
+
+      const relayPrompt = 'Your customer sent you a message. They said: "' + text.slice(0, 300) + '". Would you like me to help you reply or update them on the job?';
+      await pushArtisanNotification({
+        artisanId, tmId, bookingId: bookingDoc.id,
+        title: 'New message from client',
+        body: text.slice(0, 100),
+        type: 'chat_message',
+        extraData: { launch_lizzy: 'true', lizzy_prompt: relayPrompt },
+      });
+
+      return { success: true, message: 'Your message has been sent to your artisan.' };
     }
 
     // ═══════════════════════════════════════════
@@ -7395,6 +7551,7 @@ PHOTO ANALYSIS FOR RFQ:
 💬 MESSAGING:
 - Get messages/chat history for a booking (get_messages)
 - Send a message to the artisan or admin about a booking (send_message)
+- Send a message directly to the customer's assigned ARTISAN (message_artisan). Use this whenever the customer wants to tell, ask, or pass something to their artisan — e.g. "tell my plumber I'll be 10 minutes late", "ask the artisan to bring a ladder", "let him know the gate code is 1234". The artisan gets a push notification and can reply. If the customer has more than one active job, confirm which booking first.
 
 🎫 SUPPORT CASES:
 - List your support cases (list_cases)

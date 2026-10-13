@@ -1987,6 +1987,8 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
           tasks_management_id: payloadData.tasks_management_id || '',
           provider_doc_id: providerDocId || '',
           provider_uid: primaryUid || '',
+          ...(payloadData.launch_lizzy ? { launch_lizzy: String(payloadData.launch_lizzy) } : {}),
+          ...(payloadData.lizzy_prompt ? { lizzy_prompt: String(payloadData.lizzy_prompt) } : {}),
         },
       });
     }
@@ -2720,11 +2722,12 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
 
     try {
       const providerDoc = await getServiceProviderDocByAnyId(smArtisanId);
+      const _artisanRelayPrompt = 'Your customer sent you a message. They said: "' + smMessage.substring(0, 300) + '". Would you like me to help you reply or update them on the job?';
       await writePersonalNotificationForProviderDoc(
         providerDoc,
         'New message from client',
         smMessage.substring(0, 100),
-        { booking_id: smBookingId, tasks_management_id: smTmId, type: 'chat_message' }
+        { booking_id: smBookingId, tasks_management_id: smTmId, type: 'chat_message', launch_lizzy: 'true', lizzy_prompt: _artisanRelayPrompt }
       );
     } catch (_notifErr) { /* best-effort notification */ }
 
@@ -4071,6 +4074,131 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         order_type: String(data.is_rfq || '').toLowerCase() === 'yes' ? 'rfq' : 'order',
         created_at: String(data.created_at || '').trim(),
         service_address: String(data.service_address || data.address || '').trim(),
+      },
+    };
+  }
+
+  // -- Shared job memory: one aggregated summary Lizzy can speak across turns --
+  if (action === 'get_job_summary') {
+    const data = await loadBooking();
+    if (!data) return { ok: false, status: 404, error: 'booking_not_found' };
+    const userId = String(data.user_id || '').trim();
+    const artisanId = String(data.service_provider_id || '').trim();
+    const allowed =
+      (actorRole === 'client' && userId === actorUid) ||
+      (actorRole === 'artisan' && await actorMatchesArtisanAssignment(artisanId, actorUid)) ||
+      actorRole === 'admin';
+    if (!allowed) return { ok: false, status: 403, error: 'forbidden' };
+
+    // Artisan name
+    let artisanName = '';
+    if (artisanId && artisanId !== 'admin') {
+      try {
+        const providerDoc = await getServiceProviderDocByAnyId(artisanId);
+        if (providerDoc && providerDoc.exists) {
+          const pd = providerDoc.data() || {};
+          artisanName = String(pd.name || pd.full_name || pd.displayName || pd.firstName || '').trim();
+        }
+      } catch (e) { console.warn('\u26a0\ufe0f job summary artisan:', e.message); }
+    }
+
+    // Live progress from tasksManagement
+    let progressStage = 'pending';
+    let tmData = null;
+    const tmId = String(data.tasks_management_id || '').trim();
+    try {
+      if (tmId) {
+        const tmDoc = await firestore.collection('tasksManagement').doc(tmId).get();
+        if (tmDoc.exists) tmData = tmDoc.data() || {};
+      }
+      if (!tmData) {
+        const tmDoc2 = await firestore.collection('tasksManagement').doc(bookingId).get();
+        if (tmDoc2.exists) tmData = tmDoc2.data() || {};
+      }
+      if (tmData) {
+        const buyingMaterial = String(tmData.buying_material || '');
+        const artisanImages = String(tmData.artisan_images || '0').trim() || '0';
+        const tmStatus = String(tmData.status || data.status || '').toLowerCase();
+        const accepted = tmData.accept === '1' || tmData.accept === 1 ||
+          String(tmData.artisan_confirmed || '') === 'yes' ||
+          String(data.artisan_confirmed || '') === 'yes';
+        if (tmStatus === 'completed' || tmStatus === 'closed' ||
+            tmStatus === 'awaiting_client_confirmation' || artisanImages === '2') {
+          progressStage = 'completed';
+        } else if (artisanImages === '1') {
+          progressStage = 'working_on_site';
+        } else if (buyingMaterial === 'true') {
+          progressStage = 'buying_materials';
+        } else if (tmStatus === 'progress' || tmStatus === 'in_progress') {
+          progressStage = 'on_the_way';
+        } else if (accepted) {
+          progressStage = 'accepted';
+        }
+      }
+    } catch (e) { console.warn('\u26a0\ufe0f job summary progress:', e.message); }
+
+    // Last few chat messages so Lizzy remembers what was discussed
+    const recentMessages = [];
+    try {
+      const chatTmId = tmId || bookingId;
+      const chatSnap = await firestore.collection('tasksManagement').doc(chatTmId)
+        .collection('chat').orderBy('timestamp', 'desc').limit(5).get();
+      chatSnap.forEach((d) => {
+        const m = d.data() || {};
+        recentMessages.push({
+          from: String(m.sender_id || '') === userId ? 'client' : 'artisan',
+          message: String(m.message || '').substring(0, 200),
+        });
+      });
+      recentMessages.reverse();
+    } catch (e) { console.warn('\u26a0\ufe0f job summary chat:', e.message); }
+
+    const stageHuman = {
+      pending: 'waiting for an artisan to be confirmed',
+      accepted: 'accepted by the artisan, waiting for payment or start',
+      on_the_way: 'the artisan is on the way',
+      buying_materials: 'the artisan is buying materials',
+      working_on_site: 'the artisan is working on site',
+      completed: 'the work is completed',
+    }[progressStage] || progressStage;
+
+    const paymentStatus = String(data.payment_status || '').trim() || 'unknown';
+    const category = String(data.category_name || data.categoryName || '').trim();
+    const schedDate = String(data.scheduled_date || '').trim();
+    const schedTime = String(data.scheduled_time || '').trim();
+    const price = String(data.total_price || data.quoted_price || data.price || '').trim();
+
+    let summaryText = 'Here is the summary for this job';
+    if (category) summaryText += ' (' + category + ')';
+    summaryText += '. ';
+    if (artisanName) summaryText += 'The artisan is ' + artisanName + '. ';
+    summaryText += 'Currently, ' + stageHuman + '. ';
+    if (schedDate) summaryText += 'It is scheduled for ' + schedDate + (schedTime ? ' at ' + schedTime : '') + '. ';
+    summaryText += 'Payment status is ' + paymentStatus + '. ';
+    if (price) summaryText += 'The amount is ' + price + '. ';
+    if (recentMessages.length > 0) {
+      const last = recentMessages[recentMessages.length - 1];
+      summaryText += 'The most recent message was from the ' + last.from + ': "' + last.message + '". ';
+    }
+
+    return {
+      ok: true,
+      status: 200,
+      data: {
+        booking_id: bookingId,
+        tasks_management_id: tmId,
+        category_name: category,
+        scheduled_date: schedDate,
+        scheduled_time: schedTime,
+        status: String(data.status || ''),
+        payment_status: paymentStatus,
+        progress_stage: progressStage,
+        total_price: price,
+        artisan_name: artisanName || null,
+        service_provider_id: artisanId,
+        recent_messages: recentMessages,
+        order_type: String(data.is_rfq || '').toLowerCase() === 'yes' ? 'rfq' : 'order',
+        summary_text: summaryText.trim(),
       },
     };
   }

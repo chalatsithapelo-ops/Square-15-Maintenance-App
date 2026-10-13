@@ -2455,6 +2455,44 @@ async def entrypoint(ctx: JobContext):
             logger.error(f"artisan_buying_materials error: {e}", exc_info=True)
             return "Sorry, I had trouble updating the status. Please try again."
 
+    @llm.function_tool(
+        description=(
+            "Get ONE combined summary of a job so you remember everything about it across the "
+            "conversation: the service, artisan, current progress stage, schedule, payment status, "
+            "amount, and the most recent chat messages between client and artisan. "
+            "Use this when the user asks 'what's happening with my job', 'remind me', 'where are we', "
+            "or whenever you need full context before helping. booking_id is optional - if omitted it "
+            "uses the booking the user is currently focused on."
+        )
+    )
+    async def get_job_summary(booking_id: str = "") -> str:
+        """Return an aggregated, speakable summary of a single job."""
+        nonlocal backend_client, app_context_focus_booking_id
+        if not (booking_id or "").strip() and app_context_focus_booking_id:
+            booking_id = app_context_focus_booking_id
+        if not (booking_id or "").strip():
+            return "Which booking would you like the summary for? Please tell me the booking number."
+        if not backend_client:
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
+        try:
+            result = await backend_client.call_backend_action(
+                'get_job_summary', {'booking_id': booking_id}
+            )
+            if not result.get('ok') and not result.get('success'):
+                error = result.get('error', 'unknown_error')
+                if error == 'booking_not_found':
+                    return f"I couldn't find booking {booking_id}."
+                if error == 'forbidden':
+                    return "You don't have permission to view that booking."
+                return f"There was an issue getting the summary: {error}"
+            data = result.get('data', result.get('result', {}))
+            summary = str(data.get('summary_text', '') or '').strip()
+            return summary if summary else "I couldn't build a summary for that job right now."
+        except Exception as e:
+            logger.error(f"get_job_summary error: {e}", exc_info=True)
+            return "Sorry, I had trouble getting the job summary. Please try again."
+
     # â”€â”€ New tools â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     @llm.function_tool(
@@ -3026,6 +3064,7 @@ async def entrypoint(ctx: JobContext):
             ui_navigate,
             # Read-only backend tools
             get_booking_status,
+            get_job_summary,
             list_my_bookings,
             get_booking_analytics,
             explain_quote,
