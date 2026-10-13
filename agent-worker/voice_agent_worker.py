@@ -465,6 +465,9 @@ async def entrypoint(ctx: JobContext):
     # Bookings sent from the app context (fallback when backend_client is not yet initialized)
     app_context_bookings = []
     app_context_user_id = ""
+    # Booking the user was looking at when they tapped a notification to open Lizzy.
+    # Payment/status tools default to this when no booking_id is given.
+    app_context_focus_booking_id = ""
     # The caller's first name (from app context) so Lizzy can greet them by name.
     caller_name = ""
     # Photos staged by the app's manual "Add Photos" button; attached to the next booking.
@@ -777,6 +780,9 @@ async def entrypoint(ctx: JobContext):
                 "  IMPORTANT: Before calling artisan_cancel_and_reassign, you MUST ask the artisan to confirm. "
                 "Say something like 'Are you sure you want to cancel this job and have it reassigned to another artisan?' "
                 "Only proceed if the artisan explicitly says yes.\n"
+                "- On the way to site: artisan_set_on_the_way(booking_id) - tells the customer you are travelling to them.\n"
+                "- Buying materials: artisan_buying_materials(booking_id) - tells the customer you are getting parts/materials.\n"
+                "- To add before/after work photos, open the job screen in the app (photos are required proof and cannot be added by voice).\n"
                 "- Artisan screens: open_artisan_requests, open_artisan_appointments, open_artisan_wallet, open_schedule.\n"
                 "- Do not dispatch artisans while talking to an artisan.\n"
             )
@@ -1510,6 +1516,10 @@ async def entrypoint(ctx: JobContext):
     async def request_payment_link(booking_id: str, payment_type: str = "full", payment_method: str = "card") -> str:
         """Request a PayFast card/EFT payment link via the backend."""
         nonlocal backend_client
+        # When the user tapped a payment notification to reach Lizzy, default to
+        # that booking so 'yes, pay' needs no disambiguation.
+        if not (booking_id or "").strip() and app_context_focus_booking_id:
+            booking_id = app_context_focus_booking_id
         if not backend_client:
             if not await _ensure_backend_or_retry():
                 return _CONNECTION_RETRY_MSG
@@ -2397,6 +2407,54 @@ async def entrypoint(ctx: JobContext):
             logger.error(f"artisan_cancel_and_reassign error: {e}", exc_info=True)
             return "Sorry, I had trouble with the reassignment. Please try again."
 
+    @llm.function_tool(
+        description=(
+            "ARTISAN ONLY: tell the customer you are ON THE WAY / travelling to their site. "
+            "Call this when the artisan says they are heading to the job, leaving now, or on their way. "
+            "Requires: booking_id. This updates the live job tracker and sends the customer a push notification."
+        )
+    )
+    async def artisan_set_on_the_way(booking_id: str) -> str:
+        """Mark the job as 'on the way' and notify the customer."""
+        nonlocal backend_client
+        if not backend_client:
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
+        try:
+            result = await backend_client.call_backend_action(
+                'artisan_update_status', {'booking_id': booking_id, 'stage': 'on_the_way'}
+            )
+            if not result.get('ok') and not result.get('success'):
+                return f"I couldn't update the status: {result.get('error', 'unknown_error')}"
+            return "Done - I've let the customer know you are on the way."
+        except Exception as e:
+            logger.error(f"artisan_set_on_the_way error: {e}", exc_info=True)
+            return "Sorry, I had trouble updating the status. Please try again."
+
+    @llm.function_tool(
+        description=(
+            "ARTISAN ONLY: tell the customer you are BUYING MATERIALS for their job. "
+            "Call this when the artisan says they are getting, buying, or picking up materials or parts. "
+            "Requires: booking_id. This updates the live job tracker and sends the customer a push notification."
+        )
+    )
+    async def artisan_buying_materials(booking_id: str) -> str:
+        """Mark the job as 'buying materials' and notify the customer."""
+        nonlocal backend_client
+        if not backend_client:
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
+        try:
+            result = await backend_client.call_backend_action(
+                'artisan_update_status', {'booking_id': booking_id, 'stage': 'buying_materials'}
+            )
+            if not result.get('ok') and not result.get('success'):
+                return f"I couldn't update the status: {result.get('error', 'unknown_error')}"
+            return "Done - I've let the customer know you are buying the materials."
+        except Exception as e:
+            logger.error(f"artisan_buying_materials error: {e}", exc_info=True)
+            return "Sorry, I had trouble updating the status. Please try again."
+
     # â”€â”€ New tools â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     @llm.function_tool(
@@ -2986,6 +3044,8 @@ async def entrypoint(ctx: JobContext):
             reschedule_booking,
             mark_booking_in_progress,
             artisan_cancel_and_reassign,
+            artisan_set_on_the_way,
+            artisan_buying_materials,
             submit_rating,
             submit_complaint,
             # Payment action tools
@@ -3056,7 +3116,7 @@ async def entrypoint(ctx: JobContext):
         return True
 
     def on_participant_metadata_changed(participant, old_metadata, new_metadata):
-        nonlocal backend_client, firebase_token, session_id, session_nonce, app_context_bookings, app_context_user_id, caller_name
+        nonlocal backend_client, firebase_token, session_id, session_nonce, app_context_bookings, app_context_user_id, caller_name, app_context_focus_booking_id
         try:
             if not new_metadata or not str(new_metadata).strip():
                 return
@@ -3149,6 +3209,9 @@ async def entrypoint(ctx: JobContext):
                 uid = (payload.get("user_id") or "").strip()
                 if uid:
                     app_context_user_id = uid
+                focus_bid = (payload.get("focus_booking_id") or "").strip()
+                if focus_bid:
+                    app_context_focus_booking_id = focus_bid
                 if not caller_name:
                     nm = _first_name(payload.get("user_name") or "")
                     if nm:
@@ -3360,7 +3423,7 @@ async def entrypoint(ctx: JobContext):
     # so we can read it directly from any remote participant's metadata JSON.
     def _scan_participants_for_credentials():
         """Scan all remote participants for firebase_token in metadata."""
-        nonlocal backend_client, app_context_bookings, app_context_user_id, caller_name
+        nonlocal backend_client, app_context_bookings, app_context_user_id, caller_name, app_context_focus_booking_id
         try:
             participants = ctx.room.remote_participants
             # Handle both dict.values() and direct iteration
@@ -3399,6 +3462,9 @@ async def entrypoint(ctx: JobContext):
                     uid = (msg.get('user_id') or '').strip()
                     if uid:
                         app_context_user_id = uid
+                    focus_bid = (msg.get('focus_booking_id') or '').strip()
+                    if focus_bid:
+                        app_context_focus_booking_id = focus_bid
                     if not caller_name:
                         _pl = msg.get('payload') if isinstance(msg.get('payload'), dict) else {}
                         nm = _first_name(msg.get('user_name') or _pl.get('user_name') or '')

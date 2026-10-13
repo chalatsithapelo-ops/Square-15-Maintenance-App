@@ -1664,6 +1664,35 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     return await _writeNotificationImpl({ userId, userType, title, message, data, sendPush: true });
   }
 
+  // Proactive message Lizzy voice should speak when the user taps a status
+  // notification of this type (null = this type should not launch Lizzy).
+  // Mirrors the client-side map in future_booking_service.dart.
+  function lizzyPromptForType(type) {
+    switch (String(type || '').trim()) {
+      case 'future_booking_payment_required':
+      case 'payment_required':
+      case 'rfq_accepted':
+      case 'artisan_confirmed':
+        return 'Good news - an artisan has accepted your booking. You can pay now to confirm, and your money stays safe in escrow until the job is done. Would you like me to help you pay?';
+      case 'artisan_going_to_site':
+      case 'on_the_way':
+        return 'Your artisan is on the way to your site. Would you like me to show you live tracking, or is there anything you would like to ask?';
+      case 'artisan_buying_material':
+      case 'buying_material':
+        return 'Your artisan is buying the materials needed for your job. Is there anything you would like to ask about your booking?';
+      case 'artisan_working_on_site':
+      case 'working_on_site':
+        return 'Your artisan has arrived and started working on your job. Let me know if you need anything.';
+      case 'artisan_work_completed':
+      case 'work_completed':
+        return 'Your artisan has completed the work. Would you like to review the photos, rate the artisan, or is there anything else I can help with?';
+      case 'balance_payment_due':
+        return 'Your artisan has completed the work and a balance payment is now due. Would you like me to help you pay it so your booking is finalised?';
+      default:
+        return null;
+    }
+  }
+
   async function writeAdminNotification({ title, message, data }) {
     // Write notification doc for admin UI
     await _writeNotificationImpl({
@@ -1876,6 +1905,8 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
             notification_id: ref.id,
             user_type: utype,
             booking_id: payloadData.booking_id || payloadData.bookingId || '',
+            ...(payloadData.launch_lizzy ? { launch_lizzy: String(payloadData.launch_lizzy) } : {}),
+            ...(payloadData.lizzy_prompt ? { lizzy_prompt: String(payloadData.lizzy_prompt) } : {}),
           },
         });
         await ref.set(
@@ -2748,12 +2779,13 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     } catch (e) { console.warn('\u26a0\ufe0f chat unread count update (artisan):', e.message); }
 
     try {
+      const _relayPrompt = 'Your artisan sent you a message. They said: "' + scMessage.substring(0, 300) + '". Would you like me to help you reply?';
       await writePersonalNotification({
         userId: scClientId,
         userType: 'user',
         title: 'Message from your artisan',
         message: scMessage.substring(0, 100),
-        data: { booking_id: scBookingId, tasks_management_id: scTmId, type: 'chat_message' },
+        data: { booking_id: scBookingId, tasks_management_id: scTmId, type: 'chat_message', launch_lizzy: 'true', lizzy_prompt: _relayPrompt },
       });
     } catch (_notifErr) { /* best-effort notification */ }
 
@@ -4569,6 +4601,62 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     await _rescheduleBatch.commit();
 
     return { ok: true, status: 200, data: { rescheduled: true } };
+  }
+
+  if (action === 'artisan_update_status') {
+    if (!(actorRole === 'artisan' && await actorMatchesArtisanAssignment(artisanId, actorUid))) {
+      return { ok: false, status: 403, error: 'forbidden' };
+    }
+    const stage = String(payload.stage || '').trim().toLowerCase();
+    const _statusBatch = firestore.batch();
+    let clientType = '';
+    let clientTitle = '';
+    let clientMsg = '';
+    if (stage === 'on_the_way') {
+      _statusBatch.set(bookingRef, { status: 'in_progress', updated_at: now }, { merge: true });
+      if (tmId) {
+        _statusBatch.set(
+          firestore.collection('tasksManagement').doc(tmId),
+          { status: 'progress', accept: '1', updated_at: now },
+          { merge: true },
+        );
+      }
+      clientType = 'artisan_going_to_site';
+      clientTitle = 'Artisan On The Way';
+      clientMsg = 'Your artisan is on the way to your site.';
+    } else if (stage === 'buying_materials' || stage === 'buying_material') {
+      if (tmId) {
+        _statusBatch.set(
+          firestore.collection('tasksManagement').doc(tmId),
+          { buying_material: 'true', updated_at: now },
+          { merge: true },
+        );
+      }
+      clientType = 'artisan_buying_material';
+      clientTitle = 'Artisan Buying Materials';
+      clientMsg = 'Your artisan is buying the materials needed for your job.';
+    } else {
+      return { ok: false, status: 400, error: 'invalid_stage', message: "stage must be 'on_the_way' or 'buying_materials'" };
+    }
+    await _statusBatch.commit();
+    if (userId) {
+      try {
+        const lp = lizzyPromptForType(clientType);
+        await writePersonalNotification({
+          userId,
+          userType: 'user',
+          title: clientTitle,
+          message: clientMsg,
+          data: {
+            type: clientType,
+            booking_id: bookingId,
+            tasks_management_id: tmId || '',
+            ...(lp ? { launch_lizzy: 'true', lizzy_prompt: lp } : {}),
+          },
+        });
+      } catch (_e) { /* best-effort client notification */ }
+    }
+    return { ok: true, status: 200, data: { stage, notified: !!userId } };
   }
 
   if (action === 'mark_booking_in_progress') {
