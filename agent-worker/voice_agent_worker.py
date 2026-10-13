@@ -673,6 +673,7 @@ async def entrypoint(ctx: JobContext):
             "- The tool ALWAYS returns pricing data. Read back the prices from the results.\n"
             "- If cost is null for a service, say 'This service requires a quote from an artisan'.\n"
             "- NEVER guess or make up prices. ALWAYS call lookup_service_pricing.\n"
+            "- CRITICAL: Every fixed price is for LABOUR ONLY. Whenever you quote a fixed price, you MUST tell the customer it covers labour only and that materials are quoted separately. For example: 'The labour for this is 450 rand; materials are quoted separately.'\n"
             "\n"
             "DIAGNOSIS & QUOTING (IMPORTANT â€” ASK BEFORE BOOKING):\n"
             "- When a user describes a maintenance problem, DO NOT immediately create a booking.\n"
@@ -744,7 +745,7 @@ async def entrypoint(ctx: JobContext):
             "\n"
             "PRICE CONFIRMATION (CRITICAL â€” NEVER SKIP):\n"
             "- After calling lookup_service_pricing, you MUST present the price to the customer and WAIT for their explicit confirmation BEFORE calling ui_navigate(action='create_order_booking').\n"
-            "- Say something like: 'The cost for [service] is [amount] rand. Shall I go ahead and create the booking?'\n"
+            "- Say something like: 'The labour cost for [service] is [amount] rand - this covers labour only, materials are quoted separately. Shall I go ahead and create the booking?'\n"
             "- Do NOT create a booking in the same turn as the pricing lookup. You must STOP and wait for the customer to say yes or confirm.\n"
             "- Only after the customer confirms (e.g. 'yes', 'ok', 'go ahead', 'book it') should you create the booking.\n"
             "- If the customer questions the price or wants to negotiate, do NOT create the booking â€” explain the pricing and wait.\n"
@@ -1586,7 +1587,7 @@ async def entrypoint(ctx: JobContext):
                     id_map.append(f"{name} => {tid}")
 
             total = result.get('matched', len(services))
-            header = f"Found {total} service(s)."
+            header = f"Found {total} service(s). Please note: these fixed prices cover labour only - materials are quoted separately."
             if total > 15:
                 header += " Here are the first 15:"
 
