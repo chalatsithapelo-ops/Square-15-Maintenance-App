@@ -996,8 +996,10 @@ async def entrypoint(ctx: JobContext):
     @llm.function_tool(
         description=(
             "Get the current status of a booking by booking ID. "
-            "Returns status, scheduled time, artisan details, and payment info. "
-            "Use this when user asks 'What's my booking status?' or 'Where is my artisan?'"
+            "Returns status, scheduled time, artisan details, payment status (received / deposit / pending), "
+            "and the artisan's live progress: accepted, on the way, buying materials, working on site, or completed. "
+            "Use this whenever the user asks about a booking, e.g. 'What's my booking status?', 'Where is my artisan?', "
+            "'Has my payment gone through?', 'Is the artisan on the way?', 'Is the job done yet?'"
         )
     )
     async def get_booking_status(booking_id: str) -> str:
@@ -1055,6 +1057,9 @@ async def entrypoint(ctx: JobContext):
             rfq_no = data.get('rfq_no', '')
             rfq_status = data.get('rfq_status', '')
             order_type = data.get('order_type', '')
+            payment_status = str(data.get('payment_status', '') or '').strip().lower()
+            progress_stage = str(data.get('progress_stage', '') or '').strip().lower()
+            artisan_location = data.get('artisan_location')
 
             response = f"Booking {booking_id} for {category}: Status is {status}."
             if problem:
@@ -1067,8 +1072,37 @@ async def entrypoint(ctx: JobContext):
                 response += f" Price: R{price}."
             if rfq_no:
                 response += f" RFQ #{rfq_no}, RFQ status: {rfq_status}."
-            if artisan_confirmed:
+
+            # Payment status in plain language so Lizzy can confirm the client's payment.
+            if payment_status == 'paid':
+                response += " Payment: received in full and held safely in escrow until the work is done."
+            elif payment_status == 'deposit_paid':
+                response += " Payment: deposit received and held in escrow; the balance is due when the work is completed."
+            elif payment_status in ('pending', 'unpaid', ''):
+                if artisan_confirmed and str(artisan_confirmed).lower() in ('yes', 'accepted', 'confirmed'):
+                    response += " Payment: not yet received. Please pay to confirm the order."
+            else:
+                response += f" Payment status: {payment_status}."
+
+            # Live progress stage so Lizzy can report where the artisan is up to.
+            progress_phrases = {
+                'accepted': "Progress: the artisan has accepted the job and will head out soon.",
+                'on_the_way': "Progress: the artisan is on the way to your site.",
+                'buying_materials': "Progress: the artisan is buying the materials needed for the job.",
+                'working_on_site': "Progress: the artisan is on site working on the job.",
+                'completed': "Progress: the artisan has completed the work.",
+                'pending': "Progress: waiting for an artisan to be assigned and accept the job.",
+            }
+            if progress_stage in progress_phrases:
+                response += f" {progress_phrases[progress_stage]}"
+            elif artisan_confirmed:
                 response += f" Artisan confirmation: {artisan_confirmed}."
+
+            # Live location: Lizzy can't speak coordinates, so point the client to the map.
+            if artisan_location and isinstance(artisan_location, dict) and \
+                    progress_stage in ('on_the_way', 'buying_materials', 'working_on_site'):
+                response += " You can track the artisan's live location on the map in the app."
+
             if address:
                 response += f" Location: {address}."
 

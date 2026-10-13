@@ -3948,8 +3948,9 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       };
     }
 
-    // Enrich with artisan name/phone from serviceProvider collection
+    // Enrich with artisan name/phone + live location from serviceProvider collection
     let artisanInfo = null;
+    let artisanLocation = null;
     if (artisanId && artisanId !== 'admin') {
       try {
         const providerDoc = await getServiceProviderDocByAnyId(artisanId);
@@ -3960,9 +3961,56 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
             phone: String(pd.phone || pd.phoneNumber || pd.phone_number || pd.mobile || '').trim() || null,
             trade: String(pd.profession || pd.trade || pd.specialization || '').trim() || null,
           };
+          const plat = parseFloat(String(pd.lat || pd.latitude || ''));
+          const plng = parseFloat(String(pd.lng || pd.longitude || ''));
+          if (!isNaN(plat) && !isNaN(plng) && plat !== 0 && plng !== 0) {
+            artisanLocation = { lat: plat, lng: plng };
+          }
         }
       } catch (e) { console.warn('\u26a0\ufe0f artisan info lookup:', e.message); }
     }
+
+    // Enrich with LIVE progress from the linked tasksManagement doc so Lizzy can
+    // report whether the artisan is on the way, buying materials, working on
+    // site, or has completed the job (not just the futureBookings status).
+    let progressStage = '';
+    let buyingMaterial = '';
+    let artisanImages = '';
+    try {
+      const tmId = String(data.tasks_management_id || '').trim();
+      let tmData = null;
+      if (tmId) {
+        const tmDoc = await firestore.collection('tasksManagement').doc(tmId).get();
+        if (tmDoc.exists) tmData = tmDoc.data() || {};
+      }
+      // Fallback: WhatsApp bookings key tasksManagement by the order/booking id.
+      if (!tmData) {
+        const tmDoc2 = await firestore.collection('tasksManagement').doc(bookingId).get();
+        if (tmDoc2.exists) tmData = tmDoc2.data() || {};
+      }
+      if (tmData) {
+        buyingMaterial = String(tmData.buying_material || '');
+        artisanImages = String(tmData.artisan_images || '0').trim() || '0';
+        const tmStatus = String(tmData.status || data.status || '').toLowerCase();
+        const accepted = tmData.accept === '1' || tmData.accept === 1 ||
+          String(tmData.artisan_confirmed || '') === 'yes' ||
+          String(data.artisan_confirmed || '') === 'yes';
+        if (tmStatus === 'completed' || tmStatus === 'closed' ||
+            tmStatus === 'awaiting_client_confirmation' || artisanImages === '2') {
+          progressStage = 'completed';
+        } else if (artisanImages === '1') {
+          progressStage = 'working_on_site';
+        } else if (buyingMaterial === 'true') {
+          progressStage = 'buying_materials';
+        } else if (tmStatus === 'progress' || tmStatus === 'in_progress') {
+          progressStage = 'on_the_way';
+        } else if (accepted) {
+          progressStage = 'accepted';
+        } else {
+          progressStage = 'pending';
+        }
+      }
+    } catch (e) { console.warn('\u26a0\ufe0f progress enrich:', e.message); }
 
     return {
       ok: true,
@@ -3979,6 +4027,10 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         artisan_confirmed: String(data.artisan_confirmed || ''),
         service_provider_id: artisanId,
         artisan: artisanInfo,
+        progress_stage: progressStage,
+        buying_material: buyingMaterial,
+        artisan_images: artisanImages,
+        artisan_location: artisanLocation,
         tasks_management_id: String(data.tasks_management_id || '').trim(),
         order_no: String(data.order_no || '').trim(),
         order_number: String(data.order_no || data.order_number || '').trim(),

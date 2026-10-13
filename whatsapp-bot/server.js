@@ -3483,10 +3483,36 @@ async function executeWaTool(name, args, session) {
       const balanceRemaining = isDeposit ? (parseFloat(d.balance_remaining || d.balance_amount || '0') || Math.round((totalCost - depositAmount) * 100) / 100) : 0;
       const balancePaid = d.balance_paid === true;
 
+      // Derive a human-readable progress stage from the live task fields so the
+      // assistant can report whether the artisan is on the way, buying
+      // materials, working on site, or done — not just the raw status.
+      let liveData = d;
+      if (d.artisan_images === undefined && d.buying_material === undefined) {
+        const tmLink = String(d.tasks_management_id || '').trim();
+        if (tmLink) {
+          try {
+            const tmDoc = await firestore.collection('tasksManagement').doc(tmLink).get();
+            if (tmDoc.exists) liveData = tmDoc.data();
+          } catch (_) {}
+        }
+      }
+      const _ai = String(liveData.artisan_images || '0').trim() || '0';
+      const _bm = String(liveData.buying_material || '');
+      const _st = String(liveData.status || d.status || '').toLowerCase();
+      const _accepted = liveData.accept === '1' || liveData.accept === 1 ||
+        String(liveData.artisan_confirmed || '') === 'yes' || d.accept === '1';
+      let progress = 'pending';
+      if (_st === 'completed' || _st === 'closed' || _st === 'awaiting_client_confirmation' || _ai === '2') progress = 'completed';
+      else if (_ai === '1') progress = 'working_on_site';
+      else if (_bm === 'true') progress = 'buying_materials';
+      else if (_st === 'progress' || _st === 'in_progress') progress = 'on_the_way';
+      else if (_accepted) progress = 'accepted';
+
       return {
         bookingId: doc.id,
         orderNo: d.order_no || doc.id,
         status: d.status || 'unknown',
+        progress,
         category: d.category_name || d.category || '',
         artisan: d.service_provider_name || d.artisanName || 'Not assigned yet',
         cost: totalCost > 0 ? `R${totalCost.toFixed(2)}` : 'Pending quote',
@@ -7379,7 +7405,13 @@ PHOTO ANALYSIS FOR RFQ:
 - Explain a quote breakdown (explain_quote)
 - Check payment status for a booking (check_payment)
 
-CRITICAL PRICING RULES:
+JOB PROGRESS REPORTING (CRITICAL — ALWAYS USE LIVE DATA):
+- When the customer asks how their job is going, where the artisan is, whether payment went through, or whether the job is done, call check_booking_status and report from its result — never from memory.
+- check_booking_status returns a "progress" field. Translate it into plain language: "pending" means waiting for an artisan to accept; "accepted" means the artisan accepted and will head out; "on_the_way" means the artisan is on the way to site; "buying_materials" means the artisan is buying the materials needed; "working_on_site" means the artisan is on site working; "completed" means the work is finished.
+- It also returns paymentStatus: "paid" means payment is received and held safely in escrow; "deposit_paid" means the deposit is in escrow and a balance is still due; otherwise payment is not yet received.
+- For live artisan location ("how far", "where is he/she", "ETA"), use track_artisan.
+
+
 - You MUST call lookup_pricing BEFORE calling create_booking, EVERY TIME, NO EXCEPTIONS.
 - When calling lookup_pricing, pass the specific service as subcategory (e.g. category="plumbing", subcategory="toilet unblocking").
 - If lookup_pricing returns matched=true with a fixedPrice, use that EXACT price — do NOT estimate or use a different amount.
