@@ -619,6 +619,8 @@ async def entrypoint(ctx: JobContext):
             "    - CARD â†’ call request_payment_link(booking_id, payment_type, payment_method='card') â€” sends a secure PayFast card link to their phone.\n"
             "    - BUY-NOW-PAY-LATER â†’ call pay_with_bnpl(booking_id, payment_type, provider) â€” PayFast buy-now-pay-later. provider is 'moretyme' (default), 'mobicred', or 'rcs'. If the customer names one, pass it; otherwise use moretyme. Sends a secure link to their phone.\n"
             "  STEP 4: After the payment, CONFIRM it went through by calling check_payment(booking_id). Tell the customer the status, then continue â€” once money is in escrow the artisan proceeds.\n"
+            "- PAYMENT ALREADY MADE (CRITICAL â€” NEVER ASK THEM TO PAY TWICE): If the customer says they have already paid, or that they just made the payment, do NOT imply they did not pay and do NOT start a new payment. FIRST call check_payment(booking_id). If it already shows received or deposit paid, confirm it warmly and continue. If it does NOT show yet, REASSURE them: instant EFT and card payments can take a minute or two to reflect on our side â€” say you will check again shortly, stay with them, and offer to wait a moment and re-check. Do NOT go quiet and do NOT offer to pay again. Only start a brand new payment if the customer EXPLICITLY asks to pay again.\n"
+            "- After sending an EFT or card payment link, the money confirms via the bank and can take a minute or two. Never treat 'not reflected yet' as 'not paid'. Keep the customer company, reassure them, and re-check with check_payment rather than restarting payment or going silent.\n"
             "- WALLET SAFETY: NEVER charge the wallet without the customer explicitly choosing wallet AND confirming the amount out loud. If their balance is too low, offer EFT, card, or buy-now-pay-later instead.\n"
             "- If customer says 'deposit' or '35 percent' â†’ use payment_type='deposit'. If 'full' or 'pay everything' â†’ use payment_type='full'.\n"
             "- RFQ QUOTE tools: generate_rfq_quote (trigger AI quote), accept_rfq (accept quote â†’ payment), reject_rfq (negotiate quote). Use when handling RFQ requests.\n"
@@ -720,6 +722,11 @@ async def entrypoint(ctx: JobContext):
             "- Before creating ANY booking you MUST know where the artisan should go. If the customer has not told you, ASK: 'Where should I send the artisan â€” your current location, or a different address?'\n"
             "- If they say their current location, pass service_address='current location'. If they give an address, pass it verbatim as service_address.\n"
             "- NEVER create a booking without a location. Do not silently assume â€” always confirm it with the customer at least once.\n"
+            "\n"
+            "APPOINTMENT TIME (CRITICAL â€” ALWAYS ASK, NEVER ASSUME NOW):\n"
+            "- Before creating ANY booking you MUST know WHEN the customer wants the appointment. If they have not told you, ASK: 'When would you like the appointment â€” as soon as possible, or scheduled for a specific day and time?'\n"
+            "- Do NOT assume 'now'. Only use scheduled_date='now' and scheduled_time='now' if the customer clearly says now, as soon as possible, asap, or urgent, OR explicitly agrees to the soonest availability.\n"
+            "- If they give a day and/or time, pass it as scheduled_date (YYYY-MM-DD) and scheduled_time (HH:MM). If they give only a day, ask for a rough time of day. Confirm the chosen date and time back to them once before booking.\n"
             "\n"
             "BOOKING COMPLETION (CRITICAL â€” ALWAYS FINISH THE JOB):\n"
             "- Your job is NOT done until a booking is actually created. NEVER end with 'let me know if you need anything else', NEVER just say 'thank you', and NEVER go quiet BEFORE the booking has been created.\n"
@@ -1486,7 +1493,11 @@ async def entrypoint(ctx: JobContext):
             transactions = data.get('transactions', [])
 
             if payment_status == 'not_found':
-                return "I couldn't find any payment records for that booking."
+                return (
+                    "I'm not seeing the payment reflected just yet. If you've just paid by "
+                    "instant EFT or card, it can take a minute or two to confirm on our side. "
+                    "Let's give it a moment and I'll check again \u2014 no need to pay again."
+                )
 
             response = message or f"Payment status: {payment_status}."
             if transactions and len(transactions) > 0:
