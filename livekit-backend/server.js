@@ -3517,11 +3517,15 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         const t = Date.parse(v); return Number.isNaN(t) ? 0 : t;
       };
 
-      // Try to find payment in transactionLogs by booking_id
+      // Find the payment in transactionLogs. Wallet and in-app payments log
+      // under booking_id, but that value may be a futureBooking id OR a
+      // tasksManagement id depending on which flow paid, so search by the
+      // effective id first, then fall back to a tasks_management_id match.
+      const _effId = bookingId || tmIdDirect;
       let qs = null;
-      if (bookingId) {
+      if (_effId) {
         qs = await firestore.collection('transactionLogs')
-          .where('booking_id', '==', bookingId)
+          .where('booking_id', '==', _effId)
           .limit(20)
           .get();
       }
@@ -3533,7 +3537,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
           const bData = await loadBooking();
           tmIdToSearch = String((bData || {}).tasks_management_id || '').trim();
         }
-        if (tmIdToSearch) {
+        if (tmIdToSearch && tmIdToSearch !== _effId) {
           qs = await firestore.collection('transactionLogs')
             .where('tasks_management_id', '==', tmIdToSearch)
             .limit(20)
@@ -3541,10 +3545,26 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         }
       }
 
-      // Load the booking once so we can report full-vs-deposit and the
-      // outstanding balance, and build a balance reminder for deposit payers.
+      // Load the booking so we can report full-vs-deposit and the outstanding
+      // balance. Read from BOTH the futureBooking (via loadBooking) and the
+      // tasksManagement doc, because a wallet / in-app payment may update only
+      // one of them — we must never report "unpaid" when the other says paid.
       let _bk = null;
-      if (bookingId) { try { _bk = await loadBooking(); } catch (_) {} }
+      try { if (bookingId || tmIdDirect) _bk = await loadBooking(); } catch (_) {}
+      const _rank = (s) => { s = String(s || '').toLowerCase(); return s === 'paid' ? 3 : (s === 'deposit_paid' ? 2 : (s ? 1 : 0)); };
+      try {
+        const _tmCandidateId = tmIdDirect || String((_bk || {}).tasks_management_id || '').trim() || (bookingId || '');
+        if (_tmCandidateId) {
+          const _tmSnap = await firestore.collection('tasksManagement').doc(_tmCandidateId).get();
+          if (_tmSnap.exists) {
+            const _tmData = _tmSnap.data() || {};
+            const _tmStatus = String(_tmData.payment_status || _tmData.paymentStatus || '').trim();
+            const _curStatus = String((_bk || {}).payment_status || (_bk || {}).paymentStatus || '').trim();
+            if (!_bk) _bk = _tmData;
+            else if (_rank(_tmStatus) > _rank(_curStatus)) _bk = { ..._bk, ..._tmData };
+          }
+        }
+      } catch (_) {}
       const _num = (v) => { const n = parseFloat(String(v == null ? '' : v).replace(/[^0-9.\-]/g, '')); return Number.isFinite(n) ? n : 0; };
       const _bkStatus = String((_bk || {}).payment_status || (_bk || {}).paymentStatus || '').trim().toLowerCase();
       const _total = _num((_bk || {}).cost || (_bk || {}).total_cost || (_bk || {}).total_price);
