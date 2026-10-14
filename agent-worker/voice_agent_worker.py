@@ -618,7 +618,7 @@ async def entrypoint(ctx: JobContext):
             "    - INSTANT EFT â†’ call request_payment_link(booking_id, payment_type, payment_method='eft') â€” sends a secure PayFast EFT link to their phone.\n"
             "    - CARD â†’ call request_payment_link(booking_id, payment_type, payment_method='card') â€” sends a secure PayFast card link to their phone.\n"
             "    - BUY-NOW-PAY-LATER â†’ call pay_with_bnpl(booking_id, payment_type, provider) â€” PayFast buy-now-pay-later. provider is 'moretyme' (default), 'mobicred', or 'rcs'. If the customer names one, pass it; otherwise use moretyme. Sends a secure link to their phone.\n"
-            "  STEP 4: After the payment, CONFIRM it went through by calling check_payment(booking_id). Tell the customer the status, then continue â€” once money is in escrow the artisan proceeds.\n"
+            "  STEP 4: After the payment, CONFIRM it went through by calling check_payment(booking_id). Tell the customer the status clearly â€” whether the payment was RECEIVED, whether it was the FULL amount or a DEPOSIT, and if it was a deposit, remind them of the exact remaining balance and that it is due after the job is completed. Then continue â€” once money is in escrow the artisan proceeds.\n"
             "- PAYMENT ALREADY MADE (CRITICAL â€” NEVER ASK THEM TO PAY TWICE): If the customer says they have already paid, or that they just made the payment, do NOT imply they did not pay and do NOT start a new payment. FIRST call check_payment(booking_id). If it already shows received or deposit paid, confirm it warmly and continue. If it does NOT show yet, REASSURE them: instant EFT and card payments can take a minute or two to reflect on our side â€” say you will check again shortly, stay with them, and offer to wait a moment and re-check. Do NOT go quiet and do NOT offer to pay again. Only start a brand new payment if the customer EXPLICITLY asks to pay again.\n"
             "- After sending an EFT or card payment link, the money confirms via the bank and can take a minute or two. Never treat 'not reflected yet' as 'not paid'. Keep the customer company, reassure them, and re-check with check_payment rather than restarting payment or going silent.\n"
             "- WALLET SAFETY: NEVER charge the wallet without the customer explicitly choosing wallet AND confirming the amount out loud. If their balance is too low, offer EFT, card, or buy-now-pay-later instead.\n"
@@ -1469,7 +1469,10 @@ async def entrypoint(ctx: JobContext):
     @llm.function_tool(
         description=(
             "READ-ONLY payment status check. Use ONLY when the user asks 'Did I pay?', "
-            "'What is my payment status?', 'Has payment been received?'. "
+            "'What is my payment status?', 'Has payment been received?', 'Did my deposit go "
+            "through?', 'How much do I still owe?'. It returns whether payment was received, "
+            "whether it was a full payment or a deposit, and the outstanding balance if any. "
+            "Read the returned message to the customer, including any balance reminder. "
             "DO NOT call this when the user wants to pay or wants a payment link \u2014 "
             "for that, call request_payment_link instead."
         )

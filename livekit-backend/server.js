@@ -1909,6 +1909,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
             booking_id: payloadData.booking_id || payloadData.bookingId || '',
             ...(payloadData.launch_lizzy ? { launch_lizzy: String(payloadData.launch_lizzy) } : {}),
             ...(payloadData.lizzy_prompt ? { lizzy_prompt: String(payloadData.lizzy_prompt) } : {}),
+            ...(payloadData.lizzy_target_role ? { lizzy_target_role: String(payloadData.lizzy_target_role) } : {}),
           },
         });
         await ref.set(
@@ -1991,6 +1992,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
           provider_uid: primaryUid || '',
           ...(payloadData.launch_lizzy ? { launch_lizzy: String(payloadData.launch_lizzy) } : {}),
           ...(payloadData.lizzy_prompt ? { lizzy_prompt: String(payloadData.lizzy_prompt) } : {}),
+          ...(payloadData.lizzy_target_role ? { lizzy_target_role: String(payloadData.lizzy_target_role) } : {}),
         },
       });
     }
@@ -2729,8 +2731,21 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         providerDoc,
         'New message from client',
         smMessage.substring(0, 100),
-        { booking_id: smBookingId, tasks_management_id: smTmId, type: 'chat_message', launch_lizzy: 'true', lizzy_prompt: _artisanRelayPrompt }
+        { booking_id: smBookingId, tasks_management_id: smTmId, type: 'chat_message', launch_lizzy: 'true', lizzy_prompt: _artisanRelayPrompt, lizzy_target_role: 'artisan' }
       );
+    } catch (_notifErr) { /* best-effort notification */ }
+
+    // Confirmation back to the CLIENT (sender) so they can trace that the
+    // message was delivered. NO launch_lizzy here, and no artisan-worded
+    // prompt, so the client never sees the artisan's relay text.
+    try {
+      await writePersonalNotification({
+        userId: smUserId,
+        userType: 'user',
+        title: 'Message sent to your artisan',
+        message: 'Delivered: "' + smMessage.substring(0, 90) + '". We\'ll let you know as soon as they reply.',
+        data: { booking_id: smBookingId, tasks_management_id: smTmId, type: 'chat_message_sent' },
+      });
     } catch (_notifErr) { /* best-effort notification */ }
 
     return {
@@ -2790,8 +2805,20 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         userType: 'user',
         title: 'Message from your artisan',
         message: scMessage.substring(0, 100),
-        data: { booking_id: scBookingId, tasks_management_id: scTmId, type: 'chat_message', launch_lizzy: 'true', lizzy_prompt: _relayPrompt },
+        data: { booking_id: scBookingId, tasks_management_id: scTmId, type: 'chat_message', launch_lizzy: 'true', lizzy_prompt: _relayPrompt, lizzy_target_role: 'client' },
       });
+    } catch (_notifErr) { /* best-effort notification */ }
+
+    // Confirmation back to the ARTISAN (sender) so they can trace delivery.
+    // NO launch_lizzy and no client-worded prompt.
+    try {
+      const _artProvDoc = await getServiceProviderDocByAnyId(scArtisanId);
+      await writePersonalNotificationForProviderDoc(
+        _artProvDoc,
+        'Message sent to your client',
+        'Delivered: "' + scMessage.substring(0, 90) + '".',
+        { booking_id: scBookingId, tasks_management_id: scTmId, type: 'chat_message_sent' }
+      );
     } catch (_notifErr) { /* best-effort notification */ }
 
     return {
@@ -3492,24 +3519,46 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         }
       }
 
+      // Load the booking once so we can report full-vs-deposit and the
+      // outstanding balance, and build a balance reminder for deposit payers.
+      let _bk = null;
+      if (bookingId) { try { _bk = await loadBooking(); } catch (_) {} }
+      const _num = (v) => { const n = parseFloat(String(v == null ? '' : v).replace(/[^0-9.\-]/g, '')); return Number.isFinite(n) ? n : 0; };
+      const _bkStatus = String((_bk || {}).payment_status || (_bk || {}).paymentStatus || '').trim().toLowerCase();
+      const _total = _num((_bk || {}).cost || (_bk || {}).total_cost || (_bk || {}).total_price);
+      const _isDeposit = String((_bk || {}).payment_type || '').toLowerCase() === 'deposit' || _bkStatus === 'deposit_paid';
+      const _depositAmt = _isDeposit ? (_num((_bk || {}).deposit_amount) || Math.round(_total * 0.35 * 100) / 100) : 0;
+      const _balancePaid = (_bk || {}).balance_paid === true;
+      const _balanceRemaining = _isDeposit && !_balancePaid ? (_num((_bk || {}).balance_remaining || (_bk || {}).balance_amount) || Math.round((_total - _depositAmt) * 100) / 100) : 0;
+      const _jobCompleted = ['completed', 'closed', 'awaiting_client_confirmation'].includes(String((_bk || {}).status || '').toLowerCase());
+      const paymentSummary = {
+        payment_type: _isDeposit ? 'deposit' : 'full',
+        total_price: _total ? _total.toFixed(2) : '',
+        deposit_amount: _isDeposit ? _depositAmt.toFixed(2) : '',
+        balance_remaining: _isDeposit && !_balancePaid && _balanceRemaining > 0 ? _balanceRemaining.toFixed(2) : '',
+        balance_paid: _isDeposit ? _balancePaid : null,
+      };
+      const _balanceReminder = (_isDeposit && !_balancePaid && _balanceRemaining > 0)
+        ? ` You paid a deposit, so the remaining balance of R${_balanceRemaining.toFixed(2)} is due ${_jobCompleted ? 'now that the job is complete' : 'after the job is completed'}.`
+        : '';
+
       if (!qs || qs.empty) {
-        // Check the booking's own payment_status field
-        if (bookingId) {
-          const bData = await loadBooking();
-          const paymentStatus = String((bData || {}).payment_status || '').trim();
-          return {
-            ok: true,
-            status: 200,
-            data: {
-              payment_status: paymentStatus || 'not_found',
-              message: paymentStatus ? `Booking payment status: ${paymentStatus}` : 'No payment records found for this booking',
-            },
-          };
-        }
+        // No transaction logs: fall back to the booking's own payment_status.
+        const paymentStatus = _bkStatus || 'not_found';
+        let message;
+        if (paymentStatus === 'paid') message = 'Your payment has been received in full and is held safely in escrow until the job is done.';
+        else if (paymentStatus === 'deposit_paid') message = 'Your deposit has been received and is held safely in escrow.' + _balanceReminder;
+        else if (paymentStatus === 'not_found') message = 'No payment records found for this booking';
+        else message = `Booking payment status: ${paymentStatus}.` + _balanceReminder;
         return {
           ok: true,
           status: 200,
-          data: { payment_status: 'not_found', message: 'No payment records found' },
+          data: {
+            payment_status: paymentStatus,
+            received: paymentStatus === 'paid' || paymentStatus === 'deposit_paid',
+            ...paymentSummary,
+            message,
+          },
         };
       }
 
@@ -3530,13 +3579,25 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       }));
 
       const latestTx = transactions[0] || null;
+      // Prefer the booking's authoritative payment_status when it says paid, so
+      // a successful payment is never reported as "unknown" from a tx row.
+      const effectiveStatus = (_bkStatus === 'paid' || _bkStatus === 'deposit_paid')
+        ? _bkStatus
+        : (latestTx ? latestTx.status : 'unknown');
+      let txMessage;
+      if (effectiveStatus === 'paid') txMessage = 'Your payment has been received in full and is held safely in escrow until the job is done.';
+      else if (effectiveStatus === 'deposit_paid') txMessage = 'Your deposit has been received and is held safely in escrow.' + _balanceReminder;
+      else if (latestTx && latestTx.amount) txMessage = `Latest payment of R${latestTx.amount} is ${effectiveStatus}.` + _balanceReminder;
+      else txMessage = `Payment status: ${effectiveStatus}.` + _balanceReminder;
       return {
         ok: true,
         status: 200,
         data: {
-          payment_status: latestTx ? latestTx.status : 'unknown',
+          payment_status: effectiveStatus,
+          received: effectiveStatus === 'paid' || effectiveStatus === 'deposit_paid',
+          ...paymentSummary,
           transactions,
-          message: latestTx ? `Latest payment: ${latestTx.status}` : 'No payment records found',
+          message: txMessage,
         },
       };
     } catch (err) {

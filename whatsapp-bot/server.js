@@ -3727,7 +3727,7 @@ async function executeWaTool(name, args, session) {
         title: 'New message from client',
         body: text.slice(0, 100),
         type: 'chat_message',
-        extraData: { launch_lizzy: 'true', lizzy_prompt: relayPrompt },
+        extraData: { launch_lizzy: 'true', lizzy_prompt: relayPrompt, lizzy_target_role: 'artisan' },
       });
 
       return { success: true, message: 'Your message has been sent to your artisan.' };
