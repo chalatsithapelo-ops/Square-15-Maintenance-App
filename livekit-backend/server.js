@@ -1133,6 +1133,25 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
           } catch (e) { console.warn('\u26a0\ufe0f booking lookup by alt field:', e.message); }
         }
       }
+
+      // Final fallback: the id may be a tasksManagement (dispatch bridge) doc
+      // id rather than a futureBookings id. Status/payment pushes to the
+      // client sometimes carry only the tasks_management_id, so resolve its
+      // linked futureBooking and act on that so Lizzy can continue the flow.
+      try {
+        const tmSnap = await firestore.collection('tasksManagement').doc(bookingId).get();
+        if (tmSnap.exists) {
+          const tm = tmSnap.data() || {};
+          const fbId = String(tm.future_booking_id || tm.futureBookingId || tm.booking_id || '').trim();
+          if (fbId) {
+            const fbSnap = await firestore.collection('futureBookings').doc(fbId).get();
+            if (fbSnap.exists) {
+              bookingRef = fbSnap.ref;
+              return fbSnap.data() || {};
+            }
+          }
+        }
+      } catch (e) { console.warn('\u26a0\ufe0f booking lookup via tasksManagement:', e.message); }
     }
     return null;
   }
@@ -1688,6 +1707,9 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       case 'artisan_work_completed':
       case 'work_completed':
         return 'Your artisan has completed the work. Would you like to review the photos, rate the artisan, or is there anything else I can help with?';
+      case 'rfq_quote_ready':
+      case 'rfq_amended':
+        return 'Good news - your quote is ready. I can walk you through the price breakdown, and if you are happy I can help you accept it so we can assign an artisan - or negotiate if the price does not work for you. Would you like me to go through it with you?';
       case 'balance_payment_due':
         return 'Your artisan has completed the work and a balance payment is now due. Would you like me to help you pay it so your booking is finalised?';
       default:
