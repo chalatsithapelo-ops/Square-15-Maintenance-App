@@ -3805,7 +3805,7 @@ async function executeWaTool(name, args, session) {
             fixedPrice: `R${matchedPrice.toFixed(2)}`,
             category: categoryName,
             pricingBasis: 'labour_only',
-            note: 'This is a FIXED price for the matched service and it covers LABOUR ONLY — materials are quoted separately. Use this exact amount when creating the booking. Do NOT pick any other price. When you present this price to the customer you MUST state clearly that it is for labour only and that materials are quoted separately.',
+            note: 'This is a FIXED price for the matched service and it is a LABOUR AMOUNT ONLY. Use this exact amount when creating the booking. Do NOT pick any other price. When you present this price to the customer you MUST state clearly that it is a labour amount only and that any materials that might be needed, the artisan will advise them to buy.',
           };
         }
 
@@ -7572,7 +7572,7 @@ JOB PROGRESS REPORTING (CRITICAL — ALWAYS USE LIVE DATA):
 - You MUST call lookup_pricing BEFORE calling create_booking, EVERY TIME, NO EXCEPTIONS.
 - When calling lookup_pricing, pass the specific service as subcategory (e.g. category="plumbing", subcategory="toilet unblocking").
 - If lookup_pricing returns matched=true with a fixedPrice, use that EXACT price — do NOT estimate or use a different amount.
-- ⛔ EVERY fixed price covers LABOUR ONLY — materials are quoted separately. Whenever you present a fixed price you MUST say so, e.g. "The labour for this is R[price] (labour only — materials are quoted separately)." Never present a fixed price as if it includes materials.
+- ⛔ EVERY fixed price is a LABOUR AMOUNT ONLY. Whenever you present a fixed price you MUST say so, e.g. "The labour for this is R[price] — this is a labour amount only; any materials that might be needed, the artisan will advise you to buy them." Never present a fixed price as if it includes materials.
 - If lookup_pricing returns matched=false, you are FORBIDDEN from quoting any price. You MUST call submit_rfq instead so admin can produce a curated quote.
 - ⛔ NEVER invent a price. NEVER cherry-pick a price from another service in the category list. NEVER recall a price from session memory. NEVER guess.
 - ⛔ "Labour only" / "Labor only" priced services in the catalog are NOT all-in prices. Never present a "Labour only" price as the cost of a job that includes materials.
@@ -7587,7 +7587,7 @@ DIAGNOSTIC / INVESTIGATION REQUESTS (CRITICAL — NEVER MISPRICE A SYMPTOM):
 
 PRICE CONFIRMATION (CRITICAL — NEVER SKIP):
 - After calling lookup_pricing, you MUST present the price to the customer and WAIT for their explicit confirmation BEFORE calling create_booking.
-- Say something like: "The labour for [service] is R[price] — this covers labour only, materials are quoted separately. Shall I go ahead and create the booking?"
+- Say something like: "The labour for [service] is R[price] — this is a labour amount only; any materials that might be needed, the artisan will advise you to buy them. Shall I go ahead and create the booking?"
 - Do NOT call create_booking in the same response as lookup_pricing. You must STOP and wait for the customer to say yes/confirm.
 - Only after the customer confirms (e.g. "yes", "ok", "go ahead", "book it") should you call create_booking.
 - If the customer questions the price or wants to negotiate, do NOT create the booking — explain the pricing and wait.
