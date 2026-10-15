@@ -3565,54 +3565,94 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         const t = Date.parse(v); return Number.isNaN(t) ? 0 : t;
       };
 
-      // Find the payment in transactionLogs. Wallet and in-app payments log
-      // under booking_id, but that value may be a futureBooking id OR a
-      // tasksManagement id depending on which flow paid, so search by the
-      // effective id first, then fall back to a tasks_management_id match.
-      const _effId = bookingId || tmIdDirect;
-      let qs = null;
-      if (_effId) {
-        qs = await firestore.collection('transactionLogs')
-          .where('booking_id', '==', _effId)
-          .limit(20)
-          .get();
-      }
+      // A wallet / in-app payment can be LOGGED and have payment_status flipped
+      // under EITHER the futureBooking id OR the linked tasksManagement id. The id
+      // Lizzy holds may be the OTHER side (she usually holds the futureBooking id
+      // while the in-app payment screen pays under the tasksManagement id), so we
+      // resolve the full set of related ids and search them ALL. Missing this is
+      // exactly what left a paid customer reported as "not paid" (payment limbo).
+      const candidateIds = new Set();
+      const addId = (v) => { const s = String(v == null ? '' : v).trim(); if (s) candidateIds.add(s); };
+      addId(bookingId); addId(tmIdDirect);
 
-      // Fallback: try tasks_management_id
-      if (!qs || qs.empty) {
-        let tmIdToSearch = tmIdDirect;
-        if (!tmIdToSearch && bookingId) {
-          const bData = await loadBooking();
-          tmIdToSearch = String((bData || {}).tasks_management_id || '').trim();
-        }
-        if (tmIdToSearch && tmIdToSearch !== _effId) {
-          qs = await firestore.collection('transactionLogs')
-            .where('tasks_management_id', '==', tmIdToSearch)
-            .limit(20)
-            .get();
-        }
-      }
-
-      // Load the booking so we can report full-vs-deposit and the outstanding
-      // balance. Read from BOTH the futureBooking (via loadBooking) and the
-      // tasksManagement doc, because a wallet / in-app payment may update only
-      // one of them — we must never report "unpaid" when the other says paid.
-      let _bk = null;
-      try { if (bookingId || tmIdDirect) _bk = await loadBooking(); } catch (_) {}
       const _rank = (s) => { s = String(s || '').toLowerCase(); return s === 'paid' ? 3 : (s === 'deposit_paid' ? 2 : (s ? 1 : 0)); };
-      try {
-        const _tmCandidateId = tmIdDirect || String((_bk || {}).tasks_management_id || '').trim() || (bookingId || '');
-        if (_tmCandidateId) {
-          const _tmSnap = await firestore.collection('tasksManagement').doc(_tmCandidateId).get();
-          if (_tmSnap.exists) {
-            const _tmData = _tmSnap.data() || {};
-            const _tmStatus = String(_tmData.payment_status || _tmData.paymentStatus || '').trim();
-            const _curStatus = String((_bk || {}).payment_status || (_bk || {}).paymentStatus || '').trim();
-            if (!_bk) _bk = _tmData;
-            else if (_rank(_tmStatus) > _rank(_curStatus)) _bk = { ..._bk, ..._tmData };
+
+      // loadBooking() follows a tasksManagement id through to its futureBooking and
+      // repoints bookingRef at it, so afterwards bookingRef.id is the resolved
+      // futureBooking id and _bk carries any tasks_management link.
+      let _bk = null;
+      try { _bk = await loadBooking(); } catch (_) {}
+      if (bookingRef && bookingRef.id) addId(bookingRef.id);
+      if (_bk) { addId(_bk.tasks_management_id); addId(_bk.tasksManagementId); addId(_bk.future_booking_id); addId(_bk.futureBookingId); addId(_bk.booking_id); }
+
+      // tasksManagement -> futureBooking link (for any candidate that is a TM doc).
+      for (const cid of Array.from(candidateIds)) {
+        try {
+          const s = await firestore.collection('tasksManagement').doc(cid).get();
+          if (s.exists) { const tm = s.data() || {}; addId(tm.future_booking_id); addId(tm.futureBookingId); addId(tm.booking_id); }
+        } catch (_) {}
+      }
+      // futureBooking -> tasksManagement link. The TM doc stores future_booking_id
+      // but the futureBooking usually does NOT store the TM id, so query for it.
+      {
+        const futIds = Array.from(candidateIds).slice(0, 10);
+        if (futIds.length > 0) {
+          try {
+            const q = await firestore.collection('tasksManagement')
+              .where('future_booking_id', 'in', futIds).limit(10).get();
+            for (const d of q.docs) { addId(d.id); const tm = d.data() || {}; addId(tm.booking_id); }
+          } catch (_) {
+            for (const fid of futIds) {
+              try {
+                const q = await firestore.collection('tasksManagement')
+                  .where('future_booking_id', '==', fid).limit(5).get();
+                for (const d of q.docs) { addId(d.id); const tm = d.data() || {}; addId(tm.booking_id); }
+              } catch (_) {}
+            }
           }
         }
-      } catch (_) {}
+      }
+
+      const idList = Array.from(candidateIds).slice(0, 10);
+
+      // Gather transactionLogs recorded under ANY candidate id (booking_id or
+      // tasks_management_id), de-duplicated by doc id.
+      const txById = new Map();
+      if (idList.length > 0) {
+        for (const field of ['booking_id', 'tasks_management_id']) {
+          try {
+            const q = await firestore.collection('transactionLogs')
+              .where(field, 'in', idList).limit(40).get();
+            for (const d of q.docs) txById.set(d.id, d);
+          } catch (_) {
+            for (const id of idList) {
+              try {
+                const q = await firestore.collection('transactionLogs')
+                  .where(field, '==', id).limit(20).get();
+                for (const d of q.docs) txById.set(d.id, d);
+              } catch (_) {}
+            }
+          }
+        }
+      }
+      const txDocsArr = Array.from(txById.values());
+
+      // Take the STRONGEST payment_status across every candidate doc in both
+      // collections (paid > deposit_paid > other) so we never report "unpaid"
+      // when either side already says paid.
+      let bestRank = _rank((_bk || {}).payment_status || (_bk || {}).paymentStatus);
+      for (const id of idList) {
+        for (const coll of ['futureBookings', 'tasksManagement']) {
+          try {
+            const snap = await firestore.collection(coll).doc(id).get();
+            if (!snap.exists) continue;
+            const d = snap.data() || {};
+            const r = _rank(d.payment_status || d.paymentStatus);
+            if (!_bk) { _bk = d; bestRank = r; }
+            else if (r > bestRank) { _bk = { ..._bk, ...d }; bestRank = r; }
+          } catch (_) {}
+        }
+      }
       const _num = (v) => { const n = parseFloat(String(v == null ? '' : v).replace(/[^0-9.\-]/g, '')); return Number.isFinite(n) ? n : 0; };
       const _bkStatus = String((_bk || {}).payment_status || (_bk || {}).paymentStatus || '').trim().toLowerCase();
       const _total = _num((_bk || {}).cost || (_bk || {}).total_cost || (_bk || {}).total_price);
@@ -3632,7 +3672,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         ? ` You paid a deposit, so the remaining balance of R${_balanceRemaining.toFixed(2)} is due ${_jobCompleted ? 'now that the job is complete' : 'after the job is completed'}.`
         : '';
 
-      if (!qs || qs.empty) {
+      if (txDocsArr.length === 0) {
         // No transaction logs: fall back to the booking's own payment_status.
         const paymentStatus = _bkStatus || 'not_found';
         let message;
@@ -3653,7 +3693,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       }
 
       const rows = [];
-      for (const doc of qs.docs) {
+      for (const doc of txDocsArr) {
         const tx = doc.data() || {};
         const txUserId = String(tx.user_id || tx.client_id || '').trim();
         if (actorRole !== 'admin' && txUserId !== actorUid) continue;
