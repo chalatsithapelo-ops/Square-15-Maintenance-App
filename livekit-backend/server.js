@@ -4083,11 +4083,41 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         updateData.payment_status = 'paid';
       }
 
-      // Update both collections
-      const bookingRef = firestore.collection('futureBookings').doc(bid);
-      if ((await bookingRef.get()).exists) await bookingRef.update(updateData);
-      const taskRef = firestore.collection('tasksManagement').doc(bid);
-      if ((await taskRef.get()).exists) await taskRef.update(updateData);
+      // Update the status on BOTH the futureBooking AND its linked tasksManagement
+      // doc. The id we paid under may be EITHER one; the client's voice watcher
+      // listens to the futureBooking doc, so if we only flip the tasksManagement
+      // side that doc never changes and the customer is left in limbo even though
+      // the payment succeeded. Resolve every linked id and update them all.
+      const idsToUpdate = new Set([bid]);
+      try {
+        const _tm = await firestore.collection('tasksManagement').doc(bid).get();
+        if (_tm.exists) {
+          const d = _tm.data() || {};
+          const fb = String(d.future_booking_id || d.futureBookingId || d.booking_id || '').trim();
+          if (fb) idsToUpdate.add(fb);
+        }
+      } catch (_) {}
+      try {
+        const _fb = await firestore.collection('futureBookings').doc(bid).get();
+        if (_fb.exists) {
+          const d = _fb.data() || {};
+          const tm = String(d.tasks_management_id || d.tasksManagementId || '').trim();
+          if (tm) idsToUpdate.add(tm);
+        }
+      } catch (_) {}
+      try {
+        const _tmQ = await firestore.collection('tasksManagement')
+          .where('future_booking_id', '==', bid).limit(5).get();
+        for (const d of _tmQ.docs) idsToUpdate.add(d.id);
+      } catch (_) {}
+      for (const id of idsToUpdate) {
+        for (const coll of ['futureBookings', 'tasksManagement']) {
+          try {
+            const ref = firestore.collection(coll).doc(id);
+            if ((await ref.get()).exists) await ref.update(updateData);
+          } catch (_) {}
+        }
+      }
 
       // Log transaction
       await firestore.collection('transactionLogs').add({
