@@ -1627,23 +1627,26 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         if (!isPublished(artisanData.status)) continue;
         if (!isArtisanActive(artisanData)) continue;
         if (!hasUsableArtisanAuthIdentity(artisanDocId, artisanData)) continue;
+        // Availability is a SOFT preference, not a hard filter: a busy artisan is
+        // still a candidate (and still gets the push) so a nearby reachable artisan
+        // always receives the request instead of it going unassigned. They simply
+        // decline if they are busy and it reassigns to the next nearest.
         const isAvail = await checkArtisanAvailability({
           artisanId: artisanDocId,
           scheduledDate,
           scheduledTime,
           excludeBookingId: bookingId,
         });
-        if (!isAvail) continue;
 
         const coords = extractLatLng(artisanData);
         const aLat = coords.lat || 0.0;
         const aLng = coords.lng || 0.0;
         const distance = clientLat !== 0.0 && clientLng !== 0.0 && aLat !== 0.0 && aLng !== 0.0 ? calculateDistanceKm(clientLat, clientLng, aLat, aLng) : 9999.0;
-        availableWithDistance.push({ artisan_id: artisanDocId, distance, reachable: artisanHasPushToken(artisanData) });
+        availableWithDistance.push({ artisan_id: artisanDocId, distance, reachable: artisanHasPushToken(artisanData), available: isAvail });
       }
     }
 
-    // If no task-mapped artisan was available, fall back to broad category matching.
+    // If no task-mapped artisan matched at all, fall back to broad category matching.
     if (availableWithDistance.length === 0) {
       let snap;
       try {
@@ -1666,30 +1669,34 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         const acceptAnyway = !hasTask && categoryName && String(categoryName).trim();
         if (!hasTask && !acceptAnyway) continue;
 
+        // Soft availability (see note above): keep busy artisans as candidates.
         const isAvail = await checkArtisanAvailability({
           artisanId: artisanDocId,
           scheduledDate,
           scheduledTime,
           excludeBookingId: bookingId,
         });
-        if (!isAvail) continue;
 
         const coords = extractLatLng(artisanData);
         const aLat = coords.lat || 0.0;
         const aLng = coords.lng || 0.0;
         const distance = clientLat !== 0.0 && clientLng !== 0.0 && aLat !== 0.0 && aLng !== 0.0 ? calculateDistanceKm(clientLat, clientLng, aLat, aLng) : 9999.0;
-        availableWithDistance.push({ artisan_id: artisanDocId, distance, reachable: artisanHasPushToken(artisanData) });
+        availableWithDistance.push({ artisan_id: artisanDocId, distance, reachable: artisanHasPushToken(artisanData), available: isAvail });
       }
     }
 
     if (availableWithDistance.length === 0) return null;
-    // Prefer artisans who can actually be notified (have a push token), then by
-    // nearest distance. If none are reachable, fall back to nearest overall so a
-    // booking is never left unassigned just because tokens are missing.
-    const reachable = availableWithDistance.filter((a) => a.reachable);
-    const pool = reachable.length > 0 ? reachable : availableWithDistance;
-    pool.sort((a, b) => a.distance - b.distance);
-    return String(pool[0].artisan_id || '').trim() || null;
+    // Priority: reachable (push-notifiable) first, then not-busy, then nearest.
+    // A busy BUT reachable nearby artisan still beats an unreachable one so the
+    // request always lands on a phone; busy artisans simply decline and it
+    // reassigns to the next nearest. Reachability outranks availability because an
+    // unreachable artisan is never notified at all.
+    availableWithDistance.sort((a, b) => {
+      if (!!b.reachable !== !!a.reachable) return (b.reachable ? 1 : 0) - (a.reachable ? 1 : 0);
+      if (!!b.available !== !!a.available) return (b.available ? 1 : 0) - (a.available ? 1 : 0);
+      return a.distance - b.distance;
+    });
+    return String(availableWithDistance[0].artisan_id || '').trim() || null;
   }
 
   function stringList(v) {
