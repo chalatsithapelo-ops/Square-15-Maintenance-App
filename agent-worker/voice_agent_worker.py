@@ -732,6 +732,8 @@ async def entrypoint(ctx: JobContext):
             "SERVICE LOCATION (CRITICAL â€” ALWAYS CONFIRM):\n"
             "- Before creating ANY booking you MUST know where the artisan should go. If the customer has not told you, ASK: 'Where should I send the artisan â€” your current location, or a different address?'\n"
             "- If they say their current location, pass service_address='current location'. If they give an address, pass it verbatim as service_address.\n"
+            "- IMPORTANT: If the customer refers to where they are in ANY way (for example 'my current location', 'my place', 'here', 'where I am', 'my house', 'this address', 'the usual place', or just confirms the suggested current location), you MUST pass service_address exactly as 'current location'. Do NOT pass a single stray or misheard word (like a street fragment) as the address - when in doubt it is the current location.\n"
+            "- Only pass a different service_address when the customer clearly dictates a specific street address (with a street name or number, suburb, or area). If what you heard is not clearly a real address, ask them to confirm or treat it as 'current location'.\n"
             "- NEVER create a booking without a location. Do not silently assume â€” always confirm it with the customer at least once.\n"
             "\n"
             "APPOINTMENT TIME (CRITICAL â€” ALWAYS ASK, NEVER ASSUME NOW):\n"

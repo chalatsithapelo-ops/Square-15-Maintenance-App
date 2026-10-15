@@ -1243,6 +1243,24 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     return ['true', 'yes', 'y', '1', 'active', 'online', 'available', 'on'].includes(s);
   }
 
+  // True when an address string is really a "use my current location" phrase
+  // rather than a real street address (voice agent / failed geocoding sends these).
+  function looksLikeCurrentLocationAddress(value) {
+    const s = String(value || '').trim().toLowerCase();
+    if (!s) return false;
+    const exact = new Set([
+      'current location',
+      'my current location',
+      'my location',
+      'current',
+      'here',
+      'use current location',
+      'current address',
+      'my current address',
+    ]);
+    return exact.has(s) || s.includes('current location');
+  }
+
   function isPublished(status) {
     const raw = String(status || '').trim();
     if (!raw) return true;
@@ -1591,6 +1609,14 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     const availableWithDistance = [];
     const candidates = await candidateArtisanIdsForTask(taskId);
 
+    // An artisan can only be *notified* of a new job if they have a push token.
+    // Prefer reachable artisans so requests actually land on a phone; token-less
+    // artisans stay as a fallback (they still see the job if they open the app).
+    const artisanHasPushToken = (data) => {
+      const t = data && (data.fcmToken || data.fcm_token || data.deviceToken || data.device_token);
+      return !!(t && String(t).trim());
+    };
+
     if (candidates && candidates.size > 0) {
       for (const candidateId of candidates.values()) {
         const providerDoc = await getServiceProviderDocByAnyId(candidateId);
@@ -1613,7 +1639,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         const aLat = coords.lat || 0.0;
         const aLng = coords.lng || 0.0;
         const distance = clientLat !== 0.0 && clientLng !== 0.0 && aLat !== 0.0 && aLng !== 0.0 ? calculateDistanceKm(clientLat, clientLng, aLat, aLng) : 9999.0;
-        availableWithDistance.push({ artisan_id: artisanDocId, distance });
+        availableWithDistance.push({ artisan_id: artisanDocId, distance, reachable: artisanHasPushToken(artisanData) });
       }
     }
 
@@ -1652,13 +1678,18 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         const aLat = coords.lat || 0.0;
         const aLng = coords.lng || 0.0;
         const distance = clientLat !== 0.0 && clientLng !== 0.0 && aLat !== 0.0 && aLng !== 0.0 ? calculateDistanceKm(clientLat, clientLng, aLat, aLng) : 9999.0;
-        availableWithDistance.push({ artisan_id: artisanDocId, distance });
+        availableWithDistance.push({ artisan_id: artisanDocId, distance, reachable: artisanHasPushToken(artisanData) });
       }
     }
 
     if (availableWithDistance.length === 0) return null;
-    availableWithDistance.sort((a, b) => a.distance - b.distance);
-    return String(availableWithDistance[0].artisan_id || '').trim() || null;
+    // Prefer artisans who can actually be notified (have a push token), then by
+    // nearest distance. If none are reachable, fall back to nearest overall so a
+    // booking is never left unassigned just because tokens are missing.
+    const reachable = availableWithDistance.filter((a) => a.reachable);
+    const pool = reachable.length > 0 ? reachable : availableWithDistance;
+    pool.sort((a, b) => a.distance - b.distance);
+    return String(pool[0].artisan_id || '').trim() || null;
   }
 
   function stringList(v) {
@@ -2409,14 +2440,14 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       return { ok: false, status: 400, error: 'missing_priced_service' };
     }
 
-    const serviceOnCurrentLocation = isTruthyExtended(
+    let serviceOnCurrentLocation = isTruthyExtended(
       p.service_on_current_location ??
         p.serviceOnCurrentLocation ??
         p.is_service_on_current_location ??
         p.isServiceOnCurrentLocation
     );
 
-    const providedAddress = String(
+    let providedAddress = String(
       p.provided_address ||
         p.user_provided_address ||
         p.userProvidedAddress ||
@@ -2424,6 +2455,16 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         p.serviceAddress ||
         ''
     ).trim();
+
+    // Normalize "current location" phrasing: the voice agent (and failed
+    // device-side reverse geocoding) can send the literal string "current
+    // location" as the address. Treat it as the current-location flag and drop
+    // the literal so we (a) never store "current location" as a street address
+    // and (b) resolve the client's real GPS coords below for nearest dispatch.
+    if (looksLikeCurrentLocationAddress(providedAddress)) {
+      serviceOnCurrentLocation = true;
+      providedAddress = '';
+    }
 
     let userLat = String(p.user_lat || p.userLat || '').trim();
     let userLng = String(p.user_lng || p.userLng || '').trim();
@@ -4666,12 +4707,15 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
           if (cats && cat && !cats.includes(cat) && cat !== 'general_maintenance') continue;
           const aName = ad.name || ad.userName || ad.full_name || artDoc.id;
           matchedArtisans.push({ id: artDoc.id, name: aName, token: (ad.fcm_token || ad.deviceToken || '').toString().trim() });
-          if (matchedArtisans.length >= 3) break;
         }
-        if (matchedArtisans.length > 0) {
-          const artisanIds = matchedArtisans.map(a => a.id);
+        // Prefer artisans who can actually be notified (have a push token) so the
+        // RFQ lands on a reachable phone, then cap at 3.
+        matchedArtisans.sort((a, b) => (b.token ? 1 : 0) - (a.token ? 1 : 0));
+        const topMatched = matchedArtisans.slice(0, 3);
+        if (topMatched.length > 0) {
+          const artisanIds = topMatched.map(a => a.id);
           const artisanNames = {};
-          matchedArtisans.forEach(a => { artisanNames[a.id] = a.name; });
+          topMatched.forEach(a => { artisanNames[a.id] = a.name; });
 
           await bookingRef.update({
             rfq_status: 'pending_artisan_acceptance',
@@ -4683,7 +4727,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
             rfq_auto_assign_reason: autoReason,
             rfq_artisan_rejection_count: 0,
             rfq_artisan_rejections: [],
-            artisan_name: matchedArtisans[0].name,
+            artisan_name: topMatched[0].name,
           });
 
           await firestore.collection('tasksManagement').doc(bookingId).update({
@@ -4693,7 +4737,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
             rfq_auto_assign_reason: autoReason,
           });
 
-          for (const art of matchedArtisans) {
+          for (const art of topMatched) {
             if (!art.token) continue;
             try {
               await admin.messaging().send({
