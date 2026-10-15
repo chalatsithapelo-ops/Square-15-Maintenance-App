@@ -645,12 +645,14 @@ async def entrypoint(ctx: JobContext):
             "- If user refers to a booking by price, call list_my_bookings first to find it.\n"
             "\n"
             "BOOKING LOOKUP (CRITICAL â€” MUST USE TOOLS):\n"
-            "- When user asks about a booking, 'where is my artisan/plumber?', 'what's the status of my booking?', or similar:\n"
-            "  1. FIRST call list_my_bookings() to get their bookings.\n"
-            "  2. Find the relevant booking from the results (match by category, artisan, date, or pick the most recent active one).\n"
-            "  3. THEN call get_booking_status(booking_id) with the relevant booking ID to get full details.\n"
+            "- CURRENT JOB IN FOCUS: If you were opened from a notification or reminder about a SPECIFIC job, that job is in focus and is your DEFAULT for everything. For 'what's the status of my booking?', 'where is my artisan?', 'is it paid?', before/after photos, or messaging about THIS job, call the tool WITHOUT a booking_id (e.g. get_booking_status(), check_payment(), get_job_summary(), send_message_to_artisan(message=...)) - the system automatically uses the job you were opened for. Do NOT call list_my_bookings and do NOT 'pick the most recent' when the customer is asking about the job you were opened for.\n"
+            "- ONLY when there is NO job in focus, or the customer clearly asks about a DIFFERENT or OTHER booking, or asks to see ALL their bookings:\n"
+            "  1. call list_my_bookings() to get their bookings.\n"
+            "  2. match the right one by category, artisan, date, order number or price. If several could match and you are unsure, ASK the customer which job - never guess or assume the most recent.\n"
+            "  3. call get_booking_status(booking_id) with that booking ID to get full details.\n"
             "  4. Tell the user the booking status, artisan name, and any relevant info.\n"
-            "- NEVER say you 'can't access bookings' or 'unable to retrieve'. ALWAYS call list_my_bookings first. Even if there's an error, try the tool.\n"
+            "- NEVER say you 'can't access bookings' or 'unable to retrieve'. Always try the tool. When the customer has multiple jobs and you are unsure which they mean, ASK them which job rather than assuming.\n"
+            "- PHOTOS ON A COMPLETED JOB: If the job is already completed, the artisan's before/after photos are usually already on file - call get_booking_status()/get_job_summary() and if photos exist, tell the customer they can view them on the job screen, rather than asking the artisan to resend. Only message the artisan for photos if none are on file.\n"
             "\n"
             "MESSAGING & CHAT (IMPORTANT â€” USE BACKEND TOOLS, NOT ui_navigate):\n"
             "- 'Open chat' / 'open messages' / 'contact support' â†’ call ui_navigate(action='open_support')\n"
@@ -1017,12 +1019,18 @@ async def entrypoint(ctx: JobContext):
             "Returns status, scheduled time, artisan details, payment status (received / deposit / pending), "
             "and the artisan's live progress: accepted, on the way, buying materials, working on site, or completed. "
             "Use this whenever the user asks about a booking, e.g. 'What's my booking status?', 'Where is my artisan?', "
-            "'Has my payment gone through?', 'Is the artisan on the way?', 'Is the job done yet?'"
+            "'Has my payment gone through?', 'Is the artisan on the way?', 'Is the job done yet?' "
+            "booking_id is OPTIONAL \u2014 if you were opened from a notification about a specific job, omit it and the "
+            "system uses that job automatically. Only pass a booking_id when the customer asks about a different booking."
         )
     )
-    async def get_booking_status(booking_id: str) -> str:
+    async def get_booking_status(booking_id: str = "") -> str:
         """Get booking status from backend API."""
-        nonlocal backend_client, app_context_bookings
+        nonlocal backend_client, app_context_bookings, app_context_focus_booking_id
+        if not (booking_id or "").strip() and app_context_focus_booking_id:
+            booking_id = app_context_focus_booking_id
+        if not (booking_id or "").strip():
+            return "Which booking would you like me to check? Tell me the booking number, or say 'list my bookings'."
         logger.info(f"ðŸ“‹ get_booking_status called: booking_id={booking_id}, backend_client={'SET' if backend_client else 'NONE'}, app_bookings={len(app_context_bookings)}")
         if not backend_client:
             # Fallback: check app context bookings if available
@@ -1479,12 +1487,18 @@ async def entrypoint(ctx: JobContext):
             "whether it was a full payment or a deposit, and the outstanding balance if any. "
             "Read the returned message to the customer, including any balance reminder. "
             "DO NOT call this when the user wants to pay or wants a payment link \u2014 "
-            "for that, call request_payment_link instead."
+            "for that, call request_payment_link instead. "
+            "booking_id is OPTIONAL \u2014 if you were opened from a notification about a specific job, omit it and the "
+            "system uses that job automatically."
         )
     )
-    async def check_payment(booking_id: str) -> str:
+    async def check_payment(booking_id: str = "") -> str:
         """Check payment status from backend API."""
-        nonlocal backend_client
+        nonlocal backend_client, app_context_focus_booking_id
+        if not (booking_id or "").strip() and app_context_focus_booking_id:
+            booking_id = app_context_focus_booking_id
+        if not (booking_id or "").strip():
+            return "Which booking's payment would you like me to check? Tell me the booking number."
         if not backend_client:
             if not await _ensure_backend_or_retry():
                 return _CONNECTION_RETRY_MSG
@@ -1902,16 +1916,22 @@ async def entrypoint(ctx: JobContext):
     @llm.function_tool(
         description=(
             "Send a message to the artisan assigned to a booking. "
-            "Use this when the user wants to contact their artisan (ask about ETA, location, confirm details, etc.). "
-            "Requires: booking_id, message."
+            "Use this when the user wants to contact their artisan (ask about ETA, location, confirm details, "
+            "request before/after photos, etc.). "
+            "booking_id is OPTIONAL \u2014 if you were opened from a notification about a specific job, omit it and the "
+            "system messages the artisan on that job automatically. message is required."
         )
     )
     async def send_message_to_artisan(
-        booking_id: str,
-        message: str
+        booking_id: str = "",
+        message: str = ""
     ) -> str:
         """Send a message to the artisan assigned to a booking."""
-        nonlocal backend_client
+        nonlocal backend_client, app_context_focus_booking_id
+        if not (booking_id or "").strip() and app_context_focus_booking_id:
+            booking_id = app_context_focus_booking_id
+        if not (message or "").strip():
+            return "What would you like me to tell the artisan?"
         logger.info(f"ðŸ“¨ send_message_to_artisan called: booking_id={booking_id}, message={message!r}, backend_client={'SET' if backend_client else 'NONE'}")
         if not backend_client:
             if not await _ensure_backend_or_retry():
@@ -1943,11 +1963,15 @@ async def entrypoint(ctx: JobContext):
         )
     )
     async def send_message_to_client(
-        booking_id: str,
-        message: str
+        booking_id: str = "",
+        message: str = ""
     ) -> str:
         """Send a message to the client who made a booking."""
-        nonlocal backend_client
+        nonlocal backend_client, app_context_focus_booking_id
+        if not (booking_id or "").strip() and app_context_focus_booking_id:
+            booking_id = app_context_focus_booking_id
+        if not (message or "").strip():
+            return "What would you like me to tell the client?"
         logger.info(f"ðŸ“¨ send_message_to_client called: booking_id={booking_id}, message={message!r}, backend_client={'SET' if backend_client else 'NONE'}")
         if not backend_client:
             if not await _ensure_backend_or_retry():
@@ -2023,7 +2047,9 @@ async def entrypoint(ctx: JobContext):
         tasks_management_id: str = ""
     ) -> str:
         """Get chat messages for a booking."""
-        nonlocal backend_client
+        nonlocal backend_client, app_context_focus_booking_id
+        if not (booking_id or "").strip() and not (tasks_management_id or "").strip() and app_context_focus_booking_id:
+            booking_id = app_context_focus_booking_id
         if not backend_client:
             if not await _ensure_backend_or_retry():
                 return _CONNECTION_RETRY_MSG
@@ -2229,12 +2255,18 @@ async def entrypoint(ctx: JobContext):
             "(1) an artisan has accepted the job, (2) the customer EXPLICITLY chose to pay from "
             "their wallet, and (3) you told them the exact amount and they said yes. "
             "Use payment_type='full' for full payment or 'deposit' for a 35 percent deposit. "
-            "Do NOT use this for card or EFT (use request_payment_link) or buy-now-pay-later (use pay_with_bnpl)."
+            "Do NOT use this for card or EFT (use request_payment_link) or buy-now-pay-later (use pay_with_bnpl). "
+            "booking_id is OPTIONAL \u2014 if you were opened from a notification about a specific job, omit it and the "
+            "system pays for that job automatically."
         )
     )
-    async def pay_with_wallet(booking_id: str, payment_type: str = "full") -> str:
+    async def pay_with_wallet(booking_id: str = "", payment_type: str = "full") -> str:
         """Charge the user's wallet for a booking via the backend action."""
-        nonlocal backend_client
+        nonlocal backend_client, app_context_focus_booking_id
+        if not (booking_id or "").strip() and app_context_focus_booking_id:
+            booking_id = app_context_focus_booking_id
+        if not (booking_id or "").strip():
+            return "Which booking would you like to pay for? Please tell me the booking number."
         if not backend_client:
             if not await _ensure_backend_or_retry():
                 return _CONNECTION_RETRY_MSG

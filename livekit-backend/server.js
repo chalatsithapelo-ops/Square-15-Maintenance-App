@@ -3807,19 +3807,28 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         created_at: admin.firestore.FieldValue.serverTimestamp(),
       });
 
-      // Send notification to the customer so they receive the link
+      // Send notification + FCM PUSH to the customer so they actually RECEIVE the
+      // link on their phone. This previously wrote a raw notifications doc with NO
+      // push, so the link only sat in the in-app list and the customer never got it
+      // ("she said she sent a card payment link but I never received the link").
+      // writePersonalNotification writes the doc AND sends the FCM push. launch_lizzy
+      // makes tapping the push re-open Lizzy scoped to this booking to finish paying.
       if (actorUid) {
-        await firestore.collection('notifications').add({
-          title: 'Payment Link Ready',
-          body: `Tap to pay R${payAmount.toFixed(2)} ${itemSuffix} for booking ${bData.order_no || bData.rfq_no || bid}`,
-          type: 'payment_link',
-          booking_id: bid,
-          amount: payAmount,
-          payment_type: paymentType,
-          payment_url: paymentUrl,
+        await writePersonalNotification({
           userId: actorUid,
-          status: 'unread',
-          created_at: admin.firestore.FieldValue.serverTimestamp(),
+          userType: 'user',
+          title: 'Payment Link Ready',
+          message: `Tap to pay R${payAmount.toFixed(2)} ${itemSuffix} for booking ${bData.order_no || bData.rfq_no || bid}`,
+          data: {
+            type: 'payment_link',
+            booking_id: bid,
+            amount: payAmount,
+            payment_type: paymentType,
+            payment_url: paymentUrl,
+            launch_lizzy: 'true',
+            lizzy_prompt: 'Your payment link is ready. Would you like me to help you complete the payment now?',
+            lizzy_target_role: 'client',
+          },
         });
       }
 
