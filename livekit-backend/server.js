@@ -4070,17 +4070,28 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       const now = new Date().toISOString();
 
       const updateData = { payment_method: 'wallet', updated_at: now };
+      // Advance the lifecycle status off a pre-payment state so a paid job no
+      // longer reads 'pending_payment'. Mirrors what the artisan screen already
+      // self-corrects to ('accepted' = paid, ready for the artisan to start).
+      // Only advance pre-payment statuses so we never regress a job that is
+      // already in progress / awaiting confirmation / completed.
+      const curStatus = String(bData.status || '').trim().toLowerCase();
+      const isPrePaymentStatus = ['', 'pending', 'pending_payment', 'confirmed'].includes(curStatus);
       if (isDepositBooking && !depositAlreadyPaid) {
         updateData.deposit_paid = true;
         updateData.deposit_paid_at = now;
         updateData.payment_status = 'deposit_paid';
         updateData.payment_type = 'deposit';
+        if (isPrePaymentStatus) updateData.status = 'accepted';
       } else if (depositAlreadyPaid && bData.balance_paid !== true) {
+        // Final balance payment after completion — leave the lifecycle status
+        // untouched (client confirmation/rating closes the job).
         updateData.balance_paid = true;
         updateData.balance_paid_at = now;
         updateData.payment_status = 'paid';
       } else {
         updateData.payment_status = 'paid';
+        if (isPrePaymentStatus) updateData.status = 'accepted';
       }
 
       // Update the status on BOTH the futureBooking AND its linked tasksManagement
