@@ -1754,6 +1754,8 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         return 'Good news - your quote is ready. I can walk you through the price breakdown, and if you are happy I can help you accept it so we can assign an artisan - or negotiate if the price does not work for you. Would you like me to go through it with you?';
       case 'balance_payment_due':
         return 'Your artisan has completed the work, so the remaining balance is now due. How would you like to pay it - from your wallet, by card, by instant EFT, or buy-now-pay-later? Once it is paid I will help you rate your artisan and the service.';
+      case 'balance_collected':
+        return 'Your artisan has confirmed they received your balance payment, so your booking is now fully paid and complete. How would you rate your artisan and the service, from one to five stars? Let me know and I will record it for you.';
       case 'balance_paid_rate_service':
       case 'rate_service':
         return 'Your booking is now fully paid and complete. How would you rate your artisan and the service, from one to five stars? Let me know and I will record it for you.';
@@ -5566,6 +5568,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     }
     const eff = String(tmData.status || bookingData.status || '').trim().toLowerCase();
     const buyingMaterial = String(tmData.buying_material || '').trim().toLowerCase() === 'true';
+    const artisanImages = String(tmData.artisan_images || '0').trim() || '0';
     let providerName = '';
     let providerPhone = '';
     let artisanLoc = null;
@@ -5602,19 +5605,23 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     } catch (_e) { /* best-effort */ }
     let stage;
     let msg;
+    // "Go to Site" (on the way) and "arrived/working on site" BOTH set
+    // tasksManagement.status='progress'. The ONLY thing that marks the artisan
+    // as actually on site is artisan_images='1' (the before-photo stage). So
+    // status='progress' with no before-photo yet means ON THE WAY, not on site.
+    const onTheWayMsg = (artisanLoc && distanceKm != null)
+      ? `Your artisan is on the way - they are roughly ${distanceKm} kilometres from your site. You can watch their live location on the map in the app.`
+      : artisanLoc
+        ? 'Your artisan is on the way to your site. You can watch their live location on the map in the app.'
+        : 'Your artisan is on the way to your site. I do not have a live GPS position yet, but you can contact them directly.';
     if (eff === 'completed') { stage = 'completed'; msg = 'This job is already complete.'; }
-    else if (eff === 'awaiting_client_confirmation') { stage = 'work_completed'; msg = 'Your artisan has finished the work and is waiting for you to confirm it is done right.'; }
-    else if (buyingMaterial) { stage = 'buying_materials'; msg = 'Your artisan is buying the materials needed for your job.'; }
-    else if (eff === 'progress' || eff === 'in_progress') { stage = 'working_on_site'; msg = 'Your artisan is on site working on your job right now.'; }
+    else if (eff === 'awaiting_client_confirmation' || artisanImages === '2') { stage = 'work_completed'; msg = 'Your artisan has finished the work and is waiting for you to confirm it is done right.'; }
+    else if (artisanImages === '1') { stage = 'working_on_site'; msg = 'Your artisan has arrived and is on site working on your job right now.'; }
+    else if (buyingMaterial) { stage = 'buying_materials'; msg = 'Your artisan is buying the materials needed for your job.' + (artisanLoc ? ' You can watch their live location on the map in the app.' : ''); }
+    else if (eff === 'progress' || eff === 'in_progress') { stage = 'on_the_way'; msg = onTheWayMsg; }
     else if (bookingData.artisan_confirmed === 'yes' || bookingData.accept === '1' || bookingData.accept === 1) {
       stage = 'accepted';
-      if (artisanLoc && distanceKm != null) {
-        msg = `Your artisan has accepted and is on the way - they are roughly ${distanceKm} kilometres from your site. You can watch their live location on the map in the app.`;
-      } else if (artisanLoc) {
-        msg = 'Your artisan has accepted and is heading to your site. You can watch their live location on the map in the app.';
-      } else {
-        msg = 'Your artisan has accepted and will be heading to your site. I do not have a live GPS position yet, but you can contact them directly.';
-      }
+      msg = 'Your artisan has accepted the job and will be heading to your site soon.';
     }
     else { stage = 'pending'; msg = 'An artisan has not started on this job yet.'; }
     return { ok: true, status: 200, data: { stage, message: msg, artisan_name: providerName, artisan_phone: providerPhone, artisan_location: artisanLoc, distance_km: distanceKm } };
