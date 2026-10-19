@@ -966,6 +966,10 @@ const ACTION_TIERS = Object.freeze({
   check_sla_escalation: 'B',
   submit_rating: 'B',
   submit_complaint: 'B',
+  confirm_job_complete: 'B',
+  report_problem: 'B',
+  get_artisan_eta: 'A',
+  top_up_wallet: 'B',
   request_payment_link: 'B',
   pay_with_wallet: 'B',
   // Phase 4: Admin automation tools (Tier B � admin role required)
@@ -4187,6 +4191,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     'get_scheduled_bookings',
     'get_artisan_info',
     'submit_complaint',
+    'top_up_wallet',
     'admin_bulk_reassign',
     'admin_close_stale_cases',
     'admin_broadcast_notification',
@@ -5009,8 +5014,41 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       clientType = 'artisan_buying_material';
       clientTitle = 'Artisan Buying Materials';
       clientMsg = 'Your artisan is buying the materials needed for your job.';
+    } else if (stage === 'working_on_site' || stage === 'on_site' || stage === 'started' || stage === 'arrived') {
+      _statusBatch.set(bookingRef, { status: 'in_progress', updated_at: now }, { merge: true });
+      if (tmId) {
+        _statusBatch.set(
+          firestore.collection('tasksManagement').doc(tmId),
+          { status: 'progress', accept: '1', artisan_images: '1', updated_at: now },
+          { merge: true },
+        );
+      }
+      clientType = 'artisan_working_on_site';
+      clientTitle = 'Artisan Working On Site';
+      clientMsg = 'Your artisan has started working on your job.';
+    } else if (stage === 'work_completed' || stage === 'completed' || stage === 'done' || stage === 'finished') {
+      _statusBatch.set(bookingRef, { status: 'awaiting_client_confirmation', updated_at: now }, { merge: true });
+      if (tmId) {
+        _statusBatch.set(
+          firestore.collection('tasksManagement').doc(tmId),
+          { status: 'awaiting_client_confirmation', artisan_images: '2', updated_at: now },
+          { merge: true },
+        );
+      }
+      // Balance-due vs plain-completed notification mirrors the app after-photo flow.
+      const _depositPaid = bookingData.deposit_paid === true;
+      const _balancePaid = bookingData.balance_paid === true;
+      if (_depositPaid && !_balancePaid) {
+        clientType = 'balance_payment_due';
+        clientTitle = 'Work Complete - Balance Due';
+        clientMsg = 'Your artisan has completed the job. Please pay the remaining balance and confirm the work is done right.';
+      } else {
+        clientType = 'artisan_work_completed';
+        clientTitle = 'Work Completed';
+        clientMsg = 'Your artisan has completed the job. Please review and confirm the work is done right.';
+      }
     } else {
-      return { ok: false, status: 400, error: 'invalid_stage', message: "stage must be 'on_the_way' or 'buying_materials'" };
+      return { ok: false, status: 400, error: 'invalid_stage', message: "stage must be 'on_the_way', 'buying_materials', 'working_on_site', or 'work_completed'" };
     }
     await _statusBatch.commit();
     if (userId) {
@@ -5416,6 +5454,218 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
   }
 
   // -- New Tier B: submit_rating ----------------------------------
+  if (action === 'confirm_job_complete') {
+    if (!(actorRole === 'client' && userId === actorUid)) {
+      return { ok: false, status: 403, error: 'forbidden' };
+    }
+    const curStatus = String(bookingData.status || '').trim().toLowerCase();
+    if (curStatus === 'completed' || curStatus === 'closed') {
+      return { ok: true, status: 200, data: { already: true, message: 'This job is already marked complete.' } };
+    }
+    // Only confirm once the artisan has actually worked on / finished the job.
+    const okToComplete = ['awaiting_client_confirmation', 'in_progress', 'progress', 'completed'].includes(curStatus)
+      || bookingData.artisan_confirmed === 'yes';
+    if (!okToComplete) {
+      return { ok: false, status: 400, error: 'The job is not ready to be confirmed complete yet.' };
+    }
+    const ratingNum = Number(payload.rating);
+    const hasRating = Number.isFinite(ratingNum) && ratingNum >= 1 && ratingNum <= 5;
+    const review = String(payload.review || payload.comment || '').trim();
+    const completeBatch = firestore.batch();
+    completeBatch.set(bookingRef, {
+      status: 'completed',
+      completion_date: now,
+      updated_at: now,
+      ...(hasRating ? { rating: ratingNum, review } : {}),
+    }, { merge: true });
+    if (tmId) {
+      completeBatch.set(firestore.collection('tasksManagement').doc(tmId), {
+        status: 'completed',
+        completion_date: now,
+        updated_at: now,
+        ...(hasRating ? { rating: String(ratingNum), user_comment: review } : {}),
+      }, { merge: true });
+    }
+    await completeBatch.commit();
+    // Save the review on the artisan and tell them the job was confirmed.
+    try {
+      if (artisanId) {
+        const providerDoc = await getServiceProviderDocByAnyId(artisanId);
+        if (hasRating && providerDoc && providerDoc.exists) {
+          await firestore.collection('serviceProvider').doc(providerDoc.id)
+            .collection('reviews').doc(bookingId).set({
+              booking_id: bookingId, user_id: actorUid, rating: ratingNum, review, created_at: now,
+            });
+        }
+        await writePersonalNotificationForProviderDoc(
+          providerDoc,
+          'Job Confirmed Complete',
+          'The client confirmed the job is complete. Your payout is being released from escrow.',
+          { type: 'job_confirmed_complete', booking_id: bookingId, tasks_management_id: tmId || '' },
+        );
+      }
+    } catch (e) { console.warn('[confirm_job_complete] artisan notify/review:', e.message); }
+    return { ok: true, status: 200, data: { completed: true, rated: hasRating, booking_id: bookingId } };
+  }
+
+  if (action === 'report_problem') {
+    if (!(actorRole === 'client' && userId === actorUid)) {
+      return { ok: false, status: 403, error: 'forbidden' };
+    }
+    const description = String(payload.description || payload.reason || payload.message || '').trim();
+    if (!description) return { ok: false, status: 400, error: 'Please describe what went wrong so I can log it.' };
+    const curStatus = String(bookingData.status || '').trim().toLowerCase();
+    if (curStatus === 'closed') {
+      return { ok: false, status: 400, error: 'This job is already closed. Please raise a complaint instead.' };
+    }
+    // Flag the dispute and HOLD escrow (never auto-complete a disputed job).
+    await bookingRef.set({ client_disputed: 'yes', dispute_reason: description, disputed_at: now, updated_at: now }, { merge: true });
+    if (tmId) {
+      await firestore.collection('tasksManagement').doc(tmId).set(
+        { client_disputed: 'yes', dispute_reason: description, disputed_at: now, updated_at: now }, { merge: true });
+    }
+    const slaDeadline = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString();
+    const ccRef = firestore.collection('assistant_cases').doc();
+    await ccRef.set({
+      case_id: ccRef.id, type: 'dispute', booking_id: bookingId, client_uid: actorUid,
+      description, state: 'open', priority: 'high',
+      created_at: now, updated_at: now, sla_deadline: slaDeadline,
+      timeline: [{ timestamp: now, actor: actorUid, action: 'case_created', notes: description }],
+    });
+    try {
+      await writeAdminNotification({
+        title: `Work Disputed (Booking ${bookingData.order_no || bookingId})`,
+        message: description.substring(0, 150),
+        data: { type: 'work_dispute', case_id: ccRef.id, booking_id: bookingId, priority: 'high' },
+      });
+    } catch (_e) { /* best-effort */ }
+    try {
+      if (artisanId) {
+        const pd = await getServiceProviderDocByAnyId(artisanId);
+        await writePersonalNotificationForProviderDoc(
+          pd,
+          'Client Reported an Issue',
+          'The client reported a problem with the work. Admin will be in touch. Your payout is on hold until it is resolved.',
+          { type: 'work_dispute', booking_id: bookingId, tasks_management_id: tmId || '' },
+        );
+      }
+    } catch (_e) { /* best-effort */ }
+    return { ok: true, status: 200, data: { reported: true, case_id: ccRef.id, escrow_held: true } };
+  }
+
+  if (action === 'get_artisan_eta') {
+    let tmData = {};
+    if (tmId) {
+      try {
+        const s = await firestore.collection('tasksManagement').doc(tmId).get();
+        if (s.exists) tmData = s.data() || {};
+      } catch (_e) { /* ignore */ }
+    }
+    const eff = String(tmData.status || bookingData.status || '').trim().toLowerCase();
+    const buyingMaterial = String(tmData.buying_material || '').trim().toLowerCase() === 'true';
+    let providerName = '';
+    let providerPhone = '';
+    try {
+      if (artisanId) {
+        const pd = await getServiceProviderDocByAnyId(artisanId);
+        if (pd && pd.exists) {
+          const d = pd.data() || {};
+          providerName = String(d.name || d.full_name || '').trim();
+          providerPhone = String(d.phone || d.phone_number || d.mobile || '').trim();
+        }
+      }
+    } catch (_e) { /* best-effort */ }
+    let stage;
+    let msg;
+    if (eff === 'completed') { stage = 'completed'; msg = 'This job is already complete.'; }
+    else if (eff === 'awaiting_client_confirmation') { stage = 'work_completed'; msg = 'Your artisan has finished the work and is waiting for you to confirm it is done right.'; }
+    else if (buyingMaterial) { stage = 'buying_materials'; msg = 'Your artisan is buying the materials needed for your job.'; }
+    else if (eff === 'progress' || eff === 'in_progress') { stage = 'working_on_site'; msg = 'Your artisan is on site working on your job right now.'; }
+    else if (bookingData.artisan_confirmed === 'yes' || bookingData.accept === '1' || bookingData.accept === 1) { stage = 'accepted'; msg = 'Your artisan has accepted and will be heading to your site. I do not have a live GPS arrival time yet, but you can contact them directly.'; }
+    else { stage = 'pending'; msg = 'An artisan has not started on this job yet.'; }
+    return { ok: true, status: 200, data: { stage, message: msg, artisan_name: providerName, artisan_phone: providerPhone } };
+  }
+
+  if (action === 'top_up_wallet') {
+    if (actorRole !== 'client') {
+      return { ok: false, status: 403, error: 'forbidden' };
+    }
+    const amt = Math.round(parseFloat(payload.amount || payload.topup_amount || '0') * 100) / 100;
+    if (!Number.isFinite(amt) || amt <= 0) {
+      return { ok: false, status: 400, error: 'Please tell me how much you would like to add to your wallet.' };
+    }
+    if (amt > 50000) {
+      return { ok: false, status: 400, error: 'Wallet top-ups are limited to R50,000 at a time.' };
+    }
+    try {
+      const merchantId = env('PAYFAST_MERCHANT_ID');
+      const merchantKey = env('PAYFAST_MERCHANT_KEY');
+      const payfastUrl = env('PAYFAST_URL') || 'https://www.payfast.co.za/eng/process';
+      const backendUrl = env('RENDER_EXTERNAL_URL') || 'https://square15-livekit-backend.onrender.com';
+      if (!merchantId || !merchantKey) {
+        return { ok: false, status: 503, error: 'Wallet top-up is temporarily unavailable. Please try again later.' };
+      }
+      const topupRef = `wallet_topup_${actorUid}`;
+      const _sig = signPaymentCallback(topupRef);
+      const returnUrl = `${backendUrl}/api/payment/ozow-result?status=success&booking_id=${encodeURIComponent(topupRef)}${_sig}`;
+      const cancelUrl = `${backendUrl}/api/payment/ozow-result?status=cancel&booking_id=${encodeURIComponent(topupRef)}${_sig}`;
+      const notifyUrl = `${backendUrl}/api/payment/itn`;
+      const pmIn = String(payload.payment_method || 'card').toLowerCase();
+      const pfMethod = (pmIn === 'eft' || pmIn === 'instant_eft' || pmIn === 'instanteft' || pmIn === 'ozow') ? 'eft' : 'cc';
+      const paymentData = {
+        merchant_id: merchantId,
+        merchant_key: merchantKey,
+        amount: amt.toFixed(2),
+        item_name: 'Square 15 Wallet Top-Up',
+        return_url: returnUrl,
+        cancel_url: cancelUrl,
+        notify_url: notifyUrl,
+        custom_str1: topupRef,
+        payment_method: pfMethod,
+      };
+      const passphrase = env('PAYFAST_PASSPHRASE') || '';
+      const pfParamString = Object.entries(paymentData)
+        .map(([k, v]) => `${encodeURIComponent(k).replace(/%20/g, '+')}=${encodeURIComponent(String(v || '')).replace(/%20/g, '+')}`)
+        .join('&');
+      let sigInput = pfParamString;
+      if (passphrase) sigInput += `&passphrase=${encodeURIComponent(passphrase).replace(/%20/g, '+')}`;
+      paymentData.signature = crypto.createHash('md5').update(sigInput).digest('hex');
+      const qs = Object.entries(paymentData)
+        .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+        .join('&');
+      const paymentUrl = `${payfastUrl}?${qs}`;
+      await firestore.collection('payment_links').doc(`TOPUP-${actorUid}-${Date.now().toString(36)}`).set({
+        topup: true,
+        user_id: actorUid,
+        amount: amt,
+        payment_url: paymentUrl,
+        status: 'pending',
+        source: payload.source || 'voice',
+        created_at: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      await writePersonalNotification({
+        userId: actorUid,
+        userType: 'user',
+        title: 'Wallet Top-Up Link Ready',
+        message: `Tap to add R${amt.toFixed(2)} to your Square 15 wallet.`,
+        data: {
+          type: 'wallet_topup',
+          amount: amt,
+          payment_url: paymentUrl,
+          launch_lizzy: 'true',
+          lizzy_prompt: 'Your wallet top-up link is ready. Would you like me to help you complete it?',
+          lizzy_target_role: 'client',
+        },
+      });
+      return { ok: true, status: 200, data: {
+        message: `A top-up link for R${amt.toFixed(2)} has been sent to your phone. Once it clears, the funds will appear in your wallet.`,
+        paymentUrl, amount: amt,
+      }};
+    } catch (err) {
+      return { ok: false, status: 500, error: `wallet_topup_error: ${err.message}` };
+    }
+  }
+
   if (action === 'submit_rating') {
     const targetBookingId = String(payload.booking_id || bookingId || '').trim();
     if (!targetBookingId) return { ok: false, status: 400, error: 'booking_id required' };
@@ -11878,6 +12128,54 @@ app.post('/api/payment/itn', async (req, res) => {
           }
           throw replayErr;
         }
+      }
+      // Wallet top-ups carry custom_str1 = `wallet_topup_{uid}` (no booking). Credit
+      // the user's wallet from the VERIFIED PayFast amount instead of processing a
+      // booking payment. Replay protection above already deduped by pf_payment_id.
+      if (customStr1.startsWith('wallet_topup_')) {
+        const topupUid = customStr1.replace('wallet_topup_', '').trim();
+        const creditAmt = parseFloat(amountGross);
+        if (topupUid && Number.isFinite(creditAmt) && creditAmt > 0) {
+          try {
+            const uRef = admin.firestore().collection('users').doc(topupUid);
+            let newBal = 0;
+            await admin.firestore().runTransaction(async (txn) => {
+              const uSnap = await txn.get(uRef);
+              const ud = uSnap.exists ? (uSnap.data() || {}) : {};
+              const cur = parseFloat(ud.balance || ud.wallet_balance || '0') || 0;
+              newBal = Math.round((cur + creditAmt) * 100) / 100;
+              txn.set(uRef, { balance: newBal, updated_at: new Date().toISOString() }, { merge: true });
+              txn.set(admin.firestore().collection('transactionLogs').doc(), {
+                user_id: topupUid,
+                amount: creditAmt.toFixed(2),
+                type: 'wallet_topup',
+                subtype: 'wallet_credit',
+                direction: 'credit',
+                balance_after: newBal.toFixed(2),
+                pf_payment_id: pfPaymentId,
+                source: 'payfast_itn',
+                created_at: new Date().toISOString(),
+              });
+            });
+            console.log(`[ITN] Wallet top-up R${creditAmt.toFixed(2)} credited to ${topupUid}, new balance R${newBal.toFixed(2)}`);
+            try {
+              await admin.firestore().collection('notifications').add({
+                user_id: topupUid,
+                userId: topupUid,
+                user_type: 'user',
+                title: 'Wallet Topped Up',
+                message: `R${creditAmt.toFixed(2)} has been added to your wallet. New balance: R${newBal.toFixed(2)}.`,
+                body: `R${creditAmt.toFixed(2)} added to your wallet.`,
+                type: 'wallet_topup_success',
+                read: false,
+                created_at: new Date().toISOString(),
+              });
+            } catch (_n) { /* best-effort notification */ }
+          } catch (wErr) {
+            console.error(`[ITN] wallet top-up credit failed for ${topupUid}: ${wErr.message}`);
+          }
+        }
+        return res.status(200).send('OK');
       }
       const result = await processSuccessfulPayment(customStr1, {
         amountGross,

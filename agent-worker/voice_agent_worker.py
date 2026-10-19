@@ -1565,7 +1565,7 @@ async def entrypoint(ctx: JobContext):
         # Hard gate: never assume the amount or the method. If either was not
         # explicitly chosen by the customer, ask instead of generating a link.
         pt = (payment_type or "").strip().lower()
-        if pt not in ("full", "deposit"):
+        if pt not in ("full", "deposit", "balance"):
             return ("Before I send the link, would you like to pay the full amount, or a "
                     "35 percent deposit now and the balance after the job is done?")
         pm = (payment_method or "").strip().lower()
@@ -2296,7 +2296,7 @@ async def entrypoint(ctx: JobContext):
             return "Which booking would you like to pay for? Please tell me the booking number."
         # Hard gate: never assume the amount. Ask if the customer has not chosen.
         pt = (payment_type or "").strip().lower()
-        if pt not in ("full", "deposit"):
+        if pt not in ("full", "deposit", "balance"):
             return ("Would you like to pay the full amount from your wallet, or just the "
                     "35 percent deposit now and the balance after the job is done?")
         payment_type = pt
@@ -2344,7 +2344,7 @@ async def entrypoint(ctx: JobContext):
         nonlocal backend_client
         # Hard gate: never assume the amount. Ask if the customer has not chosen.
         pt = (payment_type or "").strip().lower()
-        if pt not in ("full", "deposit"):
+        if pt not in ("full", "deposit", "balance"):
             return ("Would you like the buy-now-pay-later to cover the full amount, or just "
                     "the 35 percent deposit now and the balance after the job is done?")
         payment_type = pt
@@ -2544,6 +2544,208 @@ async def entrypoint(ctx: JobContext):
         except Exception as e:
             logger.error(f"artisan_buying_materials error: {e}", exc_info=True)
             return "Sorry, I had trouble updating the status. Please try again."
+
+    @llm.function_tool(
+        description=(
+            "ARTISAN ONLY: mark that you have ARRIVED on site and STARTED the job (the 'before' "
+            "stage). Call this when the artisan says they have arrived, are on site, or have "
+            "started working. Notifies the customer their artisan is working on site. "
+            "booking_id is OPTIONAL if you were opened from a specific job."
+        )
+    )
+    async def artisan_arrived_on_site(booking_id: str = "") -> str:
+        """Mark the job as working-on-site and notify the customer."""
+        nonlocal backend_client, app_context_focus_booking_id
+        if not (booking_id or "").strip() and app_context_focus_booking_id:
+            booking_id = app_context_focus_booking_id
+        if not (booking_id or "").strip():
+            return "Which job have you arrived at? Please tell me the booking number."
+        if not backend_client:
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
+        try:
+            result = await backend_client.call_backend_action(
+                'artisan_update_status', {'booking_id': booking_id, 'stage': 'working_on_site', 'source': 'voice'}
+            )
+            if not result.get('ok') and not result.get('success'):
+                return f"I couldn't update the job: {result.get('error', 'unknown_error')}"
+            return "Done - I've let the customer know you're on site and working."
+        except Exception as e:
+            logger.error(f"artisan_arrived_on_site error: {e}", exc_info=True)
+            return "Sorry, I had trouble updating the job status. Please try again."
+
+    @llm.function_tool(
+        description=(
+            "ARTISAN ONLY: mark the job as COMPLETED by you (the 'after' stage). Call this when the "
+            "artisan says they have finished the work, are done, or have uploaded the after photo. "
+            "This moves the job to awaiting the customer's confirmation and asks them to settle any "
+            "remaining balance and confirm. booking_id is OPTIONAL if opened from a specific job."
+        )
+    )
+    async def artisan_work_completed(booking_id: str = "") -> str:
+        """Mark the job as completed by the artisan and notify the customer."""
+        nonlocal backend_client, app_context_focus_booking_id
+        if not (booking_id or "").strip() and app_context_focus_booking_id:
+            booking_id = app_context_focus_booking_id
+        if not (booking_id or "").strip():
+            return "Which job have you finished? Please tell me the booking number."
+        if not backend_client:
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
+        try:
+            result = await backend_client.call_backend_action(
+                'artisan_update_status', {'booking_id': booking_id, 'stage': 'work_completed', 'source': 'voice'}
+            )
+            if not result.get('ok') and not result.get('success'):
+                return f"I couldn't mark the job complete: {result.get('error', 'unknown_error')}"
+            return "Great - I've marked the job complete and asked the customer to confirm and settle any balance."
+        except Exception as e:
+            logger.error(f"artisan_work_completed error: {e}", exc_info=True)
+            return "Sorry, I had trouble marking the job complete. Please try again."
+
+    @llm.function_tool(
+        description=(
+            "CONFIRM that the customer is satisfied and the job is complete - this finalises the "
+            "order and releases the artisan's payment from escrow. Call this ONLY when the customer "
+            "EXPLICITLY confirms the work is done right (e.g. 'the job is done', 'I'm happy, complete "
+            "it', 'confirm completion'). You may optionally pass a rating (1 to 5) and a short review "
+            "if they give one. booking_id is OPTIONAL if opened from a specific job."
+        )
+    )
+    async def confirm_job_complete(booking_id: str = "", rating: int = 0, review: str = "") -> str:
+        """Finalise the order and release escrow after the customer confirms completion."""
+        nonlocal backend_client, app_context_focus_booking_id
+        if not (booking_id or "").strip() and app_context_focus_booking_id:
+            booking_id = app_context_focus_booking_id
+        if not (booking_id or "").strip():
+            return "Which job would you like to confirm as complete? Please tell me the booking number."
+        if not backend_client:
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
+        payload = {'booking_id': booking_id, 'source': 'voice'}
+        if isinstance(rating, int) and 1 <= rating <= 5:
+            payload['rating'] = rating
+        if (review or "").strip():
+            payload['review'] = review.strip()
+        try:
+            result = await backend_client.call_backend_action('confirm_job_complete', payload)
+            if not result.get('ok') and not result.get('success'):
+                error = str(result.get('error', 'unknown_error'))
+                if 'not ready' in error.lower():
+                    return "This job isn't ready to be confirmed complete yet - the artisan hasn't finished the work."
+                return f"I couldn't confirm completion: {error}"
+            data = result.get('data', result.get('result', {}))
+            if data.get('already'):
+                return "This job is already marked complete."
+            return "Thank you - I've confirmed the job is complete and released the payment to your artisan. Is there anything else I can help with?"
+        except Exception as e:
+            logger.error(f"confirm_job_complete error: {e}", exc_info=True)
+            return "Sorry, I had trouble confirming completion. Please try again."
+
+    @llm.function_tool(
+        description=(
+            "Report a PROBLEM with the completed work instead of confirming it - use this when the "
+            "customer is NOT satisfied (e.g. 'the work is not done right', 'there's a problem', 'I'm "
+            "not happy'). This opens a dispute, keeps the artisan's payment on hold in escrow, and "
+            "alerts the admin team. Requires a short description of what's wrong. booking_id is "
+            "OPTIONAL if opened from a specific job."
+        )
+    )
+    async def report_problem_with_work(description: str, booking_id: str = "") -> str:
+        """Open a work dispute and hold escrow when the customer is not satisfied."""
+        nonlocal backend_client, app_context_focus_booking_id
+        if not (booking_id or "").strip() and app_context_focus_booking_id:
+            booking_id = app_context_focus_booking_id
+        if not (booking_id or "").strip():
+            return "Which job has the problem? Please tell me the booking number."
+        if not (description or "").strip():
+            return "Can you briefly tell me what's wrong with the work so I can log it?"
+        if not backend_client:
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
+        try:
+            result = await backend_client.call_backend_action(
+                'report_problem', {'booking_id': booking_id, 'description': description, 'source': 'voice'}
+            )
+            if not result.get('ok') and not result.get('success'):
+                return f"I couldn't log the problem: {result.get('error', 'unknown_error')}"
+            return ("I've logged the problem and put your artisan's payment on hold. Our team will be in "
+                    "touch to sort it out. Your money stays safe in escrow until this is resolved.")
+        except Exception as e:
+            logger.error(f"report_problem_with_work error: {e}", exc_info=True)
+            return "Sorry, I had trouble logging the problem. Please try again."
+
+    @llm.function_tool(
+        description=(
+            "Add money to the customer's Square 15 WALLET. Call this when the customer wants to top "
+            "up, load, or add funds to their wallet, OR when they want to pay from their wallet but "
+            "don't have enough. Requires the amount in rand. Sends a secure card or instant-EFT link "
+            "to their phone; the funds appear once it clears. payment_method: 'card' (default) or 'eft'."
+        )
+    )
+    async def top_up_wallet(amount: float = 0, payment_method: str = "card") -> str:
+        """Generate a PayFast link to credit the customer's wallet."""
+        nonlocal backend_client
+        try:
+            amt = float(amount or 0)
+        except (TypeError, ValueError):
+            amt = 0
+        if amt <= 0:
+            return "How much would you like to add to your wallet?"
+        if not backend_client:
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
+        pm = (payment_method or "card").strip().lower()
+        pm = "eft" if pm in ("eft", "instant eft", "bank", "ozow") else "card"
+        try:
+            result = await backend_client.call_backend_action(
+                'top_up_wallet', {'amount': amt, 'payment_method': pm, 'source': 'voice'}
+            )
+            if not result.get('ok') and not result.get('success'):
+                return f"I couldn't start the wallet top-up: {result.get('error', 'unknown_error')}"
+            data = result.get('data', result.get('result', {}))
+            message = data.get('message', '')
+            return message or f"A top-up link for R{amt:.2f} has been sent to your phone."
+        except Exception as e:
+            logger.error(f"top_up_wallet error: {e}", exc_info=True)
+            return "Sorry, I had trouble starting the wallet top-up. Please try again."
+
+    @llm.function_tool(
+        description=(
+            "Check where the customer's artisan is and what stage their job is at (accepted, on the "
+            "way, buying materials, working on site, or finished). Use when the customer asks 'where "
+            "is my artisan', 'how long until they arrive', or 'what's happening with my job'. "
+            "booking_id is OPTIONAL if opened from a specific job."
+        )
+    )
+    async def get_artisan_eta(booking_id: str = "") -> str:
+        """Report the artisan's current progress stage and contact details."""
+        nonlocal backend_client, app_context_focus_booking_id
+        if not (booking_id or "").strip() and app_context_focus_booking_id:
+            booking_id = app_context_focus_booking_id
+        if not (booking_id or "").strip():
+            return "Which booking would you like an update on? Please tell me the booking number."
+        if not backend_client:
+            if not await _ensure_backend_or_retry():
+                return _CONNECTION_RETRY_MSG
+        try:
+            result = await backend_client.call_backend_action(
+                'get_artisan_eta', {'booking_id': booking_id, 'source': 'voice'}
+            )
+            if not result.get('ok') and not result.get('success'):
+                return f"I couldn't get an update: {result.get('error', 'unknown_error')}"
+            data = result.get('data', result.get('result', {}))
+            msg = data.get('message', 'Your job is in progress.')
+            name = (data.get('artisan_name') or '').strip()
+            phone = (data.get('artisan_phone') or '').strip()
+            if name and phone:
+                msg += f" Your artisan is {name}, and you can reach them on {phone}."
+            elif name:
+                msg += f" Your artisan is {name}."
+            return msg
+        except Exception as e:
+            logger.error(f"get_artisan_eta error: {e}", exc_info=True)
+            return "Sorry, I had trouble getting the job update. Please try again."
 
     @llm.function_tool(
         description=(
@@ -3175,8 +3377,14 @@ async def entrypoint(ctx: JobContext):
             artisan_cancel_and_reassign,
             artisan_set_on_the_way,
             artisan_buying_materials,
+            artisan_arrived_on_site,
+            artisan_work_completed,
             submit_rating,
             submit_complaint,
+            confirm_job_complete,
+            report_problem_with_work,
+            get_artisan_eta,
+            top_up_wallet,
             # Payment action tools
             request_payment_link,
             pay_with_wallet,
