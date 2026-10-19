@@ -472,6 +472,10 @@ async def entrypoint(ctx: JobContext):
     # Booking the user was looking at when they tapped a notification to open Lizzy.
     # Payment/status tools default to this when no booking_id is given.
     app_context_focus_booking_id = ""
+    # When Lizzy is opened by a status push, these make the greeting lead with
+    # an update (no fresh self-introduction) and stay focused on that booking.
+    app_context_launch_type = ""
+    app_context_is_push = False
     # The caller's first name (from app context) so Lizzy can greet them by name.
     caller_name = ""
     # Photos staged by the app's manual "Add Photos" button; attached to the next booking.
@@ -612,6 +616,7 @@ async def entrypoint(ctx: JobContext):
             "- When confirming a new booking, briefly reassure the user about escrow and the artisan-photo identity check (one short sentence).\n\n"
             "RULES:\n"
             "- Greet once, then just help. Never repeat your introduction.\n"
+            "- OPENED BY A NOTIFICATION (push update): If this session was opened by a status push (the app context has a focus booking, or you were told you have an update), do NOT introduce yourself again and do NOT ask 'how can I help' - you already have one specific job in focus. Lead with a short update about THAT job and continue the relevant step. NEVER ask the customer 'which booking?' or 'which order?' and NEVER list their other bookings: the job you were opened for is the one they mean. Call tools WITHOUT a booking_id (get_booking_status(), check_payment(), submit_rating(...)) - the system auto-targets the focus job. If the job is COMPLETE and a balance is due, state the exact balance, ask how they want to pay (wallet, card, instant EFT, or buy-now-pay-later), let them complete it (on the in-app payment screen if it opens, otherwise take it by voice), confirm with check_payment, then ask them to RATE the artisan and call submit_rating. Even if the customer repeats the order number back to you, just proceed with that same focus job - do not get stuck re-confirming which order.\n"
             "- NEVER end the call, say goodbye, thank-and-close, or offer to end the call until a booking has actually been created OR the customer explicitly asks to end. This is ESPECIALLY important at the start of the conversation: right after your greeting, just keep helping. If you are unsure what the customer said, ask them to repeat - do not wrap up or end.\n"
             "- PAYMENT IS NOT DONE WHEN THE SCREEN OPENS: After the payment screen opens (or you send a payment link), you are STILL not finished. Do NOT say 'you are all set', 'that is everything', or offer to end the call, and do NOT wrap up, until you have called check_payment(booking_id) and it confirms the payment was RECEIVED (full OR deposit). Stay with the customer and let them complete the payment. When they say they have paid, CALL check_payment. If it is not reflected yet, reassure them it can take a moment, wait briefly, and CALL check_payment AGAIN - never tell them it still shows pending and then stop or wrap up. Only after check_payment confirms received (or deposit received) do you confirm warmly and move on.\n"
             "- If you are given the user's first name, use it: greet them by name and address them by their first name at least once more during the conversation so it feels personal and warm. Never overuse it.\n"
@@ -3458,7 +3463,7 @@ async def entrypoint(ctx: JobContext):
         return True
 
     def on_participant_metadata_changed(participant, old_metadata, new_metadata):
-        nonlocal backend_client, firebase_token, session_id, session_nonce, app_context_bookings, app_context_user_id, caller_name, app_context_focus_booking_id
+        nonlocal backend_client, firebase_token, session_id, session_nonce, app_context_bookings, app_context_user_id, caller_name, app_context_focus_booking_id, app_context_launch_type, app_context_is_push
         try:
             if not new_metadata or not str(new_metadata).strip():
                 return
@@ -3554,6 +3559,11 @@ async def entrypoint(ctx: JobContext):
                 focus_bid = (payload.get("focus_booking_id") or "").strip()
                 if focus_bid:
                     app_context_focus_booking_id = focus_bid
+                _lt = (payload.get("launch_notification_type") or "").strip()
+                if _lt:
+                    app_context_launch_type = _lt
+                if str(payload.get("is_push_launch") or "").strip().lower() in ("true", "1", "yes") or focus_bid:
+                    app_context_is_push = True
                 if not caller_name:
                     nm = _first_name(payload.get("user_name") or "")
                     if nm:
@@ -3765,7 +3775,7 @@ async def entrypoint(ctx: JobContext):
     # so we can read it directly from any remote participant's metadata JSON.
     def _scan_participants_for_credentials():
         """Scan all remote participants for firebase_token in metadata."""
-        nonlocal backend_client, app_context_bookings, app_context_user_id, caller_name, app_context_focus_booking_id
+        nonlocal backend_client, app_context_bookings, app_context_user_id, caller_name, app_context_focus_booking_id, app_context_launch_type, app_context_is_push
         try:
             participants = ctx.room.remote_participants
             # Handle both dict.values() and direct iteration
@@ -3807,6 +3817,11 @@ async def entrypoint(ctx: JobContext):
                     focus_bid = (msg.get('focus_booking_id') or '').strip()
                     if focus_bid:
                         app_context_focus_booking_id = focus_bid
+                    _lt = (msg.get('launch_notification_type') or '').strip()
+                    if _lt:
+                        app_context_launch_type = _lt
+                    if str(msg.get('is_push_launch') or '').strip().lower() in ('true', '1', 'yes') or focus_bid:
+                        app_context_is_push = True
                     if not caller_name:
                         _pl = msg.get('payload') if isinstance(msg.get('payload'), dict) else {}
                         nm = _first_name(msg.get('user_name') or _pl.get('user_name') or '')
@@ -3849,13 +3864,22 @@ async def entrypoint(ctx: JobContext):
         _scan_participants_for_credentials()
 
     try:
-        greeting = (
-            f"Hi {caller_name}, I am Lizzy, how can I help you today?"
-            if caller_name
-            else "Hi, I am Lizzy, how can I help you today?"
-        )
+        if app_context_is_push or app_context_focus_booking_id:
+            # Opened by a status push: lead with an update, do NOT re-introduce
+            # or ask "how can I help". The app follows with the specific update.
+            greeting = (
+                f"Hi {caller_name}, it's Lizzy. I have an update for you on your booking."
+                if caller_name
+                else "Hi, it's Lizzy. I have an update for you on your booking."
+            )
+        else:
+            greeting = (
+                f"Hi {caller_name}, I am Lizzy, how can I help you today?"
+                if caller_name
+                else "Hi, I am Lizzy, how can I help you today?"
+            )
         _greeting_handle = session.say(greeting, allow_interruptions=True)
-        logger.info(f"âœ… Greeting sent (name={'yes' if caller_name else 'no'})")
+        logger.info(f"âœ… Greeting sent (name={'yes' if caller_name else 'no'}, push={app_context_is_push or bool(app_context_focus_booking_id)})")
     except Exception as e:
         _greeting_handle = None
         logger.warning(f"âš ï¸ Could not send greeting: {e}")
