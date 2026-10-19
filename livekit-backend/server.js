@@ -5568,6 +5568,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     const buyingMaterial = String(tmData.buying_material || '').trim().toLowerCase() === 'true';
     let providerName = '';
     let providerPhone = '';
+    let artisanLoc = null;
     try {
       if (artisanId) {
         const pd = await getServiceProviderDocByAnyId(artisanId);
@@ -5575,7 +5576,28 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
           const d = pd.data() || {};
           providerName = String(d.name || d.full_name || '').trim();
           providerPhone = String(d.phone || d.phone_number || d.mobile || '').trim();
+          const plat = parseFloat(String(d.lat || d.latitude || ''));
+          const plng = parseFloat(String(d.lng || d.longitude || ''));
+          if (!isNaN(plat) && !isNaN(plng) && plat !== 0 && plng !== 0) {
+            artisanLoc = { lat: plat, lng: plng };
+          }
         }
+      }
+    } catch (_e) { /* best-effort */ }
+    // Approximate straight-line distance from the artisan to the job site so
+    // Lizzy can answer "where is my artisan" with something concrete.
+    let distanceKm = null;
+    try {
+      const dlat = parseFloat(String(bookingData.service_lat || bookingData.lat || bookingData.latitude || ''));
+      const dlng = parseFloat(String(bookingData.service_lng || bookingData.lng || bookingData.longitude || ''));
+      if (artisanLoc && !isNaN(dlat) && !isNaN(dlng) && dlat !== 0 && dlng !== 0) {
+        const toRad = (v) => (v * Math.PI) / 180;
+        const R = 6371;
+        const dLat = toRad(dlat - artisanLoc.lat);
+        const dLng = toRad(dlng - artisanLoc.lng);
+        const a = Math.sin(dLat / 2) ** 2 +
+          Math.cos(toRad(artisanLoc.lat)) * Math.cos(toRad(dlat)) * Math.sin(dLng / 2) ** 2;
+        distanceKm = Math.round(2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)) * 10) / 10;
       }
     } catch (_e) { /* best-effort */ }
     let stage;
@@ -5584,9 +5606,18 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     else if (eff === 'awaiting_client_confirmation') { stage = 'work_completed'; msg = 'Your artisan has finished the work and is waiting for you to confirm it is done right.'; }
     else if (buyingMaterial) { stage = 'buying_materials'; msg = 'Your artisan is buying the materials needed for your job.'; }
     else if (eff === 'progress' || eff === 'in_progress') { stage = 'working_on_site'; msg = 'Your artisan is on site working on your job right now.'; }
-    else if (bookingData.artisan_confirmed === 'yes' || bookingData.accept === '1' || bookingData.accept === 1) { stage = 'accepted'; msg = 'Your artisan has accepted and will be heading to your site. I do not have a live GPS arrival time yet, but you can contact them directly.'; }
+    else if (bookingData.artisan_confirmed === 'yes' || bookingData.accept === '1' || bookingData.accept === 1) {
+      stage = 'accepted';
+      if (artisanLoc && distanceKm != null) {
+        msg = `Your artisan has accepted and is on the way - they are roughly ${distanceKm} kilometres from your site. You can watch their live location on the map in the app.`;
+      } else if (artisanLoc) {
+        msg = 'Your artisan has accepted and is heading to your site. You can watch their live location on the map in the app.';
+      } else {
+        msg = 'Your artisan has accepted and will be heading to your site. I do not have a live GPS position yet, but you can contact them directly.';
+      }
+    }
     else { stage = 'pending'; msg = 'An artisan has not started on this job yet.'; }
-    return { ok: true, status: 200, data: { stage, message: msg, artisan_name: providerName, artisan_phone: providerPhone } };
+    return { ok: true, status: 200, data: { stage, message: msg, artisan_name: providerName, artisan_phone: providerPhone, artisan_location: artisanLoc, distance_km: distanceKm } };
   }
 
   if (action === 'top_up_wallet') {
