@@ -7306,8 +7306,14 @@ app.post('/api/notifications/send', authMiddleware, assistantLimiter, async (req
     }
     const { token, title, body, data, userId, userType, bookingId, type } = req.body;
 
-    if (!token || !title || !body) {
-      return res.status(400).json({ error: 'Missing required fields: token, title, body' });
+    // A caller may pass an empty token on purpose (e.g. a non-GMS device with
+    // no FCM token) and still rely on the backend to persist the in-app inbox
+    // doc via the Admin SDK. The `notifications` collection is
+    // `allow create: if isAdmin()`, so clients cannot write it themselves.
+    // Require EITHER a token (to push) OR a userId (to persist for).
+    const hasToken = !!(token && String(token).trim());
+    if ((!hasToken && !userId) || !title || !body) {
+      return res.status(400).json({ error: 'Missing required fields: (token or userId), title, body' });
     }
 
     // Determine notification channel based on type
@@ -7354,6 +7360,7 @@ app.post('/api/notifications/send', authMiddleware, assistantLimiter, async (req
 
     let result = null;
     let fcmError = null;
+    if (hasToken) {
     try {
       result = await admin.messaging().send(message);
       console.log(`? FCM sent via backend: ${result}`);
@@ -7389,25 +7396,35 @@ app.post('/api/notifications/send', authMiddleware, assistantLimiter, async (req
         console.warn('[FCM] send error:', code, err && err.message);
       }
     }
+    }
 
     // Always store in-app notification doc so the recipient sees it even
     // when FCM is silenced (battery saver, OEM kill, dead token, etc).
     // recipientId was resolved above before any prune.
     try {
       const firestore = admin.firestore();
+      const extra = (data && typeof data === 'object') ? data : {};
       await firestore.collection('notifications').add({
         user_id: recipientId || null,
         user_type: userType || 'user',
         title: String(title),
         message: String(body),
         body: String(body),
-        ...(bookingId ? { booking_id: bookingId } : {}),
+        ...(bookingId
+          ? { booking_id: bookingId }
+          : (extra.booking_id ? { booking_id: String(extra.booking_id) } : {})),
+        ...(extra.task_management_id ? { task_management_id: String(extra.task_management_id) } : {}),
+        // Carry the Lizzy deep-link so tapping the in-app notification opens
+        // Lizzy voice with the right proactive prompt (status updates such as
+        // buying material / work started / quote ready).
+        ...(extra.launch_lizzy ? { launch_lizzy: String(extra.launch_lizzy) } : {}),
+        ...(extra.lizzy_prompt ? { lizzy_prompt: String(extra.lizzy_prompt) } : {}),
         type: type || (data && data.type) || 'general',
         read: false,
         view: false,
         time: new Date().toString(),
         created_at: new Date().toISOString(),
-        delivery_status: fcmError ? 'fcm_failed' : 'fcm_sent',
+        delivery_status: fcmError ? 'fcm_failed' : (result ? 'fcm_sent' : 'inapp_only'),
         ...(fcmError ? { fcm_error_code: String(fcmError.code || 'unknown') } : {}),
       });
     } catch (inboxErr) {
