@@ -7,7 +7,7 @@ upload/deploy a minimal set of files to GitHub/Render.
 
 # â”€â”€ Version tag â€” bump this on every deploy so we can verify Render runs the
 # latest code.  Check Render logs for the startup banner.
-WORKER_VERSION = "2026-10-11-debug-wallet-only-tool"
+WORKER_VERSION = "2026-10-19-ask-method-and-amount"
 
 import os
 import sys
@@ -1544,22 +1544,40 @@ async def entrypoint(ctx: JobContext):
     @llm.function_tool(
         description=(
             "GENERATE a PayFast payment link (CARD or instant EFT) and send it to the "
-            "customer's phone. Call this when the customer chose to pay by CARD or by "
-            "INSTANT EFT. Pass payment_method='card' for card, or payment_method='eft' for "
-            "instant EFT. Do NOT call check_payment for these \u2014 that one only reads status. "
+            "customer's phone. Call this ONLY when the customer has EXPLICITLY chosen to pay "
+            "by CARD or by INSTANT EFT. Pass payment_method='card' for card, or "
+            "payment_method='eft' for instant EFT, and payment_type='full' or 'deposit'. "
+            "NEVER guess or default these - if the customer has not clearly said the amount "
+            "(full or deposit) AND the method (card or EFT), do NOT call this tool yet; ASK "
+            "them first. Do NOT call check_payment for these - that one only reads status. "
             "Do NOT use this for wallet (use pay_with_wallet) or buy-now-pay-later (use pay_with_bnpl). "
             "IMPORTANT: Only call AFTER an artisan has accepted the job. NEVER offer "
-            "payment immediately after booking creation. "
-            "Use payment_type='deposit' for 35% deposit, payment_type='full' for full payment."
+            "payment immediately after booking creation."
         )
     )
-    async def request_payment_link(booking_id: str, payment_type: str = "full", payment_method: str = "card") -> str:
+    async def request_payment_link(booking_id: str, payment_type: str = "", payment_method: str = "") -> str:
         """Request a PayFast card/EFT payment link via the backend."""
         nonlocal backend_client
         # When the user tapped a payment notification to reach Lizzy, default to
         # that booking so 'yes, pay' needs no disambiguation.
         if not (booking_id or "").strip() and app_context_focus_booking_id:
             booking_id = app_context_focus_booking_id
+        # Hard gate: never assume the amount or the method. If either was not
+        # explicitly chosen by the customer, ask instead of generating a link.
+        pt = (payment_type or "").strip().lower()
+        if pt not in ("full", "deposit"):
+            return ("Before I send the link, would you like to pay the full amount, or a "
+                    "35 percent deposit now and the balance after the job is done?")
+        pm = (payment_method or "").strip().lower()
+        if pm in ("instant eft", "eft", "bank", "bank transfer"):
+            pm = "eft"
+        elif pm in ("card", "credit card", "debit card", "credit", "debit", "bank card"):
+            pm = "card"
+        if pm not in ("card", "eft"):
+            return ("And how would you like to pay - by card, or by instant EFT? "
+                    "I can also take it from your wallet, or set up buy-now-pay-later.")
+        payment_type = pt
+        payment_method = pm
         if not backend_client:
             if not await _ensure_backend_or_retry():
                 return _CONNECTION_RETRY_MSG
@@ -2261,19 +2279,27 @@ async def entrypoint(ctx: JobContext):
             "This MOVES REAL MONEY from their wallet into escrow. Call this ONLY after ALL of: "
             "(1) an artisan has accepted the job, (2) the customer EXPLICITLY chose to pay from "
             "their wallet, and (3) you told them the exact amount and they said yes. "
-            "Use payment_type='full' for full payment or 'deposit' for a 35 percent deposit. "
+            "Pass payment_type='full' for full payment or 'deposit' for a 35 percent deposit - "
+            "NEVER guess or default it; if the customer has not said full or deposit, do NOT "
+            "call this yet, ASK them first. "
             "Do NOT use this for card or EFT (use request_payment_link) or buy-now-pay-later (use pay_with_bnpl). "
             "booking_id is OPTIONAL \u2014 if you were opened from a notification about a specific job, omit it and the "
             "system pays for that job automatically."
         )
     )
-    async def pay_with_wallet(booking_id: str = "", payment_type: str = "full") -> str:
+    async def pay_with_wallet(booking_id: str = "", payment_type: str = "") -> str:
         """Charge the user's wallet for a booking via the backend action."""
         nonlocal backend_client, app_context_focus_booking_id
         if not (booking_id or "").strip() and app_context_focus_booking_id:
             booking_id = app_context_focus_booking_id
         if not (booking_id or "").strip():
             return "Which booking would you like to pay for? Please tell me the booking number."
+        # Hard gate: never assume the amount. Ask if the customer has not chosen.
+        pt = (payment_type or "").strip().lower()
+        if pt not in ("full", "deposit"):
+            return ("Would you like to pay the full amount from your wallet, or just the "
+                    "35 percent deposit now and the balance after the job is done?")
+        payment_type = pt
         if not backend_client:
             if not await _ensure_backend_or_retry():
                 return _CONNECTION_RETRY_MSG
@@ -2313,9 +2339,15 @@ async def entrypoint(ctx: JobContext):
             "Use payment_type='full' or 'deposit'."
         )
     )
-    async def pay_with_bnpl(booking_id: str, payment_type: str = "full", provider: str = "moretyme") -> str:
+    async def pay_with_bnpl(booking_id: str, payment_type: str = "", provider: str = "moretyme") -> str:
         """Start a PayFast buy-now-pay-later checkout via request_payment_link."""
         nonlocal backend_client
+        # Hard gate: never assume the amount. Ask if the customer has not chosen.
+        pt = (payment_type or "").strip().lower()
+        if pt not in ("full", "deposit"):
+            return ("Would you like the buy-now-pay-later to cover the full amount, or just "
+                    "the 35 percent deposit now and the balance after the job is done?")
+        payment_type = pt
         if not backend_client:
             if not await _ensure_backend_or_retry():
                 return _CONNECTION_RETRY_MSG
@@ -3147,6 +3179,8 @@ async def entrypoint(ctx: JobContext):
             submit_complaint,
             # Payment action tools
             request_payment_link,
+            pay_with_wallet,
+            pay_with_bnpl,
             # RFQ quote tools
             generate_rfq_quote,
             accept_rfq,
