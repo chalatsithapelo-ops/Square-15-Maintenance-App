@@ -1748,12 +1748,15 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         return 'Your artisan has arrived and started working on your job. Let me know if you need anything.';
       case 'artisan_work_completed':
       case 'work_completed':
-        return 'Your artisan has completed the work. Would you like to review the photos, rate the artisan, or is there anything else I can help with?';
+        return 'Your artisan has completed the work. Let us review the before and after photos together, then I will help you rate your artisan and the service from one to five stars. Shall we start?';
       case 'rfq_quote_ready':
       case 'rfq_amended':
         return 'Good news - your quote is ready. I can walk you through the price breakdown, and if you are happy I can help you accept it so we can assign an artisan - or negotiate if the price does not work for you. Would you like me to go through it with you?';
       case 'balance_payment_due':
-        return 'Your artisan has completed the work and a balance payment is now due. Would you like me to help you pay it so your booking is finalised?';
+        return 'Your artisan has completed the work, so the remaining balance is now due. How would you like to pay it - from your wallet, by card, by instant EFT, or buy-now-pay-later? Once it is paid I will help you rate your artisan and the service.';
+      case 'balance_paid_rate_service':
+      case 'rate_service':
+        return 'Your booking is now fully paid and complete. How would you rate your artisan and the service, from one to five stars? Let me know and I will record it for you.';
       default:
         return null;
     }
@@ -11607,10 +11610,19 @@ Thank you for choosing Square 15! 🛠️`;
               : `Your payment has been received. Booking #${taskData.order_no || fbId} is confirmed.`;
           for (const tok of custTokens) {
             try {
+              const _custData = { type: 'payment_confirmed', booking_id: fbId, tasks_management_id: bookingId, user_type: 'customer' };
+              // After the balance is paid the job is fully settled — launch Lizzy
+              // so she can collect the artisan + service rating hands-free.
+              if (isBalancePayment) {
+                _custData.type = 'balance_paid_rate_service';
+                _custData.notification_type = 'balance_paid_rate_service';
+                _custData.launch_lizzy = 'true';
+                _custData.lizzy_prompt = lizzyPromptForType('balance_paid_rate_service') || '';
+              }
               await admin.messaging().send({
                 token: tok,
                 notification: { title: custTitle, body: custBody },
-                data: { type: 'payment_confirmed', booking_id: fbId, tasks_management_id: bookingId, user_type: 'customer' },
+                data: _custData,
                 android: { priority: 'high', notification: { channelId: 'order_request_channel', sound: 'sound' } },
               });
               console.log(`? [processPayment] Customer ${custUserId} notified via token ${tok.substring(0, 15)}...`);
@@ -11624,10 +11636,13 @@ Thank you for choosing Square 15! 🛠️`;
           user_id: custUserId,
           user_type: 'customer',
           title: isBalancePayment ? 'Balance Payment Confirmed' : isDepositPayment ? 'Deposit Confirmed' : 'Payment Confirmed',
-          message: `Your payment for booking #${taskData.order_no || fbId} has been received.`,
+          message: isBalancePayment
+            ? `Your balance for booking #${taskData.order_no || fbId} has been received. Tap to rate your artisan and the service.`
+            : `Your payment for booking #${taskData.order_no || fbId} has been received.`,
           booking_id: fbId,
           tasks_management_id: bookingId,
-          type: 'payment_confirmed',
+          type: isBalancePayment ? 'balance_paid_rate_service' : 'payment_confirmed',
+          ...(isBalancePayment ? { launch_lizzy: 'true', lizzy_prompt: lizzyPromptForType('balance_paid_rate_service') || '' } : {}),
           read: false,
           view: false,
           created_at: now,
