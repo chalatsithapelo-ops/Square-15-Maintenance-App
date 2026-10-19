@@ -7582,25 +7582,11 @@ app.post('/api/notifications/send', authMiddleware, assistantLimiter, async (req
       ? 'order_request_channel'
       : 'high_importance_channel';
 
-    // Send FCM via Admin SDK (server-side � no private key exposed to clients)
-    const message = {
-      token: String(token).trim(),
-      notification: { title: String(title), body: String(body) },
-      data: data && typeof data === 'object' ? Object.fromEntries(
-        Object.entries(data).map(([k, v]) => [String(k), String(v)])
-      ) : {},
-      android: {
-        priority: 'high',
-        notification: { channelId },
-      },
-      apns: { headers: { 'apns-priority': '10' } },
-    };
-
-    // Resolve recipient up-front (BEFORE potential prune) so the in-app
-    // inbox doc is still tagged to the correct user even if FCM fails
-    // and we end up deleting the deviceToken field below.
+    // Resolve recipient up-front (BEFORE sending) so we can gather ALL of the
+    // recipient's device tokens server-side and the in-app inbox doc is still
+    // tagged to the correct user even if FCM fails.
     let recipientId = userId;
-    if (!recipientId) {
+    if (!recipientId && hasToken) {
       try {
         const db = admin.firestore();
         const trimmed = String(token).trim();
@@ -7611,44 +7597,103 @@ app.post('/api/notifications/send', authMiddleware, assistantLimiter, async (req
       } catch (_) { /* best-effort */ }
     }
 
-    let result = null;
-    let fcmError = null;
-    if (hasToken) {
-    try {
-      result = await admin.messaging().send(message);
-      console.log(`? FCM sent via backend: ${result}`);
-    } catch (err) {
-      fcmError = err;
-      const code = err && err.code ? String(err.code) : '';
-      const dead = code === 'messaging/registration-token-not-registered'
-                || code === 'messaging/invalid-registration-token'
-                || code === 'messaging/invalid-argument';
-      if (dead) {
-        try {
-          const db = admin.firestore();
-          const trimmed = String(token).trim();
-          const collections = ['users', 'serviceProvider', 'partners', 'corporate_partners'];
-          let pruned = 0;
-          for (const col of collections) {
-            const snap = await db.collection(col).where('deviceToken', '==', trimmed).get();
-            for (const d of snap.docs) {
-              await d.ref.update({
-                deviceToken: admin.firestore.FieldValue.delete(),
-                fcm_token: admin.firestore.FieldValue.delete(),
-                fcmToken: admin.firestore.FieldValue.delete(),
-                deviceTokenInvalidatedAt: new Date().toISOString(),
-              });
-              pruned++;
+    // Build the full token set for this recipient. The app only passes ONE
+    // token (its current device), which is frequently stale or empty once the
+    // user closes the app — this is why artisan progress updates ("on the way",
+    // "working on site") used to go silent while the earlier accept/payment
+    // pushes (sent while the app was open) arrived. Resolving every stored
+    // token server-side and multicasting to all of them makes background
+    // progress pushes reliable across devices.
+    const _tokenFields = ['deviceToken', 'device_token', 'fcm_token', 'fcmToken', 'token', 'push_token', 'pushToken'];
+    const _tokenListFields = ['tokens', 'fcm_tokens', 'deviceTokens'];
+    const _tokenSet = new Set();
+    if (hasToken) _tokenSet.add(String(token).trim());
+    if (recipientId) {
+      try {
+        const db = admin.firestore();
+        const cols = (String(userType || '').toLowerCase() === 'artisan')
+          ? ['serviceProvider', 'users']
+          : ['users', 'serviceProvider'];
+        for (const col of cols) {
+          const snap = await db.collection(col).doc(recipientId).get();
+          if (!snap.exists) continue;
+          const dd = snap.data() || {};
+          for (const f of _tokenFields) {
+            const t = String(dd[f] || '').trim();
+            if (t) _tokenSet.add(t);
+          }
+          for (const lf of _tokenListFields) {
+            if (Array.isArray(dd[lf])) {
+              for (const it of dd[lf]) {
+                const t = String(it || '').trim();
+                if (t) _tokenSet.add(t);
+              }
             }
           }
-          console.log(`[FCM] pruned ${pruned} stale token refs (code=${code})`);
-        } catch (pruneErr) {
-          console.warn('[FCM] prune failed:', pruneErr && pruneErr.message);
         }
-      } else {
-        console.warn('[FCM] send error:', code, err && err.message);
-      }
+      } catch (_) { /* best-effort token resolution */ }
     }
+    const allTokens = Array.from(_tokenSet);
+
+    const dataMap = data && typeof data === 'object' ? Object.fromEntries(
+      Object.entries(data).map(([k, v]) => [String(k), String(v)])
+    ) : {};
+
+    let result = null;
+    let fcmError = null;
+    if (allTokens.length > 0) {
+      try {
+        const resp = await admin.messaging().sendEachForMulticast({
+          tokens: allTokens,
+          notification: { title: String(title), body: String(body) },
+          data: dataMap,
+          android: { priority: 'high', notification: { channelId } },
+          apns: { headers: { 'apns-priority': '10' } },
+        });
+        const okCount = resp.successCount || 0;
+        result = okCount > 0 ? `multicast ${okCount}/${allTokens.length}` : null;
+        if (okCount === 0) fcmError = { code: 'all_tokens_failed' };
+        console.log(`? FCM multicast via backend: ${okCount}/${allTokens.length} delivered`);
+
+        // Auto-heal: prune tokens the FCM response flagged as dead.
+        const stale = [];
+        (resp.responses || []).forEach((r, idx) => {
+          if (r && !r.success && r.error) {
+            const code = String(r.error.code || '').toLowerCase();
+            const msg = String(r.error.message || '').toLowerCase();
+            if (code.includes('registration-token-not-registered') ||
+                code.includes('invalid-registration-token') ||
+                (code.includes('invalid-argument') && msg.includes('token'))) {
+              stale.push(allTokens[idx]);
+            }
+          }
+        });
+        if (stale.length) {
+          try {
+            const db = admin.firestore();
+            const collections = ['users', 'serviceProvider', 'partners', 'corporate_partners'];
+            for (const st of stale) {
+              for (const col of collections) {
+                const snap = await db.collection(col).where('deviceToken', '==', st).get();
+                for (const d of snap.docs) {
+                  await d.ref.update({
+                    deviceToken: admin.firestore.FieldValue.delete(),
+                    fcm_token: admin.firestore.FieldValue.delete(),
+                    fcmToken: admin.firestore.FieldValue.delete(),
+                    deviceTokenInvalidatedAt: new Date().toISOString(),
+                  });
+                }
+              }
+            }
+            console.log(`[FCM] pruned ${stale.length} stale token refs`);
+          } catch (pruneErr) {
+            console.warn('[FCM] prune failed:', pruneErr && pruneErr.message);
+          }
+        }
+      } catch (err) {
+        fcmError = err;
+        console.warn('[FCM] multicast send error:', err && err.message);
+      }
     }
 
     // Always store in-app notification doc so the recipient sees it even
