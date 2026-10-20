@@ -3029,6 +3029,7 @@ async function executeWaTool(name, args, session) {
       // Look up pricing estimate — tasks collection is AUTHORITATIVE (admin-managed)
       let estimatedCost = '0';
       let pricingSource = 'none';
+      let measurementRoute = false; // true when the trade is priced per-m2 and needs on-site measurement
       try {
         const catSlug = (args.category || '').toLowerCase().replace(/\s+/g, '_');
         const subQuery = (args.subcategory || args.description || '').toLowerCase();
@@ -3064,6 +3065,25 @@ async function executeWaTool(name, args, session) {
         }
       } catch (e) {
         console.error('[create_booking] Pricing lookup error:', e.message);
+      }
+
+      // ── MEASUREMENT GUARD (2026-10-20) ──────────────────────────────────────
+      // Area-based trades (painting, tiling, flooring, paving, plastering, etc.)
+      // store a PER-SQUARE-METRE rate in the tasks `cost` field. Booking at that
+      // bare rate massively UNDERPRICES the job (e.g. a 40 m² paint job priced at
+      // the ~R150/m² rate instead of ~R6 000). We must never book these at the
+      // flat rate. Route them to the same quote/admin-review path as an unpriced
+      // service so an artisan measures on site and the client gets a real price.
+      {
+        const _measureKeywords = ['painting','paint','tiling','tilling','tiles','tile','celling','ceiling','ceilings','wall','walls','floor','floors','flooring','paving','paver','pavers','screed','screeding','plastering','plaster','waterproofing','laminate','carpet','carpeting','skirting'];
+        const _measureText = `${args.category || ''} ${args.subcategory || ''} ${args.description || ''}`.toLowerCase();
+        const _isMeasure = _measureText.split(/[^a-z]+/).some(w => w && _measureKeywords.includes(w));
+        if (_isMeasure && pricingSource === 'fixed') {
+          console.log(`[create_booking] ⚠️ measurement trade "${args.subcategory || args.category}" matched a per-m2 rate (R${estimatedCost}/m2) — NOT a flat price. Routing to on-site measurement quote.`);
+          estimatedCost = '0';
+          pricingSource = 'none';
+          measurementRoute = true;
+        }
       }
 
       // If no pricing found at all, convert to RFQ instead of creating R0 booking.
@@ -3219,7 +3239,9 @@ async function executeWaTool(name, args, session) {
           rfq: true,
           rfqId: rfqBookingId,
           rfq_no: rfqShortNo,
-          message: `We don't have a fixed price for "${args.subcategory || args.category}" yet. Your request has been sent to our team as a quote request (${rfqShortNo}). An admin will review and provide a custom quote shortly. You'll be notified once pricing is ready.`,
+          message: measurementRoute
+            ? `"${args.subcategory || args.category}" is priced per square metre, so the exact price depends on the area. I've logged your request (${rfqShortNo}) and our team is preparing an estimate now. An artisan will confirm the final price by measuring on site before any work starts \u2014 so you'll know the cost up front and only pay once you approve. You'll get the estimate shortly.`
+            : `We don't have a fixed price for "${args.subcategory || args.category}" yet. Your request has been sent to our team as a quote request (${rfqShortNo}). An admin will review and provide a custom quote shortly. You'll be notified once pricing is ready.`,
         };
       }
 
