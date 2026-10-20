@@ -834,6 +834,77 @@ async function pushAdminNotification({ title, body, type, bookingId = '', extraD
   }
 }
 
+// ─── Artisan push helper: writes a notification doc AND fires FCM to the ───
+// artisan's device(s). Used for customer->artisan chat relays so the artisan
+// phone lights up (and can carry launch_lizzy to open Lizzy for them).
+async function pushArtisanNotification({ artisanId, title, body, type, bookingId = '', tmId = '', extraData = {} }) {
+  const firestore = db();
+  if (!firestore || !artisanId) return;
+  try {
+    const snap = await firestore.collection('serviceProvider').doc(String(artisanId)).get();
+    if (!snap.exists) return;
+    const ad = snap.data() || {};
+    const authUid = String(ad.uid || ad.user_id || ad.userId || '').trim();
+
+    const notifPayload = {
+      title: String(title || 'Square 15'),
+      body: String(body || '').slice(0, 500),
+      type: String(type || 'chat_message'),
+      user_type: 'artisan',
+      booking_id: String(bookingId || ''),
+      tasks_management_id: String(tmId || ''),
+      read: false,
+      view: false,
+      source: 'whatsapp_bot',
+      created_at: admin.firestore.FieldValue.serverTimestamp(),
+    };
+    const ids = new Set();
+    if (authUid) ids.add(authUid);
+    ids.add(String(artisanId));
+    await Promise.all(
+      [...ids].map((id) => firestore.collection('notifications').add({ ...notifPayload, user_id: id }))
+    ).catch(() => {});
+
+    const tokens = [];
+    const seen = new Set();
+    for (const k of ['fcm_token', 'deviceToken', 'fcmToken', 'device_token', 'push_token', 'pushToken', 'token']) {
+      const t = String(ad[k] || '').trim();
+      if (t.length > 20 && !seen.has(t)) { seen.add(t); tokens.push(t); }
+    }
+    for (const k of ['tokens', 'fcm_tokens', 'deviceTokens']) {
+      if (Array.isArray(ad[k])) {
+        for (const v of ad[k]) {
+          const t = String(v || '').trim();
+          if (t.length > 20 && !seen.has(t)) { seen.add(t); tokens.push(t); }
+        }
+      }
+    }
+    if (!tokens.length) { console.warn(`[artisanPush:${type}] no tokens on artisan ${artisanId}`); return; }
+
+    const data = {
+      type: notifPayload.type,
+      user_type: 'artisan',
+      booking_id: notifPayload.booking_id,
+      tasks_management_id: notifPayload.tasks_management_id,
+    };
+    for (const [k, v] of Object.entries(extraData || {})) data[k] = String(v == null ? '' : v).slice(0, 500);
+    try {
+      const resp = await admin.messaging().sendEachForMulticast({
+        tokens,
+        notification: { title: notifPayload.title, body: notifPayload.body },
+        data,
+        android: { priority: 'high', notification: { channelId: 'high_importance_channel' } },
+        apns: { payload: { aps: { sound: 'default', badge: 1 } } },
+      });
+      console.log(`[artisanPush:${type}] FCM ${resp.successCount}/${tokens.length} delivered`);
+    } catch (fcmErr) {
+      console.warn(`[artisanPush:${type}] FCM failed:`, fcmErr && fcmErr.message);
+    }
+  } catch (e) {
+    console.warn('[artisanPush] failed:', e && e.message);
+  }
+}
+
 async function notifyWebhookProcessingFailure(phone, err, userText = '') {
   const detail = err?.message || String(err || 'unknown_error');
   try {
@@ -1762,6 +1833,21 @@ const waTools = [
       name: 'get_my_bookings',
       description: 'List the customer\'s recent bookings (up to 5). Use this when a customer asks about their bookings.',
       parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'message_artisan',
+      description: 'Send a message from the customer to the artisan assigned to their booking. Use when the customer wants to tell, ask, or send something to their artisan (e.g. "tell my plumber I will be 10 minutes late", "ask the artisan to bring a ladder"). The artisan gets a push notification and can reply via their app.',
+      parameters: {
+        type: 'object',
+        properties: {
+          message: { type: 'string', description: 'The message the customer wants to send to the artisan' },
+          bookingId: { type: 'string', description: 'Optional booking ID. If omitted, the customer\'s most recent booking with an assigned artisan is used.' },
+        },
+        required: ['message'],
+      },
     },
   },
   {
@@ -2943,7 +3029,6 @@ async function executeWaTool(name, args, session) {
       // Look up pricing estimate — tasks collection is AUTHORITATIVE (admin-managed)
       let estimatedCost = '0';
       let pricingSource = 'none';
-      let measurementRoute = false; // true when the trade is priced per-m2 and needs on-site measurement
       try {
         const catSlug = (args.category || '').toLowerCase().replace(/\s+/g, '_');
         const subQuery = (args.subcategory || args.description || '').toLowerCase();
@@ -2979,25 +3064,6 @@ async function executeWaTool(name, args, session) {
         }
       } catch (e) {
         console.error('[create_booking] Pricing lookup error:', e.message);
-      }
-
-      // ── MEASUREMENT GUARD (2026-10-20) ──────────────────────────────────────
-      // Area-based trades (painting, tiling, flooring, paving, plastering, etc.)
-      // store a PER-SQUARE-METRE rate in the tasks `cost` field. Booking at that
-      // bare rate massively UNDERPRICES the job (e.g. a 40 m² paint job priced at
-      // the ~R150/m² rate instead of ~R6 000). We must never book these at the
-      // flat rate. Route them to the same quote/admin-review path as an unpriced
-      // service so an artisan measures on site and the client gets a real price.
-      {
-        const _measureKeywords = ['painting','paint','tiling','tilling','tiles','tile','celling','ceiling','ceilings','wall','walls','floor','floors','flooring','paving','paver','pavers','screed','screeding','plastering','plaster','waterproofing','laminate','carpet','carpeting','skirting'];
-        const _measureText = `${args.category || ''} ${args.subcategory || ''} ${args.description || ''}`.toLowerCase();
-        const _isMeasure = _measureText.split(/[^a-z]+/).some(w => w && _measureKeywords.includes(w));
-        if (_isMeasure && pricingSource === 'fixed') {
-          console.log(`[create_booking] ⚠️ measurement trade "${args.subcategory || args.category}" matched a per-m2 rate (R${estimatedCost}/m2) — NOT a flat price. Routing to on-site measurement quote.`);
-          estimatedCost = '0';
-          pricingSource = 'none';
-          measurementRoute = true;
-        }
       }
 
       // If no pricing found at all, convert to RFQ instead of creating R0 booking.
@@ -3153,9 +3219,7 @@ async function executeWaTool(name, args, session) {
           rfq: true,
           rfqId: rfqBookingId,
           rfq_no: rfqShortNo,
-          message: measurementRoute
-            ? `"${args.subcategory || args.category}" is priced per square metre, so the exact price depends on the area. I've logged your request (${rfqShortNo}) and our team is preparing an estimate now. An artisan will confirm the final price by measuring on site before any work starts — so you'll know the cost up front and only pay once you approve. You'll get the estimate shortly.`
-            : `We don't have a fixed price for "${args.subcategory || args.category}" yet. Your request has been sent to our team as a quote request (${rfqShortNo}). An admin will review and provide a custom quote shortly. You'll be notified once pricing is ready.`,
+          message: `We don't have a fixed price for "${args.subcategory || args.category}" yet. Your request has been sent to our team as a quote request (${rfqShortNo}). An admin will review and provide a custom quote shortly. You'll be notified once pricing is ready.`,
         };
       }
 
@@ -3505,10 +3569,36 @@ async function executeWaTool(name, args, session) {
       const balanceRemaining = isDeposit ? (parseFloat(d.balance_remaining || d.balance_amount || '0') || Math.round((totalCost - depositAmount) * 100) / 100) : 0;
       const balancePaid = d.balance_paid === true;
 
+      // Derive a human-readable progress stage from the live task fields so the
+      // assistant can report whether the artisan is on the way, buying
+      // materials, working on site, or done — not just the raw status.
+      let liveData = d;
+      if (d.artisan_images === undefined && d.buying_material === undefined) {
+        const tmLink = String(d.tasks_management_id || '').trim();
+        if (tmLink) {
+          try {
+            const tmDoc = await firestore.collection('tasksManagement').doc(tmLink).get();
+            if (tmDoc.exists) liveData = tmDoc.data();
+          } catch (_) {}
+        }
+      }
+      const _ai = String(liveData.artisan_images || '0').trim() || '0';
+      const _bm = String(liveData.buying_material || '');
+      const _st = String(liveData.status || d.status || '').toLowerCase();
+      const _accepted = liveData.accept === '1' || liveData.accept === 1 ||
+        String(liveData.artisan_confirmed || '') === 'yes' || d.accept === '1';
+      let progress = 'pending';
+      if (_st === 'completed' || _st === 'closed' || _st === 'awaiting_client_confirmation' || _ai === '2') progress = 'completed';
+      else if (_ai === '1') progress = 'working_on_site';
+      else if (_bm === 'true') progress = 'buying_materials';
+      else if (_st === 'progress' || _st === 'in_progress') progress = 'on_the_way';
+      else if (_accepted) progress = 'accepted';
+
       return {
         bookingId: doc.id,
         orderNo: d.order_no || doc.id,
         status: d.status || 'unknown',
+        progress,
         category: d.category_name || d.category || '',
         artisan: d.service_provider_name || d.artisanName || 'Not assigned yet',
         cost: totalCost > 0 ? `R${totalCost.toFixed(2)}` : 'Pending quote',
@@ -3571,6 +3661,76 @@ async function executeWaTool(name, args, session) {
 
       if (bookings.length === 0) return { message: 'No bookings found for your number.' };
       return { bookings, count: bookings.length };
+    }
+
+    // ═══════════════════════════════════════════
+    // 4b) MESSAGE ARTISAN (customer -> assigned artisan)
+    // ═══════════════════════════════════════════
+    case 'message_artisan': {
+      if (!firestore) return { error: 'Database unavailable' };
+      const text = String(args.message || '').trim();
+      if (!text) return { error: 'What would you like to tell your artisan?' };
+      if (text.length > 1000) return { error: 'That message is too long. Please shorten it.' };
+
+      // Resolve the booking: explicit id, else the customer's most recent
+      // booking that actually has an artisan assigned.
+      let bookingDoc = null;
+      const bidArg = String(args.bookingId || '').trim();
+      if (bidArg) {
+        let d = await firestore.collection('futureBookings').doc(bidArg).get();
+        if (!d.exists) {
+          const q = await firestore.collection('futureBookings').where('order_no', '==', bidArg).limit(1).get();
+          if (!q.empty) d = q.docs[0];
+        }
+        if (d && d.exists) bookingDoc = d;
+      }
+      if (!bookingDoc && session.linkedUserId) {
+        const snap = await firestore.collection('futureBookings')
+          .where('user_id', '==', session.linkedUserId)
+          .orderBy('created_at', 'desc').limit(10).get();
+        for (const d of snap.docs) {
+          const dd = d.data() || {};
+          const spid = String(dd.service_provider_id || '').trim();
+          if (spid && spid !== 'admin') { bookingDoc = d; break; }
+        }
+      }
+      if (!bookingDoc) return { error: "I couldn't find a booking with an assigned artisan to message. Please give me the booking number." };
+
+      const bd = bookingDoc.data() || {};
+      const artisanId = String(bd.service_provider_id || '').trim();
+      const tmId = String(bd.tasks_management_id || '').trim() || bookingDoc.id;
+      if (!artisanId || artisanId === 'admin') return { error: "No artisan is assigned to that booking yet, so there is no one to message." };
+
+      const nowIso = new Date().toISOString();
+      try {
+        const chatRef = firestore.collection('tasksManagement').doc(tmId).collection('chat').doc();
+        await chatRef.set({
+          id: chatRef.id,
+          sender_id: session.linkedUserId || session.phone || 'whatsapp_client',
+          receiver_id: artisanId,
+          message: text,
+          source: 'whatsapp',
+          read: false, isRead: false,
+          timestamp: nowIso, created_at: nowIso,
+        });
+        await firestore.collection('tasksManagement').doc(tmId).set({
+          unread_artisan: admin.firestore.FieldValue.increment(1),
+          last_message: text.slice(0, 100),
+          last_message_at: nowIso,
+          last_message_by: 'client',
+        }, { merge: true });
+      } catch (e) { console.warn('[wa-tool] message_artisan chat write:', e.message); }
+
+      const relayPrompt = 'Your customer sent you a message. They said: "' + text.slice(0, 300) + '". Would you like me to help you reply or update them on the job?';
+      await pushArtisanNotification({
+        artisanId, tmId, bookingId: bookingDoc.id,
+        title: 'New message from client',
+        body: text.slice(0, 100),
+        type: 'chat_message',
+        extraData: { launch_lizzy: 'true', lizzy_prompt: relayPrompt, lizzy_target_role: 'artisan' },
+      });
+
+      return { success: true, message: 'Your message has been sent to your artisan.' };
     }
 
     // ═══════════════════════════════════════════
@@ -3644,7 +3804,8 @@ async function executeWaTool(name, args, session) {
             service: matchedService,
             fixedPrice: `R${matchedPrice.toFixed(2)}`,
             category: categoryName,
-            note: 'This is a FIXED price for the matched service. Use this exact amount when creating the booking. Do NOT pick any other price.',
+            pricingBasis: 'labour_only',
+            note: 'This is a FIXED price for the matched service and it is a LABOUR AMOUNT ONLY. Use this exact amount when creating the booking. Do NOT pick any other price. When you present this price to the customer you MUST state clearly that it is a labour amount only and that any materials that might be needed, the artisan will advise them to buy.',
           };
         }
 
@@ -5625,13 +5786,21 @@ async function executeWaTool(name, args, session) {
 
       const now = new Date().toISOString();
 
-      // Update booking with rating
-      await firestore.collection('tasksManagement').doc(bid).update({
+      // Update booking with rating. RFQ bookings may live only in
+      // futureBookings/rfq_requests (no tasksManagement doc), so update the
+      // document where it was actually found (doc.ref) to avoid a NOT_FOUND
+      // throw, then best-effort mirror to the sibling collections.
+      const ratingUpdate = {
         rating,
         user_comment: args.comment || '',
         rated_at: now,
         status: 'closed',
-      });
+      };
+      await doc.ref.update(ratingUpdate);
+      for (const col of ['tasksManagement', 'futureBookings']) {
+        if (doc.ref.parent.id === col) continue;
+        try { await firestore.collection(col).doc(bid).update(ratingUpdate); } catch (_) {}
+      }
 
       // Store review on artisan profile
       const artisanId = d.service_provider_id;
@@ -7382,6 +7551,7 @@ PHOTO ANALYSIS FOR RFQ:
 💬 MESSAGING:
 - Get messages/chat history for a booking (get_messages)
 - Send a message to the artisan or admin about a booking (send_message)
+- Send a message directly to the customer's assigned ARTISAN (message_artisan). Use this whenever the customer wants to tell, ask, or pass something to their artisan — e.g. "tell my plumber I'll be 10 minutes late", "ask the artisan to bring a ladder", "let him know the gate code is 1234". The artisan gets a push notification and can reply. If the customer has more than one active job, confirm which booking first.
 
 🎫 SUPPORT CASES:
 - List your support cases (list_cases)
@@ -7392,10 +7562,17 @@ PHOTO ANALYSIS FOR RFQ:
 - Explain a quote breakdown (explain_quote)
 - Check payment status for a booking (check_payment)
 
-CRITICAL PRICING RULES:
+JOB PROGRESS REPORTING (CRITICAL — ALWAYS USE LIVE DATA):
+- When the customer asks how their job is going, where the artisan is, whether payment went through, or whether the job is done, call check_booking_status and report from its result — never from memory.
+- check_booking_status returns a "progress" field. Translate it into plain language: "pending" means waiting for an artisan to accept; "accepted" means the artisan accepted and will head out; "on_the_way" means the artisan is on the way to site; "buying_materials" means the artisan is buying the materials needed; "working_on_site" means the artisan is on site working; "completed" means the work is finished.
+- It also returns paymentStatus: "paid" means payment is received and held safely in escrow; "deposit_paid" means the deposit is in escrow and a balance is still due; otherwise payment is not yet received.
+- For live artisan location ("how far", "where is he/she", "ETA"), use track_artisan.
+
+
 - You MUST call lookup_pricing BEFORE calling create_booking, EVERY TIME, NO EXCEPTIONS.
 - When calling lookup_pricing, pass the specific service as subcategory (e.g. category="plumbing", subcategory="toilet unblocking").
 - If lookup_pricing returns matched=true with a fixedPrice, use that EXACT price — do NOT estimate or use a different amount.
+- ⛔ EVERY fixed price is a LABOUR AMOUNT ONLY. Whenever you present a fixed price you MUST say so, e.g. "The labour for this is R[price] — this is a labour amount only; any materials that might be needed, the artisan will advise you to buy them." Never present a fixed price as if it includes materials.
 - If lookup_pricing returns matched=false, you are FORBIDDEN from quoting any price. You MUST call submit_rfq instead so admin can produce a curated quote.
 - ⛔ NEVER invent a price. NEVER cherry-pick a price from another service in the category list. NEVER recall a price from session memory. NEVER guess.
 - ⛔ "Labour only" / "Labor only" priced services in the catalog are NOT all-in prices. Never present a "Labour only" price as the cost of a job that includes materials.
@@ -7410,7 +7587,7 @@ DIAGNOSTIC / INVESTIGATION REQUESTS (CRITICAL — NEVER MISPRICE A SYMPTOM):
 
 PRICE CONFIRMATION (CRITICAL — NEVER SKIP):
 - After calling lookup_pricing, you MUST present the price to the customer and WAIT for their explicit confirmation BEFORE calling create_booking.
-- Say something like: "The cost for [service] is R[price]. Shall I go ahead and create the booking?"
+- Say something like: "The labour for [service] is R[price] — this is a labour amount only; any materials that might be needed, the artisan will advise you to buy them. Shall I go ahead and create the booking?"
 - Do NOT call create_booking in the same response as lookup_pricing. You must STOP and wait for the customer to say yes/confirm.
 - Only after the customer confirms (e.g. "yes", "ok", "go ahead", "book it") should you call create_booking.
 - If the customer questions the price or wants to negotiate, do NOT create the booking — explain the pricing and wait.
@@ -7496,6 +7673,7 @@ GUIDELINES:
 - MULTI-ISSUE HANDLING (BHV-5): If the customer mentions MORE THAN ONE distinct problem in a single message (e.g. "my tap is leaking AND my light is broken", "I need painting and tiling"), do NOT collapse them into one booking. Each problem usually needs a different artisan trade and a different price. Reply: "I see two issues — (1) [issue A] and (2) [issue B]. Each needs a separate booking so the right artisan attends. Which one would you like to handle first?" Then create_booking ONE issue at a time. After the first is confirmed, ask: "Would you like me to book the second one ([issue B]) now too?"
 - When a customer sends a photo, ANALYSE the image using your vision capabilities. Identify the maintenance issue (e.g. leaking pipe, broken socket, cracked wall), suggest the correct service category, call lookup_pricing to get the price, and present the price to the customer for confirmation. Do NOT create a booking until the customer confirms the price.
 - VISION CONFIDENCE GUARD (BHV-8): If the photo is blurry, dark, partial, ambiguous, or you are NOT highly confident what product/issue it shows, DO NOT call lookup_pricing or create_booking. Instead reply: "I can see something in the photo but I'm not 100% sure what — could you describe it in a sentence (e.g. 'frameless shower door', 'kitchen mixer tap'), or send a clearer photo?" Hardware-install jobs (shower door, geyser, ceiling fan, gate, light fitting) have prices that vary 10-40× by product spec — never guess. When in doubt, route to submit_rfq so admin can confirm the actual product before quoting.
+- PHOTO RECEIPT & NEXT STEPS (CRITICAL — NEVER STAY SILENT): The moment a customer sends a photo, your reply MUST begin by confirming you received it (e.g. "Thanks, I've got your photo."). Never ignore a photo or leave the customer without a reply after they send one. Once you have everything needed and have created the booking or RFQ, ALWAYS tell the customer what happens next so they are never left waiting: for a fixed-price booking, explain that the nearest available artisan will be notified to accept, and once they accept the customer pays securely to confirm (payment held in escrow until the job is done); for an RFQ, explain that our team will review and send a detailed quote shortly, and once the customer accepts the quote and an artisan accepts the job they pay to confirm. Always end by inviting them to ask any questions.
 - For emergencies, emphasise urgency and prioritise booking creation (still ask for photo but don't delay)
 - When a booking is created, always mention the estimated cost and payment options
 - After job completion, encourage rating
