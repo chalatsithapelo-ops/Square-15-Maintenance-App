@@ -2439,8 +2439,8 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       .map((s) => String(s || '').trim())
       .filter((s) => s);
 
-    const isRFQRequested = isTruthyExtended(p.is_rfq_requested ?? p.isRFQRequested ?? p.is_rfq ?? p.isRFQ);
-    const rfqReason = String(p.rfq_reason || p.rfqReason || '').trim();
+    let isRFQRequested = isTruthyExtended(p.is_rfq_requested ?? p.isRFQRequested ?? p.is_rfq ?? p.isRFQ);
+    let rfqReason = String(p.rfq_reason || p.rfqReason || '').trim();
 
     let jobIds = stringList(p.job_ids ?? p.jobIds ?? p.jobs ?? []);
     jobIds = jobIds.map((s) => String(s || '').trim()).filter((s) => s);
@@ -2450,10 +2450,62 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       const c = await resolveTaskCost(id);
       if (c != null && c > 0) resolvedCostsById[id] = c;
     }
-    const totalCost = Object.values(resolvedCostsById).reduce((sum, c) => sum + (typeof c === 'number' ? c : 0), 0);
+    let totalCost = Object.values(resolvedCostsById).reduce((sum, c) => sum + (typeof c === 'number' ? c : 0), 0);
 
     if (!isRFQRequested && (jobIds.length === 0 || !(totalCost > 0))) {
       return { ok: false, status: 400, error: 'missing_priced_service' };
+    }
+
+    // ── Measurement-based pricing guard ──────────────────────────────────────
+    // Area-priced trades (painting, tiling, flooring, paving, plastering,
+    // waterproofing, etc.) store a PER-SQUARE-METRE rate in the task, not a flat
+    // total. The in-app flow measures the area and multiplies; the voice/API
+    // path has no area, so booking at the raw rate massively underprices the job
+    // (e.g. a 40 m2 paint job billed at one m2 of rate). Detect these and either
+    // price rate x area when an area is supplied, or route to an on-site quote so
+    // an artisan measures first instead of dispatching at the bare per-m2 rate.
+    const MEASURE_KEYWORDS = [
+      'painting', 'paint', 'tiling', 'tilling', 'tiles', 'tile', 'celling',
+      'ceiling', 'ceilings', 'wall', 'walls', 'floor', 'floors', 'flooring',
+      'paving', 'paver', 'pavers', 'screed', 'screeding', 'plastering',
+      'plaster', 'waterproofing', 'laminate', 'carpet', 'carpeting', 'skirting',
+    ];
+    const hasMeasureWord = (txt) =>
+      String(txt || '')
+        .toLowerCase()
+        .split(/[^a-z]+/)
+        .some((w) => w && MEASURE_KEYWORDS.includes(w));
+    let measurementJob = hasMeasureWord(categoryName) || hasMeasureWord(p.task_name || p.taskName);
+    if (!measurementJob) {
+      for (const id of jobIds) {
+        if (hasMeasureWord(await resolveTaskName(id))) { measurementJob = true; break; }
+      }
+    }
+    const perM2Rate = totalCost; // measurement jobs are single-task; this is the rate
+    const areaM2 = toNumber(p.area_m2 ?? p.areaM2 ?? p.area ?? p.square_meters ?? p.squareMeters);
+    let measurementMeta = {};
+    if (measurementJob && !isRFQRequested) {
+      if (areaM2 && areaM2 > 0) {
+        // Area supplied by the caller -> price it properly: rate x area.
+        totalCost = perM2Rate * areaM2;
+        measurementMeta = {
+          needs_onsite_measurement: 'no',
+          measure_method: 'voice_estimate',
+          estimate_area_m2: areaM2,
+          rate_per_m2: perM2Rate,
+        };
+      } else {
+        // No area -> never dispatch at the bare per-m2 rate. Route to a quote so
+        // an artisan measures on site and the true price is computed.
+        isRFQRequested = true;
+        rfqReason = rfqReason || 'needs_onsite_measurement';
+        totalCost = 0; // keep cost 'TBD' until the on-site measurement is done
+        measurementMeta = {
+          needs_onsite_measurement: 'yes',
+          measure_method: 'pending',
+          rate_per_m2: perM2Rate,
+        };
+      }
     }
 
     let serviceOnCurrentLocation = isTruthyExtended(
@@ -2578,6 +2630,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       rfq_status: isRFQFlag ? 'pending_admin_review' : '',
 
       cost: isRFQFlag ? (totalCost > 0 ? moneyString(totalCost) : 'TBD') : moneyString(totalCost),
+      ...measurementMeta,
       materials_responsibility: materialsResponsibility,
 
       description: effectiveDescription,

@@ -720,6 +720,12 @@ async def entrypoint(ctx: JobContext):
             "- ONLY after gathering these details, proceed to create the booking.\n"
             "- If the user says 'just book it' or 'skip the questions', proceed immediately with what you have.\n"
             "\n"
+            "MEASUREMENT / AREA-PRICED WORK (CRITICAL - NEVER QUOTE THE RATE AS THE TOTAL):\n"
+            "- Painting, tiling, flooring, paving, plastering, waterproofing, ceilings, walls, screeding, laminate, carpet and skirting are priced PER SQUARE METRE, not as a flat price. The amount lookup_service_pricing returns for these is a RATE PER SQUARE METRE.\n"
+            "- NEVER read that rate back as the total cost of the job. Say clearly it is 'per square metre'. For example: 'Painting is charged at one hundred and fifty rand per square metre.'\n"
+            "- To give a total, you MUST know the area. ASK: 'Roughly how many square metres need doing?' If the customer gives a number, you may multiply it yourself to indicate a rough total, and when you create the booking pass that number as area_m2 so the system prices it as rate times area.\n"
+            "- If the customer does NOT know the area, that is fine and common: tell them 'No problem - the artisan will measure it on site and confirm the exact price before any work starts.' Then create the booking WITHOUT area_m2. It becomes a quote and an artisan measures first - this is the correct, safe path. NEVER book an area-priced job at the bare per-square-metre rate.\n"
+            "\n"
             "PRICE ESTIMATE FOR UNPRICED SERVICES:\n"
             "- When no exact pricing is found and an RFQ is needed, FIRST call lookup_service_pricing with a broad query for the category.\n"
             "- Use the results to give the user a PRICE RANGE: 'Based on similar jobs, this typically costs between X rand and Y rand.'\n"
@@ -1757,6 +1763,13 @@ async def entrypoint(ctx: JobContext):
             "job_ids='abc-123,def-456'). Without job_ids the backend rejects "
             "priced bookings with missing_priced_service, so either pass job_ids "
             "or use is_rfq='yes'. "
+            "For area-priced trades (painting, tiling, flooring, paving, plastering, "
+            "waterproofing, ceilings, walls, screeding, laminate, carpet, skirting) the "
+            "price is PER SQUARE METRE, not a flat total. If the customer gives you the "
+            "area, pass it as area_m2 (a number in square metres) and the price is "
+            "computed as rate times area. If you do NOT have an area, leave area_m2 empty: "
+            "the job is then booked as a quote and an artisan measures on site before "
+            "pricing - never quote the per-square-metre rate as the whole job total. "
             "This uses the propose-confirm workflow for safety."
         )
     )
@@ -1768,7 +1781,8 @@ async def entrypoint(ctx: JobContext):
         service_address: str = "",
         is_rfq: str = "no",
         job_ids: str = "",
-        skip_photos: str = ""
+        skip_photos: str = "",
+        area_m2: str = ""
     ) -> str:
         """Idempotent wrapper around the propose/confirm booking flow.
 
@@ -1842,6 +1856,7 @@ async def entrypoint(ctx: JobContext):
                 service_address=service_address,
                 is_rfq=is_rfq,
                 job_ids=job_ids,
+                area_m2=area_m2,
             )
             # Cache only successful creations so transient errors stay retryable.
             if isinstance(_result, str) and (
@@ -1857,7 +1872,8 @@ async def entrypoint(ctx: JobContext):
         scheduled_time: str = "",
         service_address: str = "",
         is_rfq: str = "no",
-        job_ids: str = ""
+        job_ids: str = "",
+        area_m2: str = ""
     ) -> str:
         """Create a booking using backend propose/confirm workflow."""
         nonlocal backend_client
@@ -1877,6 +1893,7 @@ async def entrypoint(ctx: JobContext):
                 'service_address': service_address or '',
                 'is_rfq': is_rfq,
                 'job_ids': job_ids_list,
+                'area_m2': (area_m2 or '').strip(),
             }
             # Attach any photos the customer added via the app's "Add Photos" button.
             if staged_work_image_urls:
