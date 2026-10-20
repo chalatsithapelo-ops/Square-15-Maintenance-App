@@ -905,6 +905,210 @@ async function pushArtisanNotification({ artisanId, title, body, type, bookingId
   }
 }
 
+// ─── Shared: apply a WhatsApp customer's accept/decline to an on-site ──────
+// re-approval request. Mirrors the in-app CustomerReapprovalScreen._respond so
+// the Firestore state is identical no matter which channel the client used:
+// resolves the reapproval_requests doc, locks the on-site price onto the job,
+// re-syncs the deposit/balance split (35/65) so the client is billed the
+// correct remaining balance, and notifies the artisan + admin. Returns a plain
+// customer-facing reply string (never throws).
+async function processWaReapprovalResponse({ firestore, requestRef, requestData, accept }) {
+  const _num = (v) => {
+    if (v == null) return 0;
+    if (typeof v === 'number') return v;
+    const s = String(v).replace(/[Rr,\s]/g, '').trim();
+    const n = parseFloat(s);
+    return Number.isFinite(n) ? n : 0;
+  };
+  const round2 = (n) => Math.round(n * 100) / 100;
+  const tmId = String(requestData.task_management_id || '').trim();
+  const artisanId = String(requestData.artisan_id || '').trim();
+  const serviceName = String(requestData.service_name || 'your job').trim();
+  const actualCost = _num(requestData.actual_cost);
+  const actualArea = _num(requestData.actual_area_m2);
+  const estimateCost = _num(requestData.estimate_cost);
+  const nowIso = new Date().toISOString();
+
+  // 1) Resolve the request (idempotency is enforced by the caller via a
+  //    transaction on status==='pending').
+  try {
+    await requestRef.update({
+      status: accept ? 'accepted' : 'declined',
+      responded_at: nowIso,
+      responded_via: 'whatsapp',
+    });
+  } catch (e) {
+    console.warn('[wa-reapproval] request update failed:', e && e.message);
+  }
+
+  // 2) Reflect the decision on the job.
+  if (tmId && firestore) {
+    const tmRef = firestore.collection('tasksManagement').doc(tmId);
+    try {
+      const tmUpdate = { customer_approved: accept, updated_at: nowIso };
+      if (accept) {
+        tmUpdate.cost = actualCost.toFixed(2);
+        if (actualArea > 0) tmUpdate.area = actualArea;
+        tmUpdate.ops_flagged = false;
+        // Keep deposit/balance in sync with the new price (same rule as the app).
+        try {
+          const tmSnap = await tmRef.get();
+          const tm = tmSnap.exists ? (tmSnap.data() || {}) : {};
+          const isDeposit = tm.payment_type === 'deposit'
+            || tm.payment_status === 'deposit_paid'
+            || tm.deposit_paid === true;
+          if (isDeposit && actualCost > 0) {
+            const depositPaid = tm.deposit_paid === true || tm.payment_status === 'deposit_paid';
+            const existingDeposit = _num(tm.deposit_amount);
+            if (depositPaid && existingDeposit > 0) {
+              const balance = round2(actualCost - existingDeposit);
+              tmUpdate.balance_amount = (balance < 0 ? 0 : balance).toFixed(2);
+            } else {
+              const deposit = round2(actualCost * 0.35);
+              const balance = round2(actualCost - deposit);
+              tmUpdate.deposit_amount = deposit.toFixed(2);
+              tmUpdate.balance_amount = balance.toFixed(2);
+            }
+          }
+        } catch (_) {}
+      } else {
+        tmUpdate.status = 'price_declined';
+        tmUpdate.ops_flagged = true;
+      }
+      await tmRef.update(tmUpdate);
+    } catch (e) {
+      console.warn('[wa-reapproval] tasksManagement update failed:', e && e.message);
+    }
+  }
+
+  // 3) Notify artisan + admin so the loop closes regardless of channel.
+  try {
+    if (artisanId) {
+      await pushArtisanNotification({
+        artisanId,
+        title: accept ? 'Price Approved' : 'Price Declined',
+        body: accept
+          ? 'The customer approved the updated price on WhatsApp. You may start the job.'
+          : 'The customer declined the updated price on WhatsApp. Do not proceed — Square 15 support will follow up.',
+        type: 'measurement_reapproval_result',
+        bookingId: tmId,
+        tmId,
+      });
+    }
+  } catch (_) {}
+  try {
+    await pushAdminNotification({
+      title: accept ? 'Price Re-approved (WhatsApp)' : 'Price Declined (WhatsApp)',
+      body: accept
+        ? `Customer approved on-site price R${actualCost.toFixed(2)} for "${serviceName}" via WhatsApp.`
+        : `Customer declined on-site price R${actualCost.toFixed(2)} for "${serviceName}" via WhatsApp. Needs review.`,
+      type: 'measurement_reapproval_result',
+      bookingId: tmId,
+    });
+  } catch (_) {}
+
+  // 4) Build the customer-facing reply.
+  if (accept) {
+    const delta = actualCost - estimateCost;
+    const areaStr = actualArea > 0 ? ` (${(actualArea % 1 === 0 ? actualArea.toFixed(0) : actualArea.toFixed(2))} m²)` : '';
+    let msg = `✅ *Price approved — thank you!*\n\n` +
+      `You've approved the on-site price of *R${actualCost.toFixed(2)}*${areaStr} for ${serviceName}. Your artisan can now start the job.`;
+    if (estimateCost > 0 && Math.abs(delta) >= 1) {
+      msg += delta > 0
+        ? `\n\nThis is R${Math.abs(delta).toFixed(2)} more than the original estimate because the job measured larger on site.`
+        : `\n\nGood news — this is R${Math.abs(delta).toFixed(2)} less than the original estimate.`;
+    }
+    msg += `\n\nWhen the work is done I'll send you the balance to pay securely here. Never pay cash off the app — your payment is only protected through Square 15. 🔒`;
+    return msg;
+  }
+  return `❌ *Price declined.*\n\n` +
+    `You've declined the updated on-site price of R${actualCost.toFixed(2)} for ${serviceName}. The artisan has been told not to proceed, and our support team will follow up with you shortly.\n\n` +
+    `If this was a mistake, just reply and let me know.`;
+}
+
+// ─── Resolve the pending on-site re-approval for a WhatsApp session and apply ─
+// the customer's accept/decline. Looks up the request by the id pinned on the
+// session (in-memory or restored from wa_sessions), falling back to a query by
+// the linked user id / phone. Transactionally claims the doc so a double-reply
+// (or a race with the in-app screen) can only resolve it once. Returns
+// { message } on success or { error } when there is nothing pending to act on.
+async function resolveAndApplyWaReapproval(session, accept) {
+  const firestore = db();
+  if (!firestore) return { error: 'Database unavailable' };
+
+  const REAPPROVAL_TTL_MS = 14 * 24 * 60 * 60 * 1000;
+  const toMs = (ts) => {
+    if (!ts) return 0;
+    if (typeof ts === 'object' && typeof ts.toMillis === 'function') return ts.toMillis();
+    if (typeof ts === 'object' && ts._seconds) return ts._seconds * 1000;
+    if (typeof ts === 'string') return Date.parse(ts) || 0;
+    if (typeof ts === 'number') return ts;
+    return 0;
+  };
+  const fresh = (ts) => { const ms = toMs(ts); return ms === 0 || (Date.now() - ms) < REAPPROVAL_TTL_MS; };
+
+  // 1) Collect candidate request ids: the one pinned on the session first.
+  const candidateIds = [];
+  const pinned = (session.pendingReapproval && session.pendingReapproval.requestId)
+    || session.pendingReapprovalRequestId || '';
+  if (pinned) candidateIds.push(String(pinned));
+
+  // 2) Fall back to a query by owner (linked uid, else resolve via phone).
+  try {
+    let ownerUid = String(session.linkedUserId || '').trim();
+    if (!ownerUid || ownerUid.startsWith('wa_')) {
+      const u = await findUserByPhone(session.phone).catch(() => null);
+      if (u && u.id) ownerUid = String(u.id);
+    }
+    if (ownerUid) {
+      const q = await firestore.collection('reapproval_requests')
+        .where('user_id', '==', ownerUid)
+        .where('status', '==', 'pending')
+        .limit(10).get();
+      for (const d of q.docs) if (!candidateIds.includes(d.id)) candidateIds.push(d.id);
+    }
+  } catch (e) {
+    console.warn('[wa-reapproval] owner query failed:', e && e.message);
+  }
+
+  if (candidateIds.length === 0) return { error: 'no_pending_reapproval' };
+
+  // 3) Try each candidate: claim it transactionally (pending -> processing) so
+  //    only one responder wins, then apply the decision.
+  for (const reqId of candidateIds) {
+    const requestRef = firestore.collection('reapproval_requests').doc(reqId);
+    let requestData = null;
+    try {
+      requestData = await firestore.runTransaction(async (tx) => {
+        const snap = await tx.get(requestRef);
+        if (!snap.exists) return null;
+        const data = snap.data() || {};
+        if (String(data.status || '').toLowerCase() !== 'pending') return null;
+        if (!fresh(data.created_at)) return null;
+        tx.update(requestRef, { status: 'processing', processing_at: new Date().toISOString() });
+        return data;
+      });
+    } catch (e) {
+      console.warn(`[wa-reapproval] claim failed for ${reqId}:`, e && e.message);
+      continue;
+    }
+    if (!requestData) continue;
+
+    try {
+      const message = await processWaReapprovalResponse({ firestore, requestRef, requestData, accept });
+      console.log(`[wa-reapproval] ${accept ? 'accepted' : 'declined'} ${reqId} via WhatsApp`);
+      return { message };
+    } catch (e) {
+      // Un-claim so it can be retried / handled in-app.
+      try { await requestRef.update({ status: 'pending', processing_at: null }); } catch (_) {}
+      console.warn(`[wa-reapproval] apply failed for ${reqId}:`, e && e.message);
+      return { error: 'apply_failed' };
+    }
+  }
+
+  return { error: 'no_pending_reapproval' };
+}
+
 async function notifyWebhookProcessingFailure(phone, err, userText = '') {
   const detail = err?.message || String(err || 'unknown_error');
   try {
@@ -1433,6 +1637,7 @@ async function restoreSessionFromFirestore(session) {
     if (data.lastBookingCost) session.lastBookingCost = data.lastBookingCost;
     if (ageMs <= RFQ_PTR_TTL_MS && data.lastRfqId) session.lastRfqId = data.lastRfqId;
     if (data.pendingRatingBookingId) session.pendingRatingBookingId = data.pendingRatingBookingId;
+    if (data.pendingReapprovalRequestId) session.pendingReapprovalRequestId = data.pendingReapprovalRequestId;
     if (data.sharedAddress) session.sharedAddress = data.sharedAddress;
     if (data.sharedLatitude) session.sharedLatitude = data.sharedLatitude;
     if (data.sharedLongitude) session.sharedLongitude = data.sharedLongitude;
@@ -2037,6 +2242,20 @@ const waTools = [
           comment:   { type: 'string', description: 'Optional review comment' },
         },
         required: ['bookingId', 'rating'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'respond_to_reapproval',
+      description: "Record the customer's approve/decline decision on an on-site price re-approval request (raised when the artisan measured the job on site and the price changed). Only call this when there is a pending re-approval for this customer.",
+      parameters: {
+        type: 'object',
+        properties: {
+          decision: { type: 'string', enum: ['approve', 'decline'], description: "'approve' to accept the updated on-site price, 'decline' to reject it" },
+        },
+        required: ['decision'],
       },
     },
   },
@@ -5913,6 +6132,25 @@ async function executeWaTool(name, args, session) {
     }
 
     // ═══════════════════════════════════════════
+    // 13.5) RESPOND TO ON-SITE PRICE RE-APPROVAL
+    // ═══════════════════════════════════════════
+    case 'respond_to_reapproval': {
+      if (!firestore) return { error: 'Database unavailable' };
+      const decision = String(args.decision || '').toLowerCase().trim();
+      const accept = decision === 'approve' || decision === 'accept' || decision === 'approved';
+      if (!accept && decision !== 'decline' && decision !== 'reject' && decision !== 'declined') {
+        return { error: 'Please tell me whether you approve or decline the updated price.' };
+      }
+      const reply = await resolveAndApplyWaReapproval(session, accept);
+      if (reply && reply.message) {
+        session.pendingReapproval = null;
+        session.pendingReapprovalRequestId = null;
+        return { success: true, message: reply.message };
+      }
+      return { error: (reply && reply.error) || 'I could not find a pending price approval for your account.' };
+    }
+
+    // ═══════════════════════════════════════════
     // 14) REQUEST REFUND
     // ═══════════════════════════════════════════
     case 'request_refund': {
@@ -7898,6 +8136,65 @@ async function handleMessage(session, userMessage, imageDataUrl) {
       console.warn('[rating-intercept] failed:', e.message);
     }
 
+    // ── HARD INTERCEPT: on-site price re-approval yes/no ──
+    // The artisan measured the job on site and the price changed; the customer
+    // was asked to approve. A plain "yes"/"no" reply must resolve THAT request,
+    // not start a new booking. We detect a pending re-approval (pinned on the
+    // session or restorable from wa_sessions) and apply the decision directly.
+    try {
+      const rawText = (typeof userMessage === 'string' ? userMessage : '').trim();
+      let hasPending = !!(session.pendingReapproval && session.pendingReapproval.requestId)
+        || !!session.pendingReapprovalRequestId;
+      // Restore from Firestore after a cold start if the in-memory session lost it.
+      if (!hasPending) {
+        try {
+          const firestore = db();
+          if (firestore) {
+            const waDoc = await firestore.collection('wa_sessions').doc(session.phone).get();
+            const rid = waDoc.exists ? String((waDoc.data() || {}).pendingReapprovalRequestId || '') : '';
+            if (rid) {
+              const rq = await firestore.collection('reapproval_requests').doc(rid).get();
+              if (rq.exists && String((rq.data() || {}).status || '').toLowerCase() === 'pending') {
+                session.pendingReapprovalRequestId = rid;
+                hasPending = true;
+              }
+            }
+          }
+        } catch (_) { /* ignore — fall through to AI */ }
+      }
+      if (hasPending && rawText) {
+        const yes = /^\s*(yes|yep|yeah|yebo|ok|okay|okey|sure|approve[d]?|accept[ed]?|confirm[ed]?|agree[d]?|go ahead|proceed|do it|👍|✅)\s*[.!]*\s*$/i.test(rawText);
+        const no = /^\s*(no|nope|nah|decline[d]?|reject[ed]?|cancel|don'?t|do not|disagree)\s*[.!]*\s*$/i.test(rawText);
+        if (yes || no) {
+          console.log(`[reapproval-intercept] direct ${yes ? 'approve' : 'decline'} for ${maskPhone(session.phone)}`);
+          const result = await resolveAndApplyWaReapproval(session, yes);
+          if (result && result.message) {
+            session.pendingReapproval = null;
+            session.pendingReapprovalRequestId = null;
+            try {
+              const firestore = db();
+              if (firestore) {
+                await firestore.collection('wa_sessions').doc(session.phone).set({
+                  phone: session.phone,
+                  pendingReapprovalRequestId: admin.firestore.FieldValue.delete(),
+                  lastActivity: admin.firestore.FieldValue.serverTimestamp(),
+                }, { merge: true });
+              }
+            } catch (_) {}
+            session.messages.push({ role: 'assistant', content: result.message });
+            return result.message;
+          }
+          if (result && (result.error === 'no_pending_reapproval')) {
+            // Nothing pending after all — clear stale pointer and let AI handle it.
+            session.pendingReapproval = null;
+            session.pendingReapprovalRequestId = null;
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('[reapproval-intercept] failed:', e.message);
+    }
+
     // Inject pending-rating hint so the AI knows to prompt the customer
     const sysMessages = [{ role: 'system', content: SYSTEM_PROMPT }];
 
@@ -7941,6 +8238,15 @@ async function handleMessage(session, userMessage, imageDataUrl) {
       sysMessages.push({
         role: 'system',
         content: `[PENDING RATING] Booking #${session.pendingRatingBookingId} has been completed and is awaiting a 1-5 star rating from the customer. Proactively ask if they'd like to rate the artisan.`,
+      });
+    }
+
+    if (session.pendingReapproval || session.pendingReapprovalRequestId) {
+      const pr = session.pendingReapproval || {};
+      const priceStr = pr.actualCost ? `R${Number(pr.actualCost).toFixed(2)}` : 'the updated on-site price';
+      sysMessages.push({
+        role: 'system',
+        content: `[PENDING RE-APPROVAL] The artisan measured "${pr.serviceName || 'the job'}" on site and the price changed to ${priceStr}. The customer must approve or decline before work starts. If the customer approves (yes/ok/approve/go ahead) call respond_to_reapproval with decision="approve"; if they decline (no/reject) call it with decision="decline". Do NOT start a new booking or quote; this reply is about the price change only.`,
       });
     }
 
@@ -8450,6 +8756,7 @@ async function handleMessage(session, userMessage, imageDataUrl) {
         lastBookingCost: session.lastBookingCost || null,
         lastRfqId: session.lastRfqId || null,
         pendingRatingBookingId: session.pendingRatingBookingId || null,
+        pendingReapprovalRequestId: session.pendingReapprovalRequestId || (session.pendingReapproval && session.pendingReapproval.requestId) || null,
         sharedAddress: session.sharedAddress || null,
         sharedLatitude: session.sharedLatitude || null,
         sharedLongitude: session.sharedLongitude || null,
@@ -11768,6 +12075,146 @@ function startRatingPromptListener() {
   }
 }
 
+// ─── Listener: on-site price re-approval request for WhatsApp clients ───────
+// Fires when the artisan measures a job on site and the price changes enough to
+// need the customer's approval (artisan writes a reapproval_requests doc). For
+// app clients this surfaces in CustomerReapprovalScreen; this listener is the
+// WhatsApp-only channel so a client with no app can approve/decline by reply.
+// Idempotent via wa_reapproval_sent_at (claimed in a transaction). Only sends
+// for WhatsApp-sourced bookings — app bookings are left to the in-app screen.
+function startReapprovalListener() {
+  try {
+    const firestore = db();
+    if (!firestore) return;
+    firestore.collection('reapproval_requests')
+      .where('status', '==', 'pending')
+      .onSnapshot(async (snap) => {
+        for (const change of snap.docChanges()) {
+          if (change.type !== 'added' && change.type !== 'modified') continue;
+          const doc = change.doc;
+          const data = doc.data() || {};
+          if (data.wa_reapproval_sent_at) continue;
+          if (String(data.status || '').toLowerCase() !== 'pending') continue;
+
+          const tmId = String(data.task_management_id || '').trim();
+          if (!tmId) continue;
+
+          // Resolve the booking to get the customer phone + confirm WA source.
+          let tm = {};
+          try {
+            const tmDoc = await firestore.collection('tasksManagement').doc(tmId).get();
+            if (tmDoc.exists) tm = tmDoc.data() || {};
+          } catch (_) {}
+
+          const src = String(tm.source || '').toLowerCase();
+          let isWa = src.includes('whatsapp') || tmId.startsWith('RFQ-') || tmId.startsWith('WA-');
+          let phoneRaw = tm.user_phone || tm.customerPhone || tm.contact || tm.client_phone || tm.phone || '';
+          let orderNo = tm.order_no || tm.rfq_no || tmId;
+          const fbLinkId = String(tm.future_booking_id || '').trim();
+          if (fbLinkId) {
+            try {
+              const fbDoc = await firestore.collection('futureBookings').doc(fbLinkId).get();
+              if (fbDoc.exists) {
+                const fb = fbDoc.data() || {};
+                const fbSrc = String(fb.source || '').toLowerCase();
+                if (fbSrc.includes('whatsapp') || fbLinkId.startsWith('RFQ-') || fbLinkId.startsWith('WA-')) isWa = true;
+                if (!phoneRaw) phoneRaw = fb.user_phone || fb.customerPhone || fb.contact || fb.client_phone || fb.phone || '';
+                if (!orderNo || orderNo === tmId) orderNo = fb.order_no || fb.rfq_no || orderNo;
+              }
+            } catch (_) {}
+          }
+          // The source stored on the request itself is a last resort.
+          if (!isWa && String(data.source || '').toLowerCase().includes('whatsapp')) isWa = true;
+          if (!isWa) continue;        // app client — handled in-app
+          if (!phoneRaw) continue;    // no WA number to reach them on
+
+          let to = String(phoneRaw).replace(/[^0-9]/g, '');
+          if (to.length === 10 && to.startsWith('0')) to = '27' + to.slice(1);
+          if (to.length < 11) continue;
+
+          // Atomic claim so we send exactly once (guards cold-start re-reads
+          // and a possible race with the in-app screen).
+          try {
+            const claimed = await firestore.runTransaction(async (tx) => {
+              const s2 = await tx.get(doc.ref);
+              if (!s2.exists) return false;
+              const d2 = s2.data() || {};
+              if (d2.wa_reapproval_sent_at) return false;
+              if (String(d2.status || '').toLowerCase() !== 'pending') return false;
+              tx.update(doc.ref, { wa_reapproval_sent_at: new Date().toISOString() });
+              return true;
+            });
+            if (!claimed) continue;
+          } catch (e) {
+            console.warn(`[wa-reapproval-notify] claim failed for ${doc.id}:`, e && e.message);
+            continue;
+          }
+
+          const num = (v) => { const n = parseFloat(String(v == null ? '' : v).replace(/[Rr,\s]/g, '')); return Number.isFinite(n) ? n : 0; };
+          const service = String(data.service_name || 'your job').trim();
+          const actualCost = num(data.actual_cost);
+          const actualArea = num(data.actual_area_m2);
+          const estimateCost = num(data.estimate_cost);
+          const estimateArea = num(data.estimate_area_m2);
+          const noPrior = data.no_prior_estimate === true || estimateCost <= 0;
+          const areaStr = actualArea > 0 ? `${actualArea % 1 === 0 ? actualArea.toFixed(0) : actualArea.toFixed(2)} m²` : '';
+
+          let msg = `📐 *Price update for booking #${orderNo}*\n\n` +
+            `Your artisan measured *${service}* on site.`;
+          if (noPrior) {
+            msg += `\n\nMeasured${areaStr ? ` ${areaStr}` : ''} → *R${actualCost.toFixed(2)}*.`;
+          } else {
+            msg += `\n\n• Original estimate: ${estimateArea > 0 ? `${estimateArea % 1 === 0 ? estimateArea.toFixed(0) : estimateArea.toFixed(2)} m² · ` : ''}R${estimateCost.toFixed(2)}` +
+              `\n• Measured on site: ${areaStr ? `${areaStr} · ` : ''}*R${actualCost.toFixed(2)}*`;
+            const delta = actualCost - estimateCost;
+            if (Math.abs(delta) >= 1) {
+              msg += delta > 0
+                ? `\n\nThe job is larger than estimated — R${Math.abs(delta).toFixed(2)} more.`
+                : `\n\nGood news — it's R${Math.abs(delta).toFixed(2)} cheaper than estimated.`;
+            }
+          }
+          msg += `\n\nThis is a labour price and must be approved before work starts.\n` +
+            `👉 Reply *YES* to approve R${actualCost.toFixed(2)}, or *NO* to decline.\n\n` +
+            `(Never pay cash off the app — your payment is only protected through Square 15. 🔒)`;
+
+          try {
+            await sendWhatsAppMessage(to, msg);
+            // Pin the pending request on the session + persist so the reply is
+            // routed to this exact request even after a bot cold start.
+            const session = sessions.get(to);
+            if (session) {
+              session.pendingReapproval = { requestId: doc.id, taskManagementId: tmId, actualCost, serviceName: service };
+              session.pendingReapprovalRequestId = doc.id;
+              session.messages.push({
+                role: 'system',
+                content: `[PENDING RE-APPROVAL] Booking #${orderNo} has an on-site price of R${actualCost.toFixed(2)} for "${service}" awaiting the customer's approval. If their next message approves (yes/ok/approve) or declines (no/reject), call respond_to_reapproval with the matching decision. Do NOT create a new booking.`,
+              });
+            }
+            try {
+              await firestore.collection('wa_sessions').doc(to).set({
+                phone: to,
+                pendingReapprovalRequestId: doc.id,
+                lastActivity: admin.firestore.FieldValue.serverTimestamp(),
+              }, { merge: true });
+            } catch (e) {
+              console.warn(`[wa-reapproval-notify] wa_sessions persist failed for ${to}:`, e && e.message);
+            }
+            console.log(`[wa-reapproval-notify] sent re-approval to ${to} for ${doc.id} (tm=${tmId})`);
+          } catch (e) {
+            // Un-claim so a later pass can retry the send.
+            try { await doc.ref.update({ wa_reapproval_sent_at: admin.firestore.FieldValue.delete() }); } catch (_) {}
+            console.warn(`[wa-reapproval-notify] WA send failed for ${doc.id}:`, e && e.message);
+          }
+        }
+      }, (err) => {
+        console.error('[wa-reapproval-notify] listener error:', err && err.message);
+      });
+    console.log('[wa-reapproval-notify] listener started (reapproval_requests where status == pending).');
+  } catch (e) {
+    console.error('[wa-reapproval-notify] init failed:', e && e.message);
+  }
+}
+
 
 app.listen(PORT, () => {
   console.log(`[whatsapp-bot] listening on :${PORT}`);
@@ -11784,6 +12231,7 @@ app.listen(PORT, () => {
   setTimeout(() => { try { startBuyingMaterialListener(); } catch (e) { console.error('[buying-material] start failed:', e.message); } }, 5000);
   setTimeout(() => { try { startArtisanPhotoListener(); } catch (e) { console.error('[artisan-photo] start failed:', e.message); } }, 5500);
   setTimeout(() => { try { startRatingPromptListener(); } catch (e) { console.error('[rating-prompt] start failed:', e.message); } }, 6000);
+  setTimeout(() => { try { startReapprovalListener(); } catch (e) { console.error('[wa-reapproval-notify] start failed:', e.message); } }, 6500);
 
   // One-time cleanup: remove stale service_prices from pricingGuidance documents.
   // Keep labor_cost_per_hour, material_multiplier, outsourced_labor_rate (used by RFQ).
