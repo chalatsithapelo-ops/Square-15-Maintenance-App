@@ -1329,7 +1329,9 @@ async def entrypoint(ctx: JobContext):
     )
     async def explain_quote(booking_id: str) -> str:
         """Explain RFQ quote from backend API."""
-        nonlocal backend_client
+        nonlocal backend_client, app_context_focus_booking_id
+        if not (booking_id or "").strip() and app_context_focus_booking_id:
+            booking_id = app_context_focus_booking_id
         if not backend_client:
             if not await _ensure_backend_or_retry():
                 return _CONNECTION_RETRY_MSG
@@ -1390,7 +1392,9 @@ async def entrypoint(ctx: JobContext):
     )
     async def generate_rfq_quote(booking_id: str) -> str:
         """Generate AI quote for an RFQ via backend."""
-        nonlocal backend_client
+        nonlocal backend_client, app_context_focus_booking_id
+        if not (booking_id or "").strip() and app_context_focus_booking_id:
+            booking_id = app_context_focus_booking_id
         if not backend_client:
             if not await _ensure_backend_or_retry():
                 return _CONNECTION_RETRY_MSG
@@ -1405,6 +1409,8 @@ async def entrypoint(ctx: JobContext):
                     return "AI quote generation is temporarily unavailable. Admin will review and provide a quote."
                 elif error == 'ai_generation_failed':
                     return "Quote generation encountered an issue. Admin will review manually."
+                if error == 'forbidden':
+                    return "I can only quote bookings that are on your own account, and that RFQ does not appear to be one of yours."
                 return f"Could not generate quote: {error}"
 
             data = result.get('data', result.get('result', {}))
@@ -1452,7 +1458,9 @@ async def entrypoint(ctx: JobContext):
     )
     async def accept_rfq(booking_id: str) -> str:
         """Accept RFQ quote via backend."""
-        nonlocal backend_client
+        nonlocal backend_client, app_context_focus_booking_id
+        if not (booking_id or "").strip() and app_context_focus_booking_id:
+            booking_id = app_context_focus_booking_id
         if not backend_client:
             if not await _ensure_backend_or_retry():
                 return _CONNECTION_RETRY_MSG
@@ -1463,12 +1471,14 @@ async def entrypoint(ctx: JobContext):
                 error = result.get('error', 'unknown_error')
                 if error == 'no_quote_available':
                     return "There's no quote available for this RFQ yet. Let me generate one first."
+                if error == 'forbidden':
+                    return "I can only act on bookings that are on your own account, and that RFQ does not appear to be one of yours."
                 return f"Could not accept the quote: {error}"
 
             data = result.get('data', result.get('result', {}))
             price = data.get('price', '0')
             rfq_no = data.get('rfq_no', booking_id)
-            return f"Quote accepted for RFQ {rfq_no}! The total is {price} rand. Your booking is now ready for payment. You can pay via wallet or card in the app."
+            return f"Quote accepted for RFQ {rfq_no}! The total is {price} rand. We're assigning an artisan now - you'll be able to pay in the app as soon as one accepts the job."
         except Exception as e:
             logger.error(f"accept_rfq error: {e}", exc_info=True)
             return "Sorry, I had trouble accepting the quote. Please try again."
@@ -1481,7 +1491,9 @@ async def entrypoint(ctx: JobContext):
     )
     async def reject_rfq(booking_id: str, reason: str = "") -> str:
         """Reject/negotiate RFQ quote via backend."""
-        nonlocal backend_client
+        nonlocal backend_client, app_context_focus_booking_id
+        if not (booking_id or "").strip() and app_context_focus_booking_id:
+            booking_id = app_context_focus_booking_id
         if not backend_client:
             if not await _ensure_backend_or_retry():
                 return _CONNECTION_RETRY_MSG
@@ -1489,7 +1501,10 @@ async def entrypoint(ctx: JobContext):
         try:
             result = await backend_client.reject_rfq_quote(booking_id, reason)
             if not result.get('ok') and not result.get('success'):
-                return f"Could not process negotiation: {result.get('error', 'unknown_error')}"
+                _err = result.get('error', 'unknown_error')
+                if _err == 'forbidden':
+                    return "I can only act on bookings that are on your own account, and that RFQ does not appear to be one of yours."
+                return f"Could not process negotiation: {_err}"
 
             data = result.get('data', result.get('result', {}))
             rfq_no = data.get('rfq_no', booking_id)

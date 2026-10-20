@@ -3497,10 +3497,10 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         order_no: String(b.order_no || '').trim(),
         order_number: String(b.order_no || b.order_number || '').trim(),
         category_name: String(b.category_name || '').trim(),
-        problem_description: String(b.problem_description || '').trim(),
+        problem_description: String(b.problem_description || b.description || '').trim(),
         scheduled_date: String(b.scheduled_date || '').trim(),
         scheduled_time: String(b.scheduled_time || '').trim(),
-        total_price: String(b.total_price || b.quoted_price || b.price || '').trim(),
+        total_price: String(b.total_price || b.quoted_price || b.price || b.cost || '').trim(),
         created_at: String(b.created_at || '').trim(),
       };
     };
@@ -4307,11 +4307,11 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         booking_id: bookingId,
         status: String(data.status || ''),
         category_name: String(data.category_name || '').trim(),
-        problem_description: String(data.problem_description || '').trim(),
+        problem_description: String(data.problem_description || data.description || '').trim(),
         scheduled_date: String(data.scheduled_date || ''),
         scheduled_time: String(data.scheduled_time || ''),
         payment_status: String(data.payment_status || ''),
-        total_price: String(data.total_price || data.quoted_price || data.price || '').trim(),
+        total_price: String(data.total_price || data.quoted_price || data.price || data.cost || '').trim(),
         artisan_confirmed: String(data.artisan_confirmed || ''),
         service_provider_id: artisanId,
         artisan: artisanInfo,
@@ -4326,7 +4326,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         rfq_status: String(data.rfq_status || '').trim(),
         order_type: String(data.is_rfq || '').toLowerCase() === 'yes' ? 'rfq' : 'order',
         created_at: String(data.created_at || '').trim(),
-        service_address: String(data.service_address || data.address || '').trim(),
+        service_address: String(data.service_address || data.address || data.user_provided_address || '').trim(),
       },
     };
   }
@@ -4537,6 +4537,12 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     const data = await loadBooking();
     if (!data) return { ok: false, status: 404, error: 'booking_not_found' };
 
+    // Ownership guard: only the booking owner (or admin) may quote it. Without
+    // this, any signed-in client could burn AI/Builders cost on someone
+    // else's RFQ by supplying its id or short rfq_no.
+    const _genUid = String(data.user_id || data.client_id || '').trim();
+    if (actorRole !== 'admin' && _genUid !== actorUid) return { ok: false, status: 403, error: 'forbidden' };
+
     const isRfq = String(data.is_rfq || data.is_rfq_requested || '').toLowerCase() === 'yes';
     if (!isRfq) return { ok: false, status: 400, error: 'not_an_rfq' };
 
@@ -4716,6 +4722,10 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
   if (action === 'accept_rfq_quote') {
     const data = await loadBooking();
     if (!data) return { ok: false, status: 404, error: 'booking_not_found' };
+    // Ownership guard: only the booking owner (or admin) may accept the quote.
+    // Otherwise any client could accept another user's RFQ and trigger dispatch.
+    const _accUid = String(data.user_id || data.client_id || '').trim();
+    if (actorRole !== 'admin' && _accUid !== actorUid) return { ok: false, status: 403, error: 'forbidden' };
     if (!data.ai_quote && !data.quoted_price) return { ok: false, status: 400, error: 'no_quote_available' };
 
     const price = data.quoted_price || (data.ai_quote ? String(data.ai_quote.grand_total) : '0');
@@ -4835,6 +4845,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
             rfq_auto_assign_reason: autoReason,
           });
 
+          let _pushed = 0;
           for (const art of topMatched) {
             if (!art.token) continue;
             try {
@@ -4844,9 +4855,13 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
                 data: { type: 'rfq_accepted', booking_id: bookingId },
                 android: { notification: { channelId: 'order_request_channel', sound: 'sound' } },
               });
+              _pushed++;
             } catch (fcmErr) { console.warn(`[voice] FCM to artisan ${art.id} failed:`, fcmErr.message); }
           }
-          autoDispatched = true;
+          // Only count as auto-dispatched if at least one reachable artisan was
+          // actually pushed; otherwise fall through to the admin "assign
+          // artisan" notification so the RFQ can't silently stall.
+          autoDispatched = _pushed > 0;
           console.log(`[voice] Auto-dispatched RFQ ${bookingId} to ${artisanIds.length} artisans (${autoReason})`);
         }
       } catch (e) { console.warn('[voice] auto-dispatch failed:', e.message); }
@@ -4867,6 +4882,9 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
   if (action === 'reject_rfq_quote') {
     const data = await loadBooking();
     if (!data) return { ok: false, status: 404, error: 'booking_not_found' };
+    // Ownership guard: only the booking owner (or admin) may reject/negotiate.
+    const _rejUid = String(data.user_id || data.client_id || '').trim();
+    if (actorRole !== 'admin' && _rejUid !== actorUid) return { ok: false, status: 403, error: 'forbidden' };
 
     const reason = String(payload.reason || 'Customer wants negotiation').trim();
     await bookingRef.update({
@@ -5591,8 +5609,8 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     // Lizzy can answer "where is my artisan" with something concrete.
     let distanceKm = null;
     try {
-      const dlat = parseFloat(String(bookingData.service_lat || bookingData.lat || bookingData.latitude || ''));
-      const dlng = parseFloat(String(bookingData.service_lng || bookingData.lng || bookingData.longitude || ''));
+      const dlat = parseFloat(String(bookingData.service_lat || bookingData.lat || bookingData.latitude || bookingData.user_lat || bookingData.other_lat || ''));
+      const dlng = parseFloat(String(bookingData.service_lng || bookingData.lng || bookingData.longitude || bookingData.user_lng || bookingData.other_lng || ''));
       if (artisanLoc && !isNaN(dlat) && !isNaN(dlng) && dlat !== 0 && dlng !== 0) {
         const toRad = (v) => (v * Math.PI) / 180;
         const R = 6371;
