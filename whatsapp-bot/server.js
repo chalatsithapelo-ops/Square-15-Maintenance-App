@@ -1809,6 +1809,9 @@ const waTools = [
           customerName: { type: 'string', description: 'Customer full name' },
           scheduledDate:{ type: 'string', description: 'Preferred date (YYYY-MM-DD) if customer specifies' },
           scheduledTime:{ type: 'string', description: 'Preferred time (HH:MM) if customer specifies' },
+          area_m2:      { type: 'number', description: 'Area in SQUARE METRES for area-priced trades (painting, tiling, flooring, paving, plastering, waterproofing, ceilings, walls, screeding, laminate, carpet, skirting). Required for these trades so the labour price = rate x area. If the customer gives length and width instead, pass those in length_m and width_m.' },
+          length_m:     { type: 'number', description: 'Length in METRES (used with width_m to compute area for area-priced trades when the customer does not know the square metres).' },
+          width_m:      { type: 'number', description: 'Width in METRES (used with length_m to compute area for area-priced trades).' },
         },
         required: ['category', 'description', 'address', 'customerName'],
       },
@@ -3067,22 +3070,50 @@ async function executeWaTool(name, args, session) {
         console.error('[create_booking] Pricing lookup error:', e.message);
       }
 
-      // ── MEASUREMENT GUARD (2026-10-20) ──────────────────────────────────────
-      // Area-based trades (painting, tiling, flooring, paving, plastering, etc.)
-      // store a PER-SQUARE-METRE rate in the tasks `cost` field. Booking at that
-      // bare rate massively UNDERPRICES the job (e.g. a 40 m² paint job priced at
-      // the ~R150/m² rate instead of ~R6 000). We must never book these at the
-      // flat rate. Route them to the same quote/admin-review path as an unpriced
-      // service so an artisan measures on site and the client gets a real price.
+      // ── MEASUREMENT GUARD (2026-10-20, Tier 1) ──────────────────────────────
+      // Area-based trades store a PER-SQUARE-METRE rate in tasks.cost. We never
+      // book at the bare rate, and we always give the client an up-front
+      // LABOUR-ONLY estimate. Two paths:
+      //   (1) client gives exact m2        -> estimate = rate x m2
+      //   (2) client gives length x width  -> estimate = rate x (l x w)
+      // If we still have no area, ASK for it (never book priceless). The artisan
+      // re-measures on site and any deviation is re-approved, which adjusts the
+      // charge for client, admin and artisan.
+      let measurementMeta = null;
       {
         const _measureKeywords = ['painting','paint','tiling','tilling','tiles','tile','celling','ceiling','ceilings','wall','walls','floor','floors','flooring','paving','paver','pavers','screed','screeding','plastering','plaster','waterproofing','laminate','carpet','carpeting','skirting'];
         const _measureText = `${args.category || ''} ${args.subcategory || ''} ${args.description || ''}`.toLowerCase();
         const _isMeasure = _measureText.split(/[^a-z]+/).some(w => w && _measureKeywords.includes(w));
         if (_isMeasure && pricingSource === 'fixed') {
-          console.log(`[create_booking] ⚠️ measurement trade "${args.subcategory || args.category}" matched a per-m2 rate (R${estimatedCost}/m2) — NOT a flat price. Routing to on-site measurement quote.`);
-          estimatedCost = '0';
-          pricingSource = 'none';
-          measurementRoute = true;
+          const ratePerM2 = parseFloat(estimatedCost) || 0;
+          const _len = parseFloat(args.length_m || args.lengthM || 0) || 0;
+          const _wid = parseFloat(args.width_m || args.widthM || 0) || 0;
+          let areaM2 = parseFloat(args.area_m2 || args.areaM2 || args.area || 0) || 0;
+          if (areaM2 <= 0 && _len > 0 && _wid > 0) areaM2 = _len * _wid;
+
+          if (ratePerM2 > 0 && areaM2 > 0) {
+            // Path 1/2: price the labour as rate x area (labour only).
+            const labour = Math.round(ratePerM2 * areaM2);
+            console.log(`[create_booking] measurement trade "${args.subcategory || args.category}": R${ratePerM2}/m2 x ${areaM2}m2 = R${labour} (labour only).`);
+            estimatedCost = labour.toString();
+            pricingSource = 'fixed';
+            measurementRoute = false;
+            measurementMeta = {
+              needs_onsite_measurement: 'no',
+              measure_method: 'client_estimate',
+              estimate_area_m2: areaM2,
+              rate_per_m2: ratePerM2,
+            };
+          } else {
+            // No area yet — ask the client before booking. Never book priceless.
+            console.log(`[create_booking] measurement trade "${args.subcategory || args.category}" has no area — asking the client for square metres.`);
+            return {
+              success: false,
+              error: 'area_required',
+              required_next_action: 'ask_for_area',
+              instruction: `"${args.subcategory || args.category}" is priced per square metre at R${ratePerM2} per m2, and that is a LABOUR price only. Before booking you MUST ask the customer for the area so you can give an exact labour estimate. Ask: 'Roughly how many square metres need doing? If you are not sure, give me the length and width in metres (for example 4 by 3) and I will work it out for you.' When they reply, call create_booking again with area_m2 (or length_m and width_m). Tell them the artisan re-measures on site and confirms the final price before any work starts, and they only pay once they approve. Do NOT call create_booking again until you have the area.`,
+            };
+          }
         }
       }
 
@@ -3298,6 +3329,7 @@ async function executeWaTool(name, args, session) {
         created_at: now,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
         updated_at: now,
+        ...(measurementMeta || {}),
       };
 
       await firestore.collection('tasksManagement').doc(bookingId).set(booking);
@@ -3343,6 +3375,7 @@ async function executeWaTool(name, args, session) {
         creation_date: now,
         created_at: now,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        ...(measurementMeta || {}),
       };
 
       await firestore.collection('futureBookings').doc(bookingId).set(futureBooking);
@@ -7600,6 +7633,7 @@ JOB PROGRESS REPORTING (CRITICAL — ALWAYS USE LIVE DATA):
 - ⛔ "Labour only" / "Labor only" priced services in the catalog are NOT all-in prices. Never present a "Labour only" price as the cost of a job that includes materials.
 - ⛔ A reply that contains a "R{number}" amount that did NOT come from a tool result on this turn is a BUG. The only way you may state a Rand amount is if (a) lookup_pricing returned matched=true on this turn, or (b) submit_rfq / accept_rfq_quote / check_rfq_status returned a quote on this turn.
 - If create_booking returns an estimated cost of R0.00, it means no fixed price was found — DO NOT quote a price; tell the customer the job needs an RFQ and call submit_rfq.
+- AREA-PRICED TRADES (painting, tiling, flooring, paving, plastering, waterproofing, ceilings, walls, screeding, laminate, carpet, skirting): these are priced PER SQUARE METRE and that per-m2 amount is a LABOUR price only. To give a total you need the AREA. Two paths: (1) the customer knows the square metres — pass area_m2; (2) the customer does not know — ask for the length and width in metres (for example '4 by 3') and pass length_m and width_m so the system works out area = length x width. Before create_booking for these trades, ask: "Roughly how many square metres need doing? If you are not sure, give me the length and width in metres and I will work it out." Then call create_booking with area_m2 (or length_m and width_m); the system prices labour = rate x area. NEVER quote or book an area-priced job at the bare per-m2 rate, and NEVER guess the area. Always add that the artisan re-measures on site and confirms the final price before any work starts, and the customer only pays once they approve. If create_booking returns error "area_required", follow its instruction and ask the customer for the area.
 
 DIAGNOSTIC / INVESTIGATION REQUESTS (CRITICAL — NEVER MISPRICE A SYMPTOM):
 - When a customer describes a SYMPTOM whose cause is not yet known — e.g. 'there is a bad smell, please investigate', 'water is coming from somewhere', 'a strange noise', 'damp on the wall, not sure why', 'something is wrong but I do not know what' — this is a DIAGNOSTIC job. The real work is UNKNOWN until an artisan inspects.
