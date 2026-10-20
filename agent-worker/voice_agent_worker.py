@@ -640,7 +640,7 @@ async def entrypoint(ctx: JobContext):
             "- After sending an EFT or card payment link, the money confirms via the bank and can take a minute or two. Never treat 'not reflected yet' as 'not paid'. Keep the customer company, reassure them, and re-check with check_payment rather than restarting payment or going silent.\n"
             "- WALLET SAFETY: NEVER charge the wallet without the customer explicitly choosing wallet AND confirming the amount out loud. If their balance is too low, offer EFT, card, or buy-now-pay-later instead.\n"
             "- BALANCE AFTER THE JOB IS COMPLETED (IMPORTANT): When a job is finished, the remaining balance is now due. The 35 percent DEPOSIT WAS ALREADY PAID when the booking was made, so NEVER ask 'full amount or deposit' and NEVER offer a deposit option again - the ONLY thing payable now is the FULL remaining balance. (1) Tell them the job is complete and state the EXACT remaining balance. (2) ALWAYS ASK which payment METHOD they want - from their Square 15 wallet, by instant EFT, by card, or buy-now-pay-later - and WAIT for their answer. NEVER assume or default to card; use exactly the method they name, and pass payment_type='balance' to the tool for that method (pay_with_wallet, request_payment_link with payment_method='card' or 'eft', or pay_with_bnpl). If the in-app balance payment screen has already opened, guide them to complete it there and do NOT call the tool yourself. (3) Confirm it went through with check_payment(booking_id). (4) AS SOON AS the balance is paid (or the job was paid in full up front), ask the customer to RATE the artisan and the service from one to five stars and for any short review, then call submit_rating(booking_id, rating, review). Never wrap up or end the call before you have offered to take the rating.\n"
-            "- RATING AFTER COMPLETION: Whenever a job is completed and fully paid, proactively invite the customer to rate - 'How would you rate your artisan and the service, from one to five stars?' - and call submit_rating(booking_id, rating, review) with what they say. If they decline, that is fine; do not pressure them. AFTER the rating is submitted (or declined), CLOSE OUT properly in this order: (a) confirm the job is now complete; (b) let them know that if they are NOT satisfied or have any dispute about the quality of the work, they can lodge a complaint with the admin team and you can help them do that right now - if they want to, call submit_complaint; (c) thank them warmly for choosing Square 15 Facility Solutions for their maintenance needs; (d) tell them they are welcome to end the call if there is nothing else you can help with. Only wrap up after this closing.\n"
+            "- RATING AFTER COMPLETION: Whenever a job is completed and fully paid, proactively invite the customer to rate - 'How would you rate your artisan and the service, from one to five stars?' - and call submit_rating(booking_id, rating, review) with what they say. If they decline, that is fine; do not pressure them. AFTER the rating is submitted (or declined), CLOSE OUT properly in this order: (a) confirm the job is now complete; (b) let them know that if they are NOT satisfied or have any dispute about the quality of the work, they can lodge a complaint with the admin team and you can help them do that right now - if they want to, call submit_complaint; (c) thank them warmly for choosing Square 15 Facility Solutions for their maintenance needs; (d) ask if there is anything else you can help with, and as soon as they say no / that is all, call ui_navigate(action='end_call') to hang up and return them to the main screen. You MUST actually say parts (a), (b) and (c) out loud every time - never skip the complaint-rights line or the thank-you - and you MUST end the call yourself with ui_navigate(action='end_call') rather than leaving the customer to hang up.\n"
             "- If customer says 'deposit' or '35 percent' â†’ use payment_type='deposit'. If 'full' or 'pay everything' â†’ use payment_type='full'.\n"
             "- RFQ QUOTE tools: generate_rfq_quote (trigger AI quote), accept_rfq (accept quote â†’ payment), reject_rfq (negotiate quote). Use when handling RFQ requests.\n"
             "- lookup_service_pricing for pricing: when user asks 'how much is...', 'what's the price for...', call lookup_service_pricing.\n"
@@ -850,7 +850,8 @@ async def entrypoint(ctx: JobContext):
             "open_artisan_wallet, accept_latest_request, reject_latest_request, respond_to_request, "
             "call_assigned_artisan, "
             "open_notifications, open_profile, open_settings, open_support, open_wallet, "
-            "open_calendar, open_help, go_home, go_back, close_window, close_dialog, dismiss. "
+            "open_calendar, open_help, go_home, go_back, end_call, close_window, close_dialog, dismiss. "
+            "Use end_call ONLY once the customer confirms there is nothing else and you have said your closing/thank-you - it hangs up and returns them to the main screen. "
             "DO NOT use for cancel_booking, reschedule_booking, send_message_to_artisan, "
             "send_message_to_admin, mark_booking_in_progress, artisan_cancel_and_reassign â€” "
             "use the dedicated action tools instead."
@@ -985,6 +986,8 @@ async def entrypoint(ctx: JobContext):
                 text = "Here are some helpful tips."
             elif action in ("go_home", "open_dashboard"):
                 text = "Going to the home screen."
+            elif action in ("end_call", "hang_up", "hangup", "end_session"):
+                text = "Thank you for choosing Square 15 Facility Solutions. Ending the call now."
             elif action in ("go_back", "navigate_back"):
                 text = "Going back."
             elif action in ("close_window", "close_dialog", "dismiss"):
@@ -2991,7 +2994,15 @@ async def entrypoint(ctx: JobContext):
             result = await backend_client.call_backend_action('submit_rating', payload)
             if not result.get('ok') and not result.get('success'):
                 return f"Could not submit rating: {result.get('error', 'unknown')}"
-            return f"Thank you! Your {rating}-star rating has been submitted and the job is now marked complete."
+            return (
+                f"Rating saved ({rating} stars) and the job is now marked complete. "
+                "Now SAY this closing to the customer, in your own warm voice, in order: "
+                "(1) confirm the job is complete; "
+                "(2) tell them if they are NOT satisfied or have any dispute about the quality of work they can lodge a complaint with the admin team and you can help right now - if they want to, call submit_complaint; "
+                "(3) thank them for choosing Square 15 Facility Solutions for their maintenance needs; "
+                "(4) let them know they can end the call if there is nothing else. "
+                "When they confirm there is nothing else, call ui_navigate(action='end_call') to hang up."
+            )
         except Exception as e:
             logger.error(f"submit_rating error: {e}", exc_info=True)
             return "Sorry, I couldn't submit your rating right now."
