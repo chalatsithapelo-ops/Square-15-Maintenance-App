@@ -5719,17 +5719,34 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     const review = String(payload.review || payload.comment || '').trim();
 
     try {
-      const bRef = firestore.collection('futureBookings').doc(targetBookingId);
-      const bSnap = await bRef.get();
-      if (!bSnap.exists) return { ok: false, status: 404, error: 'booking_not_found' };
-      const bData = bSnap.data() || {};
+      // Resolve the booking across futureBookings AND the tasksManagement
+      // dispatch bridge. Completion/payment pushes to the client often carry
+      // only the tasks_management_id (or an order/rfq number), not a raw
+      // futureBookings id, so re-querying futureBookings directly used to 404
+      // and break Lizzy's rating flow. loadBooking() resolves all of these and
+      // points bookingRef at the real futureBookings doc.
+      const bData = await loadBooking();
+      if (!bData) return { ok: false, status: 404, error: 'booking_not_found' };
+      const bRef = bookingRef;
+      const ratedBookingId = String((bRef && bRef.id) || targetBookingId);
 
-      if (String(bData.user_id || '').trim() !== actorUid) {
+      // Ownership: allow the booking owner (matched across the common id
+      // fields) or an admin acting on their behalf.
+      const ownerId = String(
+        bData.user_id || bData.userId || bData.client_id || bData.clientId || bData.customer_id || ''
+      ).trim();
+      if (ownerId && actorUid && ownerId !== actorUid && actorRole !== 'admin') {
         return { ok: false, status: 403, error: 'only booking owner can rate' };
       }
 
-      const artisanToRate = String(bData.service_provider_id || '').trim();
-      if (!artisanToRate) return { ok: false, status: 400, error: 'no artisan assigned' };
+      // Resolve the artisan to rate from whichever field carries it.
+      const artisanToRate = String(
+        bData.service_provider_id || bData.serviceProviderId || bData.artisan_id ||
+        bData.assigned_artisan_id || bData.provider_id || ''
+      ).trim();
+      if (!artisanToRate || artisanToRate.toLowerCase() === 'admin') {
+        return { ok: false, status: 400, error: 'no artisan assigned' };
+      }
 
       // Save rating on booking
       await bRef.set({
@@ -5745,9 +5762,9 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         if (providerDoc) {
           await firestore.collection('serviceProvider').doc(providerDoc.id)
             .collection('reviews')
-            .doc(targetBookingId)
+            .doc(ratedBookingId)
             .set({
-              booking_id: targetBookingId,
+              booking_id: ratedBookingId,
               user_id: actorUid,
               rating: rating,
               review: review,
@@ -5756,7 +5773,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         }
       } catch (e) { console.warn('\u26a0\ufe0f review write best-effort:', e.message); }
 
-      return { ok: true, status: 200, data: { rated: true, booking_id: targetBookingId, rating } };
+      return { ok: true, status: 200, data: { rated: true, booking_id: ratedBookingId, rating } };
     } catch (e) {
       return { ok: false, status: 500, error: e.message || 'failed' };
     }
@@ -6735,6 +6752,23 @@ app.post('/api/action/execute', assistantLimiter, async (req, res) => {
           debug: result.debug || null,
         },
       });
+      // Surface genuine tool failures to the admin Live Issues board. Skip
+      // pure validation/permission rejections (400/401/403) so the board is
+      // not spammed, but capture not-found/conflict/server errors (404/409/5xx)
+      // which indicate a real bug Lizzy hit mid-conversation.
+      try {
+        const st = Number(result.status) || 500;
+        if (st === 404 || st === 409 || st >= 500) {
+          await logErrorToAdmin(
+            'livekit_error',
+            `Lizzy action "${action}" failed: ${result.error || 'unknown error'}`,
+            'action_execute',
+            JSON.stringify({ action, status: st, error: result.error, actor_role: actorRole }).slice(0, 1500),
+            normalizeBookingId(payload) || '',
+            st >= 500 ? 'high' : 'medium',
+          );
+        }
+      } catch (_logErr) { /* never let logging break the response */ }
       return res.status(result.status).json({
         error: result.error,
         message: 'Action failed',
@@ -6776,6 +6810,17 @@ app.post('/api/action/execute', assistantLimiter, async (req, res) => {
         exception_message: e && e.message ? String(e.message) : String(e),
       },
     });
+    // A crash inside an action is always worth an admin Live Issues alert.
+    try {
+      await logErrorToAdmin(
+        'livekit_error',
+        `Lizzy action "${action}" crashed: ${e && e.message ? e.message : String(e)}`,
+        'action_execute',
+        String(e && e.stack ? e.stack : e).slice(0, 1500),
+        normalizeBookingId(payload) || '',
+        'high',
+      );
+    } catch (_logErr) { /* never let logging break the response */ }
     return res.status(500).json({
       error: 'internal_error',
       message: 'Action execution failed',
@@ -7113,6 +7158,21 @@ app.post('/api/action/confirm', assistantLimiter, async (req, res) => {
         },
       });
       await proposalRef.set({ status: 'error', updated_at: nowIso(), error: result.error }, { merge: true });
+      // Surface genuine tool failures to the admin Live Issues board (skip
+      // benign validation/permission rejections).
+      try {
+        const st = Number(result.status) || 500;
+        if (st === 404 || st === 409 || st >= 500) {
+          await logErrorToAdmin(
+            'livekit_error',
+            `Lizzy action "${action}" failed: ${result.error || 'unknown error'}`,
+            'action_confirm',
+            JSON.stringify({ action, status: st, error: result.error, actor_role: actorRole }).slice(0, 1500),
+            normalizeBookingId(payload) || normalizeBookingId(proposal) || '',
+            st >= 500 ? 'high' : 'medium',
+          );
+        }
+      } catch (_logErr) { /* never let logging break the response */ }
       return res.status(result.status).json({
         error: result.error,
         message: 'Action failed',
@@ -7159,6 +7219,17 @@ app.post('/api/action/confirm', assistantLimiter, async (req, res) => {
       },
     });
     await proposalRef.set({ status: 'error', updated_at: nowIso(), error: 'exception' }, { merge: true });
+    // A crash inside a confirmed action is always worth an admin Live Issues alert.
+    try {
+      await logErrorToAdmin(
+        'livekit_error',
+        `Lizzy action "${action}" crashed: ${e && e.message ? e.message : String(e)}`,
+        'action_confirm',
+        String(e && e.stack ? e.stack : e).slice(0, 1500),
+        normalizeBookingId(payload) || normalizeBookingId(proposal) || '',
+        'high',
+      );
+    } catch (_logErr) { /* never let logging break the response */ }
     return res.status(500).json({
       error: 'internal_error',
       message: 'Action confirmation failed',
