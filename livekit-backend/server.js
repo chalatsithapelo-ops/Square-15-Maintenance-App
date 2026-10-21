@@ -13583,8 +13583,8 @@ async function _maybeBuildWeeklyBatch(force = false) {
     // Send an INFO-level admin notification once per batch. Not an error.
     if (!prevNotifiedAt) {
       try {
-        const message = `Weekly payout batch ${weekKey} ready for review: ${items.length} items, R${totalAmount.toFixed(2)}. Open admin app → Payouts to approve.`;
-        await firestore.collection('notifications').add({
+        const message = `Weekly payout batch ${weekKey} ready for review: ${items.length} items, R${totalAmount.toFixed(2)}. Open admin app -> Payouts to approve.`;
+        const batchNotif = {
           title: 'Weekly Payout Batch Ready',
           message,
           body: message,
@@ -13592,12 +13592,77 @@ async function _maybeBuildWeeklyBatch(force = false) {
           severity: 'info',
           target: 'admin',
           user_type: 'admin',
-          user_id: 'admin',
           batch_id: weekKey,
           read: false,
           timestamp: admin.firestore.FieldValue.serverTimestamp(),
           created_at: admin.firestore.FieldValue.serverTimestamp(),
-        });
+        };
+        // 1) Generic admin doc (in-app popup listener picks this up via user_id='admin').
+        await firestore.collection('notifications').add({ ...batchNotif, user_id: 'admin' });
+
+        // 2) Per-admin docs + REAL FCM push so the owner's phone actually pings.
+        try {
+          const adminSnap = await firestore.collection('users')
+            .where('isAdmin', '==', true).limit(25).get();
+          const TOKEN_FIELDS_SINGLE = ['deviceToken', 'device_token', 'fcm_token', 'fcmToken', 'token', 'push_token', 'pushToken'];
+          const TOKEN_FIELDS_LIST = ['tokens', 'fcm_tokens', 'deviceTokens'];
+          const tokens = [];
+          const tokenSet = new Set();
+          const perAdminWrites = [];
+          for (const doc of adminSnap.docs) {
+            const data = doc.data() || {};
+            perAdminWrites.push(firestore.collection('notifications').add({ ...batchNotif, user_id: doc.id }));
+            for (const f of TOKEN_FIELDS_SINGLE) {
+              const t = String(data[f] || '').trim();
+              if (t && !tokenSet.has(t)) { tokenSet.add(t); tokens.push(t); }
+            }
+            for (const f of TOKEN_FIELDS_LIST) {
+              const list = data[f];
+              if (!Array.isArray(list)) continue;
+              for (const item of list) {
+                const t = String(item || '').trim();
+                if (t && !tokenSet.has(t)) { tokenSet.add(t); tokens.push(t); }
+              }
+            }
+          }
+          await Promise.all(perAdminWrites).catch(() => {});
+          if (tokens.length > 0) {
+            const stale = [];
+            try {
+              const resp = await admin.messaging().sendEachForMulticast({
+                tokens,
+                notification: { title: 'Weekly Payout Batch Ready', body: message.slice(0, 240) },
+                data: {
+                  type: 'payout_batch_ready',
+                  batch_id: String(weekKey),
+                  item_count: String(items.length),
+                  total_amount: String(totalAmount.toFixed(2)),
+                },
+                android: { priority: 'high', notification: { channelId: 'high_importance_channel' } },
+                apns: { payload: { aps: { sound: 'default', badge: 1 } } },
+              });
+              (resp.responses || []).forEach((r, idx) => {
+                if (r && !r.success && r.error) {
+                  const code = String(r.error.code || '').toLowerCase();
+                  if (code.includes('registration-token-not-registered') || code.includes('invalid-registration-token')) {
+                    stale.push(tokens[idx]);
+                  }
+                }
+              });
+              console.log(`[payout-batch] FCM push: ${resp.successCount}/${tokens.length} delivered for ${weekKey}`);
+            } catch (fcmErr) {
+              console.warn('[payout-batch] FCM multicast failed:', fcmErr && fcmErr.message);
+            }
+            if (stale.length && typeof _cleanStaleFcmTokens === 'function') {
+              _cleanStaleFcmTokens(stale).catch(() => {});
+            }
+          } else {
+            console.warn('[payout-batch] No admin FCM tokens found - push not sent (in-app doc still written).');
+          }
+        } catch (fanoutErr) {
+          console.warn('[payout-batch] admin fanout failed:', fanoutErr && fanoutErr.message);
+        }
+
         await firestore.collection('payout_batches').doc(weekKey).update({
           notified_at: new Date().toISOString(),
         });
