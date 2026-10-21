@@ -13490,6 +13490,9 @@ function _startRefundReconciliationSweeper() {
 // Idempotent — won't create a second draft if one already exists for the week.
 function _startWeeklyPayoutBatchSweep() {
   const CHECK_INTERVAL_MS = 60 * 60 * 1000; // re-check every hour
+  // Accrue artisan earnings shortly after boot and hourly so balances stay fresh.
+  setTimeout(() => _sweepArtisanEarnings(admin.apps.length ? admin.firestore() : null).catch(() => {}), 45 * 1000);
+  setInterval(() => _sweepArtisanEarnings(admin.apps.length ? admin.firestore() : null).catch(() => {}), CHECK_INTERVAL_MS).unref?.();
   // Run once shortly after boot, then hourly.
   setTimeout(() => _maybeBuildWeeklyBatch(false), 60 * 1000);
   setInterval(() => _maybeBuildWeeklyBatch(false), CHECK_INTERVAL_MS).unref?.();
@@ -13500,6 +13503,8 @@ async function _maybeBuildWeeklyBatch(force = false) {
   try {
     const firestore = admin.apps.length ? admin.firestore() : null;
     if (!firestore) return { skipped: 'no_firestore' };
+    // Accrue fresh artisan earnings so the batch reflects real amounts owed.
+    await _sweepArtisanEarnings(firestore).catch(() => {});
     const now = new Date();
     const sastMs = now.getTime() + 2 * 60 * 60 * 1000;
     const sast = new Date(sastMs);
@@ -13672,6 +13677,131 @@ async function _maybeBuildWeeklyBatch(force = false) {
     return { ok: true, batch_id: weekKey, item_count: items.length, total_amount: totalAmount };
   } catch (e) {
     console.warn('[payout-batch] sweeper error:', e && e.message);
+    return { error: e && e.message };
+  }
+}
+
+// ─── Artisan earnings accrual ─────────────────────────────────────────────
+// Credits serviceProvider.balance for every completed + fully-paid job the
+// artisan has not been credited for yet. Idempotent via the artisan_earnings
+// ledger (doc id = `${artisanId}__${orderNo}`). Only jobs on/after
+// ARTISAN_ACCRUAL_START are considered so historical pre-launch jobs are ignored.
+// Artisan earns (1 - platform_fee): fixed-price uses the job category's fee
+// (editable in admin Categories, default 35%); RFQ uses the 35% pricing-guide
+// margin. Also reconciles the ledger's paid flags against the live balance so
+// payouts (manual per-job OR weekly batch) are reflected without double-paying.
+const ARTISAN_ACCRUAL_START_MS = Date.parse('2026-10-01T00:00:00Z');
+
+function _artisanJobTimeMs(x) {
+  const c = x.completion_date || x.closed_date || x.updated_at || x.created_at || x.creation_date || x.date || '';
+  const t = Date.parse(String(c));
+  return Number.isNaN(t) ? null : t;
+}
+
+function _artisanFeeFraction(jobData, categoryFeeByName) {
+  const isRfq = String(jobData.is_rfq || '').toLowerCase() === 'yes' || jobData.is_rfq === true;
+  if (isRfq) return 0.35;
+  const cat = String(jobData.category || jobData.sub_category || jobData.service || '').toLowerCase();
+  const f = categoryFeeByName[cat];
+  return (typeof f === 'number' && f > 0 && f < 1) ? f : 0.35;
+}
+
+async function _sweepArtisanEarnings(firestore) {
+  try {
+    if (!firestore) return { skipped: 'no_firestore' };
+    const money = v => Math.round((Number(v) || 0) * 100) / 100;
+    const num = v => parseFloat(String(v == null ? '0' : v).replace(/[^0-9.\-]/g, '')) || 0;
+
+    // Per-category platform fees (editable in admin Categories). Accept 35 or 0.35.
+    const catSnap = await firestore.collection('categories').get().catch(() => null);
+    const categoryFeeByName = {};
+    if (catSnap) for (const d of catSnap.docs) {
+      const x = d.data() || {};
+      const pct = Number(x.platform_fee_percent);
+      if (!Number.isNaN(pct) && pct > 0) {
+        const frac = pct > 1 ? pct / 100 : pct;
+        if (frac > 0 && frac < 1 && x.name) categoryFeeByName[String(x.name).toLowerCase()] = frac;
+      }
+    }
+
+    const paidSnap = await firestore.collection('tasksManagement')
+      .where('payment_status', '==', 'paid').limit(5000).get().catch(() => null);
+    if (!paidSnap) return { skipped: 'query_failed' };
+
+    // Dedupe genuine completed + fully-paid + on/after-cutoff jobs by artisan+order.
+    const groups = new Map();
+    for (const d of paidSnap.docs) {
+      const x = d.data() || {};
+      const artisanId = x.service_provider_id;
+      if (!artisanId) continue;
+      if (!['completed', 'closed', 'done'].includes(String(x.status || '').toLowerCase())) continue;
+      const tms = _artisanJobTimeMs(x);
+      if (tms == null || tms < ARTISAN_ACCRUAL_START_MS) continue;
+      const orderNo = String(x.order_no || d.id);
+      const key = `${artisanId}__${orderNo}`;
+      const g = groups.get(key) || { artisanId, orderNo, cost: 0, data: x };
+      g.cost = Math.max(g.cost, num(x.cost));
+      groups.set(key, g);
+    }
+
+    let credited = 0, creditedTotal = 0;
+    const balanceDelta = new Map();
+    for (const [key, g] of groups) {
+      if (g.cost <= 0) continue;
+      const ledgerRef = firestore.collection('artisan_earnings').doc(key);
+      if ((await ledgerRef.get()).exists) continue; // already accrued
+      const fee = _artisanFeeFraction(g.data, categoryFeeByName);
+      const earning = money(g.cost * (1 - fee));
+      if (earning <= 0) continue;
+      await ledgerRef.set({
+        id: key, artisan_id: g.artisanId, order_no: g.orderNo, cost: g.cost,
+        platform_fee_percent: fee, earning,
+        is_rfq: String(g.data.is_rfq || '').toLowerCase() === 'yes' || g.data.is_rfq === true,
+        paid: false, credited_at: new Date().toISOString(), source: 'auto_accrual',
+      });
+      balanceDelta.set(g.artisanId, money((balanceDelta.get(g.artisanId) || 0) + earning));
+      credited++; creditedTotal = money(creditedTotal + earning);
+    }
+
+    for (const [artisanId, delta] of balanceDelta) {
+      if (delta <= 0) continue;
+      const spRef = firestore.collection('serviceProvider').doc(artisanId);
+      await firestore.runTransaction(async (t) => {
+        const s = await t.get(spRef);
+        if (!s.exists) return;
+        const cur = parseFloat(String((s.data() || {}).balance || '0').replace(/[^0-9.\-]/g, '')) || 0;
+        t.update(spRef, { balance: money(cur + delta).toFixed(2), balance_updated_at: new Date().toISOString() });
+      }).catch(e => console.warn('[earnings] balance credit failed', artisanId, e && e.message));
+    }
+
+    // Reconcile paid flags: if an artisan's live balance dropped below their
+    // unpaid-ledger sum, a payout happened (manual or batch) — mark the oldest
+    // unpaid entries paid to match, so the ledger never double-counts.
+    const artisanIds = new Set([...groups.values()].map(g => g.artisanId));
+    for (const artisanId of artisanIds) {
+      try {
+        const unpaid = await firestore.collection('artisan_earnings')
+          .where('artisan_id', '==', artisanId).where('paid', '==', false).get();
+        if (unpaid.empty) continue;
+        const unpaidSum = money(unpaid.docs.reduce((s, d) => s + (Number((d.data() || {}).earning) || 0), 0));
+        const spSnap = await firestore.collection('serviceProvider').doc(artisanId).get();
+        const bal = spSnap.exists ? (parseFloat(String((spSnap.data() || {}).balance || '0').replace(/[^0-9.\-]/g, '')) || 0) : 0;
+        let toSettle = money(unpaidSum - bal);
+        if (toSettle <= 0) continue;
+        const ordered = unpaid.docs.sort((a, b) => String((a.data() || {}).credited_at || '').localeCompare(String((b.data() || {}).credited_at || '')));
+        for (const d of ordered) {
+          if (toSettle <= 0.001) break;
+          const e = Number((d.data() || {}).earning) || 0;
+          await d.ref.update({ paid: true, paid_at: new Date().toISOString(), paid_reconciled: true });
+          toSettle = money(toSettle - e);
+        }
+      } catch (_) {}
+    }
+
+    if (credited > 0) console.log(`[earnings] accrued ${credited} jobs, R${creditedTotal.toFixed(2)} across ${balanceDelta.size} artisans`);
+    return { ok: true, credited, creditedTotal };
+  } catch (e) {
+    console.warn('[earnings] sweep error:', e && e.message);
     return { error: e && e.message };
   }
 }
