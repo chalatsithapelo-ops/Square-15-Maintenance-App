@@ -3252,6 +3252,7 @@ async function executeWaTool(name, args, session) {
       let estimatedCost = '0';
       let pricingSource = 'none';
       let measurementRoute = false; // true when the trade is priced per-m2 and needs on-site measurement
+      let matchedTaskName = ''; // authoritative task name used for area-priced detection (never free-text)
       try {
         const catSlug = (args.category || '').toLowerCase().replace(/\s+/g, '_');
         const subQuery = (args.subcategory || args.description || '').toLowerCase();
@@ -3276,6 +3277,7 @@ async function executeWaTool(name, args, session) {
           if (result.matched) {
             estimatedCost = result.cost.toString();
             pricingSource = 'fixed';
+            matchedTaskName = result.name || '';
             console.log(`[create_booking] Best price match: "${result.name}" R${result.cost} (score=${result.score})`);
           } else {
             if (result.rejected && result.rejected.length) {
@@ -3301,7 +3303,12 @@ async function executeWaTool(name, args, session) {
       let measurementMeta = null;
       {
         const _measureKeywords = ['painting','paint','tiling','tilling','tiles','tile','celling','ceiling','ceilings','wall','walls','floor','floors','flooring','paving','paver','pavers','screed','screeding','plastering','plaster','waterproofing','laminate','carpet','carpeting','skirting'];
-        const _measureText = `${args.category || ''} ${args.subcategory || ''} ${args.description || ''}`.toLowerCase();
+        // Detect area-pricing from the SERVICE IDENTITY (category + subcategory +
+        // the matched task name) only. Do NOT include the free-text description:
+        // a flat-rate repair whose description mentions floor/wall/tile/paint
+        // (e.g. "leaking tap under the kitchen floor") would be misread as
+        // area-priced and charged rate x area. Matches the backend + client app.
+        const _measureText = `${args.category || ''} ${args.subcategory || ''} ${matchedTaskName || ''}`.toLowerCase();
         const _isMeasure = _measureText.split(/[^a-z]+/).some(w => w && _measureKeywords.includes(w));
         if (_isMeasure && pricingSource === 'fixed') {
           const ratePerM2 = parseFloat(estimatedCost) || 0;
