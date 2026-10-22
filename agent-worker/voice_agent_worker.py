@@ -7,7 +7,7 @@ upload/deploy a minimal set of files to GitHub/Render.
 
 # â”€â”€ Version tag â€” bump this on every deploy so we can verify Render runs the
 # latest code.  Check Render logs for the startup banner.
-WORKER_VERSION = "2026-10-19-ask-method-and-amount"
+WORKER_VERSION = "2026-10-22-audit-fixes"
 
 import os
 import sys
@@ -1635,7 +1635,7 @@ async def entrypoint(ctx: JobContext):
             escrow_msg = " Your money is held securely in escrow until you confirm you are satisfied with the work. 100 percent money-back guarantee."
             if message:
                 return message + escrow_msg
-            pt_label = "deposit" if payment_type == "deposit" else "full payment"
+            pt_label = {"deposit": "deposit", "balance": "remaining balance"}.get(payment_type, "full payment")
             return f"A {pt_label} link for {amount} rand has been sent to your phone. Check your notifications to complete payment.{escrow_msg}"
         except Exception as e:
             logger.error(f"request_payment_link error: {e}", exc_info=True)
@@ -1813,6 +1813,10 @@ async def entrypoint(ctx: JobContext):
                         "scheduled_date": scheduled_date or "",
                         "scheduled_time": scheduled_time or "",
                         "is_rfq": "yes" if _is_rfq_booking else "no",
+                        # Pass through any area the customer already stated so the
+                        # app prices rate x area instead of re-prompting the
+                        # measuring tool for an area it already has.
+                        "area_m2": (area_m2 or "").strip(),
                     },
                     "text": "Opening the photo screen now - please add a quick photo of the issue so the artisan can see what needs doing.",
                 })
@@ -1840,6 +1844,11 @@ async def entrypoint(ctx: JobContext):
             (category_name or '').strip().lower(),
             (problem_description or '').strip().lower()[:120],
             (is_rfq or 'no').strip().lower(),
+            # Include address + schedule so two genuinely different bookings in
+            # the same short window are NOT collapsed into one.
+            (service_address or '').strip().lower()[:80],
+            (scheduled_date or '').strip().lower(),
+            (scheduled_time or '').strip().lower(),
         ])
         async with _create_booking_lock:
             _prev = _recent_booking_creates.get(_sig)
@@ -2150,8 +2159,16 @@ async def entrypoint(ctx: JobContext):
 
             # Format messages for readability
             msg_list = []
+            _uid = (app_context_user_id or '').strip()
             for msg in messages[-5:]:  # Last 5 messages
-                sender = "You" if msg.get('sender_id') == app_context_user_id else "Artisan"
+                if _uid and msg.get('sender_id') == _uid:
+                    sender = "You"
+                elif _uid:
+                    sender = "Artisan"
+                else:
+                    # Without a known user id we cannot tell who sent what, so
+                    # avoid mislabelling the customer's own messages as the artisan.
+                    sender = "Message"
                 text = msg.get('message', '')
                 msg_list.append(f"{sender}: {text}")
 
@@ -2383,9 +2400,15 @@ async def entrypoint(ctx: JobContext):
             "Use payment_type='full' or 'deposit'."
         )
     )
-    async def pay_with_bnpl(booking_id: str, payment_type: str = "", provider: str = "moretyme") -> str:
+    async def pay_with_bnpl(booking_id: str = "", payment_type: str = "", provider: str = "moretyme") -> str:
         """Start a PayFast buy-now-pay-later checkout via request_payment_link."""
-        nonlocal backend_client
+        nonlocal backend_client, app_context_focus_booking_id
+        # Mirror the other payment tools: fall back to the focused booking from a
+        # payment push and never proceed with an empty id.
+        if not (booking_id or "").strip() and app_context_focus_booking_id:
+            booking_id = app_context_focus_booking_id
+        if not (booking_id or "").strip():
+            return "Which booking would you like to pay for? Please tell me the booking number."
         # Hard gate: never assume the amount. Ask if the customer has not chosen.
         pt = (payment_type or "").strip().lower()
         if pt not in ("full", "deposit", "balance"):
@@ -3017,7 +3040,13 @@ async def entrypoint(ctx: JobContext):
     )
     async def submit_rating(booking_id: str, rating: int, review: str = "") -> str:
         """Rate an artisan after service completion."""
-        nonlocal backend_client
+        nonlocal backend_client, app_context_focus_booking_id
+        # Rating is commonly launched from a completion push that carries only the
+        # focused booking, so fall back to it when no id was spoken.
+        if not (booking_id or "").strip() and app_context_focus_booking_id:
+            booking_id = app_context_focus_booking_id
+        if not (booking_id or "").strip():
+            return "Which booking would you like to rate? Please tell me the booking number."
         if not backend_client:
             if not await _ensure_backend_or_retry():
                 return _CONNECTION_RETRY_MSG
@@ -3027,7 +3056,7 @@ async def entrypoint(ctx: JobContext):
             if not result.get('ok') and not result.get('success'):
                 return f"Could not submit rating: {result.get('error', 'unknown')}"
             return (
-                f"Rating saved ({rating} stars) and the job is now marked complete. "
+                f"Rating saved ({rating} stars), thank you. "
                 "Now SAY this closing to the customer, in your own warm voice, in order: "
                 "(1) confirm the job is complete; "
                 "(2) tell them if they are NOT satisfied or have any dispute about the quality of work they can lodge a complaint with the admin team and you can help right now - if they want to, call submit_complaint; "
@@ -3145,10 +3174,14 @@ async def entrypoint(ctx: JobContext):
         elif 'dashboard' in r or r == '/':
             name = screen_data.get('user_name', '')
             count = screen_data.get('active_bookings_count', 0)
+            try:
+                count = int(str(count).strip() or '0')
+            except (TypeError, ValueError):
+                count = 0
             if name:
                 parts.append(f"Welcome {name}.")
-            if count and int(str(count)) > 0:
-                parts.append(f"You have {count} active booking{'s' if int(str(count)) > 1 else ''}.")
+            if count > 0:
+                parts.append(f"You have {count} active booking{'s' if count > 1 else ''}.")
                 parts.append("Would you like me to show your bookings, check their status, or create a new one?")
             else:
                 parts.append("You have no active bookings right now.")
