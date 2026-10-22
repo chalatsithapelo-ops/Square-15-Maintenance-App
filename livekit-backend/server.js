@@ -2672,6 +2672,52 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       updated_at: now,
     };
 
+    // ── SERVICE-AREA GATE (safety net; mirrors the app + WA bot) ──────────
+    // Managed by the admin app via app_config/service_areas. Only blocks when
+    // we can positively place the customer OUTSIDE every active area; unknown
+    // locations pass through so we never block a real customer by mistake.
+    try {
+      const geoCfgSnap = await firestore.collection('app_config').doc('service_areas').get();
+      const geoCfg = geoCfgSnap.exists ? (geoCfgSnap.data() || {}) : {};
+      if (geoCfg.enforce_geo_fence === true) {
+        const gLat = Number(coordsLat);
+        const gLng = Number(coordsLng);
+        const haveLoc = Number.isFinite(gLat) && Number.isFinite(gLng) && !(gLat === 0 && gLng === 0);
+        if (haveLoc) {
+          const activeAreas = (Array.isArray(geoCfg.areas) ? geoCfg.areas : []).filter((a) => a && a.active === true);
+          const hav = (la1, lo1, la2, lo2) => {
+            const R = 6371, tr = (d) => d * Math.PI / 180;
+            const dLa = tr(la2 - la1), dLo = tr(lo2 - lo1);
+            const h = Math.sin(dLa / 2) ** 2 + Math.cos(tr(la1)) * Math.cos(tr(la2)) * Math.sin(dLo / 2) ** 2;
+            return R * 2 * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
+          };
+          const inside = activeAreas.length > 0 && activeAreas.some((ar) => {
+            const aLat = Number(ar.lat), aLng = Number(ar.lng), rk = Number(ar.radius_km);
+            return Number.isFinite(aLat) && Number.isFinite(aLng) && Number.isFinite(rk) && hav(gLat, gLng, aLat, aLng) <= rk;
+          });
+          if (!inside) {
+            const names = activeAreas.map((a) => String(a.name || '').trim()).filter(Boolean);
+            const areaList = names.length ? ` We currently serve: ${names.join(', ')}.` : '';
+            const geoMsg = `Our service is not yet available in your area.${areaList} We are expanding soon — stay tuned!`;
+            try {
+              const leadRef = await firestore.collection('coverage_requests').add({
+                name: clientName || '', phone: clientPhone || '', user_id: actorUid || '',
+                channel: 'voice', category: categoryName || '', description: effectiveDescription || '',
+                address: providedAddress || '', lat: gLat, lng: gLng, status: 'new',
+                created_at: now, created_at_str: new Date().toISOString(),
+              });
+              await writeAdminNotification({
+                title: 'Out-of-area request',
+                message: `${clientName || clientPhone || 'A customer'} tried to book ${categoryName || 'a service'} outside our current service area. Commercial team: please follow up.`,
+                data: { type: 'coverage_request', booking_id: leadRef.id, channel: 'voice' },
+              });
+            } catch (leadErr) { console.warn('[geofence] lead capture failed:', leadErr && leadErr.message); }
+            return { ok: false, status: 200, error: 'out_of_service_area', out_of_service_area: true, message: geoMsg, data: { message: geoMsg } };
+          }
+        }
+      }
+    } catch (geoErr) { console.warn('[geofence] check failed (allowing):', geoErr && geoErr.message); }
+
     await bookingRefLocal.set(bookingDoc);
 
     let tasksManagementId = null;

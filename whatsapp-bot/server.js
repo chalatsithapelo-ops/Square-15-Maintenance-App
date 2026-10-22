@@ -905,6 +905,145 @@ async function pushArtisanNotification({ artisanId, title, body, type, bookingId
   }
 }
 
+// ─── Service-area geofence (shared with the app via app_config/service_areas) ──
+// The admin app maintains this doc: { enforce_geo_fence: bool, areas: [{name,
+// lat, lng, radius_km, active}] }. When enforce_geo_fence is false, everything
+// is allowed. Mirrors lib/services/service_area_checker.dart so WhatsApp and
+// voice behave identically to the app.
+let _serviceAreaCache = null;
+let _serviceAreaCacheAt = 0;
+const _SERVICE_AREA_TTL_MS = 5 * 60 * 1000;
+
+async function getServiceAreaConfig() {
+  if (_serviceAreaCache && (Date.now() - _serviceAreaCacheAt) < _SERVICE_AREA_TTL_MS) {
+    return _serviceAreaCache;
+  }
+  const firestore = db();
+  if (!firestore) return {};
+  try {
+    const snap = await firestore.collection('app_config').doc('service_areas').get();
+    _serviceAreaCache = snap.exists ? (snap.data() || {}) : {};
+  } catch (_) {
+    _serviceAreaCache = {};
+  }
+  _serviceAreaCacheAt = Date.now();
+  return _serviceAreaCache;
+}
+
+function _geoHaversineKm(lat1, lng1, lat2, lng2) {
+  const R = 6371.0;
+  const toRad = (d) => d * (Math.PI / 180);
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a = Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+// Forward-geocode a free-text address to {lat, lng} via OpenStreetMap Nominatim.
+// Returns null on failure. Biased to South Africa to reduce ambiguity.
+async function geocodeAddressToLatLng(address) {
+  const q = String(address || '').trim();
+  if (!q || q.toLowerCase() === 'current location') return null;
+  try {
+    const r = await fetch(
+      `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&countrycodes=za&q=${encodeURIComponent(q)}`,
+      {
+        headers: { 'User-Agent': 'Square15-WA-Bot/1.0 (support@square15.co.za)' },
+        signal: AbortSignal.timeout(5000),
+      }
+    );
+    if (r && r.ok) {
+      const j = await r.json();
+      if (Array.isArray(j) && j.length) {
+        const lat = Number(j[0].lat);
+        const lng = Number(j[0].lon);
+        if (Number.isFinite(lat) && Number.isFinite(lng)) return { lat, lng };
+      }
+    }
+  } catch (geoErr) {
+    console.warn('[geofence] forward-geocode failed:', geoErr && geoErr.message);
+  }
+  return null;
+}
+
+// Returns { allowed: true } if within coverage (or geofence disabled / location
+// unknown), else { allowed: false, message, areaNames }. We only BLOCK when we
+// can positively place the customer OUTSIDE every active area; an unknown
+// location is allowed through so we never block a real customer by mistake.
+async function checkWaServiceArea({ lat, lng }) {
+  const config = await getServiceAreaConfig();
+  if (config.enforce_geo_fence !== true) return { allowed: true };
+
+  const rawAreas = Array.isArray(config.areas) ? config.areas : [];
+  const areas = rawAreas.filter((a) => a && a.active === true);
+  const names = areas.map((a) => String(a.name || '').trim()).filter(Boolean);
+
+  const nLat = Number(lat);
+  const nLng = Number(lng);
+  const haveLoc = Number.isFinite(nLat) && Number.isFinite(nLng) && !(nLat === 0 && nLng === 0);
+  // Can't place the customer → do NOT block (avoid false negatives).
+  if (!haveLoc) return { allowed: true };
+
+  if (areas.length === 0) {
+    return {
+      allowed: false,
+      areaNames: names,
+      message: 'Our service is not yet available in your area. We are launching soon — stay tuned!',
+    };
+  }
+
+  for (const area of areas) {
+    const aLat = Number(area.lat);
+    const aLng = Number(area.lng);
+    const radiusKm = Number(area.radius_km);
+    if (!Number.isFinite(aLat) || !Number.isFinite(aLng) || !Number.isFinite(radiusKm)) continue;
+    if (_geoHaversineKm(nLat, nLng, aLat, aLng) <= radiusKm) return { allowed: true };
+  }
+
+  const areaList = names.length ? ` We currently serve: ${names.join(', ')}.` : '';
+  return {
+    allowed: false,
+    areaNames: names,
+    message: `Our service is not yet available in your area.${areaList} We are expanding soon — stay tuned!`,
+  };
+}
+
+// Records an out-of-area booking attempt as a lead and alerts admins so the
+// commercial team (not the app team) can follow up. Fire-and-forget.
+async function captureCoverageLead({ channel = 'whatsapp', name = '', phone = '', userId = '', category = '', description = '', address = '', lat = null, lng = null }) {
+  const firestore = db();
+  if (!firestore) return;
+  try {
+    const ref = await firestore.collection('coverage_requests').add({
+      name: String(name || ''),
+      phone: String(phone || ''),
+      user_id: String(userId || ''),
+      channel: String(channel || 'whatsapp'),
+      category: String(category || ''),
+      description: String(description || ''),
+      address: String(address || ''),
+      lat: lat == null ? null : Number(lat),
+      lng: lng == null ? null : Number(lng),
+      status: 'new',
+      created_at: admin.firestore.FieldValue.serverTimestamp(),
+      created_at_str: new Date().toISOString(),
+    });
+    const where = String(address || '').trim() || (lat != null && lng != null ? `(${lat}, ${lng})` : 'an unknown location');
+    const who = String(name || '').trim() || String(phone || '').trim() || 'A customer';
+    const what = String(category || '').trim() || 'a service';
+    await pushAdminNotification({
+      title: 'Out-of-area request',
+      body: `${who} tried to book ${what} at ${where} which is outside our current service area. Commercial team: please follow up.`,
+      type: 'coverage_request',
+      bookingId: ref.id,
+      extraData: { channel, phone: String(phone || ''), address: String(address || '') },
+    });
+  } catch (e) {
+    console.warn('[geofence] captureCoverageLead failed:', e && e.message);
+  }
+}
+
 // ─── Shared: apply a WhatsApp customer's accept/decline to an on-site ──────
 // re-approval request. Mirrors the in-app CustomerReapprovalScreen._respond so
 // the Firestore state is identical no matter which channel the client used:
@@ -3244,6 +3383,34 @@ async function executeWaTool(name, args, session) {
         }
       }
 
+      // ── SERVICE-AREA GATE: block (and capture a lead) when the customer is
+      // outside active coverage. Managed by the admin app via app_config/
+      // service_areas. Unknown locations are allowed through (never block a
+      // real customer by mistake).
+      {
+        let gLat = Number(session.sharedLatitude);
+        let gLng = Number(session.sharedLongitude);
+        if (!(Number.isFinite(gLat) && Number.isFinite(gLng))) {
+          const geo = await geocodeAddressToLatLng(args.address);
+          if (geo) { gLat = geo.lat; gLng = geo.lng; }
+        }
+        const area = await checkWaServiceArea({ lat: gLat, lng: gLng });
+        if (!area.allowed) {
+          captureCoverageLead({
+            channel: 'whatsapp',
+            name: session.customerName || '',
+            phone: session.phone,
+            userId: session.linkedUserId || '',
+            category: args.category || '',
+            description: args.description || args.subcategory || '',
+            address: args.address || session.sharedAddress || '',
+            lat: Number.isFinite(gLat) ? gLat : null,
+            lng: Number.isFinite(gLng) ? gLng : null,
+          });
+          return { success: false, error: 'out_of_service_area', message: area.message };
+        }
+      }
+
       const bookingId = `WA-${Date.now().toString(36).toUpperCase()}`;
       const orderNo = `SQ15-${bookingId}`;
       const now = new Date().toISOString();
@@ -4829,6 +4996,33 @@ async function executeWaTool(name, args, session) {
             required_next_action: 'ask_for_address',
             instruction: "Before filing this RFQ, you MUST ask the customer for the FULL service address — street, suburb/area, city, AND country if the customer is outside South Africa (Square 15 also serves Lesotho, Botswana, Namibia, Zimbabwe, Eswatini and beyond). Example: 'Could you please share the full address where the work needs to be done? (street, area, city — and country if outside South Africa). You can also drop a WhatsApp location pin if that's easier.' Do NOT call submit_rfq again until they reply with an address.",
           };
+        }
+      }
+
+      // ── SERVICE-AREA GATE: block (and capture a lead) when the customer is
+      // outside active coverage. Managed by the admin app via app_config/
+      // service_areas. Unknown locations are allowed through.
+      {
+        let gLat = Number(session.sharedLatitude);
+        let gLng = Number(session.sharedLongitude);
+        if (!(Number.isFinite(gLat) && Number.isFinite(gLng))) {
+          const geo = await geocodeAddressToLatLng(args.address);
+          if (geo) { gLat = geo.lat; gLng = geo.lng; }
+        }
+        const area = await checkWaServiceArea({ lat: gLat, lng: gLng });
+        if (!area.allowed) {
+          captureCoverageLead({
+            channel: 'whatsapp',
+            name: session.customerName || '',
+            phone: session.phone,
+            userId: session.linkedUserId || '',
+            category: args.category || '',
+            description: args.description || args.subcategory || '',
+            address: args.address || session.sharedAddress || '',
+            lat: Number.isFinite(gLat) ? gLat : null,
+            lng: Number.isFinite(gLng) ? gLng : null,
+          });
+          return { success: false, error: 'out_of_service_area', message: area.message };
         }
       }
 
