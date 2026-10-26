@@ -10889,6 +10889,60 @@ app.get('/api/admin/payout-batches/:batchId', authMiddleware, async (req, res) =
   }
 });
 
+// Per-recipient payout breakdown: which jobs make up this payout and how much each.
+// Artisan payouts are itemised in the artisan_earnings ledger (one doc per job).
+app.get('/api/admin/payout-breakdown', authMiddleware, async (req, res) => {
+  try {
+    const db = admin.firestore();
+    const role = await resolveRole({ firestore: db, uid: req.user.uid, decodedToken: req.user });
+    if (role !== 'admin') return res.status(403).json({ error: 'Admin access required.' });
+    const recipientType = String(req.query.recipient_type || '').toLowerCase();
+    const recipientId = String(req.query.recipient_id || '').trim();
+    if (!recipientId) return res.status(400).json({ error: 'recipient_id required' });
+
+    if (recipientType === 'artisan') {
+      const snap = await db.collection('artisan_earnings')
+        .where('artisan_id', '==', recipientId)
+        .where('paid', '==', false)
+        .limit(500).get().catch(() => null);
+      const docs = snap ? snap.docs.map(d => d.data() || {}) : [];
+      const jobs = [];
+      for (const e of docs) {
+        let title = '', category = '', client = '', completedAt = '';
+        try {
+          const tq = await db.collection('tasksManagement')
+            .where('order_no', '==', String(e.order_no)).limit(1).get();
+          if (!tq.empty) {
+            const t = tq.docs[0].data() || {};
+            title = t.description || t.task || t.title || '';
+            category = t.category || t.category_name || '';
+            client = t.client_name || t.customer_name || t.user_name || '';
+            completedAt = t.completed_at || t.updated_at || '';
+          }
+        } catch (_) {}
+        jobs.push({
+          order_no: e.order_no,
+          cost: Number(e.cost) || 0,
+          earning: Number(e.earning) || 0,
+          platform_fee_percent: Number(e.platform_fee_percent) || 0,
+          is_rfq: !!e.is_rfq,
+          credited_at: e.credited_at || '',
+          title, category, client, completed_at: completedAt,
+        });
+      }
+      jobs.sort((a, b) => String(a.credited_at).localeCompare(String(b.credited_at)));
+      const total = jobs.reduce((s, j) => s + j.earning, 0);
+      return res.json({ ok: true, recipient_type: 'artisan', job_count: jobs.length, total: parseFloat(total.toFixed(2)), jobs });
+    }
+
+    // Partner payouts aren't itemised per job (aggregate pending_payout).
+    return res.json({ ok: true, recipient_type: recipientType || 'unknown', job_count: 0, total: 0, jobs: [], note: 'Per-job breakdown is only available for artisan payouts.' });
+  } catch (e) {
+    console.error('[payout-breakdown] error:', e && e.message);
+    res.status(500).json({ error: 'Failed to load breakdown' });
+  }
+});
+
 // Edit a single line item (change amount or skip).
 // Body: { item_id, amount?, skip?, notes? }
 app.patch('/api/admin/payout-batches/:batchId/items', authMiddleware, async (req, res) => {
@@ -10961,11 +11015,25 @@ app.post('/api/admin/payout-batches/:batchId/approve', authMiddleware, async (re
       });
     }
 
+    // Resolve a human-readable approver for the audit trail.
+    let approverEmail = (req.user && req.user.email) ? String(req.user.email) : '';
+    let approverName = '';
+    try {
+      const u = await db.collection('users').doc(req.user.uid).get();
+      if (u.exists) {
+        const ud = u.data() || {};
+        approverName = ud.name || ud.full_name || ud.displayName || '';
+        if (!approverEmail) approverEmail = ud.email || '';
+      }
+    } catch (_) {}
+
     // Mark approved before firing (prevents double-approve).
     await batchRef.update({
       status: 'processing',
       approved_at: new Date().toISOString(),
       approved_by: req.user.uid,
+      approved_by_email: approverEmail,
+      approved_by_name: approverName,
     });
 
     const items = allItems;
@@ -11029,12 +11097,19 @@ app.post('/api/admin/payout-batches/:batchId/approve', authMiddleware, async (re
       }
     }
 
+    // Attach recipient name + amount to each result for a readable audit trail.
+    const itemById = new Map(items.map(i => [i.item_id, i]));
+    const auditResults = results.map(r => {
+      const it = itemById.get(r.item_id) || {};
+      return { ...r, recipient_name: it.recipient_name || '', recipient_type: it.recipient_type || '', amount: it.amount || 0 };
+    });
+
     await batchRef.update({
       status: failCount === 0 ? 'completed' : (okCount === 0 ? 'failed' : 'partial'),
       completed_at: new Date().toISOString(),
       ok_count: okCount,
       fail_count: failCount,
-      results,
+      results: auditResults,
     });
     res.json({ ok: true, ok_count: okCount, fail_count: failCount, results });
   } catch (e) {
