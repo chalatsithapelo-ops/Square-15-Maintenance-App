@@ -2000,7 +2000,15 @@ function findFixedPriceMatch({ subcategory, description, taskResults }) {
     return { matched: false, rejected: [{ name: '', reason: 'diagnostic-investigation' }] };
   }
 
-  const askedLabourOnly = /\b(lab[ou]r)\s*only\b/i.test(subQuery);
+  const askedLabourOnly = /\b(lab(?:ou|o)r)\s*only\b/i.test(subQuery);
+
+  // Area-priced trades (painting / tiling / flooring etc.) are charged per m².
+  // A wrong pick AMONG two such tasks is harmless: both route to the same
+  // guided-measurement flow and the artisan re-measures & confirms the per-m²
+  // price on site. Used by the ambiguity guard to relax RFQ fallback when the
+  // two closest candidates are both area trades.
+  const AREA_TRADE_RE = /\b(paint|painting|pva|enamel|varnish|tile|tiling|tiles|floor|flooring|pav(?:e|ing|er)|plaster|waterproof|ceiling|wall|walls|screed|laminate|carpet|skirting|skirt)\b/i;
+  const isAreaTradeName = (nm) => AREA_TRADE_RE.test(String(nm || ''));
 
   // Normalize: strip parentheticals, lowercase, alphanumeric only
   const norm = (s) => String(s || '')
@@ -2019,9 +2027,16 @@ function findFixedPriceMatch({ subcategory, description, taskResults }) {
     'only','also','about','around','over','under','very',
   ]);
 
-  // Word match: complete word OR 5-char prefix stem (no substring leakage)
+  // Word match: complete word OR singular/plural variant OR 5-char prefix stem
+  // (no substring leakage). The plural step lets "walls"↔"wall", "tiles"↔"tile"
+  // match so natural phrasings ("paint interior walls") reach per-m² tasks.
+  const depluralize = (x) => (x.length >= 5 && x.endsWith('s')) ? x.slice(0, -1) : x;
   const wordMatch = (hayWords, w) => {
     if (hayWords.includes(w)) return true;
+    const wd = depluralize(w);
+    for (const hw of hayWords) {
+      if (depluralize(hw) === wd) return true;
+    }
     if (w.length >= 5) {
       const stem = w.slice(0, 5);
       for (const hw of hayWords) {
@@ -2048,8 +2063,8 @@ function findFixedPriceMatch({ subcategory, description, taskResults }) {
     for (const w of new Set(matchTokens)) freq[w] = (freq[w] || 0) + 1;
   }
 
-  let bestScore = 0, best = null;
-  let secondScore = 0;
+  let bestScore = 0, best = null, bestTask = null;
+  let secondScore = 0, secondTask = null;
   const rejected = [];
 
   for (const c of corpus) {
@@ -2058,7 +2073,7 @@ function findFixedPriceMatch({ subcategory, description, taskResults }) {
 
     // Labour-only guard (BHV-2 preserved): task tagged "labour only"
     // requires the customer to explicitly ask for labour only.
-    const isLabourOnly = /\b(lab[ou]r)\s*only\b/i.test(t.name);
+    const isLabourOnly = /\b(lab(?:ou|o)r)\s*only\b/i.test(t.name);
     if (isLabourOnly && !askedLabourOnly) {
       rejected.push({ name: t.name, reason: 'labour-only-not-asked' });
       continue;
@@ -2102,7 +2117,9 @@ function findFixedPriceMatch({ subcategory, description, taskResults }) {
 
     if (score > bestScore) {
       secondScore = bestScore;
+      secondTask = bestTask;
       bestScore = score;
+      bestTask = t;
       best = {
         name: t.name,
         cost: t.cost,
@@ -2112,13 +2129,22 @@ function findFixedPriceMatch({ subcategory, description, taskResults }) {
       };
     } else if (score > secondScore) {
       secondScore = score;
+      secondTask = t;
     }
   }
 
-  // Ambiguity guard: weak best + close second → RFQ
+  // Ambiguity guard: weak best + close second → RFQ.
+  // EXCEPTION: when the two closest candidates are BOTH area-priced trades
+  // (e.g. two interior-painting tasks), a wrong pick is harmless — both route
+  // to the same per-m² measurement flow — so keep the best instead of forcing
+  // an RFQ. This lets natural phrasings like "paint the ceiling" quote.
   if (best && bestScore < 500 && secondScore > 0 && secondScore / bestScore > 0.85) {
-    rejected.push({ name: best.name, reason: `ambiguous-${bestScore.toFixed(0)}-vs-${secondScore.toFixed(0)}` });
-    best = null;
+    const bothAreaTrades = bestTask && secondTask &&
+      isAreaTradeName(bestTask.name) && isAreaTradeName(secondTask.name);
+    if (!bothAreaTrades) {
+      rejected.push({ name: best.name, reason: `ambiguous-${bestScore.toFixed(0)}-vs-${secondScore.toFixed(0)}` });
+      best = null;
+    }
   }
 
   if (best) return { matched: true, ...best, rejected };
