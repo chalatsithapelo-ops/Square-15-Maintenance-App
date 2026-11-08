@@ -4037,6 +4037,132 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     }
   }
 
+  // -- Settle on-site measurement overcharge (credit client wallet) --
+  // When the artisan's on-site measurement comes out LOWER than the estimate
+  // the client already PAID in full, the difference is an overcharge that must
+  // be returned to the client's wallet. The amount is computed SERVER-SIDE from
+  // the recorded payment and the artisan-locked price (never from client input),
+  // and the write is idempotent via the `overcharge_credited` flag.
+  if (action === 'settle_measurement_overcharge') {
+    try {
+      const bid = bookingId || String(payload.tasks_management_id || payload.booking_id || '').trim();
+      if (!bid) return { ok: false, status: 400, error: 'missing_booking_id' };
+      if (!actorUid) return { ok: false, status: 401, error: 'unauthorized' };
+
+      const tmRef = firestore.collection('tasksManagement').doc(bid);
+      const tmSnap = await tmRef.get();
+      if (!tmSnap.exists) return { ok: false, status: 404, error: 'booking_not_found' };
+      const tm = tmSnap.data() || {};
+
+      // Only the client who owns the booking (or an admin) may settle it.
+      const ownerUid = String(tm.user_id || tm.userId || '').trim();
+      if (actorRole !== 'admin' && ownerUid && ownerUid !== actorUid) {
+        return { ok: false, status: 403, error: 'forbidden' };
+      }
+
+      // There is only an overcharge to return if the client paid IN FULL.
+      const paymentStatus = String(tm.payment_status || tm.paymentStatus || '').toLowerCase();
+      if (paymentStatus !== 'paid') {
+        return { ok: true, status: 200, data: { credited: false, reason: 'not_fully_paid', bookingId: bid } };
+      }
+
+      // Idempotent — never credit the same overcharge twice.
+      if (isTruthy(tm.overcharge_credited) || tm.overcharge_credited === true) {
+        return { ok: true, status: 200, data: { credited: false, reason: 'already_credited', bookingId: bid } };
+      }
+
+      // What the client ACTUALLY paid (server-trusted): prefer the recorded
+      // service_payment ledger entry, then fall back to stored payment fields.
+      let paidAmount = 0;
+      try {
+        const txq = await firestore.collection('transactionLogs')
+          .where('tasks_management_id', '==', bid)
+          .where('subtype', '==', 'service_payment')
+          .where('status', '==', 'success')
+          .limit(1).get();
+        if (!txq.empty) paidAmount = toNumber(txq.docs[0].data().amount) ?? 0;
+      } catch (e) { console.warn('[overcharge] paid-amount lookup:', e.message); }
+      if (paidAmount <= 0) {
+        paidAmount = toNumber(tm.paid_amount) ?? toNumber(tm.amount_paid) ??
+          toNumber(tm.estimate_cost) ?? 0;
+      }
+
+      // Current (post-measurement) price the artisan locked onto the job.
+      const actualCost = toNumber(tm.actual_cost) ?? toNumber(tm.cost) ?? 0;
+      if (paidAmount <= 0 || actualCost <= 0) {
+        return { ok: true, status: 200, data: { credited: false, reason: 'insufficient_price_data', bookingId: bid } };
+      }
+
+      const overcharge = Math.round((paidAmount - actualCost) * 100) / 100;
+      if (overcharge <= 0.01) {
+        return { ok: true, status: 200, data: { credited: false, reason: 'no_overcharge', bookingId: bid } };
+      }
+
+      const userId = ownerUid || actorUid;
+      const result = await firestore.runTransaction(async (tx) => {
+        const freshSnap = await tx.get(tmRef);
+        const fresh = freshSnap.exists ? freshSnap.data() || {} : {};
+        if (isTruthy(fresh.overcharge_credited) || fresh.overcharge_credited === true) {
+          return { credited: false, reason: 'already_credited' };
+        }
+        const userRef = firestore.collection('users').doc(userId);
+        const userSnap = await tx.get(userRef);
+        const userData = userSnap.exists ? userSnap.data() || {} : {};
+        const currentBalance = toNumber(userData.balance) ?? 0.0;
+        const newBalance = currentBalance + overcharge;
+        const txId = randomId('tx-');
+
+        tx.set(userRef, { balance: moneyString(newBalance) }, { merge: true });
+        tx.set(tmRef, {
+          overcharge_credited: 'yes',
+          overcharge_credit_amount: overcharge,
+          overcharge_credited_at: now,
+          overcharge_credit_txn_id: txId,
+          updated_at: now,
+        }, { merge: true });
+        tx.set(firestore.collection('transactionLogs').doc(txId), {
+          id: txId,
+          amount: moneyString(overcharge),
+          transaction_at: now,
+          status: 'success',
+          booking_id: '',
+          tasks_management_id: bid,
+          transaction_by: userId,
+          user_id: userId,
+          type: 'wallet',
+          subtype: 'overcharge_refund',
+          direction: 'in',
+          cash_movement: false,
+          profit: '0.00',
+          schema_version: 2,
+          reason: 'measurement_lower_than_estimate',
+          balance: moneyString(newBalance),
+          balance_after: moneyString(newBalance),
+          previous_balance: moneyString(currentBalance),
+          assistant_context: { actor_uid: actorUid, actor_role: actorRole },
+        });
+        return { credited: true, amount: overcharge, newBalance, txId };
+      });
+
+      if (result.credited) {
+        try {
+          await _writeNotificationImpl({
+            userId,
+            userType: 'user',
+            title: 'Refund credited to wallet',
+            message: `R${overcharge.toFixed(2)} was credited to your wallet \u2014 the on-site measurement came in lower than the estimate.`,
+            data: { type: 'wallet_credit', tasks_management_id: bid, booking_id: bid },
+            sendPush: true,
+          });
+        } catch (e) { console.warn('[overcharge] notify:', e.message); }
+      }
+
+      return { ok: true, status: 200, data: { ...result, bookingId: bid } };
+    } catch (e) {
+      return { ok: false, status: 500, error: 'overcharge_settlement_failed', debug: String((e && e.message) || e) };
+    }
+  }
+
   // -- Pay with Wallet --
   if (action === 'pay_with_wallet') {
     try {
