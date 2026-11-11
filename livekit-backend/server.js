@@ -4450,10 +4450,17 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         return { ok: true, status: 200, data: { message: 'No variation is awaiting payment on this booking.', bookingId: bid } };
       }
 
-      // Find the specific pending variation entry (the latest unpaid one).
+      // Settle the SPECIFIC variation the client approved (by id). A task can
+      // accrue several variations over its life, so never assume "the latest".
+      // Fall back to the newest still-pending entry only when no id is given.
       const variations = Array.isArray(bData.variation_requests) ? bData.variation_requests : [];
-      const pending = [...variations].reverse().find(v =>
-        v && v.status === 'pending_client_approval');
+      const wantId = String(payload.variation_id || payload.variationId || '').trim();
+      const pending = wantId
+        ? variations.find(v => v && v.id === wantId && v.status === 'pending_client_approval')
+        : [...variations].reverse().find(v => v && v.status === 'pending_client_approval');
+      if (wantId && !pending) {
+        return { ok: true, status: 200, data: { message: 'This extra-work request was already paid or withdrawn.', bookingId: bid } };
+      }
       const payAmount = Math.round(
         parseFloat((pending && pending.amount) || bData.variation_amount || '0') * 100) / 100;
       if (!(payAmount > 0)) return { ok: false, status: 400, error: 'no_variation_amount' };
