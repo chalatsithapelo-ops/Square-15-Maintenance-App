@@ -3299,7 +3299,7 @@ function formatQuoteForWhatsApp(quote, rfqNo) {
       lines.push(`  \u{1F3E2} ${ps.builders} Builders-priced | ${ps.catalog} catalog | ${ps.ai_estimate} estimated`);
     }
   } else if (quote.materialsBOM.length > 0) {
-    lines.push(`\u2022 Materials (client provides): ${quote.materialsBOM.length} items listed`);
+    lines.push(`\u2022 Materials (you provide): ${quote.materialsBOM.length} items \u2014 labour only`);
   }
 
   if (quote.equipmentCost > 0) {
@@ -3321,6 +3321,20 @@ function formatQuoteForWhatsApp(quote, rfqNo) {
     });
     lines.push('');
     lines.push('\u2705 = Builders.co.za price | \u{1F4D7} = Catalog | \u{1F4CA} = Estimated');
+  }
+
+  // Materials-readiness gate for labour-only jobs (client provides materials).
+  // List the parts so the client can check they're on site, and offer to hand
+  // sourcing to Square 15 if anything is missing.
+  if (quote.materialsBOM.length > 0 && quote.materials_responsibility !== 'artisan') {
+    lines.push('');
+    lines.push('\u{1F4E6} *Materials you need on site (labour-only job):*');
+    quote.materialsBOM.forEach((m, i) => {
+      lines.push(`${i + 1}. ${m.name} \u2014 ${m.qty} ${m.unit}`);
+    });
+    lines.push('');
+    lines.push('\u2757 *Please confirm you have ALL of these on site.* The artisan is coming to do labour only \u2014 if parts are missing or wrong when they arrive, the job can\u2019t proceed and a call-out fee may apply.');
+    lines.push('If you don\u2019t have everything, reply *SUPPLY* and Square 15 will source the correct materials for you (added to your quote).');
   }
 
   lines.push('');
@@ -8031,7 +8045,12 @@ RFQ FLOW (CRITICAL — Follow this exactly):
 8. If NEGOTIATE (the customer says "no", "reject", "negotiate", "too expensive", "change", "lower", or any clear push-back) → call reject_rfq_quote with their feedback → admin reviews
 9. Customer can check RFQ status anytime with check_rfq_status
 
-🛡️ POST-ACCEPTANCE WORDING (NEVER MIX UP ACCEPT vs REJECT):
+� MATERIALS-READINESS GATE (LABOUR-ONLY JOBS — NEVER SKIP):
+- When the customer chose to supply materials themselves (materialsResponsibility=client) and the quote lists materials, the artisan is coming to do LABOUR ONLY. The quote message asks the customer to confirm they have ALL the listed parts on site.
+- If the customer says they do NOT have the materials, are not sure, or replies SUPPLY / 'you supply' / 'Square 15 buy them' / 'source them for me', then Square 15 should source the materials instead. Call submit_rfq AGAIN for the same job with materialsResponsibility=artisan so the quote is re-priced with materials included and sent to admin for review. Tell the customer: 'No problem — Square 15 will source the correct materials and our admin will confirm the updated price shortly.'
+- NEVER dispatch or confirm a labour-only booking when the customer has told you the material is missing or wrong. A wasted trip may incur a call-out fee, so always resolve materials first.
+
+�🛡️ POST-ACCEPTANCE WORDING (NEVER MIX UP ACCEPT vs REJECT):
 - After accept_rfq_quote returns success, the quote is ACCEPTED and the booking is CONFIRMED. Use phrasing like "Your quote is accepted ✅ — the booking is confirmed". Then ask for the preferred date/time and call set_preferred_schedule.
 - NEVER say "admin will review and adjust", "admin will get back to you", or any wording that implies the quote is still being negotiated — that language belongs ONLY to reject_rfq_quote.
 - NEVER call reject_rfq_quote in the same turn (or immediately after) accept_rfq_quote. They are mutually exclusive.

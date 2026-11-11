@@ -972,6 +972,10 @@ const ACTION_TIERS = Object.freeze({
   top_up_wallet: 'B',
   request_payment_link: 'B',
   pay_with_wallet: 'B',
+  // Client approves + pays an artisan-raised in-field variation (extra
+  // materials / sourcing / call-out) from their wallet. Tier B = normal
+  // state change with a server-side wallet deduction.
+  settle_variation: 'B',
   // Phase 4: Admin automation tools (Tier B � admin role required)
   admin_bulk_reassign: 'B',
   admin_close_stale_cases: 'B',
@@ -4407,6 +4411,164 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       }};
     } catch (err) {
       return { ok: false, status: 500, error: `wallet_payment_error: ${err.message}` };
+    }
+  }
+
+  // ── Client approves + pays an artisan-raised in-field variation ──────────
+  // When an artisan hits a missing/wrong-material situation on a labour-only
+  // job they raise a variation (extra materials + sourcing + call-out). This
+  // settles the OUTSTANDING variation amount from the client's wallet, marks
+  // the variation paid on BOTH the tasksManagement and futureBooking docs, and
+  // notifies the artisan so they can proceed. Amount is computed SERVER-SIDE
+  // from the booking doc — the client never dictates the charge.
+  if (action === 'settle_variation') {
+    try {
+      const bid = bookingId || String(payload.tasks_management_id || payload.booking_id || '').trim();
+      if (!bid) return { ok: false, status: 400, error: 'missing_booking_id' };
+      if (!actorUid) return { ok: false, status: 401, error: 'unauthorized' };
+
+      // Resolve the booking doc from either collection.
+      let bData = null;
+      let bColl = null;
+      {
+        const fb = await firestore.collection('futureBookings').doc(bid).get();
+        if (fb.exists) { bData = fb.data() || {}; bColl = 'futureBookings'; }
+        if (!bData) {
+          const tm = await firestore.collection('tasksManagement').doc(bid).get();
+          if (tm.exists) { bData = tm.data() || {}; bColl = 'tasksManagement'; }
+        }
+      }
+      if (!bData) return { ok: false, status: 404, error: 'booking_not_found' };
+
+      // Only the owning client may settle their variation.
+      const ownerUid = String(bData.user_id || bData.userId || bData.client_id || bData.customer_id || '').trim();
+      if (ownerUid && ownerUid !== actorUid) {
+        return { ok: false, status: 403, error: 'not_your_booking' };
+      }
+
+      if (bData.variation_pending !== true) {
+        return { ok: true, status: 200, data: { message: 'No variation is awaiting payment on this booking.', bookingId: bid } };
+      }
+
+      // Find the specific pending variation entry (the latest unpaid one).
+      const variations = Array.isArray(bData.variation_requests) ? bData.variation_requests : [];
+      const pending = [...variations].reverse().find(v =>
+        v && v.status === 'pending_client_approval');
+      const payAmount = Math.round(
+        parseFloat((pending && pending.amount) || bData.variation_amount || '0') * 100) / 100;
+      if (!(payAmount > 0)) return { ok: false, status: 400, error: 'no_variation_amount' };
+
+      // Check + deduct wallet atomically.
+      const userSnap = await firestore.collection('users').doc(actorUid).get();
+      if (!userSnap.exists) return { ok: false, status: 404, error: 'user_not_found' };
+      const walletBalance = parseFloat((userSnap.data() || {}).balance || (userSnap.data() || {}).wallet_balance || '0');
+      if (walletBalance < payAmount) {
+        return { ok: false, status: 400, error: `Insufficient wallet balance. You have R${walletBalance.toFixed(2)} but need R${payAmount.toFixed(2)} for the approved extra work.` };
+      }
+
+      let newBalance;
+      await firestore.runTransaction(async (transaction) => {
+        const userRef = firestore.collection('users').doc(actorUid);
+        const freshSnap = await transaction.get(userRef);
+        if (!freshSnap.exists) throw new Error('user_not_found');
+        const freshData = freshSnap.data() || {};
+        const currentBalance = parseFloat(freshData.balance || freshData.wallet_balance || '0');
+        if (currentBalance < payAmount) {
+          throw new Error(`Insufficient wallet balance. You have R${currentBalance.toFixed(2)} but need R${payAmount.toFixed(2)}.`);
+        }
+        newBalance = currentBalance - payAmount;
+        transaction.update(userRef, {
+          balance: newBalance.toFixed(2),
+          updated_at: new Date().toISOString(),
+        });
+      });
+
+      const now = new Date().toISOString();
+      const variationId = (pending && pending.id) || null;
+
+      // Mark the matched variation entry paid; clear the pending flags.
+      const updatedVariations = variations.map(v => {
+        if (v && ((variationId && v.id === variationId) ||
+            (!variationId && v.status === 'pending_client_approval'))) {
+          return { ...v, status: 'paid', paid_at: now, paid_by: actorUid };
+        }
+        return v;
+      });
+      const stillPending = updatedVariations.some(v => v && v.status === 'pending_client_approval');
+      const variationUpdate = {
+        variation_requests: updatedVariations,
+        variation_pending: stillPending,
+        variation_status: stillPending ? 'pending_client_approval' : 'paid',
+        variation_paid_total: admin.firestore.FieldValue.increment(payAmount),
+        updated_at: now,
+      };
+
+      // Mirror the update onto every linked doc (futureBooking + tasksManagement).
+      const idsToUpdate = new Set([bid]);
+      try {
+        const _tm = await firestore.collection('tasksManagement').doc(bid).get();
+        if (_tm.exists) {
+          const d = _tm.data() || {};
+          const fb = String(d.future_booking_id || d.futureBookingId || d.booking_id || '').trim();
+          if (fb) idsToUpdate.add(fb);
+        }
+      } catch (_) {}
+      try {
+        const _fb = await firestore.collection('futureBookings').doc(bid).get();
+        if (_fb.exists) {
+          const d = _fb.data() || {};
+          const tm = String(d.tasks_management_id || d.tasksManagementId || '').trim();
+          if (tm) idsToUpdate.add(tm);
+        }
+      } catch (_) {}
+      for (const id of idsToUpdate) {
+        for (const coll of ['futureBookings', 'tasksManagement']) {
+          try {
+            const ref = firestore.collection(coll).doc(id);
+            if ((await ref.get()).exists) await ref.update(variationUpdate);
+          } catch (_) {}
+        }
+      }
+
+      // Ledger entry for the top-up.
+      await firestore.collection('transactionLogs').add({
+        booking_id: bid,
+        user_id: actorUid,
+        amount: payAmount.toFixed(2),
+        payment_method: 'wallet',
+        payment_type: 'variation',
+        variation_id: variationId,
+        status: 'success',
+        wallet_balance_before: walletBalance.toFixed(2),
+        wallet_balance_after: newBalance.toFixed(2),
+        created_at: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      // Notify the artisan that the extra work is funded so they can proceed.
+      try {
+        const artisanId = String(bData.artisan_id || bData.artisanId || bData.service_provider_id || (pending && pending.raised_by) || '').trim();
+        if (artisanId) {
+          await firestore.collection('notifications').add({
+            user_id: artisanId,
+            title: 'Extra work approved & paid',
+            message: `The client approved and paid R${payAmount.toFixed(2)} for the extra materials/work. You can now proceed.`,
+            type: 'variation_paid',
+            booking_id: bid,
+            read: false,
+            created_at: admin.firestore.FieldValue.serverTimestamp(),
+          });
+        }
+      } catch (e) {
+        console.warn('[settle_variation] artisan notify failed (non-fatal):', e.message);
+      }
+
+      return { ok: true, status: 200, data: {
+        message: `Extra work of R${payAmount.toFixed(2)} paid from your wallet. Remaining balance: R${newBalance.toFixed(2)}.`,
+        bookingId: bid, amount: payAmount, new_balance: newBalance,
+        variation_pending: stillPending,
+      }};
+    } catch (err) {
+      return { ok: false, status: 500, error: `settle_variation_error: ${err.message}` };
     }
   }
 
