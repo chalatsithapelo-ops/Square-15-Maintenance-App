@@ -2174,7 +2174,10 @@ function findFixedPriceMatch({ subcategory, description, taskResults }) {
         if (!isAreaTradeName(t.name)) continue;
         let s = 0;
         for (const w of c.nm.split(' ')) { if (w && stemHit(MEASURE, w) && stemShare(w)) s += 1; }
-        if (s > aScore) { aScore = s; aBest = t; }
+        // Prefer the strongest keyword overlap; break ties on the LOWER per-m²
+        // rate so a generic "paint" request quotes the same conservative rate
+        // that create_booking will book (deterministic across both tools).
+        if (s > aScore || (s === aScore && aBest && t.cost < aBest.cost)) { aScore = s; aBest = t; }
       }
       if (aBest && aScore >= 1) {
         best = {
