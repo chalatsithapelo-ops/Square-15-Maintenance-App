@@ -4297,6 +4297,51 @@ async function executeWaTool(name, args, session) {
           };
         }
 
+        // ── PER-M² AREA-TRADE RECOVERY (painting / tiling / flooring etc.) ──
+        // findFixedPriceMatch targets flat-rate jobs and can MISS area-priced
+        // tasks whose leading token differs from the customer's word (e.g.
+        // "paint" vs a task named "PVA Wall Paint and ceiling" whose leading
+        // token is "wall"). These trades are quoted PER SQUARE METRE (rate x
+        // area) exactly like create_booking + the voice agent, so recover the
+        // per-m² rate here instead of forcing an RFQ. Only fires when the
+        // normal matcher found nothing AND the request clearly names an area
+        // trade — so it can never override a real flat-rate match.
+        if (!matchedService) {
+          const AREA_RE = /\b(paint|painting|pva|enamel|varnish|tile|tiling|tiles|floor|flooring|pav(?:e|ing|er)|plaster|waterproof|ceiling|ceilings|wall|walls|screed|screeding|laminate|carpet|carpeting|skirting|skirt)\b/i;
+          const qText = `${args.category || ''} ${args.subcategory || ''} ${args.description || ''}`.toLowerCase();
+          if (AREA_RE.test(qText)) {
+            const qWords = new Set(qText.replace(/[^a-z]+/g, ' ').split(' ').filter(Boolean));
+            let bestM2 = null, bestM2Score = -1;
+            for (const t of taskResults) {
+              if (!t || !t.name || !(t.cost > 0)) continue;
+              if (!AREA_RE.test(t.name)) continue;
+              // Honour the caller's category when one was supplied.
+              const catId = normalize(t.category_id);
+              const catNameNorm = normalize(t.category_name);
+              const catSlugNorm = normalize(catSlug);
+              const catOk = !catSlug || catId === catSlugNorm || catId.includes(catSlugNorm) || catSlugNorm.includes(catId)
+                  || catNameNorm === catSlugNorm || catNameNorm.includes(catSlugNorm) || catSlugNorm.includes(catNameNorm);
+              if (!catOk) continue;
+              // Score by shared words between the request and the task name so
+              // "PVA ..." prefers the PVA task over the Enamel task.
+              let s = 0;
+              for (const w of normalize(t.name).split(' ')) { if (w && qWords.has(w)) s += 1; }
+              if (s > bestM2Score) { bestM2Score = s; bestM2 = t; }
+            }
+            if (bestM2 && bestM2.cost > 0) {
+              return {
+                matched: true,
+                service: bestM2.name,
+                fixedPrice: `R${bestM2.cost.toFixed(2)}`,
+                pricePerM2: bestM2.cost,
+                category: bestM2.category_name || categoryName,
+                pricingBasis: 'per_square_metre_labour_only',
+                note: `This is an AREA-PRICED trade: R${bestM2.cost.toFixed(2)} per SQUARE METRE and it is a LABOUR AMOUNT ONLY (materials excluded). You MUST NOT give a flat total at the bare rate. FIRST get the AREA in square metres (ask the customer; if they are unsure, offer to help them measure the easy way). Then the labour total = R${bestM2.cost.toFixed(2)} x area. When you present the price you MUST: (a) state clearly it is a LABOUR amount only; (b) tell the customer to make sure they have all the materials on site before the artisan arrives, because if the materials are missing or wrong when the artisan gets there a call-out fee may apply; and (c) tell them that if they would prefer, they can reply SUPPLY and Square 15 will source the correct materials for them (our admin will confirm the updated price). Add that the artisan re-measures on site and confirms the final price before any work starts, and they only pay once they approve. Then call create_booking with area_m2 (or length_m and width_m).`,
+              };
+            }
+          }
+        }
+
         // No match → DO NOT hand GPT a price list to pick from.
         // The bot must call submit_rfq instead. Returning availableServices
         // here causes hallucinated quotes (e.g. "shower door = R480" picked
