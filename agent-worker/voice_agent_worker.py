@@ -500,7 +500,7 @@ async def entrypoint(ctx: JobContext):
             {
                 'session_id': f'agent-startup-{room_name}',
                 'event': 'agent_entrypoint',
-                'text': f'room={room_name} build=labour-readiness-gate-v1',
+                'text': f'room={room_name} build=labour-readiness-gate-v2',
             }
         ))
     except Exception:
@@ -3803,10 +3803,12 @@ async def entrypoint(ctx: JobContext):
                                     for it in items[-15:]:
                                         role = getattr(it, 'role', None) or getattr(it, 'type', '?')
                                         c = getattr(it, 'content', None)
+                                        # Keep assistant content long enough to audit full spoken replies.
+                                        climit = 600 if str(role).lower() == 'assistant' else 120
                                         if isinstance(c, list):
-                                            ctext = ' | '.join(str(x)[:120] for x in c)
+                                            ctext = ' | '.join(str(x)[:climit] for x in c)
                                         else:
-                                            ctext = str(c)[:120] if c else ''
+                                            ctext = str(c)[:climit] if c else ''
                                         name = getattr(it, 'name', '') or getattr(it, 'tool_name', '')
                                         args = getattr(it, 'arguments', '')
                                         extra = f' name={name} args={str(args)[:100]}' if (name or args) else ''
@@ -3815,7 +3817,7 @@ async def entrypoint(ctx: JobContext):
                                     f"{backend_url.rstrip('/')}/debug/voice-breadcrumb",
                                     {'session_id': session_id or 'unknown',
                                      'event': 'llm_done',
-                                     'text': (' ;; '.join(dump))[:1500] or '<empty>'}
+                                     'text': (' ;; '.join(dump))[:3000] or '<empty>'}
                                 )
                             except Exception as ge:
                                 await _post_breadcrumb(
