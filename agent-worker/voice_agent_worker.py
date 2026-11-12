@@ -500,7 +500,7 @@ async def entrypoint(ctx: JobContext):
             {
                 'session_id': f'agent-startup-{room_name}',
                 'event': 'agent_entrypoint',
-                'text': f'room={room_name} build=create-booking-dedup-v1',
+                'text': f'room={room_name} build=labour-readiness-gate-v1',
             }
         ))
     except Exception:
