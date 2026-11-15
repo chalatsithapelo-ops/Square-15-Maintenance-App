@@ -1984,7 +1984,7 @@ function _isDiagnosticQuery(text) {
  * Mirrors the Dart implementation in lib/services/ai_text_chat_service.dart.
  * The labour-only guard is kept from BHV-2 (varnish door frame Labour only).
  */
-function findFixedPriceMatch({ subcategory, description, taskResults }) {
+function findFixedPriceMatch({ subcategory, description, category, taskResults }) {
   const subQuery = String(subcategory || description || '').toLowerCase();
   if (!subQuery) return { matched: false, rejected: [] };
 
@@ -2009,6 +2009,12 @@ function findFixedPriceMatch({ subcategory, description, taskResults }) {
   // two closest candidates are both area trades.
   const AREA_TRADE_RE = /\b(paint|painting|pva|enamel|varnish|tile|tiling|tiles|floor|flooring|pav(?:e|ing|er)|plaster|waterproof|ceiling|wall|walls|screed|laminate|carpet|skirting|skirt)\b/i;
   const isAreaTradeName = (nm) => AREA_TRADE_RE.test(String(nm || ''));
+  // When the CATEGORY itself is an area trade (e.g. "Painting"), a bare surface
+  // noun the LLM passes as the subcategory ("wall", "ceiling", "floor") is
+  // unambiguously area-priced even though those words are not PRIMARY trade
+  // verbs. This lets the area-trade recovery below fire for them. A non-area
+  // category (e.g. Electrical "wall socket") stays gated and cannot mis-price.
+  const categoryIsAreaTrade = AREA_TRADE_RE.test(String(category || ''));
 
   // Normalize: strip parentheticals, lowercase, alphanumeric only
   const norm = (s) => String(s || '')
@@ -2162,12 +2168,14 @@ function findFixedPriceMatch({ subcategory, description, taskResults }) {
     const PRIMARY = ['paint','painting','pva','enamel','tile','tiling','tiles','floor','flooring','pav','paver','pavers','paving','plaster','plastering','screed','screeding','waterproof','waterproofing','laminate','carpet','carpeting','skirting'];
     const stemHit = (list, w) => list.includes(w) || (w.length >= 5 && list.some(k => k.length >= 5 && w.startsWith(k.slice(0, 5))));
     const qAreaWords = hayWords.filter(Boolean);
-    const qPrimary = qAreaWords.some(w => stemHit(PRIMARY, w));
+    const qPrimary = qAreaWords.some(w => stemHit(PRIMARY, w)) || categoryIsAreaTrade;
     if (qPrimary) {
       const qMeasure = qAreaWords.filter(w => stemHit(MEASURE, w));
-      const stemShare = (taskWord) => qMeasure.some(qw =>
-        qw === taskWord ||
-        (qw.length >= 5 && taskWord.length >= 5 && (qw.startsWith(taskWord.slice(0, 5)) || taskWord.startsWith(qw.slice(0, 5)))));
+      // Depluralize both sides so a single-token task name ("Wall", "Ceiling")
+      // and a plural query word ("walls") still intersect. Mirrors the main
+      // scorer's depluralize so both passes agree.
+      const _depl = (x) => (x.length >= 5 && x.endsWith('s')) ? x.slice(0, -1) : x;
+      const stemShare = (taskWord) => { const tw = _depl(taskWord); return qMeasure.some(qw => { const q = _depl(qw); return q === tw || (q.length >= 5 && tw.length >= 5 && (q.startsWith(tw.slice(0, 5)) || tw.startsWith(q.slice(0, 5)))); }); };
       let aBest = null, aScore = 0;
       for (const c of corpus) {
         const t = c.raw;
@@ -3524,7 +3532,7 @@ async function executeWaTool(name, args, session) {
               taskResults.push({ name, cost, category_id: d.categoryId || d.category_id || '', category_name: d.category_name || d.categoryName || '' });
             }
           }
-          const result = findFixedPriceMatch({ subcategory: subQuery, description: args.description, taskResults });
+          const result = findFixedPriceMatch({ subcategory: subQuery, description: args.description, category: args.category, taskResults });
           if (result.matched) {
             estimatedCost = result.cost.toString();
             pricingSource = 'fixed';
@@ -4300,8 +4308,8 @@ async function executeWaTool(name, args, session) {
         // hardware-install containment/distinctive rules, R800 sanity gate)
         // live there. Any future tweak applies to BOTH lookup_pricing and
         // create_booking automatically.
-        if (subQuery) {
-          const result = findFixedPriceMatch({ subcategory: subQuery, description: args.description, taskResults });
+        if (subQuery || args.description) {
+          const result = findFixedPriceMatch({ subcategory: subQuery, description: args.description, category: args.category, taskResults });
           if (result.matched) {
             matchedService = result.name;
             matchedPrice = result.cost;
