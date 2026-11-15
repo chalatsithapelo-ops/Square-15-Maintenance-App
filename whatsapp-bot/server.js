@@ -1277,6 +1277,21 @@ async function notifyWebhookProcessingFailure(phone, err, userText = '') {
 const sessions = new Map();
 const SESSION_TTL_MS = 30 * 60 * 1000; // 30 min
 
+// Dynamic system message carrying today's date (South Africa Standard Time) so
+// the model resolves "today"/"tomorrow"/weekday names correctly and never
+// echoes a date from the wrong year. The booking date itself is resolved
+// server-side by parseScheduleFromText; this only keeps the chat text honest.
+function currentDateSystemMessage() {
+  try {
+    const todaySast = new Date().toLocaleDateString('en-ZA', {
+      timeZone: 'Africa/Johannesburg', weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+    });
+    return { role: 'system', content: `CURRENT DATE: Today is ${todaySast} (South Africa Standard Time). Resolve "today", "tomorrow", "Friday", "next week" etc. relative to THIS date, and NEVER state a date from any other year. When you confirm a scheduled date to the customer, compute it from this current date.` };
+  } catch (_) {
+    return null;
+  }
+}
+
 // ─── Natural-language schedule parser ───
 // Returns { date: 'YYYY-MM-DD', time: 'HH:MM' | '' } or null.
 // Handles: today, tomorrow, weekday names ("Friday", "next Monday"),
@@ -3596,7 +3611,7 @@ async function executeWaTool(name, args, session) {
               success: false,
               error: 'area_required',
               required_next_action: 'ask_for_area',
-              instruction: `"${args.subcategory || args.category}" is priced per square metre at R${ratePerM2} per m2, and that is a LABOUR price only. Before booking you MUST get the area. FIRST ask whether the customer knows the measurements. If they do, ask for the square metres or the length and width in metres (for example '4 by 3'). If they are NOT sure, OFFER TO HELP them measure the easy way and let them pick the method: 'No problem - you can measure it the easy way. Whichever suits you: count floor tiles, pace it out in steps, or use arm-spans - just tell me the count for the length and for the width.' Then convert their counts to metres YOURSELF: one standard floor tile = 0.6 m, one walking step = 0.75 m, one arm-span = 1.6 m. Multiply count x factor for the length and the width, then length x width = area in square metres. If the job covers MORE THAN ONE wall, room or section, do this for EACH part and ADD the areas together for the TOTAL square metres (for example a 4x3 wall is 12 and a 5x3 wall is 15, so 27 m2 in total), then book with that combined total. Read back the area and rough total and confirm, then call create_booking again with area_m2 (or length_m and width_m). Tell them the artisan re-measures on site and confirms the final price before any work starts, and they only pay once they approve. Do NOT call create_booking again until you have the area.`,
+              instruction: `"${args.subcategory || args.category}" is priced per square metre at R${ratePerM2} per m2, and that is a LABOUR price only. Before booking you MUST get the area. FIRST ask whether the customer knows the measurements. If they do, ask for the square metres or the length and width in metres (for example '4 by 3'). If they are NOT sure, OFFER TO HELP them measure the easy way and let them pick the method: 'No problem - you can measure it the easy way. Whichever suits you: count floor tiles, pace it out in steps, use arm-spans, or place a standard A4 sheet or a bank card flat against the wall and send me a photo so I can use it as a ruler - just tell me the count for the length and for the width.' Then convert their counts to metres YOURSELF: one standard floor tile = 0.6 m, one walking step = 0.75 m, one arm-span = 1.6 m, one A4 sheet long edge = 0.297 m, one bank or ID card long edge = 0.0856 m. For a photo with a reference object, estimate how many reference-lengths span the width and the height and multiply by the reference length (never guess a size with no reference object visible). Multiply count x factor for the length and the width, then length x width = area in square metres. If the job covers MORE THAN ONE wall, room or section, do this for EACH part and ADD the areas together for the TOTAL square metres (for example a 4x3 wall is 12 and a 5x3 wall is 15, so 27 m2 in total), then book with that combined total. Read back the area and rough total and confirm, then call create_booking again with area_m2 (or length_m and width_m). Tell them the artisan re-measures on site and confirms the final price before any work starts, and they only pay once they approve. Do NOT call create_booking again until you have the area.`,
             };
           }
         }
@@ -8188,7 +8203,7 @@ JOB PROGRESS REPORTING (CRITICAL — ALWAYS USE LIVE DATA):
 - ⛔ "Labour only" / "Labor only" priced services in the catalog are NOT all-in prices. Never present a "Labour only" price as the cost of a job that includes materials.
 - ⛔ A reply that contains a "R{number}" amount that did NOT come from a tool result on this turn is a BUG. The only way you may state a Rand amount is if (a) lookup_pricing returned matched=true on this turn, or (b) submit_rfq / accept_rfq_quote / check_rfq_status returned a quote on this turn.
 - If create_booking returns an estimated cost of R0.00, it means no fixed price was found — DO NOT quote a price; tell the customer the job needs an RFQ and call submit_rfq.
-- AREA-PRICED TRADES (painting, tiling, flooring, paving, plastering, waterproofing, ceilings, walls, screeding, laminate, carpet, skirting): these are priced PER SQUARE METRE and that per-m2 amount is a LABOUR price only. To give a total you need the AREA. FIRST ask whether the customer KNOWS the measurements. Three paths: (1) they know the square metres — pass area_m2; (2) they know the length and width in metres (for example '4 by 3') — pass length_m and width_m so the system works out area = length x width; (3) they are NOT sure — OFFER to help them measure the easy way and let them choose the method: count floor tiles, pace it out in steps, or use arm-spans, for both the length and the width. Convert their counts to metres yourself: one standard floor tile = 0.6 m, one walking step = 0.75 m, one arm-span = 1.6 m. Multiply count x factor for length and width, then length x width = area; if the job spans MORE THAN ONE wall, room or section, measure EACH part, work out its area and ADD them all together for the TOTAL square metres before booking; read back the area and rough total, confirm, then call create_booking with area_m2. NEVER quote or book an area-priced job at the bare per-m2 rate, and NEVER guess the area. Always add that the artisan re-measures on site and confirms the final price before any work starts, and the customer only pays once they approve. If create_booking returns error "area_required", follow its instruction and help the customer get the area.
+- AREA-PRICED TRADES (painting, tiling, flooring, paving, plastering, waterproofing, ceilings, walls, screeding, laminate, carpet, skirting): these are priced PER SQUARE METRE and that per-m2 amount is a LABOUR price only. To give a total you need the AREA. FIRST ask whether the customer KNOWS the measurements. Four paths: (1) they know the square metres — pass area_m2; (2) they know the length and width in metres (for example '4 by 3') — pass length_m and width_m so the system works out area = length x width; (3) they are NOT sure — OFFER to help them measure the easy way and let them choose the method: count floor tiles, pace it out in steps, or use arm-spans, for both the length and the width; (4) PHOTO REFERENCE — if they cannot count or pace it, tell them to place a standard A4 sheet (or a bank/ID card) FLAT against the wall or floor and send ONE clear photo, and you will use that object as a ruler to estimate the size. Convert their counts to metres yourself: one standard floor tile = 0.6 m, one walking step = 0.75 m, one arm-span = 1.6 m, one A4 sheet long edge = 0.297 m (short edge 0.21 m), one bank or ID card long edge = 0.0856 m. For the photo-reference method, estimate how many reference-object lengths span the width and how many span the height, then multiply each count by the reference length (for example a wall about 12 A4-lengths wide is about 12 x 0.297 = 3.6 m); use the reference object as a ruler and NEVER guess a size when no reference object is visible — instead ask them to add an A4 sheet or card and resend. Multiply count x factor for length and width, then length x width = area; if the job spans MORE THAN ONE wall, room or section, measure EACH part, work out its area and ADD them all together for the TOTAL square metres before booking; read back the area and rough total, confirm, then call create_booking with area_m2 (or length_m and width_m). NEVER quote or book an area-priced job at the bare per-m2 rate, and NEVER guess the area. Always add that the artisan re-measures on site and confirms the final price before any work starts, and the customer only pays once they approve. If create_booking returns error "area_required", follow its instruction and help the customer get the area.
 
 DIAGNOSTIC / INVESTIGATION REQUESTS (CRITICAL — NEVER MISPRICE A SYMPTOM):
 - When a customer describes a SYMPTOM whose cause is not yet known — e.g. 'there is a bad smell, please investigate', 'water is coming from somewhere', 'a strange noise', 'damp on the wall, not sure why', 'something is wrong but I do not know what' — this is a DIAGNOSTIC job. The real work is UNKNOWN until an artisan inspects.
@@ -8288,6 +8303,7 @@ GUIDELINES:
 - MULTI-ISSUE HANDLING (BHV-5): If the customer mentions MORE THAN ONE distinct problem in a single message (e.g. "my tap is leaking AND my light is broken", "I need painting and tiling"), do NOT collapse them into one booking. Each problem usually needs a different artisan trade and a different price. Reply: "I see two issues — (1) [issue A] and (2) [issue B]. Each needs a separate booking so the right artisan attends. Which one would you like to handle first?" Then create_booking ONE issue at a time. After the first is confirmed, ask: "Would you like me to book the second one ([issue B]) now too?"
 - When a customer sends a photo, ANALYSE the image using your vision capabilities. Identify the maintenance issue (e.g. leaking pipe, broken socket, cracked wall), suggest the correct service category, call lookup_pricing to get the price, and present the price to the customer for confirmation. Do NOT create a booking until the customer confirms the price.
 - VISION CONFIDENCE GUARD (BHV-8): If the photo is blurry, dark, partial, ambiguous, or you are NOT highly confident what product/issue it shows, DO NOT call lookup_pricing or create_booking. Instead reply: "I can see something in the photo but I'm not 100% sure what — could you describe it in a sentence (e.g. 'frameless shower door', 'kitchen mixer tap'), or send a clearer photo?" Hardware-install jobs (shower door, geyser, ceiling fan, gate, light fitting) have prices that vary 10-40× by product spec — never guess. When in doubt, route to submit_rfq so admin can confirm the actual product before quoting.
+- MEASUREMENT PHOTOS (area-priced trades only): When a customer sends a photo to MEASURE an area-priced job (painting, tiling, flooring, etc.) and it contains a SIZE REFERENCE placed flat on the wall or floor — a standard A4 sheet (long edge 0.297 m, short edge 0.21 m) or a bank/ID card (long edge 0.0856 m) — use that object as a ruler: estimate how many reference-object lengths span the WIDTH and how many span the HEIGHT, multiply each count by the reference length to get the width and length in metres, read the resulting area back to the customer to confirm, then call create_booking with length_m and width_m. If NO reference object is visible in the photo, do NOT guess a size — ask them to place an A4 sheet or bank card flat against the surface and resend, or offer the tiles/steps/arm-spans method instead. Always add that the artisan re-measures on site and confirms the final price before any work starts.
 - PHOTO RECEIPT & NEXT STEPS (CRITICAL — NEVER STAY SILENT): The moment a customer sends a photo, your reply MUST begin by confirming you received it (e.g. "Thanks, I've got your photo."). Never ignore a photo or leave the customer without a reply after they send one. Once you have everything needed and have created the booking or RFQ, ALWAYS tell the customer what happens next so they are never left waiting: for a fixed-price booking, explain that the nearest available artisan will be notified to accept, and once they accept the customer pays securely to confirm (payment held in escrow until the job is done); for an RFQ, explain that our team will review and send a detailed quote shortly, and once the customer accepts the quote and an artisan accepts the job they pay to confirm. Always end by inviting them to ask any questions.
 - For emergencies, emphasise urgency and prioritise booking creation (still ask for photo but don't delay)
 - When a booking is created, always mention the estimated cost and payment options
@@ -8518,6 +8534,7 @@ async function handleMessage(session, userMessage, imageDataUrl) {
 
     // Inject pending-rating hint so the AI knows to prompt the customer
     const sysMessages = [{ role: 'system', content: SYSTEM_PROMPT }];
+    { const _dateMsg = currentDateSystemMessage(); if (_dateMsg) sysMessages.push(_dateMsg); }
 
     // Personalize: tell Lizzy the customer's first name so she greets them by
     // name and uses it once more during the chat (feels human, not robotic).
@@ -8932,6 +8949,7 @@ async function handleMessage(session, userMessage, imageDataUrl) {
           max_tokens: 500,
           messages: [
             { role: 'system', content: SYSTEM_PROMPT },
+            ...(currentDateSystemMessage() ? [currentDateSystemMessage()] : []),
             ...session.messages,
           ],
           tools: waTools,
@@ -8947,6 +8965,7 @@ async function handleMessage(session, userMessage, imageDataUrl) {
             max_tokens: 300,
             messages: [
               { role: 'system', content: SYSTEM_PROMPT },
+              ...(currentDateSystemMessage() ? [currentDateSystemMessage()] : []),
               ...session.messages,
             ],
             tool_choice: 'none',
