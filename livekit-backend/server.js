@@ -4493,11 +4493,23 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       const now = new Date().toISOString();
       const variationId = (pending && pending.id) || null;
 
+      // Work out who keeps what BEFORE marking the entry paid (see _variationSplit).
+      let feeFrac = 0.35;
+      try {
+        const catName = String(bData.category_name || bData.category || '').trim();
+        if (catName) {
+          const cs = await firestore.collection('categories').where('name', '==', catName).limit(1).get();
+          const pct = cs.empty ? NaN : Number((cs.docs[0].data() || {}).platform_fee_percent);
+          if (!Number.isNaN(pct) && pct > 0) feeFrac = pct > 1 ? pct / 100 : pct;
+        }
+      } catch (_) {}
+      const settlement = pending ? _variationSplit(pending, payAmount, feeFrac) : null;
+
       // Mark the matched variation entry paid; clear the pending flags.
       const updatedVariations = variations.map(v => {
         if (v && ((variationId && v.id === variationId) ||
             (!variationId && v.status === 'pending_client_approval'))) {
-          return { ...v, status: 'paid', paid_at: now, paid_by: actorUid };
+          return { ...v, status: 'paid', paid_at: now, paid_by: actorUid, ...(settlement ? { settlement } : {}) };
         }
         return v;
       });
@@ -4537,19 +4549,58 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         }
       }
 
-      // Ledger entry for the top-up.
+      // Ledger entry for the top-up (profit = the platform's share).
       await firestore.collection('transactionLogs').add({
         booking_id: bid,
+        tasks_management_id: bid,
         user_id: actorUid,
         amount: payAmount.toFixed(2),
         payment_method: 'wallet',
         payment_type: 'variation',
         variation_id: variationId,
         status: 'success',
+        ...(settlement ? {
+          profit: settlement.platform_total.toFixed(2),
+          artisan_amount: settlement.artisan_total.toFixed(2),
+        } : {}),
         wallet_balance_before: walletBalance.toFixed(2),
         wallet_balance_after: newBalance.toFixed(2),
         created_at: admin.firestore.FieldValue.serverTimestamp(),
       });
+
+      // Credit the artisan's share (reimbursement + earnings). Idempotent via a
+      // per-variation artisan_earnings ledger doc; a failure never blocks the
+      // client's payment, it is logged for manual reconciliation.
+      if (settlement && settlement.artisan_total > 0) {
+        try {
+          const artisanKeyId = String(bData.service_provider_id || bData.artisan_id || bData.artisanId || '').trim();
+          const spRef = await _resolveServiceProviderRef(firestore, artisanKeyId);
+          if (spRef) {
+            const ledgerRef = firestore.collection('artisan_earnings')
+              .doc(`${artisanKeyId}__${bData.order_no || bid}__var_${variationId || now}`);
+            await firestore.runTransaction(async (t) => {
+              const [ls, sp] = await Promise.all([t.get(ledgerRef), t.get(spRef)]);
+              if (ls.exists || !sp.exists) return;
+              const cur = parseFloat(String((sp.data() || {}).balance || '0').replace(/[^0-9.\-]/g, '')) || 0;
+              t.update(spRef, {
+                balance: (Math.round((cur + settlement.artisan_total) * 100) / 100).toFixed(2),
+                balance_updated_at: now,
+              });
+              t.set(ledgerRef, {
+                id: ledgerRef.id, artisan_id: artisanKeyId, order_no: String(bData.order_no || bid),
+                kind: 'variation', variation_id: variationId, cost: payAmount,
+                platform_fee_percent: settlement.platform_fee_percent,
+                earning: settlement.artisan_total, settlement,
+                paid: false, credited_at: now, source: 'variation_settlement',
+              });
+            });
+          } else {
+            console.warn('[settle_variation] artisan provider doc not found for', artisanKeyId, '- earning NOT credited', bid);
+          }
+        } catch (e) {
+          console.warn('[settle_variation] artisan credit failed (needs manual reconcile):', bid, e.message);
+        }
+      }
 
       // Notify the artisan that the extra work is funded so they can proceed.
       // The artisan inbox filters on user_id == auth uid AND user_type ==
@@ -14145,6 +14196,40 @@ async function _maybeBuildWeeklyBatch(force = false) {
 // payouts (manual per-job OR weekly batch) are reflected without double-paying.
 const ARTISAN_ACCRUAL_START_MS = Date.parse('2026-10-01T00:00:00Z');
 
+// serviceProvider docs are keyed by a UUID, but in-app orders store the
+// artisan's AUTH uid in service_provider_id - resolve either form.
+async function _resolveServiceProviderRef(firestore, artisanId) {
+  const id = String(artisanId || '').trim();
+  if (!id) return null;
+  const direct = firestore.collection('serviceProvider').doc(id);
+  if ((await direct.get()).exists) return direct;
+  const q = await firestore.collection('serviceProvider').where('uid', '==', id).limit(1).get();
+  return q.empty ? null : q.docs[0].ref;
+}
+
+// Who gets what from a paid in-field variation (materials x1.5 + fees):
+//  - materials: artisan is reimbursed their cost AND earns 40% of cost on top;
+//    the platform keeps the remaining 10% of cost (the 1.5x markup = 40% + 10%).
+//  - sourcing + call-out fees are labour-type: split with the category platform fee.
+function _variationSplit(entry, payAmount, feeFraction) {
+  const money = v => Math.round((Number(v) || 0) * 100) / 100;
+  const base = money(entry && entry.material_base);
+  const fees = money((entry && entry.sourcing_fee) || 0) + money((entry && entry.callout_fee) || 0);
+  const artisanMaterialProfit = money(base * 0.40);
+  const artisanFees = money(fees * (1 - feeFraction));
+  let artisanTotal = money(base + artisanMaterialProfit + artisanFees);
+  if (artisanTotal > payAmount) artisanTotal = money(payAmount);
+  const platformTotal = money(payAmount - artisanTotal);
+  return {
+    material_reimbursement: base,
+    artisan_material_profit: artisanMaterialProfit,
+    artisan_fee_share: artisanFees,
+    artisan_total: artisanTotal,
+    platform_total: platformTotal,
+    platform_fee_percent: feeFraction,
+  };
+}
+
 function _artisanJobTimeMs(x) {
   const c = x.completion_date || x.closed_date || x.updated_at || x.created_at || x.creation_date || x.date || '';
   const t = Date.parse(String(c));
@@ -14199,10 +14284,15 @@ async function _sweepArtisanEarnings(firestore) {
 
     let credited = 0, creditedTotal = 0;
     const balanceDelta = new Map();
+    const spRefByArtisan = new Map();
     for (const [key, g] of groups) {
       if (g.cost <= 0) continue;
       const ledgerRef = firestore.collection('artisan_earnings').doc(key);
       if ((await ledgerRef.get()).exists) continue; // already accrued
+      // In-app orders store the artisan's auth uid, not the serviceProvider doc
+      // id - skip (and retry next sweep) rather than write a ledger row we can't credit.
+      const spRefForJob = await _resolveServiceProviderRef(firestore, g.artisanId);
+      if (!spRefForJob) continue;
       const fee = _artisanFeeFraction(g.data, categoryFeeByName);
       const earning = money(g.cost * (1 - fee));
       if (earning <= 0) continue;
@@ -14213,12 +14303,13 @@ async function _sweepArtisanEarnings(firestore) {
         paid: false, credited_at: new Date().toISOString(), source: 'auto_accrual',
       });
       balanceDelta.set(g.artisanId, money((balanceDelta.get(g.artisanId) || 0) + earning));
+      spRefByArtisan.set(g.artisanId, spRefForJob);
       credited++; creditedTotal = money(creditedTotal + earning);
     }
 
     for (const [artisanId, delta] of balanceDelta) {
       if (delta <= 0) continue;
-      const spRef = firestore.collection('serviceProvider').doc(artisanId);
+      const spRef = spRefByArtisan.get(artisanId) || firestore.collection('serviceProvider').doc(artisanId);
       await firestore.runTransaction(async (t) => {
         const s = await t.get(spRef);
         if (!s.exists) return;
@@ -14237,7 +14328,8 @@ async function _sweepArtisanEarnings(firestore) {
           .where('artisan_id', '==', artisanId).where('paid', '==', false).get();
         if (unpaid.empty) continue;
         const unpaidSum = money(unpaid.docs.reduce((s, d) => s + (Number((d.data() || {}).earning) || 0), 0));
-        const spSnap = await firestore.collection('serviceProvider').doc(artisanId).get();
+        const spReconRef = (await _resolveServiceProviderRef(firestore, artisanId)) || firestore.collection('serviceProvider').doc(artisanId);
+        const spSnap = await spReconRef.get();
         const bal = spSnap.exists ? (parseFloat(String((spSnap.data() || {}).balance || '0').replace(/[^0-9.\-]/g, '')) || 0) : 0;
         let toSettle = money(unpaidSum - bal);
         if (toSettle <= 0) continue;
