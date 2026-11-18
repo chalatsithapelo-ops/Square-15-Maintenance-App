@@ -7,7 +7,7 @@ upload/deploy a minimal set of files to GitHub/Render.
 
 # â”€â”€ Version tag â€” bump this on every deploy so we can verify Render runs the
 # latest code.  Check Render logs for the startup banner.
-WORKER_VERSION = "2026-11-01-multi-wall-sum"
+WORKER_VERSION = "2026-11-18-voice-latency-a4-ttl"
 
 import os
 import sys
@@ -500,7 +500,7 @@ async def entrypoint(ctx: JobContext):
             {
                 'session_id': f'agent-startup-{room_name}',
                 'event': 'agent_entrypoint',
-                'text': f'room={room_name} build=labour-readiness-gate-v2',
+                'text': f'room={room_name} build=voice-latency-a4-ttl',
             }
         ))
     except Exception:
@@ -724,8 +724,8 @@ async def entrypoint(ctx: JobContext):
             "- Painting, tiling, flooring, paving, plastering, waterproofing, ceilings, walls, screeding, laminate, carpet and skirting are priced PER SQUARE METRE, not as a flat price. The amount lookup_service_pricing returns for these is a RATE PER SQUARE METRE.\n"
             "- NEVER read that rate back as the total cost of the job. Say clearly it is 'per square metre'. For example: 'Painting is charged at one hundred and fifty rand per square metre.'\n"
             "- To give a total, you MUST know the area. FIRST ask whether they KNOW the measurements: 'Do you know roughly how many square metres need doing, or the length and width?' If the customer gives a number, you may multiply it yourself to indicate a rough total, and when you create the booking pass that number as area_m2 so the system prices it as rate times area.\n"
-            "- If the customer does NOT know the measurements, DO NOT guess the size and do NOT book at the bare rate. Instead OFFER TO HELP THEM MEASURE right now, the easy way, and let THEM pick the method that suits them. Say: 'No problem - I can help you measure. Whichever is easiest for you: you can count floor tiles, pace it out in steps, or use arm-spans - just tell me the count for the length and for the width.' Then convert their counts to metres YOURSELF using these factors: one standard floor tile is 0.6 metres, one walking step is about 0.75 metres, and one arm-span is about 1.6 metres. Multiply each count by its factor to get the length and the width in metres, multiply length by width to get the area in square metres, then READ BACK the area and the rough total and ask them to confirm before you book. For example: 'Eight tiles long and five tiles wide is about 4.8 by 3 metres - roughly 14 square metres, so about R2100 at R150 per square metre. Shall I book it?' If the job covers MORE THAN ONE wall or room, measure EACH one with them, work out each area, and ADD them together for the TOTAL square metres - read back that combined total before booking. When they confirm, create the booking passing that computed number as area_m2 so the system prices it as rate times area.\n"
-            "- Only if the customer does not want to estimate with you at all, fall back to the app's tool: 'No problem - when I place this, the app will open a quick measuring tool so you can measure the area with your camera for an exact price, or you can let the artisan measure it on site.' In that case create the booking WITHOUT area_m2. Either way the artisan confirms the final price by measuring before any work starts, and the customer only pays once they approve. NEVER book an area-priced job at the bare per-square-metre rate.\n"
+            "- If the customer does NOT know the measurements, DO NOT guess the size and do NOT book at the bare rate. Instead OFFER TO HELP THEM MEASURE right now, the easy way, and let THEM pick the method that suits them. Say: 'No problem - I can help you measure. Whichever is easiest for you: you can count floor tiles, pace it out in steps, use arm-spans, or take a photo with an A4 sheet of paper or a bank card placed flat on the surface as a size reference - just tell me what you would like to do.' If they count tiles, steps or arm-spans, ask for the count for the length and for the width, then convert their counts to metres YOURSELF using these factors: one standard floor tile is 0.6 metres, one walking step is about 0.75 metres, and one arm-span is about 1.6 metres. If they prefer the PHOTO METHOD, tell them: 'Great - when I place this, the app will open the measuring tool; choose the photo option, lay a standard A4 sheet (which is 29.7 centimetres long) or a bank or ID card (which is 8.5 centimetres long) flat on the surface, and snap the photo - the app uses that reference to work out the real size.' Multiply each count by its factor to get the length and the width in metres, multiply length by width to get the area in square metres, then READ BACK the area and the rough total and ask them to confirm before you book. For example: 'Eight tiles long and five tiles wide is about 4.8 by 3 metres - roughly 14 square metres, so about R2100 at R150 per square metre. Shall I book it?' If the job covers MORE THAN ONE wall or room, measure EACH one with them, work out each area, and ADD them together for the TOTAL square metres - read back that combined total before booking. When they confirm, create the booking passing that computed number as area_m2 so the system prices it as rate times area.\n"
+            "- Only if the customer does not want to estimate with you at all, fall back to the app's tool: 'No problem - when I place this, the app will open a quick measuring tool so you can measure the area - count tiles or paces, take a photo with an A4 sheet or bank card as a reference, or type the exact size - for an exact price, or you can let the artisan measure it on site.' In that case create the booking WITHOUT area_m2. Either way the artisan confirms the final price by measuring before any work starts, and the customer only pays once they approve. NEVER book an area-priced job at the bare per-square-metre rate.\n"
             "\n"
             "PRICE ESTIMATE FOR UNPRICED SERVICES:\n"
             "- When no exact pricing is found and an RFQ is needed, FIRST call lookup_service_pricing with a broad query for the category.\n"
@@ -3438,7 +3438,10 @@ async def entrypoint(ctx: JobContext):
 
     agent = voice.Agent(
         vad=vad,
-        stt=openai.STT(model="whisper-1", language="en"),
+        # Streaming transcription (gpt-4o-mini-transcribe) returns partials as the
+        # user speaks, so there is no blocking full-utterance round-trip like
+        # whisper-1 - noticeably snappier replies.
+        stt=openai.STT(model="gpt-4o-mini-transcribe", language="en"),
         llm=openai.LLM(model="gpt-4o-mini", temperature=0.4),
         tts=openai.TTS(model="tts-1", voice="alloy"),
         instructions=_instructions_for_role(caller_role),

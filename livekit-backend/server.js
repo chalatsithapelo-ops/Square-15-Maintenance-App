@@ -7004,12 +7004,16 @@ app.post('/api/voice/start', assistantLimiter, async (req, res) => {
       });
     }
 
-    // 1) Generate access token (server-side) with 15-minute TTL
+    // 1) Generate access token (server-side). TTL must comfortably exceed a
+    // real conversation: LiveKit disconnects the participant when the room
+    // token expires, and the app does not refresh the ROOM token mid-call, so a
+    // short TTL dropped calls after ~15 min and forced a re-tap (which spawned
+    // a second room). 6h covers any single session.
     const at = new AccessToken(env.apiKey, env.apiSecret, {
       identity: participantName,
       name: participantName,
       metadata: enrichedMetadata,
-      ttl: '15m',
+      ttl: '6h',
     });
 
     at.addGrant({
@@ -12988,7 +12992,9 @@ app.post('/api/token', authMiddleware, rateLimitBy('livekit_token', 30, 5 * 60 *
     const env = validateLiveKitEnv(res);
     if (!env) return;
 
-    // Create access token with 15-minute TTL
+    // Create access token. 6h TTL so the room token never expires mid-call
+    // (LiveKit drops the participant on token expiry; the app doesn't refresh
+    // the room token during a session).
     const at = new AccessToken(
       env.apiKey,
       env.apiSecret,
@@ -12996,7 +13002,7 @@ app.post('/api/token', authMiddleware, rateLimitBy('livekit_token', 30, 5 * 60 *
         identity: safeIdentity,
         name: participantName,
         metadata: metadata || '',
-        ttl: '15m',
+        ttl: '6h',
       }
     );
 
