@@ -4552,18 +4552,55 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       });
 
       // Notify the artisan that the extra work is funded so they can proceed.
+      // The artisan inbox filters on user_id == auth uid AND user_type ==
+      // 'artisan', and service_provider_id may be either the serviceProvider doc
+      // id or the auth uid - so tag the inbox doc for BOTH ids and push FCM.
       try {
-        const artisanId = String(bData.artisan_id || bData.artisanId || bData.service_provider_id || (pending && pending.raised_by) || '').trim();
+        const artisanId = String(bData.artisan_id || bData.artisanId || bData.service_provider_id || '').trim();
         if (artisanId) {
-          await firestore.collection('notifications').add({
-            user_id: artisanId,
-            title: 'Extra work approved & paid',
-            message: `The client approved and paid R${payAmount.toFixed(2)} for the extra materials/work. You can now proceed.`,
-            type: 'variation_paid',
-            booking_id: bid,
-            read: false,
-            created_at: admin.firestore.FieldValue.serverTimestamp(),
-          });
+          let providerDoc = await firestore.collection('serviceProvider').doc(artisanId).get();
+          if (!providerDoc.exists) {
+            const q = await firestore.collection('serviceProvider').where('uid', '==', artisanId).limit(1).get();
+            if (!q.empty) providerDoc = q.docs[0];
+          }
+          const pd = providerDoc && providerDoc.exists ? (providerDoc.data() || {}) : {};
+          const recipientIds = new Set([artisanId]);
+          for (const c of [pd.uid, pd.user_id, pd.userId]) {
+            const s = String(c || '').trim();
+            if (s) recipientIds.add(s);
+          }
+          const notifTitle = 'Extra work approved & paid';
+          const notifBody = `The client approved and paid R${payAmount.toFixed(2)} for the extra materials/work. You can now proceed.`;
+          for (const rid of recipientIds) {
+            await firestore.collection('notifications').add({
+              user_id: rid,
+              user_type: 'artisan',
+              title: notifTitle,
+              message: notifBody,
+              type: 'variation_paid',
+              booking_id: bid,
+              read: false,
+              view: false,
+              created_at: admin.firestore.FieldValue.serverTimestamp(),
+            });
+          }
+          const tokens = new Set();
+          for (const c of [pd.deviceToken, pd.device_token, pd.fcm_token, pd.fcmToken, pd.token, pd.push_token]) {
+            const t = String(c || '').trim();
+            if (t) tokens.add(t);
+          }
+          for (const tok of tokens) {
+            try {
+              await admin.messaging().send({
+                token: tok,
+                notification: { title: notifTitle, body: notifBody },
+                data: { type: 'variation_paid', booking_id: bid, tasks_management_id: bid, user_type: 'artisan' },
+                android: { priority: 'high', notification: { channelId: 'order_request_channel', sound: 'sound' } },
+              });
+            } catch (pushErr) {
+              console.warn('[settle_variation] artisan push failed:', pushErr.message);
+            }
+          }
         }
       } catch (e) {
         console.warn('[settle_variation] artisan notify failed (non-fatal):', e.message);
