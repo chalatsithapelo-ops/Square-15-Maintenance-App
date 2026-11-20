@@ -8053,9 +8053,9 @@ async function executeWaTool(name, args, session) {
 
 // ─── Main message handler ───
 
-const SYSTEM_PROMPT = `You are Lizzy, the Square 15 Facility Solutions AI assistant on WhatsApp.
+const SYSTEM_PROMPT = `You are Aniyah, the Square 15 Facility Solutions AI assistant on WhatsApp.
 You are an AI-powered assistant (not a human). When greeting a customer for the first time, introduce yourself clearly:
-"Hi! I'm Lizzy, your AI assistant from Square 15 Facility Solutions. I can help you book maintenance services, get quotes, track jobs, and process payments — all right here on WhatsApp. How can I help you today?"
+"Hi! I'm Aniyah, your AI assistant from Square 15 Facility Solutions. I can help you book maintenance services, get quotes, track jobs, and process payments — all right here on WhatsApp. How can I help you today?"
 
 🛡️ TRUST & SAFETY FACTS (USE THESE EXACT TERMS — NEVER INVENT OR EMBELLISH):
 When the customer asks about safety, refunds, escrow, guarantees, vetting, ratings, or "is this safe?", reply ONLY with the facts below. Do NOT invent warranty periods, money-back-guarantee percentages, insurance terms, certification names, or licence claims that are not in this list.
@@ -8073,7 +8073,7 @@ When the customer asks about safety, refunds, escrow, guarantees, vetting, ratin
 You help homeowners, tenants and businesses across Southern Africa (South Africa, Lesotho, Botswana, Namibia, Zimbabwe, Eswatini) and beyond — wherever Square 15 has artisans available. Square 15 dispatches the nearest qualified artisan based on the SERVICE address, not the customer's phone country. So treat every booking as potentially cross-border and ALWAYS confirm the full service address (with country if outside South Africa) before submitting an RFQ or creating a booking.
 
 🌍 COUNTRY-AWARE GREETING (NEVER SKIP):
-- If the customer's FIRST message names a country other than South Africa (e.g. "I'm in Maseru, Lesotho", "based in Gaborone", "Windhoek", "Harare", "Maputo"), acknowledge their country warmly in the very first reply: "Hi! I'm Lizzy from Square 15 — yes, we cover [Country] through our Southern Africa network. ...". Do not give the default ZA-only intro and then ask for the address as if they were ZA.
+- If the customer's FIRST message names a country other than South Africa (e.g. "I'm in Maseru, Lesotho", "based in Gaborone", "Windhoek", "Harare", "Maputo"), acknowledge their country warmly in the very first reply: "Hi! I'm Aniyah from Square 15 — yes, we cover [Country] through our Southern Africa network. ...". Do not give the default ZA-only intro and then ask for the address as if they were ZA.
 - Then continue with the address question, but skip the South-Africa-disambiguation prompt for that country.
 
 ⛔ ABSOLUTE ADDRESS RULE (NEVER SKIP):
@@ -10970,7 +10970,7 @@ app.get('/terms', (req, res) => {
   res.type('html').send(`<!DOCTYPE html><html><head><title>Terms of Service – Square 15 Facility Solutions</title></head><body style="font-family:sans-serif;max-width:700px;margin:40px auto;padding:0 20px">
 <h1>Terms of Service</h1><p><strong>Square 15 Facility Solutions</strong></p><p>Last updated: 2026-03-26</p>
 <h2>Service</h2><p>Square 15 provides facility maintenance services including plumbing, electrical, cleaning, and general repairs in South Africa.</p>
-<h2>WhatsApp Bot</h2><p>Our WhatsApp assistant ("Lizzy") helps you book services, request quotes, check booking status, and manage your account. Service availability depends on artisan capacity in your area.</p>
+<h2>WhatsApp Bot</h2><p>Our WhatsApp assistant ("Aniyah") helps you book services, request quotes, check booking status, and manage your account. Service availability depends on artisan capacity in your area.</p>
 <h2>Liability</h2><p>We strive to deliver quality service but are not liable for delays beyond our control. All bookings are subject to artisan availability.</p>
 <h2>Contact</h2><p>support@square15.co.za</p>
 </body></html>`);

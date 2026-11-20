@@ -7,7 +7,7 @@ upload/deploy a minimal set of files to GitHub/Render.
 
 # â”€â”€ Version tag â€” bump this on every deploy so we can verify Render runs the
 # latest code.  Check Render logs for the startup banner.
-WORKER_VERSION = "2026-11-18-voice-latency-a4-ttl"
+WORKER_VERSION = "2026-11-20-rename-aniyah"
 
 import os
 import sys
@@ -601,7 +601,7 @@ async def entrypoint(ctx: JobContext):
         role = (role or "client").strip().lower()
 
         base = (
-            f"You are Lizzy, the Square 15 Voice AI Assistant, speaking to a {role.upper()} user.\n\n"
+            f"You are Aniyah, the Square 15 Voice AI Assistant, speaking to a {role.upper()} user.\n\n"
             "HARD RULES - THESE OVERRIDE EVERYTHING BELOW. NEVER BREAK THEM:\n"
             "1. NEVER say a price (no rand amount, no 'about', no 'around', no range) unless you have ALREADY called lookup_service_pricing in THIS conversation for THIS service and are reading the amount it returned. If a customer asks the price and you have not called the tool yet, say 'Let me check that for you' and call lookup_service_pricing FIRST, then speak only the amount it returns. If you have not called the tool, you do NOT know the price - do not guess, estimate, or recall a number from memory. Stating any price you did not just get from the tool is a serious error.\n"
             "2. NEVER create a booking or open the booking/photo screen (create_booking, create_order_booking, or ui_navigate with action='open_rfq_upload' or action='create_order_booking') until you have, IN THIS ORDER, actually asked the customer and heard their answer for: (a) WHERE the job is (service location), AND (b) WHEN they want it done (a specific day/time, or they clearly said as-soon-as-possible/urgent). You must ASK 'When would you like the appointment - as soon as possible, or a specific day and time?' and WAIT for their reply. NEVER assume the date or time, and NEVER default to now unless the customer clearly said now/asap/urgent. Creating a booking without having asked WHEN is a serious error.\n"
@@ -3959,15 +3959,15 @@ async def entrypoint(ctx: JobContext):
             # Opened by a status push: lead with an update, do NOT re-introduce
             # or ask "how can I help". The app follows with the specific update.
             greeting = (
-                f"Hi {caller_name}, it's Lizzy. I have an update for you on your booking."
+                f"Hi {caller_name}, it's Aniyah. I have an update for you on your booking."
                 if caller_name
-                else "Hi, it's Lizzy. I have an update for you on your booking."
+                else "Hi, it's Aniyah. I have an update for you on your booking."
             )
         else:
             greeting = (
-                f"Hi {caller_name}, I am Lizzy, how can I help you today?"
+                f"Hi {caller_name}, I am Aniyah, how can I help you today?"
                 if caller_name
-                else "Hi, I am Lizzy, how can I help you today?"
+                else "Hi, I am Aniyah, how can I help you today?"
             )
         _greeting_handle = session.say(greeting, allow_interruptions=True)
         logger.info(f"âœ… Greeting sent (name={'yes' if caller_name else 'no'}, push={app_context_is_push or bool(app_context_focus_booking_id)})")
