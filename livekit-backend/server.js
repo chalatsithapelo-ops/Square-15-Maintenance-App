@@ -4746,6 +4746,12 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     let progressStage = '';
     let buyingMaterial = '';
     let artisanImages = '';
+    // Live, authoritative amounts from tasksManagement so Aniyah never speaks a
+    // stale futureBookings estimate (e.g. after an on-site re-measure changes
+    // the price or when a deposit/balance split applies).
+    let liveTotalPrice = '';
+    let amountDue = '';
+    let amountDueLabel = '';
     try {
       const tmId = String(data.tasks_management_id || '').trim();
       let tmData = null;
@@ -4779,6 +4785,30 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         } else {
           progressStage = 'pending';
         }
+
+        // Compute the live total + exact amount still owed.
+        const num = (v) => {
+          const n = parseFloat(String(v == null ? '' : v).replace(/[^0-9.\-]/g, ''));
+          return Number.isFinite(n) ? n : 0;
+        };
+        const liveCost = num(tmData.actual_cost) > 0 ? num(tmData.actual_cost)
+          : (num(tmData.cost) > 0 ? num(tmData.cost) : num(data.cost || data.total_price || data.quoted_price || data.price));
+        if (liveCost > 0) liveTotalPrice = liveCost.toFixed(2);
+        const ps = String(tmData.payment_status || data.payment_status || '').toLowerCase();
+        const depositPaid = tmData.deposit_paid === true || ps === 'deposit_paid';
+        const balancePaid = tmData.balance_paid === true;
+        if (ps === 'paid' || balancePaid) {
+          amountDue = '0.00';
+          amountDueLabel = 'paid in full';
+        } else if (depositPaid) {
+          let bal = num(tmData.balance_amount) || num(tmData.balance_remaining);
+          if (bal <= 0 && liveCost > 0) bal = Math.round(liveCost * 0.65 * 100) / 100;
+          amountDue = bal.toFixed(2);
+          amountDueLabel = 'remaining balance';
+        } else if (liveCost > 0) {
+          amountDue = liveCost.toFixed(2);
+          amountDueLabel = 'full amount';
+        }
       }
     } catch (e) { console.warn('\u26a0\ufe0f progress enrich:', e.message); }
 
@@ -4793,7 +4823,9 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         scheduled_date: String(data.scheduled_date || ''),
         scheduled_time: String(data.scheduled_time || ''),
         payment_status: String(data.payment_status || ''),
-        total_price: String(data.total_price || data.quoted_price || data.price || data.cost || '').trim(),
+        total_price: String(liveTotalPrice || data.total_price || data.quoted_price || data.price || data.cost || '').trim(),
+        amount_due: amountDue,
+        amount_due_label: amountDueLabel,
         artisan_confirmed: String(data.artisan_confirmed || ''),
         service_provider_id: artisanId,
         artisan: artisanInfo,

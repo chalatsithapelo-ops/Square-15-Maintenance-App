@@ -7,7 +7,7 @@ upload/deploy a minimal set of files to GitHub/Render.
 
 # â”€â”€ Version tag â€” bump this on every deploy so we can verify Render runs the
 # latest code.  Check Render logs for the startup banner.
-WORKER_VERSION = "2026-11-20-rename-aniyah"
+WORKER_VERSION = "2026-11-21-latency-amountdue"
 
 import os
 import sys
@@ -1113,6 +1113,8 @@ async def entrypoint(ctx: JobContext):
             scheduled_time = data.get('scheduled_time', '')
             artisan_confirmed = data.get('artisan_confirmed', '')
             price = data.get('total_price', '')
+            amount_due = str(data.get('amount_due', '') or '').strip()
+            amount_due_label = str(data.get('amount_due_label', '') or '').strip()
             address = data.get('service_address', '')
             rfq_no = data.get('rfq_no', '')
             rfq_status = data.get('rfq_status', '')
@@ -1130,6 +1132,14 @@ async def entrypoint(ctx: JobContext):
                 response += f" Scheduled for {scheduled_date}."
             if price:
                 response += f" Price: R{price}."
+            # Speak the EXACT amount still owed (live from tasksManagement) so the
+            # amount Aniyah says always matches what the payment screen will charge.
+            if amount_due and amount_due_label and amount_due_label != 'paid in full':
+                try:
+                    if float(amount_due) > 0:
+                        response += f" Amount due now: the {amount_due_label} of R{amount_due}."
+                except Exception:
+                    pass
             if rfq_no:
                 response += f" RFQ #{rfq_no}, RFQ status: {rfq_status}."
 
@@ -3510,10 +3520,10 @@ async def entrypoint(ctx: JobContext):
             get_fraud_alerts_report,
         ],
         # --- Latency optimizations ---
-        min_endpointing_delay=0.5,       # default 0.5 â€” faster turn completion
-        max_endpointing_delay=2.0,        # default 3.0 â€” don't wait too long
+        min_endpointing_delay=0.3,       # start responding sooner after the caller stops
+        max_endpointing_delay=2.0,        # don't wait too long on trailing pauses
         preemptive_generation=True,        # start LLM+TTS before turn confirmed
-        min_interruption_duration=0.8,     # default 0.5 â€” faster interruption
+        min_interruption_duration=0.6,     # let the caller barge in quickly
     )
 
     # Guardrail: never allow internal/tool narration to reach TTS.
