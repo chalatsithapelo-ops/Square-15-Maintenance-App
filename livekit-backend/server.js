@@ -4167,6 +4167,139 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     }
   }
 
+  // -- Settle on-site measurement re-approval (approve AND pay the difference) --
+  // When the artisan re-measures and the price goes UP, the client must pay the
+  // difference into escrow NOW (at approval), not after the work is done. This
+  // charges the wallet for (actual_cost - already_paid); if the wallet is short
+  // it returns needs_payment so the app opens a card/EFT payment for the diff.
+  // A price DROP is refunded via settle_measurement_overcharge instead.
+  if (action === 'settle_measurement_reapproval') {
+    try {
+      const bid = bookingId || String(payload.tasks_management_id || payload.booking_id || '').trim();
+      if (!bid) return { ok: false, status: 400, error: 'missing_booking_id' };
+      if (!actorUid) return { ok: false, status: 401, error: 'unauthorized' };
+
+      const tmRef = firestore.collection('tasksManagement').doc(bid);
+      const tmSnap = await tmRef.get();
+      if (!tmSnap.exists) return { ok: false, status: 404, error: 'booking_not_found' };
+      const tm = tmSnap.data() || {};
+      const ownerUid = String(tm.user_id || tm.userId || '').trim();
+      if (actorRole !== 'admin' && ownerUid && ownerUid !== actorUid) {
+        return { ok: false, status: 403, error: 'forbidden' };
+      }
+
+      const actualCost = toNumber(tm.actual_cost) ?? toNumber(tm.cost) ?? 0;
+      // What the client has already paid toward this job.
+      let paidAmount = 0;
+      try {
+        const txq = await firestore.collection('transactionLogs')
+          .where('tasks_management_id', '==', bid)
+          .where('subtype', '==', 'service_payment')
+          .where('status', '==', 'success')
+          .limit(1).get();
+        if (!txq.empty) paidAmount = toNumber(txq.docs[0].data().amount) ?? 0;
+      } catch (_) {}
+      const ps = String(tm.payment_status || '').toLowerCase();
+      if (paidAmount <= 0) {
+        if (ps === 'paid') {
+          paidAmount = toNumber(tm.paid_amount) ?? toNumber(tm.estimate_cost) ?? toNumber(tm.cost) ?? 0;
+        } else if (ps === 'deposit_paid' || tm.deposit_paid === true) {
+          paidAmount = toNumber(tm.deposit_amount) ?? 0;
+        }
+      }
+
+      const diff = Math.round((actualCost - paidAmount) * 100) / 100;
+      const userId = ownerUid || actorUid;
+
+      async function notifyArtisanApproved(extra) {
+        try {
+          const artisanKeyId = String(tm.service_provider_id || tm.artisan_id || tm.artisanId || '').trim();
+          const spRef = await _resolveServiceProviderRef(firestore, artisanKeyId);
+          const pd = spRef ? ((await spRef.get()).data() || {}) : {};
+          const rids = new Set([artisanKeyId]);
+          for (const c of [pd.uid, pd.user_id, pd.userId]) { const s = String(c || '').trim(); if (s) rids.add(s); }
+          const title = 'Updated price approved';
+          const body = extra || 'The customer approved the updated price. You may start the job.';
+          for (const rid of rids) {
+            await firestore.collection('notifications').add({
+              user_id: rid, user_type: 'artisan', title, message: body,
+              type: 'measurement_reapproval_result', booking_id: bid, tasks_management_id: bid,
+              read: false, view: false, created_at: admin.firestore.FieldValue.serverTimestamp(),
+            });
+          }
+          const tokens = new Set();
+          for (const c of [pd.deviceToken, pd.device_token, pd.fcm_token, pd.fcmToken, pd.token, pd.push_token]) { const t = String(c || '').trim(); if (t) tokens.add(t); }
+          for (const tok of tokens) {
+            try {
+              await admin.messaging().send({
+                token: tok, notification: { title, body },
+                data: { type: 'measurement_reapproval_result', booking_id: bid, tasks_management_id: bid, user_type: 'artisan' },
+                android: { priority: 'high', notification: { channelId: 'order_request_channel', sound: 'sound' } },
+              });
+            } catch (_) {}
+          }
+        } catch (e) { console.warn('[reapproval] artisan notify:', e.message); }
+      }
+
+      // Price unchanged (within a cent) → just confirm approval.
+      if (Math.abs(diff) <= 0.01) {
+        await tmRef.set({ customer_approved: true, ops_flagged: false, updated_at: now }, { merge: true });
+        await notifyArtisanApproved();
+        return { ok: true, status: 200, data: { direction: 'none', bookingId: bid } };
+      }
+
+      // Price dropped → delegate to the refund path (keeps one source of truth).
+      if (diff < 0) {
+        await tmRef.set({ customer_approved: true, ops_flagged: false, updated_at: now }, { merge: true });
+        await notifyArtisanApproved();
+        return { ok: true, status: 200, data: { direction: 'refund_pending', amount: Math.abs(diff), bookingId: bid } };
+      }
+
+      // Price increased → the client must pay the difference NOW.
+      const userRef = firestore.collection('users').doc(userId);
+      const userSnap = await userRef.get();
+      const walletBalance = parseFloat((userSnap.data() || {}).balance || (userSnap.data() || {}).wallet_balance || '0');
+      if (walletBalance >= diff) {
+        let newBalance;
+        await firestore.runTransaction(async (t) => {
+          const fresh = await t.get(userRef);
+          const cur = parseFloat((fresh.data() || {}).balance || '0');
+          if (cur < diff) throw new Error(`Insufficient wallet balance. You have R${cur.toFixed(2)} but need R${diff.toFixed(2)}.`);
+          newBalance = Math.round((cur - diff) * 100) / 100;
+          t.update(userRef, { balance: newBalance.toFixed(2), updated_at: now });
+        });
+        await tmRef.set({
+          customer_approved: true, ops_flagged: false,
+          payment_status: 'paid', payment_type: 'full',
+          deposit_paid: true, balance_paid: true, balance_amount: 0,
+          paid_amount: actualCost.toFixed(2),
+          reapproval_paid: true, reapproval_paid_at: now, updated_at: now,
+        }, { merge: true });
+        await firestore.collection('transactionLogs').add({
+          booking_id: bid, tasks_management_id: bid, user_id: userId,
+          amount: diff.toFixed(2), payment_method: 'wallet', payment_type: 'measurement_difference',
+          subtype: 'measurement_difference', status: 'success',
+          wallet_balance_before: walletBalance.toFixed(2), wallet_balance_after: newBalance.toFixed(2),
+          created_at: admin.firestore.FieldValue.serverTimestamp(),
+        });
+        await notifyArtisanApproved(`The customer approved and PAID the updated price of R${actualCost.toFixed(2)}. You may start the job.`);
+        return { ok: true, status: 200, data: { direction: 'charged', amount: diff, new_balance: newBalance, bookingId: bid } };
+      }
+
+      // Wallet short → do NOT approve yet; stage the difference as a balance so
+      // the app's payment sheet can collect it by card/EFT/wallet top-up.
+      await tmRef.set({
+        payment_type: 'deposit', deposit_paid: true,
+        deposit_amount: paidAmount, balance_amount: diff, balance_paid: false,
+        customer_approved: false, reapproval_payment_required: true, updated_at: now,
+      }, { merge: true });
+      return { ok: true, status: 200, data: { direction: 'needs_payment', amount: diff, wallet_balance: walletBalance, bookingId: bid } };
+    } catch (e) {
+      return { ok: false, status: 500, error: 'reapproval_settlement_failed', debug: String((e && e.message) || e) };
+    }
+  }
+
+
   // -- Pay with Wallet --
   if (action === 'pay_with_wallet') {
     try {
@@ -4403,6 +4536,42 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
           console.warn('[pay_with_wallet] promo redemption record failed (non-fatal):', e.message);
         }
       }
+
+      // Notify the artisan that the client has paid (push + in-app inbox) so
+      // they know money is in escrow and can proceed. Resolves the artisan by
+      // serviceProvider doc id OR auth uid; never blocks the client's payment.
+      try {
+        const payLabel = updateData.payment_status === 'deposit_paid'
+          ? 'deposit' : (depositAlreadyPaid ? 'balance' : 'full payment');
+        const artisanKeyId = String(bData.service_provider_id || bData.artisan_id || bData.artisanId || '').trim();
+        if (artisanKeyId) {
+          const spRef = await _resolveServiceProviderRef(firestore, artisanKeyId);
+          const pd = spRef ? ((await spRef.get()).data() || {}) : {};
+          const rids = new Set([artisanKeyId]);
+          for (const c of [pd.uid, pd.user_id, pd.userId]) { const s = String(c || '').trim(); if (s) rids.add(s); }
+          const orderLabel = String(bData.order_no || bid);
+          const title = 'Payment received';
+          const body = `The client paid the ${payLabel} of R${payAmount.toFixed(2)} for booking #${orderLabel}. It's held safely in escrow — you may proceed.`;
+          for (const rid of rids) {
+            await firestore.collection('notifications').add({
+              user_id: rid, user_type: 'artisan', title, message: body,
+              type: 'payment_received', booking_id: bid, tasks_management_id: bid,
+              read: false, view: false, created_at: admin.firestore.FieldValue.serverTimestamp(),
+            });
+          }
+          const tokens = new Set();
+          for (const c of [pd.deviceToken, pd.device_token, pd.fcm_token, pd.fcmToken, pd.token, pd.push_token]) { const t = String(c || '').trim(); if (t) tokens.add(t); }
+          for (const tok of tokens) {
+            try {
+              await admin.messaging().send({
+                token: tok, notification: { title, body },
+                data: { type: 'payment_received', booking_id: bid, tasks_management_id: bid, user_type: 'artisan' },
+                android: { priority: 'high', notification: { channelId: 'order_request_channel', sound: 'sound' } },
+              });
+            } catch (_) {}
+          }
+        }
+      } catch (e) { console.warn('[pay_with_wallet] artisan notify (non-fatal):', e.message); }
 
       return { ok: true, status: 200, data: {
         message: `Payment of R${payAmount.toFixed(2)} completed from your wallet. Remaining balance: R${newBalance.toFixed(2)}.`,
@@ -12277,12 +12446,17 @@ Thank you for choosing Square 15! 🛠️`;
     }
   }
 
-  // -- Notify artisan via push notification --
+  // -- Notify artisan via push notification (works for card, EFT, BNPL — any
+  //    gateway payment that lands here, not just wallet) --
   try {
     const artisanId = (taskData.service_provider_id || '').toString().trim();
     if (artisanId) {
-      const artisanDoc = await admin.firestore().collection('serviceProvider').doc(artisanId).get();
-      if (artisanDoc.exists) {
+      // Resolve by serviceProvider doc id OR auth uid (in-app orders store the
+      // auth uid in service_provider_id), so the push + inbox always reach the
+      // artisan regardless of how the booking was created.
+      const artisanRef = await _resolveServiceProviderRef(admin.firestore(), artisanId);
+      const artisanDoc = artisanRef ? await artisanRef.get() : null;
+      if (artisanDoc && artisanDoc.exists) {
         const ad = artisanDoc.data() || {};
         // Collect all possible FCM token fields
         const tokenCandidates = [ad.deviceToken, ad.device_token, ad.fcm_token, ad.fcmToken, ad.token, ad.push_token];
@@ -12294,6 +12468,13 @@ Thank you for choosing Square 15! 🛠️`;
             tokensSeen.add(t);
             artisanTokens.push(t);
           }
+        }
+        // Inbox docs must be keyed by the artisan's AUTH uid (their app queries
+        // user_id == auth uid); include the doc id too for older mappings.
+        const recipientIds = new Set([artisanId]);
+        for (const c of [ad.uid, ad.user_id, ad.userId]) {
+          const s = String(c || '').trim();
+          if (s) recipientIds.add(s);
         }
         const orderLabel = taskData.order_no || fbId;
         const totalForArtisan = parseFloat(taskData.total_cost) || parseFloat(taskData.cost) || 0;
@@ -12325,27 +12506,28 @@ Thank you for choosing Square 15! 🛠️`;
               data: { type: 'payment_received', booking_id: fbId, tasks_management_id: bookingId, user_type: 'artisan' },
               android: { priority: 'high', notification: { channelId: 'order_request_channel', sound: 'sound' } },
             });
-            console.log(`? [processPayment] Artisan ${artisanId} notified via token ${tok.substring(0, 15)}...`);
             // Send to ALL tokens so multi-device artisans get notified everywhere
           } catch (singleErr) {
             console.warn(`[processPayment] FCM token failed for artisan ${artisanId}: ${singleErr.message}`);
           }
         }
-        // Also write in-app notification for artisan
-        try {
-          await admin.firestore().collection('notifications').add({
-            user_id: artisanId,
-            user_type: 'artisan',
-            title,
-            message: body,
-            booking_id: fbId,
-            tasks_management_id: bookingId,
-            type: 'payment_received',
-            read: false,
-            view: false,
-            created_at: now,
-          });
-        } catch (_) {}
+        // In-app inbox notification for the artisan (all candidate ids).
+        for (const rid of recipientIds) {
+          try {
+            await admin.firestore().collection('notifications').add({
+              user_id: rid,
+              user_type: 'artisan',
+              title,
+              message: body,
+              booking_id: fbId,
+              tasks_management_id: bookingId,
+              type: 'payment_received',
+              read: false,
+              view: false,
+              created_at: now,
+            });
+          } catch (_) {}
+        }
       }
     }
   } catch (artErr) {
