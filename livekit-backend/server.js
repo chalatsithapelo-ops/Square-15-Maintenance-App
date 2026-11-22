@@ -978,6 +978,8 @@ const ACTION_TIERS = Object.freeze({
   settle_variation: 'B',
   // Client declines an artisan-raised variation (notifies artisan + admin).
   decline_variation: 'B',
+  // Client pays an artisan-raised variation by card/EFT/BNPL (PayFast link).
+  request_variation_payment_link: 'B',
   // On-site re-measurement settlement. reapproval = approve + pay the price
   // difference (wallet deduction or stage a balance); overcharge = refund the
   // customer when the re-measure came out cheaper. Tier B = normal state
@@ -5181,6 +5183,101 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       return { ok: true, status: 200, data: { declined: true, amount: declinedAmount, variation_pending: stillPending, bookingId: bid } };
     } catch (err) {
       return { ok: false, status: 500, error: `decline_variation_error: ${err.message}` };
+    }
+  }
+
+  // Client chooses to pay an artisan-raised variation by CARD / INSTANT EFT /
+  // BNPL (wallet uses settle_variation instead). Builds a PayFast link for the
+  // variation amount tagged custom_str1='variation_<bid>__<variationId>' so the
+  // ITN webhook settles THAT variation (not the main booking) on success.
+  if (action === 'request_variation_payment_link') {
+    try {
+      const bid = bookingId || String(payload.tasks_management_id || payload.booking_id || '').trim();
+      if (!bid) return { ok: false, status: 400, error: 'missing_booking_id' };
+      if (!actorUid) return { ok: false, status: 401, error: 'unauthorized' };
+
+      let bData = null;
+      {
+        const fb = await firestore.collection('futureBookings').doc(bid).get();
+        if (fb.exists) bData = fb.data() || {};
+        if (!bData) {
+          const tm = await firestore.collection('tasksManagement').doc(bid).get();
+          if (tm.exists) bData = tm.data() || {};
+        }
+      }
+      if (!bData) return { ok: false, status: 404, error: 'booking_not_found' };
+      const ownerUid = String(bData.user_id || bData.userId || bData.client_id || bData.customer_id || '').trim();
+      if (ownerUid && ownerUid !== actorUid) return { ok: false, status: 403, error: 'not_your_booking' };
+      if (bData.variation_pending !== true) {
+        return { ok: false, status: 400, error: 'no_pending_variation' };
+      }
+
+      const variations = Array.isArray(bData.variation_requests) ? bData.variation_requests : [];
+      const wantId = String(payload.variation_id || payload.variationId || '').trim();
+      const pending = wantId
+        ? variations.find(v => v && v.id === wantId && v.status === 'pending_client_approval')
+        : [...variations].reverse().find(v => v && v.status === 'pending_client_approval');
+      if (!pending) return { ok: false, status: 400, error: 'variation_not_found' };
+      const variationId = String(pending.id || wantId || '').trim();
+      const payAmount = Math.round(parseFloat(pending.amount || bData.variation_amount || '0') * 100) / 100;
+      if (!(payAmount > 0)) return { ok: false, status: 400, error: 'no_variation_amount' };
+
+      const merchantId = env('PAYFAST_MERCHANT_ID');
+      const merchantKey = env('PAYFAST_MERCHANT_KEY');
+      const payfastUrl = env('PAYFAST_URL') || 'https://www.payfast.co.za/eng/process';
+      const backendUrl = env('RENDER_EXTERNAL_URL') || 'https://square15-livekit-backend.onrender.com';
+      if (!merchantId || !merchantKey) return { ok: false, status: 500, error: 'payfast_not_configured' };
+
+      const pmIn = String(payload.payment_method || 'card').toLowerCase();
+      const PF_METHOD_MAP = {
+        card: 'cc', cc: 'cc', credit: 'cc',
+        eft: 'eft', instant_eft: 'eft', instanteft: 'eft', ozow: 'eft',
+        moretyme: 'mt', 'more_tyme': 'mt', mt: 'mt',
+        mobicred: 'mc', mc: 'mc', rcs: 'rc', rc: 'rc',
+        bnpl: 'mt', paylater: 'mt', pay_later: 'mt',
+      };
+      const pfMethod = PF_METHOD_MAP[pmIn] || 'cc';
+      const customStr1 = `variation_${bid}__${variationId}`;
+      const _sig = signPaymentCallback(bid);
+      const returnUrl = `${backendUrl}/api/payment/ozow-result?status=success&booking_id=${encodeURIComponent(bid)}${_sig}`;
+      const cancelUrl = `${backendUrl}/api/payment/ozow-result?status=cancel&booking_id=${encodeURIComponent(bid)}${_sig}`;
+      const notifyUrl = `${backendUrl}/api/payment/itn`;
+      const itemName = `Square 15 Extra Work ${bData.order_no || bid}`;
+
+      const paymentData = {
+        merchant_id: merchantId,
+        merchant_key: merchantKey,
+        amount: payAmount.toFixed(2),
+        item_name: itemName,
+        return_url: returnUrl,
+        cancel_url: cancelUrl,
+        notify_url: notifyUrl,
+        custom_str1: customStr1,
+        payment_method: pfMethod,
+      };
+      const passphrase = env('PAYFAST_PASSPHRASE') || '';
+      const pfParamString = Object.entries(paymentData)
+        .map(([k, v]) => `${encodeURIComponent(k).replace(/%20/g, '+')}=${encodeURIComponent(String(v || '')).replace(/%20/g, '+')}`)
+        .join('&');
+      let sigInput = pfParamString;
+      if (passphrase) sigInput += `&passphrase=${encodeURIComponent(passphrase).replace(/%20/g, '+')}`;
+      paymentData.signature = crypto.createHash('md5').update(sigInput).digest('hex');
+      const qs = Object.entries(paymentData).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join('&');
+      const paymentUrl = `${payfastUrl}?${qs}`;
+
+      await firestore.collection('payment_links').doc(`VAR-${bid}-${Date.now().toString(36)}`).set({
+        booking_id: bid, variation_id: variationId, amount: payAmount,
+        payment_type: 'variation', user_id: actorUid, payment_url: paymentUrl,
+        status: 'pending', source: payload.source || 'app',
+        created_at: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      return { ok: true, status: 200, data: {
+        message: `Payment link for the R${payAmount.toFixed(2)} extra work is ready.`,
+        paymentUrl, bookingId: bid, variation_id: variationId, amount: payAmount,
+      }};
+    } catch (err) {
+      return { ok: false, status: 500, error: `variation_payment_link_error: ${err.message}` };
     }
   }
 
@@ -13439,6 +13536,24 @@ app.post('/api/payment/itn', async (req, res) => {
           throw replayErr;
         }
       }
+      // Variation payments carry custom_str1 = `variation_<bid>__<variationId>`.
+      // Settle THAT variation (mark paid, credit artisan, platform ledger,
+      // notify) from the verified PayFast amount instead of the main booking.
+      if (customStr1.startsWith('variation_')) {
+        try {
+          const rest = customStr1.slice('variation_'.length);
+          const sep = rest.indexOf('__');
+          const vBid = sep >= 0 ? rest.slice(0, sep) : rest;
+          const vId = sep >= 0 ? rest.slice(sep + 2) : '';
+          await _settleVariationPaidByGateway(admin.firestore(), {
+            bid: vBid, variationId: vId, payAmount: parseFloat(amountGross),
+            methodLabel: 'card/EFT', pfPaymentId,
+          });
+        } catch (vErr) {
+          console.error(`[ITN] variation settle failed for ${customStr1}: ${vErr.message}`);
+        }
+        return res.status(200).send('OK');
+      }
       // Wallet top-ups carry custom_str1 = `wallet_topup_{uid}` (no booking). Credit
       // the user's wallet from the VERIFIED PayFast amount instead of processing a
       // booking payment. Replay protection above already deduped by pf_payment_id.
@@ -14796,6 +14911,148 @@ function _variationSplit(entry, payAmount, feeFraction) {
     platform_total: platformTotal,
     platform_fee_percent: feeFraction,
   };
+}
+
+// Settle a variation that was paid through a gateway (PayFast card/EFT/BNPL),
+// called from the ITN webhook. Mirrors the post-deduction half of
+// settle_variation but takes the money as already-received (no wallet debit).
+// Idempotent: a repeat ITN for an already-paid variation is a no-op.
+async function _settleVariationPaidByGateway(firestore, { bid, variationId, payAmount, methodLabel, pfPaymentId }) {
+  if (!firestore || !bid) return;
+  const now = new Date().toISOString();
+  let bData = null;
+  {
+    const fb = await firestore.collection('futureBookings').doc(bid).get();
+    if (fb.exists) bData = fb.data() || {};
+    if (!bData) {
+      const tm = await firestore.collection('tasksManagement').doc(bid).get();
+      if (tm.exists) bData = tm.data() || {};
+    }
+  }
+  if (!bData) { console.warn('[variation-itn] booking not found', bid); return; }
+
+  const variations = Array.isArray(bData.variation_requests) ? bData.variation_requests : [];
+  const wantId = String(variationId || '').trim();
+  const entry = wantId
+    ? variations.find(v => v && v.id === wantId)
+    : [...variations].reverse().find(v => v && v.status === 'pending_client_approval');
+  if (!entry) { console.warn('[variation-itn] variation not found', bid, wantId); return; }
+  if (entry.status === 'paid') { console.log('[variation-itn] already paid, skipping', bid, wantId); return; }
+
+  const amount = Math.round((parseFloat(payAmount) || parseFloat(entry.amount) || 0) * 100) / 100;
+
+  let feeFrac = 0.35;
+  try {
+    const catName = String(bData.category_name || bData.category || '').trim();
+    if (catName) {
+      const cs = await firestore.collection('categories').where('name', '==', catName).limit(1).get();
+      const pct = cs.empty ? NaN : Number((cs.docs[0].data() || {}).platform_fee_percent);
+      if (!Number.isNaN(pct) && pct > 0) feeFrac = pct > 1 ? pct / 100 : pct;
+    }
+  } catch (_) {}
+  const settlement = _variationSplit(entry, amount, feeFrac);
+
+  const updatedVariations = variations.map(v => {
+    if (v && ((wantId && v.id === wantId) || (!wantId && v.status === 'pending_client_approval'))) {
+      return { ...v, status: 'paid', paid_at: now, paid_by: 'gateway', payment_method: methodLabel || 'card', settlement };
+    }
+    return v;
+  });
+  const stillPending = updatedVariations.some(v => v && v.status === 'pending_client_approval');
+  const variationUpdate = {
+    variation_requests: updatedVariations,
+    variation_pending: stillPending,
+    variation_status: stillPending ? 'pending_client_approval' : 'paid',
+    variation_paid_total: admin.firestore.FieldValue.increment(amount),
+    updated_at: now,
+  };
+  const idsToUpdate = new Set([bid]);
+  try { const fb = String(bData.future_booking_id || bData.futureBookingId || bData.booking_id || '').trim(); if (fb) idsToUpdate.add(fb); } catch (_) {}
+  try { const tm = String(bData.tasks_management_id || bData.tasksManagementId || '').trim(); if (tm) idsToUpdate.add(tm); } catch (_) {}
+  for (const id of idsToUpdate) {
+    for (const coll of ['futureBookings', 'tasksManagement']) {
+      try { const ref = firestore.collection(coll).doc(id); if ((await ref.get()).exists) await ref.update(variationUpdate); } catch (_) {}
+    }
+  }
+
+  const ownerUid = String(bData.user_id || bData.userId || bData.client_id || bData.customer_id || '').trim();
+  const artisanKeyId = String(bData.service_provider_id || bData.artisan_id || bData.artisanId || '').trim();
+
+  // Ledger entry for the top-up.
+  try {
+    await firestore.collection('transactionLogs').add({
+      booking_id: bid, tasks_management_id: bid, user_id: ownerUid || null,
+      amount: amount.toFixed(2), payment_method: methodLabel || 'card', payment_type: 'variation',
+      variation_id: wantId || null, status: 'success', pf_payment_id: pfPaymentId || null,
+      profit: settlement.platform_total.toFixed(2), artisan_amount: settlement.artisan_total.toFixed(2),
+      created_at: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  } catch (_) {}
+
+  // Credit the artisan's share (idempotent per-variation ledger doc).
+  if (settlement && settlement.artisan_total > 0 && artisanKeyId) {
+    try {
+      const spRef = await _resolveServiceProviderRef(firestore, artisanKeyId);
+      if (spRef) {
+        const ledgerRef = firestore.collection('artisan_earnings')
+          .doc(`${artisanKeyId}__${bData.order_no || bid}__var_${wantId || now}`);
+        await firestore.runTransaction(async (t) => {
+          const [ls, sp] = await Promise.all([t.get(ledgerRef), t.get(spRef)]);
+          if (ls.exists || !sp.exists) return;
+          const cur = parseFloat(String((sp.data() || {}).balance || '0').replace(/[^0-9.\-]/g, '')) || 0;
+          t.update(spRef, { balance: (Math.round((cur + settlement.artisan_total) * 100) / 100).toFixed(2), balance_updated_at: now });
+          t.set(ledgerRef, {
+            id: ledgerRef.id, artisan_id: artisanKeyId, order_no: String(bData.order_no || bid),
+            kind: 'variation', variation_id: wantId || null, cost: amount,
+            platform_fee_percent: settlement.platform_fee_percent, earning: settlement.artisan_total,
+            settlement, paid: false, credited_at: now, source: 'variation_gateway',
+          });
+        });
+      }
+    } catch (e) { console.warn('[variation-itn] artisan credit failed:', bid, e.message); }
+  }
+
+  // Notify the artisan.
+  try {
+    const spRef = await _resolveServiceProviderRef(firestore, artisanKeyId);
+    const pd = spRef ? ((await spRef.get()).data() || {}) : {};
+    const rids = new Set([artisanKeyId]);
+    for (const c of [pd.uid, pd.user_id, pd.userId]) { const s = String(c || '').trim(); if (s) rids.add(s); }
+    const title = 'Extra work approved & paid';
+    const body = `The client approved and paid R${amount.toFixed(2)} for the extra materials/work. You can now proceed.`;
+    for (const rid of rids) {
+      if (!rid) continue;
+      await firestore.collection('notifications').add({
+        user_id: rid, user_type: 'artisan', title, message: body,
+        type: 'variation_paid', booking_id: bid, tasks_management_id: bid,
+        read: false, view: false, created_at: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    }
+    const tokens = new Set();
+    for (const c of [pd.deviceToken, pd.device_token, pd.fcm_token, pd.fcmToken, pd.token, pd.push_token]) { const t = String(c || '').trim(); if (t) tokens.add(t); }
+    for (const tok of tokens) {
+      try {
+        await admin.messaging().send({
+          token: tok, notification: { title, body },
+          data: { type: 'variation_paid', booking_id: bid, tasks_management_id: bid, user_type: 'artisan' },
+          android: { priority: 'high', notification: { channelId: 'order_request_channel', sound: 'sound' } },
+        });
+      } catch (_) {}
+    }
+  } catch (e) { console.warn('[variation-itn] artisan notify failed:', e.message); }
+
+  // Confirm to the client.
+  if (ownerUid) {
+    try {
+      await firestore.collection('notifications').add({
+        user_id: ownerUid, user_type: 'user', title: 'Extra work paid',
+        message: `Your R${amount.toFixed(2)} payment for the extra work went through. The artisan can continue.`,
+        type: 'payment_received', booking_id: bid, tasks_management_id: bid,
+        read: false, view: false, created_at: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    } catch (_) {}
+  }
+  console.log(`[variation-itn] settled variation ${wantId} on ${bid}: R${amount.toFixed(2)} (artisan R${settlement.artisan_total.toFixed(2)}, platform R${settlement.platform_total.toFixed(2)})`);
 }
 
 function _artisanJobTimeMs(x) {
