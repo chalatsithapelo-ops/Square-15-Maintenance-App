@@ -7,7 +7,7 @@ upload/deploy a minimal set of files to GitHub/Render.
 
 # â”€â”€ Version tag â€” bump this on every deploy so we can verify Render runs the
 # latest code.  Check Render logs for the startup banner.
-WORKER_VERSION = "2026-11-21-latency-amountdue"
+WORKER_VERSION = "2026-11-22-realtime-s2s"
 
 import os
 import sys
@@ -605,12 +605,15 @@ async def entrypoint(ctx: JobContext):
             "HARD RULES - THESE OVERRIDE EVERYTHING BELOW. NEVER BREAK THEM:\n"
             "1. NEVER say a price (no rand amount, no 'about', no 'around', no range) unless you have ALREADY called lookup_service_pricing in THIS conversation for THIS service and are reading the amount it returned. If a customer asks the price and you have not called the tool yet, say 'Let me check that for you' and call lookup_service_pricing FIRST, then speak only the amount it returns. If you have not called the tool, you do NOT know the price - do not guess, estimate, or recall a number from memory. Stating any price you did not just get from the tool is a serious error.\n"
             "2. NEVER create a booking or open the booking/photo screen (create_booking, create_order_booking, or ui_navigate with action='open_rfq_upload' or action='create_order_booking') until you have, IN THIS ORDER, actually asked the customer and heard their answer for: (a) WHERE the job is (service location), AND (b) WHEN they want it done (a specific day/time, or they clearly said as-soon-as-possible/urgent). You must ASK 'When would you like the appointment - as soon as possible, or a specific day and time?' and WAIT for their reply. NEVER assume the date or time, and NEVER default to now unless the customer clearly said now/asap/urgent. Creating a booking without having asked WHEN is a serious error.\n"
-            "3. For a priced (non-RFQ) service you MUST call lookup_service_pricing, read the price back, and get a clear 'yes' from the customer BEFORE creating the booking. This keeps the job as a fixed-price order that is dispatched to an artisan immediately. Do not skip the price lookup - skipping it can turn the job into a quote request that is NOT sent to artisans until later.\n\n"
+            "3. For a priced (non-RFQ) service you MUST call lookup_service_pricing, read the price back, and get a clear 'yes' from the customer BEFORE creating the booking. This keeps the job as a fixed-price order that is dispatched to an artisan immediately. Do not skip the price lookup - skipping it can turn the job into a quote request that is NOT sent to artisans until later.\n"
+            "4. NO LOOPS, NO LIMBO. (a) WALLET: ask for the customer's 'yes' to pay from the wallet exactly ONCE; as soon as they say yes, call pay_with_wallet immediately - never ask them to confirm the wallet or the amount a second time. (b) After pay_with_wallet (or check_payment) confirms the money is in, say so once and move straight on - do NOT re-ask about payment. (c) After you call submit_rating (or the customer declines to rate), you MUST, in the SAME turn, say the thank-you/complaint-rights lines and then call ui_navigate(action='end_call'). NEVER go silent, NEVER wait for the customer to speak again, and NEVER leave the call hanging open after a rating. Staying silent or re-asking the same question is a serious error.\n\n"
             "TRUST & SAFETY FACTS (use ONLY these â€” never invent warranties, insurance, criminal-background checks, or licence claims):\n"
             "- Escrow: every payment is held by Square 15 and only released to the artisan after the customer confirms the job is done right.\n"
             "- Vetting: every active artisan is registered with Square 15, has submitted government ID, and is rated by past customers.\n"
             "- Identity check: when the artisan is on the way, the system sends the customer the artisan's profile photo via WhatsApp so they can match the face at the door.\n"
             "- Refund policy: full refund if cancelled before work starts; partial refund (minus materials already bought and time worked) if cancelled mid-job; if work is completed but the customer is not satisfied, payment stays in escrow until admin investigates. Wallet refunds are instant; card refunds take three to five business days.\n"
+            "- ON-SITE RE-MEASURE & PRICE CHANGES (DISCLOSE THIS WHEN BOOKING A MEASURED/AREA-BASED JOB): The first price is an estimate based on the size the customer gives. When the artisan arrives they re-measure the actual area on site. If the real size differs enough to change the price beyond a small threshold (about 10 percent), the app shows the customer the new price to APPROVE before any extra work â€” the customer is never charged more without approving first. If the re-measure makes it CHEAPER, the difference is automatically refunded to the customer. If it is more, the customer approves and pays only the difference. Say this plainly when creating a measured job so there are no surprises on the day.\n"
+            "- MATERIAL REIMBURSEMENT: if the artisan buys materials for the job, that cost is itemised and reimbursed to them from the payment held in escrow â€” the customer only ever pays the agreed, approved total.\n"
             "- Personal safety: tell the user that if they ever feel unsafe they can say 'help' or 'emergency' and we'll alert support; for life-threatening emergencies remind them to call 10111 or 10177 first.\n"
             "- Do NOT promise workmanship warranties, free reworks, insurance cover, or licence numbers. If asked, say our standard protection is the escrow plus refund policy, and offer to connect them with admin via send_message_to_admin.\n"
             "- When confirming a new booking, briefly reassure the user about escrow and the artisan-photo identity check (one short sentence).\n\n"
@@ -626,7 +629,8 @@ async def entrypoint(ctx: JobContext):
             "- WHERE IS MY ARTISAN / STATUS / ETA (ALWAYS USE A TOOL): When the customer asks where their artisan is, how far away they are, when they will arrive, or what stage the job is at, you MUST call get_artisan_eta (it works without a booking_id when you were opened for a specific job) and say exactly what it returns - the stage (accepted, on the way, buying materials, working on site, or finished), the distance in kilometres if it gives one, and the artisan's name and phone so they can call. If it mentions the live map, tell them they can watch the artisan's live location on the map in the app. NEVER answer these questions from memory, NEVER say 'I don't have that information' or 'I can't tell', and NEVER go quiet - always call the tool first, then report the result.\n"
             "- BACKEND tools for ACTIONS: cancel_booking, reschedule_booking, send_message_to_artisan, send_message_to_client, send_message_to_admin, mark_booking_in_progress, artisan_cancel_and_reassign, submit_rating, submit_complaint. These tools EXECUTE real actions on the backend â€” use them, NOT ui_navigate.\n"
             "- PAYMENT (only AFTER an artisan has accepted the job â€” NEVER offer payment right after booking creation):\n"
-            "  STEP 1: Ask 'Would you like to pay the full amount or a 35 percent deposit?' (payment_type='full' or 'deposit').\n"
+            "  STEP 0 (KNOW THE AMOUNT â€” NEVER ASK THE CUSTOMER HOW MUCH): BEFORE you talk money, call get_booking_status (no booking_id needed when opened for a job). It returns the exact amount due and the label (full price, deposit, or remaining balance). You ALWAYS know the figure â€” so STATE it to the customer. NEVER ask the customer how much they owe, how much the deposit is, or to confirm the amount back to you; that is your job, not theirs.\n"
+            "  STEP 1: State both figures so they can choose knowingly: 'The full amount is <full>, or you can pay a 35 percent deposit of <deposit> now and the balance after the job.' Then ask 'Which would you like?' (payment_type='full' or 'deposit'). Use the exact rand figures from get_booking_status â€” do not invent or round.\n"
             "  STEP 2: Ask the customer to CHOOSE a method: 'How would you like to pay â€” from your Square 15 wallet, by instant EFT, by card, or buy-now-pay-later?' Let THEM choose; never pick for them.\n"
             "  STEP 3: Route to the method they chose:\n"
             "    - WALLET â†’ this moves money instantly. Tell them the exact amount and get a clear 'yes' FIRST, then call pay_with_wallet(booking_id, payment_type).\n"
@@ -635,7 +639,7 @@ async def entrypoint(ctx: JobContext):
             "    - BUY-NOW-PAY-LATER â†’ call pay_with_bnpl(booking_id, payment_type, provider) â€” PayFast buy-now-pay-later. provider is 'moretyme' (default), 'mobicred', or 'rcs'. If the customer names one, pass it; otherwise use moretyme. Sends a secure link to their phone.\n"
             "  STEP 4: After the payment, CONFIRM it went through by calling check_payment(booking_id). Tell the customer the status clearly â€” whether the payment was RECEIVED, whether it was the FULL amount or a DEPOSIT, and if it was a deposit, remind them of the exact remaining balance and that it is due after the job is completed. Then continue â€” once money is in escrow the artisan proceeds.\n"
             "- WHERE TO WATCH PROGRESS AFTER PAYMENT (IMPORTANT â€” get the tab right): Once payment is confirmed, tell the customer WHERE to follow the artisan's live progress. For an IMMEDIATE or EMERGENCY job (the artisan is coming now), progress shows in the CURRENT tab of their Bookings. For a FUTURE or SCHEDULED booking (booked for a later date), progress shows in the FUTURE BOOKINGS tab. NEVER tell an emergency/immediate customer to look in Future Bookings. If you are unsure which it is, call get_booking_status or list_my_bookings to check before naming the tab. Then let them know that if there is nothing else you can help with, they are welcome to DROP THE CALL and simply monitor the progress on the app â€” we will keep them updated with notifications.\n"
-            "- IN-APP PAYMENT SCREEN (IMPORTANT): As soon as an artisan accepts, the app asks the customer ON SCREEN whether they want to pay the FULL amount or a 35 percent DEPOSIT, then opens the in-app payment screen for exactly that choice, where they pick their payment METHOD (wallet, card, instant EFT, or buy-now-pay-later) and complete the payment themselves. Guide them by voice in step with the screen: ask 'Would you like to pay the full amount or a 35 percent deposit?', tell them the exact amount for the option they choose, then let them tap their choice and complete it on the screen. Do NOT call pay_with_wallet, request_payment_link, or pay_with_bnpl yourself while that screen is open â€” the customer pays right there. Stay with them, and AFTER they say they have paid (or after a short moment) call check_payment(booking_id) to confirm and report the exact status. Only run the STEP 1-4 voice payment flow above if the screen did NOT open or the customer explicitly asks you to take the payment by voice.\n"
+            "- IN-APP PAYMENT SCREEN (IMPORTANT): As soon as an artisan accepts, the app asks the customer ON SCREEN whether they want to pay the FULL amount or a 35 percent DEPOSIT, then opens the in-app payment screen for exactly that choice, where they pick their payment METHOD (wallet, card, instant EFT, or buy-now-pay-later) and complete the payment themselves. Guide them by voice in step with the screen: FIRST call get_booking_status so you know the figures, then STATE them â€” 'The full amount is <full>, or a 35 percent deposit of <deposit>' â€” and ask which they want (never ask them to tell YOU the amount), then let them tap their choice and complete it on the screen. Do NOT call pay_with_wallet, request_payment_link, or pay_with_bnpl yourself while that screen is open â€” the customer pays right there. Stay with them, and AFTER they say they have paid (or after a short moment) call check_payment(booking_id) to confirm and report the exact status. Only run the STEP 1-4 voice payment flow above if the screen did NOT open or the customer explicitly asks you to take the payment by voice.\n"
             "- PAYMENT ALREADY MADE (CRITICAL â€” NEVER ASK THEM TO PAY TWICE): If the customer says they have already paid, or that they just made the payment, do NOT imply they did not pay and do NOT start a new payment. FIRST call check_payment(booking_id). If it already shows received or deposit paid, confirm it warmly and continue. If it does NOT show yet, REASSURE them: instant EFT and card payments can take a minute or two to reflect on our side â€” say you will check again shortly, stay with them, and offer to wait a moment and re-check. Do NOT go quiet and do NOT offer to pay again. Only start a brand new payment if the customer EXPLICITLY asks to pay again.\n"
             "- After sending an EFT or card payment link, the money confirms via the bank and can take a minute or two. Never treat 'not reflected yet' as 'not paid'. Keep the customer company, reassure them, and re-check with check_payment rather than restarting payment or going silent.\n"
             "- WALLET SAFETY: NEVER charge the wallet without the customer explicitly choosing wallet AND confirming the amount out loud. If their balance is too low, offer EFT, card, or buy-now-pay-later instead.\n"
@@ -3446,20 +3450,9 @@ async def entrypoint(ctx: JobContext):
             logger.error(f"get_fraud_alerts_report error: {e}", exc_info=True)
             return "Sorry, I couldn't fetch the fraud alerts right now."
 
-    agent = voice.Agent(
-        vad=vad,
-        # Streaming transcription (gpt-4o-mini-transcribe) returns partials as the
-        # user speaks, so there is no blocking full-utterance round-trip like
-        # whisper-1 - noticeably snappier replies.
-        stt=openai.STT(model="gpt-4o-mini-transcribe", language="en"),
-        llm=openai.LLM(model="gpt-4o-mini", temperature=0.4),
-        tts=openai.TTS(model="tts-1", voice="alloy"),
-        instructions=_instructions_for_role(caller_role),
-    )
-
-    logger.info("ðŸš€ Starting agent session...")
-    session = voice.AgentSession(
-        tools=[
+    # The full tool set Aniyah can call (shared by both the realtime and the
+    # cascade pipeline below).
+    _agent_tools = [
             ui_navigate,
             # Read-only backend tools
             get_booking_status,
@@ -3518,13 +3511,54 @@ async def entrypoint(ctx: JobContext):
             get_daily_revenue_report,
             get_failed_payments_report,
             get_fraud_alerts_report,
-        ],
-        # --- Latency optimizations ---
-        min_endpointing_delay=0.3,       # start responding sooner after the caller stops
-        max_endpointing_delay=2.0,        # don't wait too long on trailing pauses
-        preemptive_generation=True,        # start LLM+TTS before turn confirmed
-        min_interruption_duration=0.6,     # let the caller barge in quickly
-    )
+    ]
+
+    # ── LATENCY: use the OpenAI Realtime (speech-to-speech) model by default ──
+    # The old pipeline was STT (transcribe) -> LLM -> TTS: three sequential
+    # network round-trips per turn, which is why Aniyah felt slow. The Realtime
+    # API streams speech in and speech out through ONE model, so replies begin
+    # almost immediately. Set VOICE_REALTIME=false to fall back to the cascade.
+    _use_realtime = os.getenv("VOICE_REALTIME", "true").strip().lower() != "false"
+
+    if _use_realtime:
+        logger.info("ðŸ¤– Voice mode: REALTIME (speech-to-speech, low latency)")
+        agent = voice.Agent(
+            instructions=_instructions_for_role(caller_role),
+            tools=_agent_tools,
+            llm=openai.realtime.RealtimeModel(voice="alloy"),
+        )
+        logger.info("ðŸš€ Starting agent session...")
+        try:
+            session = voice.AgentSession(
+                # Realtime does its own server-side turn detection, so the cascade
+                # endpointing knobs do not apply. Keep VAD for interruption +
+                # false-interruption resilience so Aniyah never goes silent mid-turn.
+                vad=vad,
+                min_interruption_duration=0.6,
+                resume_false_interruption=True,
+                false_interruption_timeout=2.0,
+            )
+        except TypeError:
+            # Older livekit-agents without the false-interruption knobs.
+            session = voice.AgentSession(vad=vad, min_interruption_duration=0.6)
+    else:
+        logger.info("ðŸ¤– Voice mode: CASCADE (STT -> LLM -> TTS fallback)")
+        agent = voice.Agent(
+            vad=vad,
+            stt=openai.STT(model="gpt-4o-mini-transcribe", language="en"),
+            llm=openai.LLM(model="gpt-4o-mini", temperature=0.4),
+            tts=openai.TTS(model="tts-1", voice="alloy"),
+            instructions=_instructions_for_role(caller_role),
+        )
+        logger.info("ðŸš€ Starting agent session...")
+        session = voice.AgentSession(
+            tools=_agent_tools,
+            # --- Latency optimizations ---
+            min_endpointing_delay=0.3,       # start responding sooner after the caller stops
+            max_endpointing_delay=2.0,        # don't wait too long on trailing pauses
+            preemptive_generation=True,        # start LLM+TTS before turn confirmed
+            min_interruption_duration=0.6,     # let the caller barge in quickly
+        )
 
     # Guardrail: never allow internal/tool narration to reach TTS.
     _orig_say = session.say
@@ -3967,11 +4001,12 @@ async def entrypoint(ctx: JobContext):
     try:
         if app_context_is_push or app_context_focus_booking_id:
             # Opened by a status push: lead with an update, do NOT re-introduce
-            # or ask "how can I help". The app follows with the specific update.
+            # (no name self-intro) or ask "how can I help". The app follows with
+            # the specific update.
             greeting = (
-                f"Hi {caller_name}, it's Aniyah. I have an update for you on your booking."
+                f"Hi {caller_name}, here's an update on your booking."
                 if caller_name
-                else "Hi, it's Aniyah. I have an update for you on your booking."
+                else "Hi, here's an update on your booking."
             )
         else:
             greeting = (

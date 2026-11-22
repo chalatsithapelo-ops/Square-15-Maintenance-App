@@ -976,7 +976,17 @@ const ACTION_TIERS = Object.freeze({
   // materials / sourcing / call-out) from their wallet. Tier B = normal
   // state change with a server-side wallet deduction.
   settle_variation: 'B',
-  // Phase 4: Admin automation tools (Tier B � admin role required)
+  // Client declines an artisan-raised variation (notifies artisan + admin).
+  decline_variation: 'B',
+  // On-site re-measurement settlement. reapproval = approve + pay the price
+  // difference (wallet deduction or stage a balance); overcharge = refund the
+  // customer when the re-measure came out cheaper. Tier B = normal state
+  // change with a server-side wallet movement. (Previously MISSING from this
+  // map, so the endpoint rejected them with 400 unknown_action and the client
+  // "Approve & Pay" button silently failed.)
+  settle_measurement_reapproval: 'B',
+  settle_measurement_overcharge: 'B',
+  settle_measurement_decline: 'B',  // Phase 4: Admin automation tools (Tier B � admin role required)
   admin_bulk_reassign: 'B',
   admin_close_stale_cases: 'B',
   admin_broadcast_notification: 'B',
@@ -4299,6 +4309,80 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
     }
   }
 
+  // Customer DECLINES the on-site re-measured price. Done server-side (Admin
+  // SDK) because the Firestore owner-update rule only permits the decline write
+  // when `customer_approved` is in the CHANGED keys — but it is usually already
+  // false (the default while awaiting approval), so a client write is rejected
+  // with PERMISSION_DENIED. This path flags the job for ops and tells the
+  // artisan to stop; no money moves.
+  if (action === 'settle_measurement_decline') {
+    try {
+      const bid = bookingId || String(payload.tasks_management_id || payload.booking_id || '').trim();
+      if (!bid) return { ok: false, status: 400, error: 'missing_booking_id' };
+      if (!actorUid) return { ok: false, status: 401, error: 'unauthorized' };
+
+      const tmRef = firestore.collection('tasksManagement').doc(bid);
+      const tmSnap = await tmRef.get();
+      if (!tmSnap.exists) return { ok: false, status: 404, error: 'booking_not_found' };
+      const tm = tmSnap.data() || {};
+      const ownerUid = String(tm.user_id || tm.userId || '').trim();
+      if (actorRole !== 'admin' && ownerUid && ownerUid !== actorUid) {
+        return { ok: false, status: 403, error: 'forbidden' };
+      }
+
+      const actualCost = toNumber(tm.actual_cost) ?? toNumber(tm.cost) ?? 0;
+      await tmRef.set({
+        customer_approved: false, status: 'price_declined',
+        ops_flagged: true, reapproval_payment_required: false, updated_at: now,
+      }, { merge: true });
+
+      // Notify the artisan to stop. Keyed to every candidate recipient id so
+      // the artisan app (which queries user_id == auth.uid) always sees it.
+      try {
+        const artisanKeyId = String(tm.service_provider_id || tm.artisan_id || tm.artisanId || '').trim();
+        const spRef = await _resolveServiceProviderRef(firestore, artisanKeyId);
+        const pd = spRef ? ((await spRef.get()).data() || {}) : {};
+        const rids = new Set([artisanKeyId]);
+        for (const c of [pd.uid, pd.user_id, pd.userId]) { const s = String(c || '').trim(); if (s) rids.add(s); }
+        const title = 'Price Declined';
+        const body = 'The customer declined the updated price. Do not proceed — Square 15 support will follow up.';
+        for (const rid of rids) {
+          if (!rid) continue;
+          await firestore.collection('notifications').add({
+            user_id: rid, user_type: 'artisan', title, message: body,
+            type: 'measurement_reapproval_result', booking_id: bid, tasks_management_id: bid,
+            read: false, view: false, created_at: admin.firestore.FieldValue.serverTimestamp(),
+          });
+        }
+        const tokens = new Set();
+        for (const c of [pd.deviceToken, pd.device_token, pd.fcm_token, pd.fcmToken, pd.token, pd.push_token]) { const t = String(c || '').trim(); if (t) tokens.add(t); }
+        for (const tok of tokens) {
+          try {
+            await admin.messaging().send({
+              token: tok, notification: { title, body },
+              data: { type: 'measurement_reapproval_result', booking_id: bid, tasks_management_id: bid, user_type: 'artisan' },
+              android: { priority: 'high', notification: { channelId: 'order_request_channel', sound: 'sound' } },
+            });
+          } catch (_) {}
+        }
+      } catch (e) { console.warn('[decline] artisan notify:', e.message); }
+
+      // Flag for admin review.
+      try {
+        await firestore.collection('notifications').add({
+          user_type: 'admin', title: 'Price Declined',
+          message: `Customer declined on-site price R${actualCost.toFixed(2)} on job ${bid}. Needs review.`,
+          type: 'measurement_reapproval_result', booking_id: bid, tasks_management_id: bid,
+          read: false, view: false, created_at: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      } catch (_) {}
+
+      return { ok: true, status: 200, data: { direction: 'declined', bookingId: bid } };
+    } catch (e) {
+      return { ok: false, status: 500, error: 'reapproval_decline_failed', debug: String((e && e.message) || e) };
+    }
+  }
+
 
   // -- Pay with Wallet --
   if (action === 'pay_with_wallet') {
@@ -4460,6 +4544,9 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         updateData.balance_paid = true;
         updateData.balance_paid_at = now;
         updateData.payment_status = 'paid';
+        // If this balance was a staged re-measure difference, clear the gate so
+        // the artisan can start now that it is paid.
+        updateData.reapproval_payment_required = false;
       } else {
         updateData.payment_status = 'paid';
         if (isPrePaymentStatus) updateData.status = 'accepted';
@@ -4833,6 +4920,113 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       }};
     } catch (err) {
       return { ok: false, status: 500, error: `settle_variation_error: ${err.message}` };
+    }
+  }
+
+  // Client DECLINES an artisan-raised variation. Marks the matched entry
+  // declined, clears the pending flags, and notifies BOTH the artisan (stop /
+  // do not buy) and admin (needs review) so a declined top-up never silently
+  // stalls the job. No money moves.
+  if (action === 'decline_variation') {
+    try {
+      const bid = bookingId || String(payload.tasks_management_id || payload.booking_id || '').trim();
+      if (!bid) return { ok: false, status: 400, error: 'missing_booking_id' };
+      if (!actorUid) return { ok: false, status: 401, error: 'unauthorized' };
+
+      let bData = null;
+      {
+        const fb = await firestore.collection('futureBookings').doc(bid).get();
+        if (fb.exists) bData = fb.data() || {};
+        if (!bData) {
+          const tm = await firestore.collection('tasksManagement').doc(bid).get();
+          if (tm.exists) bData = tm.data() || {};
+        }
+      }
+      if (!bData) return { ok: false, status: 404, error: 'booking_not_found' };
+
+      const ownerUid = String(bData.user_id || bData.userId || bData.client_id || bData.customer_id || '').trim();
+      if (actorRole !== 'admin' && ownerUid && ownerUid !== actorUid) {
+        return { ok: false, status: 403, error: 'not_your_booking' };
+      }
+
+      const variations = Array.isArray(bData.variation_requests) ? bData.variation_requests : [];
+      const wantId = String(payload.variation_id || payload.variationId || '').trim();
+      const updatedVariations = variations.map(v => {
+        if (v && ((wantId && v.id === wantId) ||
+            (!wantId && v.status === 'pending_client_approval'))) {
+          return { ...v, status: 'declined', declined_at: now, declined_by: actorUid };
+        }
+        return v;
+      });
+      const stillPending = updatedVariations.some(v => v && v.status === 'pending_client_approval');
+      const declinedAmount = (() => {
+        const hit = variations.find(v => v && ((wantId && v.id === wantId) || (!wantId && v.status === 'pending_client_approval')));
+        return Math.round(parseFloat((hit && hit.amount) || bData.variation_amount || '0') * 100) / 100;
+      })();
+      const variationUpdate = {
+        variation_requests: updatedVariations,
+        variation_pending: stillPending,
+        variation_status: stillPending ? 'pending_client_approval' : 'declined',
+        updated_at: now,
+      };
+      const idsToUpdate = new Set([bid]);
+      try {
+        const _tm = await firestore.collection('tasksManagement').doc(bid).get();
+        if (_tm.exists) { const d = _tm.data() || {}; const fb = String(d.future_booking_id || d.futureBookingId || d.booking_id || '').trim(); if (fb) idsToUpdate.add(fb); }
+      } catch (_) {}
+      try {
+        const _fb = await firestore.collection('futureBookings').doc(bid).get();
+        if (_fb.exists) { const d = _fb.data() || {}; const tm = String(d.tasks_management_id || d.tasksManagementId || '').trim(); if (tm) idsToUpdate.add(tm); }
+      } catch (_) {}
+      for (const id of idsToUpdate) {
+        for (const coll of ['futureBookings', 'tasksManagement']) {
+          try { const ref = firestore.collection(coll).doc(id); if ((await ref.get()).exists) await ref.update(variationUpdate); } catch (_) {}
+        }
+      }
+
+      // Notify artisan: stop, do not buy.
+      try {
+        const artisanKeyId = String(bData.service_provider_id || bData.artisan_id || bData.artisanId || '').trim();
+        const spRef = await _resolveServiceProviderRef(firestore, artisanKeyId);
+        const pd = spRef ? ((await spRef.get()).data() || {}) : {};
+        const rids = new Set([artisanKeyId]);
+        for (const c of [pd.uid, pd.user_id, pd.userId]) { const s = String(c || '').trim(); if (s) rids.add(s); }
+        const title = 'Extra work declined';
+        const body = 'The client declined the extra materials/work. Do not buy parts — Square 15 support will follow up.';
+        for (const rid of rids) {
+          if (!rid) continue;
+          await firestore.collection('notifications').add({
+            user_id: rid, user_type: 'artisan', title, message: body,
+            type: 'variation_declined', booking_id: bid, tasks_management_id: bid,
+            read: false, view: false, created_at: admin.firestore.FieldValue.serverTimestamp(),
+          });
+        }
+        const tokens = new Set();
+        for (const c of [pd.deviceToken, pd.device_token, pd.fcm_token, pd.fcmToken, pd.token, pd.push_token]) { const t = String(c || '').trim(); if (t) tokens.add(t); }
+        for (const tok of tokens) {
+          try {
+            await admin.messaging().send({
+              token: tok, notification: { title, body },
+              data: { type: 'variation_declined', booking_id: bid, tasks_management_id: bid, user_type: 'artisan' },
+              android: { priority: 'high', notification: { channelId: 'order_request_channel', sound: 'sound' } },
+            });
+          } catch (_) {}
+        }
+      } catch (e) { console.warn('[decline_variation] artisan notify:', e.message); }
+
+      // Notify admin: needs review.
+      try {
+        await firestore.collection('notifications').add({
+          user_type: 'admin', title: 'Variation declined',
+          message: `Client declined extra work of R${declinedAmount.toFixed(2)} on job ${bData.order_no || bid}. Needs review.`,
+          type: 'variation_declined', booking_id: bid, tasks_management_id: bid,
+          read: false, view: false, created_at: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      } catch (_) {}
+
+      return { ok: true, status: 200, data: { declined: true, amount: declinedAmount, variation_pending: stillPending, bookingId: bid } };
+    } catch (err) {
+      return { ok: false, status: 500, error: `decline_variation_error: ${err.message}` };
     }
   }
 
