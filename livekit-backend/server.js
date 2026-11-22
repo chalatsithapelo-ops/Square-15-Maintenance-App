@@ -4313,8 +4313,16 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
   // SDK) because the Firestore owner-update rule only permits the decline write
   // when `customer_approved` is in the CHANGED keys — but it is usually already
   // false (the default while awaiting approval), so a client write is rejected
-  // with PERMISSION_DENIED. This path flags the job for ops and tells the
-  // artisan to stop; no money moves.
+  // with PERMISSION_DENIED.
+  //
+  // resolution:
+  //   'support' (default) — block the job, flag for ops, tell the artisan to
+  //                         stop. No money moves; admin mediates.
+  //   'cancel'            — cancel the job and settle the escrow: the artisan
+  //                         keeps a call-out fee (R150 default, admin-amendable)
+  //                         for attending, the platform retains its 35% of the
+  //                         original total, and whatever is left is refunded to
+  //                         the client's wallet. Never overdraws the pool.
   if (action === 'settle_measurement_decline') {
     try {
       const bid = bookingId || String(payload.tasks_management_id || payload.booking_id || '').trim();
@@ -4330,42 +4338,188 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         return { ok: false, status: 403, error: 'forbidden' };
       }
 
+      const resolution = String(payload.resolution || 'support').trim().toLowerCase();
       const actualCost = toNumber(tm.actual_cost) ?? toNumber(tm.cost) ?? 0;
+      const artisanKeyId = String(tm.service_provider_id || tm.artisan_id || tm.artisanId || '').trim();
+
+      async function notifyArtisan(title, body) {
+        try {
+          const spRef = await _resolveServiceProviderRef(firestore, artisanKeyId);
+          const pd = spRef ? ((await spRef.get()).data() || {}) : {};
+          const rids = new Set([artisanKeyId]);
+          for (const c of [pd.uid, pd.user_id, pd.userId]) { const s = String(c || '').trim(); if (s) rids.add(s); }
+          for (const rid of rids) {
+            if (!rid) continue;
+            await firestore.collection('notifications').add({
+              user_id: rid, user_type: 'artisan', title, message: body,
+              type: 'measurement_reapproval_result', booking_id: bid, tasks_management_id: bid,
+              read: false, view: false, created_at: admin.firestore.FieldValue.serverTimestamp(),
+            });
+          }
+          const tokens = new Set();
+          for (const c of [pd.deviceToken, pd.device_token, pd.fcm_token, pd.fcmToken, pd.token, pd.push_token]) { const t = String(c || '').trim(); if (t) tokens.add(t); }
+          for (const tok of tokens) {
+            try {
+              await admin.messaging().send({
+                token: tok, notification: { title, body },
+                data: { type: 'measurement_reapproval_result', booking_id: bid, tasks_management_id: bid, user_type: 'artisan' },
+                android: { priority: 'high', notification: { channelId: 'order_request_channel', sound: 'sound' } },
+              });
+            } catch (_) {}
+          }
+        } catch (e) { console.warn('[decline] artisan notify:', e.message); }
+      }
+
+      // ── CANCEL + SETTLE ────────────────────────────────────────────────
+      if (resolution === 'cancel') {
+        if (tm.decline_cancelled === true) {
+          return { ok: true, status: 200, data: { direction: 'cancelled', already: true, bookingId: bid } };
+        }
+        // Money actually paid into escrow for this job.
+        let paidAmount = 0;
+        try {
+          const txq = await firestore.collection('transactionLogs')
+            .where('tasks_management_id', '==', bid)
+            .where('subtype', '==', 'service_payment')
+            .where('status', '==', 'success')
+            .limit(1).get();
+          if (!txq.empty) paidAmount = toNumber(txq.docs[0].data().amount) ?? 0;
+        } catch (_) {}
+        const ps = String(tm.payment_status || '').toLowerCase();
+        if (paidAmount <= 0) {
+          if (ps === 'paid') paidAmount = toNumber(tm.paid_amount) ?? toNumber(tm.estimate_cost) ?? toNumber(tm.cost) ?? 0;
+          else if (ps === 'deposit_paid' || tm.deposit_paid === true) paidAmount = toNumber(tm.deposit_amount) ?? 0;
+        }
+        // Original agreed total (NOT the declined re-measured price).
+        let originalTotal = toNumber(tm.estimate_cost) ?? 0;
+        if (!originalTotal) originalTotal = toNumber(tm.original_total) ?? toNumber(tm.cost) ?? 0;
+        if (originalTotal <= 0 && paidAmount > 0) {
+          originalTotal = (ps === 'deposit_paid' || tm.deposit_paid === true) ? Math.round((paidAmount / 0.35) * 100) / 100 : paidAmount;
+        }
+
+        // Call-out fee: R150 default; admin may override via payload.
+        let callOutFee = 150;
+        if (actorRole === 'admin') {
+          const o = toNumber(payload.call_out_fee);
+          if (o != null && o >= 0) callOutFee = o;
+        }
+
+        const pool = Math.round(Math.max(0, paidAmount) * 100) / 100;
+        const callOut = Math.round(Math.min(callOutFee, pool) * 100) / 100;
+        const remaining = Math.round((pool - callOut) * 100) / 100;
+        const platformCommission = Math.round(0.35 * Math.max(0, originalTotal) * 100) / 100;
+        const platformKeeps = Math.round(Math.min(platformCommission, remaining) * 100) / 100;
+        const clientRefund = Math.round(Math.max(0, remaining - platformKeeps) * 100) / 100;
+
+        // Mark cancelled first (idempotency guard) + mirror onto linked docs.
+        const cancelUpdate = {
+          customer_approved: false, status: 'cancelled', payment_status: 'refunded',
+          ops_flagged: false, reapproval_payment_required: false,
+          decline_cancelled: true, cancellation_reason: 'price_declined_onsite',
+          cancelled_at: now, call_out_fee: callOut, refunded_amount: clientRefund, updated_at: now,
+        };
+        const idsToUpdate = new Set([bid]);
+        try { const d = tm; const fb = String(d.future_booking_id || d.futureBookingId || d.booking_id || '').trim(); if (fb) idsToUpdate.add(fb); } catch (_) {}
+        try {
+          const _fb = await firestore.collection('futureBookings').doc(bid).get();
+          if (_fb.exists) { const d = _fb.data() || {}; const t = String(d.tasks_management_id || d.tasksManagementId || '').trim(); if (t) idsToUpdate.add(t); }
+        } catch (_) {}
+        for (const id of idsToUpdate) {
+          for (const coll of ['futureBookings', 'tasksManagement']) {
+            try { const ref = firestore.collection(coll).doc(id); if ((await ref.get()).exists) await ref.update(cancelUpdate); } catch (_) {}
+          }
+        }
+
+        // Refund the client's wallet.
+        if (clientRefund > 0 && ownerUid) {
+          try {
+            const userRef = firestore.collection('users').doc(ownerUid);
+            await firestore.runTransaction(async (t) => {
+              const s = await t.get(userRef);
+              const cur = parseFloat((s.data() || {}).balance || '0') || 0;
+              t.update(userRef, { balance: (Math.round((cur + clientRefund) * 100) / 100).toFixed(2), updated_at: now });
+            });
+            await firestore.collection('transactionLogs').add({
+              booking_id: bid, tasks_management_id: bid, user_id: ownerUid,
+              amount: clientRefund.toFixed(2), payment_method: 'wallet', payment_type: 'refund',
+              subtype: 'cancellation_refund', status: 'success', reason: 'price_declined_onsite',
+              created_at: admin.firestore.FieldValue.serverTimestamp(),
+            });
+          } catch (e) { console.warn('[decline:cancel] client refund failed:', e.message); }
+        }
+
+        // Pay the artisan the call-out fee for attending.
+        if (callOut > 0 && artisanKeyId) {
+          try {
+            const spRef = await _resolveServiceProviderRef(firestore, artisanKeyId);
+            if (spRef) {
+              const ledgerRef = firestore.collection('artisan_earnings')
+                .doc(`${artisanKeyId}__${tm.order_no || bid}__callout`);
+              await firestore.runTransaction(async (t) => {
+                const [ls, sp] = await Promise.all([t.get(ledgerRef), t.get(spRef)]);
+                if (ls.exists || !sp.exists) return;
+                const cur = parseFloat(String((sp.data() || {}).balance || '0').replace(/[^0-9.\-]/g, '')) || 0;
+                t.update(spRef, { balance: (Math.round((cur + callOut) * 100) / 100).toFixed(2), balance_updated_at: now });
+                t.set(ledgerRef, {
+                  id: ledgerRef.id, artisan_id: artisanKeyId, order_no: String(tm.order_no || bid),
+                  kind: 'call_out', earning: callOut, paid: false, credited_at: now,
+                  source: 'decline_cancellation',
+                });
+              });
+            }
+          } catch (e) { console.warn('[decline:cancel] artisan call-out credit failed:', e.message); }
+        }
+
+        // Platform profit ledger entry.
+        try {
+          await firestore.collection('transactionLogs').add({
+            booking_id: bid, tasks_management_id: bid, user_id: ownerUid || null,
+            amount: platformKeeps.toFixed(2), payment_method: 'escrow', payment_type: 'cancellation_fee',
+            subtype: 'platform_cancellation_fee', status: 'success', profit: platformKeeps.toFixed(2),
+            reason: 'price_declined_onsite', created_at: admin.firestore.FieldValue.serverTimestamp(),
+          });
+        } catch (_) {}
+
+        await notifyArtisan('Job cancelled',
+          `The customer declined the updated price and cancelled. You've been paid a R${callOut.toFixed(2)} call-out fee for attending. Do not continue the job.`);
+
+        // Tell the client what was refunded.
+        if (ownerUid) {
+          try {
+            await firestore.collection('notifications').add({
+              user_id: ownerUid, user_type: 'user', title: 'Booking cancelled & refunded',
+              message: clientRefund > 0
+                ? `Your booking was cancelled. R${clientRefund.toFixed(2)} has been refunded to your wallet (after the R${callOut.toFixed(2)} call-out fee and service fee).`
+                : `Your booking was cancelled. As disclosed, the deposit covered the call-out fee and service fee, so no refund was due.`,
+              type: 'payment_received', booking_id: bid, tasks_management_id: bid,
+              read: false, view: false, created_at: admin.firestore.FieldValue.serverTimestamp(),
+            });
+          } catch (_) {}
+        }
+
+        try {
+          await firestore.collection('notifications').add({
+            user_type: 'admin', title: 'Job cancelled (price declined on-site)',
+            message: `Job ${tm.order_no || bid}: client declined R${actualCost.toFixed(2)} & cancelled. Call-out R${callOut.toFixed(2)} to artisan, platform R${platformKeeps.toFixed(2)}, refund R${clientRefund.toFixed(2)}.`,
+            type: 'measurement_reapproval_result', booking_id: bid, tasks_management_id: bid,
+            read: false, view: false, created_at: admin.firestore.FieldValue.serverTimestamp(),
+          });
+        } catch (_) {}
+
+        return { ok: true, status: 200, data: {
+          direction: 'cancelled', bookingId: bid,
+          call_out_fee: callOut, platform_fee: platformKeeps, refund: clientRefund,
+        }};
+      }
+
+      // ── SUPPORT (default): block + flag, no money ──────────────────────
       await tmRef.set({
         customer_approved: false, status: 'price_declined',
         ops_flagged: true, reapproval_payment_required: false, updated_at: now,
       }, { merge: true });
 
-      // Notify the artisan to stop. Keyed to every candidate recipient id so
-      // the artisan app (which queries user_id == auth.uid) always sees it.
-      try {
-        const artisanKeyId = String(tm.service_provider_id || tm.artisan_id || tm.artisanId || '').trim();
-        const spRef = await _resolveServiceProviderRef(firestore, artisanKeyId);
-        const pd = spRef ? ((await spRef.get()).data() || {}) : {};
-        const rids = new Set([artisanKeyId]);
-        for (const c of [pd.uid, pd.user_id, pd.userId]) { const s = String(c || '').trim(); if (s) rids.add(s); }
-        const title = 'Price Declined';
-        const body = 'The customer declined the updated price. Do not proceed — Square 15 support will follow up.';
-        for (const rid of rids) {
-          if (!rid) continue;
-          await firestore.collection('notifications').add({
-            user_id: rid, user_type: 'artisan', title, message: body,
-            type: 'measurement_reapproval_result', booking_id: bid, tasks_management_id: bid,
-            read: false, view: false, created_at: admin.firestore.FieldValue.serverTimestamp(),
-          });
-        }
-        const tokens = new Set();
-        for (const c of [pd.deviceToken, pd.device_token, pd.fcm_token, pd.fcmToken, pd.token, pd.push_token]) { const t = String(c || '').trim(); if (t) tokens.add(t); }
-        for (const tok of tokens) {
-          try {
-            await admin.messaging().send({
-              token: tok, notification: { title, body },
-              data: { type: 'measurement_reapproval_result', booking_id: bid, tasks_management_id: bid, user_type: 'artisan' },
-              android: { priority: 'high', notification: { channelId: 'order_request_channel', sound: 'sound' } },
-            });
-          } catch (_) {}
-        }
-      } catch (e) { console.warn('[decline] artisan notify:', e.message); }
+      await notifyArtisan('Price Declined',
+        'The customer declined the updated price. Do not proceed — Square 15 support will follow up.');
 
       // Flag for admin review.
       try {
