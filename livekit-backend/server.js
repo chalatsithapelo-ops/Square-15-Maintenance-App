@@ -4268,10 +4268,15 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       }
 
       // Price increased → the client must pay the difference NOW.
+      // Honour the client's chosen method: only auto-charge the wallet when they
+      // picked wallet (or didn't specify). For card/EFT/BNPL, fall through to the
+      // staging path so the app's payment sheet collects it via PayFast.
+      const preferMethod = String(payload.prefer_method || payload.payment_method || 'wallet').trim().toLowerCase();
+      const wantWallet = preferMethod === '' || preferMethod === 'wallet';
       const userRef = firestore.collection('users').doc(userId);
       const userSnap = await userRef.get();
       const walletBalance = parseFloat((userSnap.data() || {}).balance || (userSnap.data() || {}).wallet_balance || '0');
-      if (walletBalance >= diff) {
+      if (wantWallet && walletBalance >= diff) {
         let newBalance;
         await firestore.runTransaction(async (t) => {
           const fresh = await t.get(userRef);
