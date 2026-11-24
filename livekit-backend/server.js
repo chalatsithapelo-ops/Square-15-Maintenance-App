@@ -2191,10 +2191,13 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
       const fetched = await resolveTaskCost(id);
       if (fetched != null && fetched > 0) resolvedTaskCosts[id] = fetched;
     }
-    let totalCost = Object.values(resolvedTaskCosts).reduce((sum, c) => sum + (typeof c === 'number' ? c : 0), 0);
+    // Prefer the booking's ALREADY-COMPUTED total: for measured trades (painting,
+    // tiling, etc.) this is rate × area, whereas resolveTaskCost returns only the
+    // raw per-m² rate — using that here underpriced the bridge doc (e.g. R95
+    // instead of R95×10=R950) so the artisan/payment saw the bare rate.
+    let totalCost = toNumber(bookingDataLocal.cost);
     if (!(totalCost > 0)) {
-      const fallback = toNumber(bookingDataLocal.cost);
-      if (fallback && fallback > 0) totalCost = fallback;
+      totalCost = Object.values(resolvedTaskCosts).reduce((sum, c) => sum + (typeof c === 'number' ? c : 0), 0);
     }
 
     const tmId = crypto.randomUUID();
@@ -7927,6 +7930,8 @@ app.post('/api/action/execute', assistantLimiter, async (req, res) => {
       return res.status(result.status).json({
         error: result.error,
         message: 'Action failed',
+        ...(result.detail ? { detail: result.detail } : {}),
+        ...(result.debug ? { debug: result.debug } : {}),
         idempotencyKey,
         request_id: req.requestId || null,
       });
