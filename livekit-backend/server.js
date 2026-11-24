@@ -5704,11 +5704,12 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
 
     // Look up pricing guidance
     let laborRate = 150;
+    let contingencyPct = 0.15; // default 15% — declared here so it's in scope
+                              // for the quote-total block further below.
     let pricingCtx = '';
     try {
       const catSlug = category.toLowerCase().replace(/\s+/g, '_');
       const guidanceDoc = await firestore.collection('pricingGuidance').doc(catSlug).get();
-      let contingencyPct = 0.15; // default 15%
       if (guidanceDoc.exists) {
         const gd = guidanceDoc.data();
         laborRate = parseFloat(gd.labor_cost_per_hour || gd.laborCostPerHour || 150);
