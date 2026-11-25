@@ -175,7 +175,15 @@ async function getBuildersBffConfig() {
       const text = await htmlResp.text();
       if (text) { html = text; break; }
     }
-    if (!html) { _buildersBffCache = { ..._buildersBffCache, fetchedAt: now, value: null }; return null; }
+    if (!html) {
+      // Builders.co.za is behind PerimeterX bot protection; server-side fetches
+      // get redirected to /blocked. We cannot (and should not) solve the bot
+      // challenge, so mark Builders unavailable and let RFQ pricing fall back to
+      // the admin materialsCatalog + AI market estimate. Logged once per TTL.
+      console.warn('[builders] bot-protected (all bootstrap URLs blocked) — using catalog/AI fallback for pricing');
+      _buildersBffCache = { ..._buildersBffCache, fetchedAt: now, value: null };
+      return null;
+    }
     const scriptSrcs = extractScriptSrcs(html).map(toAbs).filter(Boolean);
     if (!scriptSrcs.length) { _buildersBffCache = { ..._buildersBffCache, fetchedAt: now, value: null }; return null; }
     const preferred = [...scriptSrcs].sort((a, b) => {
@@ -5730,10 +5738,10 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
         max_tokens: 1500,
         response_format: { type: 'json_object' },
         messages: [
-          { role: 'system', content: 'You are a South African maintenance quotation expert. CRITICAL: Every material in materialsBOM MUST be a real product available on builders.co.za (Builders Warehouse). Do NOT include specialty items or proprietary accessories that Builders does not stock. Return only valid JSON.' },
+          { role: 'system', content: 'You are a South African maintenance quotation expert. CRITICAL: Every material in materialsBOM MUST be a real product available at a major SA hardware retailer (Builders Warehouse, Leroy Merlin). Do NOT include specialty/proprietary items they do not stock. For estimated_price, give the CURRENT 2026 South African retail price in ZAR INCLUSIVE of VAT, realistic to today\'s market rates (not outdated or guessed-low). Return only valid JSON.' },
           {
             role: 'user',
-            content: `Generate a detailed maintenance quote:\nCategory: ${category}\nDescription: ${description}\nMaterials: ${materialsResp}\n${pricingCtx ? `Pricing: ${pricingCtx}` : ''}\n\nReturn JSON: {"laborHours":<num>,"laborCostPerHour":${laborRate},"complexity":<1-5>,"equipmentCost":<num>,"scopeOfWork":"<text>","estimatedDuration":"<text>","materialsBOM":[{"name":"<text>","qty":<num>,"unit":"<text>","estimated_price":<num>}]}`,
+            content: `Generate a detailed maintenance quote:\nCategory: ${category}\nDescription: ${description}\nMaterials: ${materialsResp}\n${pricingCtx ? `Pricing: ${pricingCtx}` : ''}\n\nReturn JSON: {"laborHours":<num>,"laborCostPerHour":${laborRate},"complexity":<1-5>,"equipmentCost":<num>,"scopeOfWork":"<text>","estimatedDuration":"<text>","materialsBOM":[{"name":"<text>","qty":<num>,"unit":"<text>","estimated_price":<num current 2026 ZAR retail price incl VAT>}]}`,
           },
         ],
       });
@@ -5832,7 +5840,7 @@ async function executeBookingAction({ firestore, action, actorUid, actorRole, pa
           ...(eqCost > 0 ? [{ description: 'Equipment & Tools', cost: eqCost.toFixed(2) }] : []),
           { description: 'Contingency (15%)', cost: contingency.toFixed(2) },
         ],
-        disclaimer: 'Quote uses real-time Builders.co.za pricing where available. Final costs may vary based on actual site conditions.',
+        disclaimer: 'Materials are priced from live retailer data where available, otherwise current market estimates. Final costs may vary with site conditions and the actual products selected.',
         generated_at: now, source: 'backend_ai_builders',
       };
 
