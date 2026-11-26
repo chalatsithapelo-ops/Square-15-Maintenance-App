@@ -7,7 +7,7 @@ upload/deploy a minimal set of files to GitHub/Render.
 
 # â”€â”€ Version tag â€” bump this on every deploy so we can verify Render runs the
 # latest code.  Check Render logs for the startup banner.
-WORKER_VERSION = "2026-11-22-realtime-s2s"
+WORKER_VERSION = "2026-11-26-cascade-default-greeting-fix"
 
 import os
 import sys
@@ -3514,12 +3514,15 @@ async def entrypoint(ctx: JobContext):
             get_fraud_alerts_report,
     ]
 
-    # ── LATENCY: use the OpenAI Realtime (speech-to-speech) model by default ──
-    # The old pipeline was STT (transcribe) -> LLM -> TTS: three sequential
-    # network round-trips per turn, which is why Aniyah felt slow. The Realtime
-    # API streams speech in and speech out through ONE model, so replies begin
-    # almost immediately. Set VOICE_REALTIME=false to fall back to the cascade.
-    _use_realtime = os.getenv("VOICE_REALTIME", "true").strip().lower() != "false"
+    # ── STABILITY: default to the proven cascade pipeline (STT -> LLM -> TTS) ──
+    # The OpenAI Realtime (speech-to-speech) path lowered latency but regressed
+    # reliability on device: calls dropped mid-conversation (persistent realtime
+    # WebSocket) and the opening greeting was silent (Realtime has no TTS, so
+    # session.say() threw). The cascade pipeline is latency-optimized (streaming
+    # gpt-4o-mini-transcribe STT + preemptive generation) and does not have those
+    # issues, so it is the default. Opt back into Realtime with VOICE_REALTIME=true
+    # once its stability has been re-validated on a live call.
+    _use_realtime = os.getenv("VOICE_REALTIME", "false").strip().lower() == "true"
 
     if _use_realtime:
         logger.info("ðŸ¤– Voice mode: REALTIME (speech-to-speech, low latency)")
@@ -3568,6 +3571,17 @@ async def entrypoint(ctx: JobContext):
         cleaned = _sanitize_spoken_text(text)
         if not cleaned:
             return None
+        if _use_realtime:
+            # The Realtime model has no separate TTS, so the real say() raises
+            # ("no TTS") and the line is silently dropped. Speak it through the
+            # model instead so every say() call in this file stays audible.
+            try:
+                return session.generate_reply(
+                    instructions=f'Say exactly this, warmly, and nothing else: "{cleaned}"'
+                )
+            except Exception as _re:
+                logger.debug(f"realtime say->generate_reply error: {_re}")
+                return None
         return _orig_say(cleaned, *args, **kwargs)
 
     session.say = _say_sanitized
@@ -4015,6 +4029,9 @@ async def entrypoint(ctx: JobContext):
                 if caller_name
                 else "Hi, I am Aniyah, how can I help you today?"
             )
+        # session.say is wrapped above to be realtime-safe (routes to the model
+        # when the Realtime path is active, which has no TTS), so this greeting is
+        # audible in both the cascade and realtime pipelines.
         _greeting_handle = session.say(greeting, allow_interruptions=True)
         logger.info(f"âœ… Greeting sent (name={'yes' if caller_name else 'no'}, push={app_context_is_push or bool(app_context_focus_booking_id)})")
     except Exception as e:
